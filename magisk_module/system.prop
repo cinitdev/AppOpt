@@ -1,0 +1,14 @@
+# AppOpt SurfaceFlinger 渲染优化
+#
+# 用途: 优化 SurfaceFlinger 帧渲染行为,配合 binder 直连降低延迟
+#
+# 参考: fas-rs 的最佳实践 (https://github.com/shadow3aaa/fas-rs)
+
+# 禁用帧速率调整 - 避免系统自动限制帧率
+vendor.perf.framepacing.enable=false
+
+# 允许使用未发出信号的缓冲区 - 减少渲染延迟
+debug.sf.latch_unsignaled=true
+
+# 禁用帧预测 - 降低输入延迟
+persist.sys.framepredict.enable=false

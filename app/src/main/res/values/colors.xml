@@ -1,0 +1,23 @@
+<resources>
+    <!-- 悬浮球胶囊配色 (沿用) -->
+    <color name="yellow_capsule">#F1C40F</color>
+    <color name="red_capsule">#E74C3C</color>
+    <color name="capsule_text">#FFFFFF</color>
+
+    <!-- 品牌主色: 性能/科技感的蓝紫 -->
+    <color name="brand_primary">#5B5BD6</color>
+    <color name="brand_primary_dark">#4A4AB8</color>
+    <color name="brand_on_primary">#FFFFFF</color>
+    <color name="brand_secondary">#00B8A3</color>
+
+    <!-- 状态色 -->
+    <color name="status_ok">#2ECC71</color>
+    <color name="status_warn">#E67E22</color>
+    <color name="status_off">#95A5A6</color>
+
+    <!-- 中性 -->
+    <color name="text_primary">#1A1A2E</color>
+    <color name="text_secondary">#6B6B80</color>
+    <color name="surface_app">#F4F4FB</color>
+    <color name="card_bg">#FFFFFF</color>
+</resources>

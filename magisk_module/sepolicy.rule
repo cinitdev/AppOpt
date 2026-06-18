@@ -1,0 +1,13 @@
+# AppOpt binder 直连权限
+allow magisk surfaceflinger binder *
+allow ksu surfaceflinger binder *
+allow su surfaceflinger binder *
+allow surfaceflinger magisk fd *
+allow surfaceflinger ksu fd *
+allow surfaceflinger su fd *
+allow surfaceflinger magisk fifo_file *
+allow surfaceflinger ksu fifo_file *
+allow surfaceflinger su fifo_file *
+allow magisk binder_device chr_file *
+allow ksu binder_device chr_file *
+allow su binder_device chr_file *

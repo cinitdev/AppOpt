@@ -1,0 +1,305 @@
+package top.suto.appopt
+
+import java.io.DataOutputStream
+
+/**
+ * 与 C 守护进程的文件式 IPC 桥接。
+ *
+ * 守护进程运行在 /data/adb/modules/AppOpt/ 下, 该目录普通应用无权限读写,
+ * 因此命令/状态文件的读写全部通过 root (su) 执行。
+ *
+ * 协议:
+ *   App  -> 守护:  写 calibrate.cmd, 内容 "start <pkg>" / "stop <pkg>"
+ *   守护 -> App:   写 calibrate.state, 内容 "idle" / "sampling <pkg>" / "done <pkg>"
+ */
+object DaemonBridge {
+
+    private const val MODULE_DIR = "/data/adb/modules/AppOpt"
+    private const val CMD_FILE = "$MODULE_DIR/calibrate.cmd"
+    private const val STATE_FILE = "$MODULE_DIR/calibrate.state"
+    private const val CONFIG_FILE = "$MODULE_DIR/applist.conf"
+    private const val HISTORY_DIR = "$MODULE_DIR/history"
+    private const val LOG_FILE = "$MODULE_DIR/AppOpt.log"
+    private const val FPS_CMD_FILE = "$MODULE_DIR/fps.cmd"
+
+    /** 检测设备是否有可用的 root (su); 首次调用会触发 Magisk 授权弹窗 */
+    fun hasRoot(): Boolean = runAsRoot("id -u").trim() == "0"
+
+    /**
+     * 检测 C 守护进程是否在运行。
+     * 用 `pgrep -x AppOpt` 按精确进程名(comm)匹配, 而非 `pgrep -f <路径>`:
+     * 后者扫描完整命令行, 会把承载本检测命令的 su 父进程(其命令行恰好含该路径字符串)
+     * 误匹配进去, 导致未刷模块也显示"运行中"。按 comm 精确匹配则 su/pgrep 自身均不命中。
+     * 找不到时用 `|| echo` 兜底, 使命令本身 exit 0(否则会被 runAsRoot 误判为出错)。
+     * 注意: calibrate.state 文件即便守护进程已死也会残留, 故必须用 pgrep 判真实存活。
+     */
+    fun isDaemonRunning(): Boolean {
+        val out = runAsRoot("pgrep -x AppOpt >/dev/null 2>&1 && echo RUNNING || echo STOPPED")
+        return out.trim() == "RUNNING"
+    }
+
+    /** 下发开始采样命令 */
+    fun startCalibration(pkg: String): Boolean {
+        if (pkg.isBlank()) return false
+        // 单引号包裹防注入; 包名本身不含单引号
+        val safe = pkg.replace("'", "")
+        return runAsRoot("printf '%s' 'start $safe' > $CMD_FILE").isNotErrored()
+    }
+
+    /** 下发停止采样命令, 守护进程随后生成规则并回写配置 */
+    fun stopCalibration(pkg: String): Boolean {
+        val safe = pkg.replace("'", "")
+        return runAsRoot("printf '%s' 'stop $safe' > $CMD_FILE").isNotErrored()
+    }
+
+    /** 通知守护进程开始真实帧率监测(perfetto), 每秒把 FPS 写到 app 私有目录 */
+    fun startFpsMonitor(pkg: String): Boolean {
+        if (pkg.isBlank()) return false
+        val safe = pkg.replace("'", "")
+        return runAsRoot("printf '%s' 'start $safe' > $FPS_CMD_FILE").isNotErrored()
+    }
+
+    /** 通知守护进程停止帧率监测 */
+    fun stopFpsMonitor(): Boolean {
+        return runAsRoot("printf '%s' 'stop' > $FPS_CMD_FILE").isNotErrored()
+    }
+
+    /** 读取守护进程当前状态; 读不到返回空串 */
+    fun readState(): String {
+        return runAsRoot("cat $STATE_FILE 2>/dev/null").trim()
+    }
+
+    /**
+     * 读取守护进程运行日志 (service.sh 把 stdout/stderr 重定向到 AppOpt.log,
+     * 每次开机覆盖写, 故只含本次开机以来的日志)。只取最近 maxLines 行避免过大。
+     */
+    fun readDaemonLog(maxLines: Int = 500): String {
+        val out = runAsRoot("tail -n $maxLines $LOG_FILE 2>/dev/null")
+        return if (out.isNotErrored()) out else ""
+    }
+
+    /**
+     * 轮询等待守护进程进入 "done ..." 状态 (规则已生成回写)。
+     * 返回状态详情: null=超时, "ok"=成功, "short"=采样时长不足, "no_load"=负载不足, "write_fail"=写回失败
+     */
+    fun waitDone(pkg: String, timeoutMs: Long = 4000): String? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val st = readState()
+            if (st.startsWith("done")) {
+                // 解析状态: "done pkg" 或 "done pkg;reason=xxx"
+                val parts = st.split(";")
+                if (parts.size > 1) {
+                    val reasonPart = parts.firstOrNull { it.startsWith("reason=") }
+                    return reasonPart?.substringAfter("reason=") ?: "ok"
+                }
+                return "ok"
+            }
+            try { Thread.sleep(250) } catch (_: InterruptedException) { return null }
+        }
+        return null
+    }
+
+    /**
+     * 读取配置文件中某包名当前生效的规则行 (排除 "=auto" 占位)。
+     * 用于校准结束后向用户展示生成结果。
+     */
+    fun readPkgRules(pkg: String): List<String> {
+        val text = readConfigRaw()
+        if (text.isBlank()) return emptyList()
+        val result = ArrayList<String>()
+        for (raw in text.lineSequence()) {
+            val line = raw.trim()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            val eq = line.indexOf('=')
+            if (eq <= 0) continue
+            var key = line.substring(0, eq).trim()
+            val brace = key.indexOf('{')
+            if (brace >= 0) key = key.substring(0, brace).trim()
+            val value = line.substring(eq + 1).trim()
+            if (key == pkg && !value.equals("auto", ignoreCase = true)) {
+                result.add(line)
+            }
+        }
+        return result
+    }
+
+    /** 读取配置文件原始内容; 读不到返回空串 */
+    fun readConfigRaw(): String {
+        val out = runAsRoot("cat $CONFIG_FILE 2>/dev/null")
+        return if (out.isNotErrored()) out else ""
+    }
+
+    /** 读取某包名的历史线程负载记录原始内容; 读不到返回空串 */
+    fun readHistory(pkg: String): String {
+        val safe = pkg.replace("'", "")
+        val out = runAsRoot("cat '$HISTORY_DIR/$safe.log' 2>/dev/null")
+        return if (out.isNotErrored()) out else ""
+    }
+
+    /** 删除某包名的整个历史记录文件(应用列表里"删除"该应用的全部历史) */
+    fun deleteHistory(pkg: String): Boolean {
+        val safe = pkg.replace("'", "")
+        if (safe.isBlank()) return false
+        return runAsRoot("rm -f '$HISTORY_DIR/$safe.log'").isNotErrored()
+    }
+
+    /**
+     * 删除某包名历史中的单次会话(按 epoch 定位)。
+     * 日志是单文件多段格式, 故读出全文 -> 过滤掉以 "# <epoch> ..." 开头的那一段 -> 写回。
+     * 删完若文件已空, 则连同文件一起删除。
+     * 返回是否成功(包括"该会话本就不存在"也视为成功)。
+     */
+    fun deleteSession(pkg: String, epoch: Long): Boolean {
+        val safe = pkg.replace("'", "")
+        if (safe.isBlank()) return false
+        val raw = readHistory(pkg)
+        if (raw.isBlank()) return true
+
+        // 调试日志: 打印要删除的 epoch 和文件中的所有段头
+        android.util.Log.d("AppOpt", "deleteSession: 要删除 epoch=$epoch")
+        raw.lineSequence().filter { it.trim().startsWith("#") }.forEach {
+            android.util.Log.d("AppOpt", "deleteSession: 文件中的段头: $it")
+        }
+
+        val out = StringBuilder()
+        var skipping = false
+        var removedAny = false
+        for (line in raw.lineSequence()) {
+            val t = line.trim()
+            if (t.startsWith("#")) {
+                // 段头: 解析 epoch 决定是否进入"跳过本段"状态
+                val first = t.removePrefix("#").trim().split(Regex("\\s+")).getOrNull(0)?.toLongOrNull()
+                skipping = (first == epoch)   // 每次遇到新段头都重新判断
+                android.util.Log.d("AppOpt", "deleteSession: 段头 epoch=$first, 匹配=${first==epoch}, skipping=$skipping")
+                if (skipping) {
+                    removedAny = true
+                    continue   // 跳过这个段头
+                }
+            }
+            if (!skipping) out.append(line).append('\n')
+        }
+        android.util.Log.d("AppOpt", "deleteSession: removedAny=$removedAny, 剩余${out.length}字符")
+        if (!removedAny) return true   // 没找到该会话, 不必写回
+        val remaining = out.toString().trim()
+
+        val result = if (remaining.isEmpty()) {
+            android.util.Log.d("AppOpt", "deleteSession: 删空了,删除整个文件")
+            deleteHistory(pkg)         // 删空了, 整文件移除
+        } else {
+            android.util.Log.d("AppOpt", "deleteSession: 写回文件,剩余内容行数=${remaining.lines().size}")
+            val writeOk = writeFileAsRoot("$HISTORY_DIR/$safe.log", remaining + "\n")
+            android.util.Log.d("AppOpt", "deleteSession: 写入结果=$writeOk")
+
+            // 验证写入: 读回文件检查
+            val verify = readHistory(pkg)
+            val verifyLines = verify.lines().filter { it.trim().startsWith("#") }
+            android.util.Log.d("AppOpt", "deleteSession: 验证读回,段头数=${verifyLines.size}")
+            verifyLines.forEach { android.util.Log.d("AppOpt", "deleteSession: 验证段头: $it") }
+
+            writeOk
+        }
+        android.util.Log.d("AppOpt", "deleteSession: 最终返回=$result")
+        return result
+    }
+
+    /** 一条历史记录的概要: 包名 + 最近一次生成时间(epoch 秒, 取文件 mtime) */
+    data class HistoryEntry(val pkg: String, val mtime: Long)
+
+    /**
+     * 枚举 history/ 目录下所有 *.log, 返回 (包名, 最近修改时间) 列表, 按时间倒序。
+     * 不依赖配置中的 auto —— 即使配置已被生成的规则替换, 历史依旧可见。
+     * 用 `ls` 一次性拿到时间戳与文件名, 避免多次 su 调用。
+     */
+    fun listHistoryEntries(): List<HistoryEntry> {
+        // %Y=mtime(epoch), %n=文件名; 仅取 .log
+        val out = runAsRoot(
+            "for f in $HISTORY_DIR/*.log; do [ -e \"\$f\" ] && stat -c '%Y %n' \"\$f\"; done 2>/dev/null"
+        )
+        if (!out.isNotErrored()) return emptyList()
+        val list = ArrayList<HistoryEntry>()
+        for (raw in out.lineSequence()) {
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            val sp = line.indexOf(' ')
+            if (sp <= 0) continue
+            val mtime = line.substring(0, sp).toLongOrNull() ?: continue
+            val full = line.substring(sp + 1).trim()
+            val name = full.substringAfterLast('/')
+            if (!name.endsWith(".log")) continue
+            val pkg = name.removeSuffix(".log")
+            if (pkg.isNotEmpty()) list.add(HistoryEntry(pkg, mtime))
+        }
+        return list.sortedByDescending { it.mtime }
+    }
+
+    private const val ERR_MARK = "__APPOPT_ERR__"
+
+    private fun String.isNotErrored(): Boolean = !this.contains(ERR_MARK)
+
+    /**
+     * 以 root 把内容写到指定路径。内容经 base64 传递再由 `base64 -d` 还原,
+     * 彻底规避 shell 转义/注入(内容里的引号、$、换行都不会被解释)。
+     * 路径由调用方用固定常量拼出(仅含包名 safe 化), 不含用户可控的危险字符。
+     *
+     * 对于大内容(>100KB),使用 heredoc 避免命令行参数长度限制。
+     */
+    private fun writeFileAsRoot(path: String, content: String): Boolean {
+        val b64 = android.util.Base64.encodeToString(
+            content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
+        )
+        // 使用 heredoc 避免参数长度限制
+        val cmd = "base64 -d > '$path' << 'EOF_BASE64'\n$b64\nEOF_BASE64"
+        return runAsRoot(cmd).isNotErrored()
+    }
+
+    /**
+     * 通过 su 执行一条 shell 命令, 返回 stdout。出错时返回值包含 ERR_MARK。
+     * 每条命令起一个短命的 su 进程, 简单可靠, 频率为秒级不构成性能问题。
+     */
+    private val DEV_NULL = java.io.File("/dev/null")
+
+    private fun runAsRoot(cmd: String): String {
+        return try {
+            // 把 stderr 重定向到 /dev/null: 没有无人读的 stderr 管道, 既避免
+            // "stderr 写满管道缓冲(~64KB)->子进程阻塞写、父进程阻塞读 stdout"的死锁,
+            // 又不像合并 stderr 那样污染 stdout(hasRoot 等按内容精确解析)。
+            // (不用 Redirect.DISCARD: 那是 Java9+ API, Android 上不可用。)
+            val process = ProcessBuilder("su", "-c", cmd)
+                .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
+                .start()
+            try {
+                val out = process.inputStream.bufferedReader().readText()
+                val code = process.waitFor()
+                if (code != 0) "$out$ERR_MARK" else out
+            } finally {
+                process.destroy()
+            }
+        } catch (e: Exception) {
+            // 某些 su 实现不支持 "su -c", 回退到管道写入方式
+            runViaStdin(cmd)
+        }
+    }
+
+    private fun runViaStdin(cmd: String): String {
+        return try {
+            val process = ProcessBuilder("su")
+                .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))   // 同理: 弃 stderr 防死锁
+                .start()
+            try {
+                DataOutputStream(process.outputStream).use { os ->
+                    os.writeBytes("$cmd\n")
+                    os.writeBytes("exit\n")
+                    os.flush()
+                }
+                val out = process.inputStream.bufferedReader().readText()
+                val code = process.waitFor()
+                if (code != 0) "$out$ERR_MARK" else out
+            } finally {
+                process.destroy()
+            }
+        } catch (e: Exception) {
+            "$ERR_MARK"
+        }
+    }
+}

@@ -1,0 +1,486 @@
+package top.suto.appopt
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.graphics.PixelFormat
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.LayoutInflater
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.TextView
+import java.util.Locale
+import kotlin.concurrent.thread
+import kotlin.math.abs
+import top.suto.appopt.databinding.OverlayResultBinding
+
+/**
+ * 悬浮球前台服务。
+ *
+ * 黄色胶囊 = 待机, 中间显示实时帧率;
+ * 点击 -> 红色胶囊 = 校准中, 向守护进程下发 start <前台包名>, 持续记录线程负载;
+ * 再次点击 -> 胶囊消失, 下发 stop, 守护进程据采样生成大小核规则并回写配置。
+ *
+ * 胶囊可拖动; 区分点击与拖动靠移动阈值判定。
+ */
+class FloatingBallService : Service() {
+
+    private lateinit var windowManager: WindowManager
+    private lateinit var capsule: TextView
+    private lateinit var layoutParams: WindowManager.LayoutParams
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private var calibrating = false
+    private var targetPkg: String? = null
+    // FileObserver 回调线程写、主线程读, 需 @Volatile 保证可见性(否则主线程可能读到陈旧值)
+    @Volatile private var currentFps = 0f
+
+    // 前台监测: 目标应用一旦退出/切后台, 自动移除悬浮球
+    private var hasAppearedForeground = false   // 目标应用是否已经在前台出现过(拉起成功)
+    private var absentCount = 0                  // 连续检测到不在前台的次数
+    private var foregroundClosing = false        // 是否已因离开前台进入关闭流程
+
+    private lateinit var fpsMonitor: FrameRateMonitor
+
+    // 当前显示的提示横幅(用于 onDestroy 兜底清理, 避免 stopSelf 后泄漏)
+    private var bannerView: View? = null
+
+    // 当前显示的结果卡片(同上, onDestroy 兜底清理)
+    private var resultView: View? = null
+
+    // 拖动状态
+    private var initialX = 0
+    private var initialY = 0
+    private var touchX = 0f
+    private var touchY = 0f
+    private var dragged = false
+
+    companion object {
+        private const val CHANNEL_ID = "appopt_floating"
+        private const val NOTIF_ID = 1001
+        private const val DRAG_THRESHOLD = 12f
+        const val EXTRA_TARGET_PKG = "target_pkg"
+
+        // 前台监测周期与离开阈值
+        private const val FG_CHECK_INTERVAL = 3000L   // 每 3s 检查一次目标应用是否在前台
+        private const val FG_ABSENT_LIMIT = 2         // 连续 2 次(约6s)不在前台才判定离开, 避免下拉通知栏等短暂切换误关
+        private const val FG_APPEAR_GRACE = 15        // 启动后等待应用出现的宽限次数(约45s)
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        startForeground(NOTIF_ID, buildNotification())
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        // fpsMonitor 延迟到 onStartCommand 初始化(需要 targetPkg)
+        addCapsule()
+    }
+
+    private fun buildNotification(): Notification {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val ch = NotificationChannel(
+            CHANNEL_ID, "AppOpt 悬浮球",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        nm.createNotificationChannel(ch)
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("AppOpt 线程优化")
+            .setContentText("悬浮球运行中, 点击胶囊开始/结束校准")
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setOngoing(true)
+            .build()
+    }
+    private fun dp(value: Float): Int =
+        TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics
+        ).toInt()
+
+    private fun addCapsule() {
+        capsule = TextView(this).apply {
+            text = "0.0"
+            setTextColor(resources.getColor(R.color.capsule_text, theme))
+            textSize = 13f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            // BOLD 之上再给文字描一层细边, 实现比常规加粗更重的字重(系统无更重字体可选)
+            paint.style = android.graphics.Paint.Style.FILL_AND_STROKE
+            paint.strokeWidth = 2.0f
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            setBackgroundResource(R.drawable.capsule_yellow)
+            // 整体再叠一层轻微透明, 让悬浮球在游戏画面上不喧宾夺主
+            alpha = 0.92f
+        }
+
+        val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+
+        // 固定尺寸: 扁胶囊, 按最宽内容("● 120.0")预留, 避免帧率变化导致忽大忽小
+        layoutParams = WindowManager.LayoutParams(
+            dp(45f),
+            dp(30f),
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = dp(16f)
+            y = dp(120f)
+        }
+
+        capsule.setOnTouchListener { _, event -> handleTouch(event) }
+        // START_STICKY 重建服务时悬浮窗权限可能已被撤销, addView 会抛 BadTokenException。
+        // 包裹后失败则直接 stopSelf, 避免崩溃 + 避免空跑一个看不见的服务。
+        try {
+            windowManager.addView(capsule, layoutParams)
+        } catch (e: Exception) {
+            stopSelf()
+        }
+    }
+
+    private fun updateCapsuleText() {
+        // 显示游戏真实渲染帧率(带 1 位小数, 由守护进程直连 binder 解析 SF 帧时间戳得出);
+        // 校准中加前缀红点。<=0 表示尚未收到数据或未在监测。
+        val label = if (currentFps > 0f) String.format(Locale.US, "%.1f", currentFps) else "0.0"
+        capsule.text = if (calibrating) label else label
+    }
+    private fun handleTouch(event: MotionEvent): Boolean {
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                initialX = layoutParams.x
+                initialY = layoutParams.y
+                touchX = event.rawX
+                touchY = event.rawY
+                dragged = false
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = event.rawX - touchX
+                val dy = event.rawY - touchY
+                if (abs(dx) > DRAG_THRESHOLD || abs(dy) > DRAG_THRESHOLD) {
+                    dragged = true
+                    layoutParams.x = initialX + dx.toInt()
+                    layoutParams.y = initialY + dy.toInt()
+                    windowManager.updateViewLayout(capsule, layoutParams)
+                }
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                if (!dragged) onCapsuleClick()
+                return true
+            }
+        }
+        return false
+    }
+    private fun onCapsuleClick() {
+        if (!calibrating) {
+            // 黄 -> 红: 开始校准。目标包名由启动 App 时通过 Intent 指定。
+            val pkg = targetPkg
+            if (pkg.isNullOrBlank()) {
+                toast("未指定目标应用, 请从优化 App 内启动")
+                return
+            }
+            calibrating = true
+            capsule.setBackgroundResource(R.drawable.capsule_red)
+            updateCapsuleText()
+            showBanner("● 开始记录线程负载\n请正常操作游戏, 完成后再次点击胶囊结束", durationMs = 3500)
+            thread {
+                val ok = DaemonBridge.startCalibration(pkg)
+                if (!ok) mainHandler.post {
+                    showBanner("下发失败, 请确认已授予 root", durationMs = 3000)
+                    revertToYellow()
+                }
+            }
+        } else {
+            // 红 -> 停止采样并生成规则; 移除胶囊, 弹出结果卡片
+            val pkg = targetPkg ?: ""
+            calibrating = false
+            // 用户主动停止: 关闭前台监测, 避免查看结果卡片时被自动关闭打断
+            foregroundClosing = true
+            mainHandler.removeCallbacks(foregroundWatcher)
+            removeCapsule()
+            showBanner("正在分析线程负载并生成规则…", durationMs = 3500)
+            thread {
+                val ok = DaemonBridge.stopCalibration(pkg)
+                val status = if (ok) DaemonBridge.waitDone(pkg) else null
+                val rules = if (status == "ok") DaemonBridge.readPkgRules(pkg) else emptyList()
+                android.util.Log.d("AppOpt", "校准完成: ok=$ok, status=$status, rules.size=${rules.size}")
+                mainHandler.post {
+                    if (ok && status == null) {
+                        showBanner("等待守护进程响应超时\n规则可能未生成，请重试或检查日志", durationMs = 3200)
+                        mainHandler.postDelayed({ stopSelf() }, 3000)
+                    } else {
+                        showResult(pkg, ok, status, rules)
+                    }
+                }
+            }
+        }
+    }
+
+    /** 校准结束后, 在悬浮窗里展示生成的规则结果; 3 秒后自动关闭, 用户也可点「完成」提前关闭。 */
+    private fun showResult(pkg: String, ok: Boolean, status: String?, rules: List<String>) {
+        // Service 的 Context 没有 Theme, 需要包装一个带主题的 ContextThemeWrapper
+        val themedContext = android.view.ContextThemeWrapper(this, R.style.Theme_AppOpt)
+        val view = OverlayResultBinding.inflate(LayoutInflater.from(themedContext))
+
+        if (!ok) {
+            view.resultIcon.setImageResource(R.drawable.ic_error)
+            view.resultTitle.text = "校准失败"
+            view.resultSummary.text = "停止采样时出错，请确认已授予 root 权限"
+            view.rulesContainer.visibility = android.view.View.GONE
+        } else if (status == "short") {
+            view.resultIcon.setImageResource(R.drawable.ic_warning)
+            view.resultTitle.text = "采样时长不足"
+            view.resultSummary.text = "需要至少 30 秒采样才能生成准确规则\n建议重新进入游戏并多玩一会"
+            view.rulesContainer.visibility = android.view.View.GONE
+        } else if (status == "no_load") {
+            view.resultIcon.setImageResource(R.drawable.ic_info)
+            view.resultTitle.text = "负载过低"
+            view.resultSummary.text = "未检测到明显的线程负载变化\n建议在游戏内正常游玩时采样"
+            view.rulesContainer.visibility = android.view.View.GONE
+        } else if (status == "write_fail") {
+            view.resultIcon.setImageResource(R.drawable.ic_error)
+            view.resultTitle.text = "写入失败"
+            view.resultSummary.text = "规则生成成功但写回配置文件失败\n请检查模块权限或查看日志"
+            view.rulesContainer.visibility = android.view.View.GONE
+        } else if (rules.isEmpty()) {
+            view.resultIcon.setImageResource(R.drawable.ic_info)
+            view.resultTitle.text = "未生成规则"
+            view.resultSummary.text = "本次未生成新规则\n请重试或检查日志获取详情"
+            view.rulesContainer.visibility = android.view.View.GONE
+        } else {
+            view.resultIcon.setImageResource(R.drawable.ic_check_circle)
+            view.resultTitle.text = "校准成功"
+            view.resultSummary.text = "已为 $pkg 生成 ${rules.size} 条大小核分配规则"
+            view.rulesContainer.visibility = android.view.View.VISIBLE
+            view.resultRules.text = rules.joinToString("\n")
+        }
+
+        val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.CENTER }
+
+        // 手动点击与自动超时共用收口: 只会真正移除+stopSelf 一次
+        var closed = false
+        val close = object : Runnable {
+            override fun run() {
+                if (closed) return
+                closed = true
+                mainHandler.removeCallbacks(this)  // 取消未触发的自动关闭
+                try { windowManager.removeView(view.root) } catch (_: Exception) {}
+                if (resultView === view.root) resultView = null
+                stopSelf()
+            }
+        }
+        view.resultOk.setOnClickListener { close.run() }
+        resultView = view.root
+        // 同 addCapsule: 悬浮窗权限可能已撤销, addView 抛异常时静默放弃此结果浮层并关闭服务
+        try {
+            windowManager.addView(view.root, lp)
+            // 3 秒后自动关闭(点击「完成」会提前触发并取消此定时)
+            mainHandler.postDelayed(close, 6000)
+        } catch (e: Exception) {
+            if (resultView === view.root) resultView = null
+            // addView 失败(权限撤销/窗口异常), 停止服务避免空跑
+            stopSelf()
+        }
+    }
+
+    private fun revertToYellow() {
+        calibrating = false
+        capsule.setBackgroundResource(R.drawable.capsule_yellow)
+        updateCapsuleText()
+    }
+
+    private fun removeCapsule() {
+        try {
+            windowManager.removeView(capsule)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun toast(msg: String) {
+        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * 在屏幕上方显示一个自动消失的提示横幅(比系统 toast 更醒目, 游戏里不易被压制)。
+     * durationMs 后自动移除。
+     */
+    private fun showBanner(msg: String, durationMs: Long = 3200) {
+        val tv = TextView(this).apply {
+            text = msg
+            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setBackgroundResource(R.drawable.bg_banner)
+            setPadding(dp(20f), dp(12f), dp(20f), dp(12f))
+        }
+        val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = dp(64f)
+        }
+        try {
+            // 先移除上一条横幅, 避免叠加
+            bannerView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
+            bannerView = tv
+            windowManager.addView(tv, lp)
+            mainHandler.postDelayed({
+                try { windowManager.removeView(tv) } catch (_: Exception) {}
+                if (bannerView === tv) bannerView = null
+            }, durationMs)
+        } catch (_: Exception) {
+        }
+    }
+
+    // ---- 前台监测: 目标应用退出/切后台时自动关闭悬浮球 ----
+
+    private var appearGraceLeft = FG_APPEAR_GRACE
+
+    private val foregroundWatcher = object : Runnable {
+        override fun run() {
+            val pkg = targetPkg
+            if (pkg.isNullOrBlank() || foregroundClosing) return
+            // 没有使用情况访问权限时无法判断前台, 跳过自动关闭(退化为手动收起),
+            // 否则会误判"不在前台"导致宽限期后把悬浮球错误关掉。仍排下次检查,
+            // 以便用户在设置里补授权后能自动恢复监测。
+            if (!ForegroundDetector.hasUsageAccess(this@FloatingBallService)) {
+                mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
+                return
+            }
+            thread {
+                val fg = ForegroundDetector.isAppForeground(this@FloatingBallService, pkg)
+                mainHandler.post { onForegroundChecked(fg) }
+            }
+            mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
+        }
+    }
+
+    private fun onForegroundChecked(foreground: Boolean) {
+        if (foregroundClosing) return
+        if (foreground) {
+            hasAppearedForeground = true
+            absentCount = 0
+            return
+        }
+        // 不在前台
+        if (!hasAppearedForeground) {
+            // 应用还没拉起来, 给一段宽限期, 超时仍未出现也关闭(避免悬空)
+            if (--appearGraceLeft <= 0) closeByForeground(appeared = false)
+            return
+        }
+        // 曾在前台, 现在离开: 累计到阈值即关闭
+        if (++absentCount >= FG_ABSENT_LIMIT) closeByForeground(appeared = true)
+    }
+
+    /**
+     * 因目标应用离开前台(或始终未出现)而自动关闭。
+     * 校准中则先停止采样; 关闭前显示明确横幅, 待横幅可见后再真正 stopSelf。
+     */
+    private fun closeByForeground(appeared: Boolean) {
+        if (foregroundClosing) return
+        foregroundClosing = true
+        mainHandler.removeCallbacks(foregroundWatcher)
+        removeCapsule()
+        val pkg = targetPkg ?: ""
+
+        val wasCalibrating = calibrating
+        calibrating = false
+
+        if (wasCalibrating && appeared && pkg.isNotBlank()) {
+            // 校准中退出游戏: 快速等待 C 端返回状态并显示具体原因
+            thread {
+                val ok = DaemonBridge.stopCalibration(pkg)
+                val status = if (ok) DaemonBridge.waitDone(pkg, timeoutMs = 2000) else null
+
+                val msg = when (status) {
+                    "ok" -> "校准完成，规则已生成"
+                    "short" -> "采样时长不足 (需要 ≥30 秒)\n建议重新进入游戏多玩一会"
+                    "no_load" -> "未检测到明显线程负载\n建议在游戏内正常游玩时采样"
+                    "write_fail" -> "规则写回配置文件失败\n请检查模块权限"
+                    else -> "已退出游戏，校准已停止\n(数据已保存到历史记录)"
+                }
+
+                mainHandler.post {
+                    showBanner(msg, durationMs = 2600)
+                    mainHandler.postDelayed({ stopSelf() }, 2600)
+                }
+            }
+        } else {
+            // 未校准或未出现: 直接显示提示并关闭
+            val msg = when {
+                appeared -> "已退出游戏，悬浮球已关闭"
+                else     -> "未检测到目标应用启动\n悬浮球已自动关闭"
+            }
+            showBanner(msg, durationMs = 2600)
+            mainHandler.postDelayed({ stopSelf() }, 2200)
+        }
+    }
+
+    override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)
+        // fpsMonitor 在 onStartCommand 才初始化; 服务若在那之前被回收, 直接访问会崩
+        if (::fpsMonitor.isInitialized) fpsMonitor.stop()
+        // 通知守护进程停止 perfetto 帧率监测(省电)。su 是独立进程,
+        // 即使本进程随后退出, 已 fork 的命令仍会执行完。
+        thread { DaemonBridge.stopFpsMonitor() }
+        removeCapsule()
+        bannerView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
+        bannerView = null
+        resultView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
+        resultView = null
+        super.onDestroy()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        intent?.getStringExtra(EXTRA_TARGET_PKG)?.let {
+            if (it.isNotBlank()) targetPkg = it
+        }
+        // 初始化真实帧率接收器(FileObserver 监听守护进程写的 fps 文件)
+        if (!::fpsMonitor.isInitialized) {
+            fpsMonitor = FrameRateMonitor(this) { fps ->
+                currentFps = fps
+                mainHandler.post { updateCapsuleText() }
+            }
+            fpsMonitor.start()
+        }
+        // 有目标应用时: 通知守护进程开始帧率监测(差分读 SF, 不清缓冲, 不干扰 Scene)
+        // + 启动前台监测看门狗。
+        if (!targetPkg.isNullOrBlank()) {
+            val pkg = targetPkg!!
+            thread {
+                if (!DaemonBridge.startFpsMonitor(pkg)) {
+                    mainHandler.post { toast("帧率监测下发失败, 请确认 root") }
+                }
+            }
+            // 重置前台检测状态(避免保留上次启动的残留值)
+            hasAppearedForeground = false
+            absentCount = 0
+            appearGraceLeft = FG_APPEAR_GRACE
+            ForegroundDetector.reset()   // 清上一轮残留的前台跟踪状态(单例跨启动保留)
+            mainHandler.removeCallbacks(foregroundWatcher)
+            mainHandler.postDelayed(foregroundWatcher, FG_CHECK_INTERVAL)
+        }
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
