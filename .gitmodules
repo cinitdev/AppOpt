@@ -1,0 +1,3 @@
+[submodule "frame-analyzer-ebpf"]
+	path = frame-analyzer-ebpf
+	url = https://github.com/shadow3aaa/frame-analyzer-ebpf.git
