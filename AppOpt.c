@@ -438,7 +438,7 @@ static void classify_topology(CpuTopology* topo) {
 
         /* 兜底范围 = 全部核心 - 最高频(大核)簇, 即小核+中核。
          * 这样进程整体与未点名的杂线程都不占用超大核, 把大核留给被显式绑定的重载线程,
-         * 避免杂线程争抢/迁移污染大核, 提升主线程的稳定性(对齐原模块 "=0-6" 的策略)。 */
+         * 避免杂线程争抢/迁移污染大核, 提升关键重载线程的稳定性(对齐原模块 "=0-6" 的策略)。 */
         cpu_set_t nonbig;
         CPU_ZERO(&nonbig);
         for (int k = 0; k < nc - 1; k++) CPU_OR(&nonbig, &nonbig, &topo->clusters[k].cpus);
@@ -716,7 +716,9 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
 
         bool found = false;
         for (size_t j = 0; j < cfg->num_pkgs; j++) {
-            if (strcmp(name, cfg->pkgs[j]) == 0) {
+            size_t plen = strlen(cfg->pkgs[j]);
+            if (strcmp(name, cfg->pkgs[j]) == 0 ||
+                (strncmp(name, cfg->pkgs[j], plen) == 0 && name[plen] == ':')) {
                 found = true;
                 break;
             }
@@ -1130,7 +1132,7 @@ static bool read_thread_cpu(int task_fd, const char* tid_name, unsigned long lon
     if (!rp) return false;
     rp++;                              /* 跳到 comm 之后 */
     /* 此处起第一个 token 是 state(字段3), utime 是字段14 => 之后第 11 个 token */
-    int field = 3;
+    int field = 2;
     unsigned long long utime = 0, stime = 0;
     char* tok = strtok(rp, " \t\n");
     while (tok) {
@@ -1314,7 +1316,7 @@ static bool calib_sample_once(CalibData* data) {
 
 /* 求线程名的"通配基名": 找到第一个数字, 截断(连同数字前的尾部空格)并加 '*'。
  * 例如 "Job.worker 0" -> "Job.worker*", "Thread-12" -> "Thread-*",
- * "UnityMain" 无数字 -> 原样返回(不加通配)。out 至少 MAX_THREAD_LEN 字节。 */
+ * "GameLoop" 无数字 -> 原样返回(不加通配)。out 至少 MAX_THREAD_LEN 字节。 */
 static void calib_wildcard_base(const char* name, char* out, size_t out_sz) {
     size_t i = 0;
     for (; name[i] && i < out_sz - 2; i++) {
@@ -1331,6 +1333,16 @@ static void calib_wildcard_base(const char* name, char* out, size_t out_sz) {
     }
 }
 
+static char* calib_merge_cpu_ranges(const CpuTopology* topo,
+                                    const char* a, const char* b) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (a && a[0]) parse_cpu_ranges(a, &set, &topo->present_cpus);
+    if (b && b[0]) parse_cpu_ranges(b, &set, &topo->present_cpus);
+    if (CPU_COUNT(&set) == 0) return NULL;
+    return cpu_set_to_str(&set);
+}
+
 /* 排序比较: busy 降序 */
 static int calib_cmp_busy(const void* a, const void* b) {
     const ThreadSample* x = a;
@@ -1340,10 +1352,30 @@ static int calib_cmp_busy(const void* a, const void* b) {
     return 0;
 }
 
+static void calib_thread_pct_stats(const ThreadSample* s, double* avg, double* max) {
+    double sum = 0.0;
+    double mx = 0.0;
+    if (!s || s->series_len == 0) {
+        *avg = 0.0;
+        *max = 0.0;
+        return;
+    }
+    for (size_t i = 0; i < s->series_len; i++) {
+        double v = s->series[i];
+        sum += v;
+        if (v > mx) mx = v;
+    }
+    *avg = sum / (double)s->series_len;
+    *max = mx;
+}
+
 /* 聚合后的通配组 */
 typedef struct {
     char base[MAX_THREAD_LEN];   /* 通配基名(可能含尾部 '*') */
     unsigned long long busy;     /* 组内线程 busy 之和 */
+    double avg_pct;              /* 组内线程平均占比之和 */
+    double max_pct;              /* 组内最高瞬时占比 */
+    double score;                /* 综合评分, 用于 Top N 排序 */
     bool is_wild;                /* base 是否含通配符 */
 } CalibGroup;
 
@@ -1374,53 +1406,73 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
             build_str(groups[gi].base, sizeof(groups[gi].base), base, NULL);
             groups[gi].is_wild = (strchr(base, '*') != NULL);
             groups[gi].busy = 0;
+            groups[gi].avg_pct = 0.0;
+            groups[gi].max_pct = 0.0;
+            groups[gi].score = 0.0;
         }
         groups[gi].busy += data->threads[i].busy;
+        double avg_pct, max_pct;
+        calib_thread_pct_stats(&data->threads[i], &avg_pct, &max_pct);
+        groups[gi].avg_pct += avg_pct;
+        if (max_pct > groups[gi].max_pct) groups[gi].max_pct = max_pct;
     }
     if (total == 0) { free(groups); return 0; }
 
-    /* 组按 busy 降序 */
+    for (size_t g = 0; g < ng; g++) {
+        if (groups[g].avg_pct > 100.0) groups[g].avg_pct = 100.0;
+        groups[g].score = groups[g].avg_pct * 0.65 + groups[g].max_pct * 0.35;
+    }
+
+    /* 组按 avg/max 综合评分降序, 峰值线程不会被累计 busy 掩盖。 */
     for (size_t a = 0; a + 1 < ng; a++)
         for (size_t b = 0; b + 1 < ng - a; b++)
-            if (groups[b].busy < groups[b + 1].busy) {
+            if (groups[b].score < groups[b + 1].score) {
                 CalibGroup t = groups[b]; groups[b] = groups[b + 1]; groups[b + 1] = t;
             }
 
-    /* 3) 动态分级: 按占比分配核心档位, 实现精细化隔离。
-     *    - >=25%: 大核(独占超大核, 给主线程/最重渲染线程)
-     *    - 15-25%: 高中核(次重载线程, 如部分渲染、物理)
-     *    - 8-15%: 低中核(中载线程, 如 worker、audio)
-     *    - <8%: 由进程级 base 规则覆盖(小核+低中核, 轻载线程)
-     *    高中核和低中核的细分只在中核>=4个时生效, 否则都用完整中核。
-     *    兜底规则用 base_str(小核+低中核), 进一步隔离高频核心给重载线程。 */
+    char* high_perf = calib_merge_cpu_ranges(topo,
+        topo->middle_high_str[0] ? topo->middle_high_str : topo->middle_str,
+        topo->big_str);
+    char* perf = calib_merge_cpu_ranges(topo, topo->middle_str, topo->big_str);
+
+    /* 3) 按负载分级, 同时参考 avg 与 max:
+     *    - Top1 且 avg>=25% 且 max>=35%: 大核。
+     *    - avg>=12% 或 max>=22%: 高中核+大核。
+     *    - avg>=6%  或 max>=12%: 中核+大核。
+     *    - 其余由进程级兜底覆盖。
+     *    不按线程名白名单/黑名单猜职责, 避免不同游戏命名差异导致误判。
+     *    只输出 Top N 线程规则, 避免生成过多静态绑核规则导致调度僵硬。 */
     char* p = out_buf;
     size_t remain = out_sz - 1;
     int lines = 0;
+    int thread_lines = 0;
+    const int max_thread_lines = 6;
     char line[256];
-    for (size_t g = 0; g < ng; g++) {
-        double ratio = (double)groups[g].busy / (double)total;
+    for (size_t g = 0; g < ng && thread_lines < max_thread_lines; g++) {
         const char* tier = NULL;
-        if (ratio >= 0.25) {
-            tier = topo->big_str;
-        } else if (ratio >= 0.15) {
-            tier = topo->middle_high_str[0] ? topo->middle_high_str : topo->middle_str;
-        } else if (ratio >= 0.08) {
-            tier = topo->middle_low_str[0] ? topo->middle_low_str : topo->middle_str;
+        double avg = groups[g].avg_pct;
+        double max = groups[g].max_pct;
+        if (g == 0 && avg >= 25.0 && max >= 35.0) {
+            tier = topo->big_str[0] ? topo->big_str : (high_perf ? high_perf : topo->all_str);
+        } else if (avg >= 12.0 || max >= 22.0) {
+            tier = high_perf ? high_perf : topo->all_str;
+        } else if (avg >= 6.0 || max >= 12.0) {
+            tier = perf ? perf : topo->all_str;
         } else {
-            continue;  /* <8% 占比由进程级兜底覆盖 */
+            continue;
         }
         if (!tier || !tier[0]) continue;
         int need = snprintf(line, sizeof(line), "%s{%s}=%s\n",
                             data->pkg, groups[g].base, tier);
         if (need < 0 || (size_t)need > remain) break;
         memcpy(p, line, need);
-        p += need; remain -= need; lines++;
+        p += need; remain -= need; lines++; thread_lines++;
     }
 
-    /* 4) 进程级兜底规则: 未点名的线程绑到"小核+低中核", 隔离高中核和大核给重载线程。
-     *    如果中核未细分, base_str 退化为 nonbig_str(小核+完整中核)。 */
-    const char* base_tier = topo->base_str[0] ? topo->base_str :
-                            (topo->nonbig_str[0] ? topo->nonbig_str : topo->all_str);
+    /* 4) 进程级兜底规则: 使用小核+中核(e_core+p_core), 对齐作者预置规则里的 0-6。
+     *    不再使用更窄的 base_str(如 0-4), 避免未知关键线程被压到低档核心。 */
+    const char* base_tier = topo->nonbig_str[0] ? topo->nonbig_str :
+                            (topo->all_str[0] ? topo->all_str : topo->base_str);
     if (base_tier[0]) {
         int need = snprintf(line, sizeof(line), "%s=%s\n", data->pkg, base_tier);
         if (need > 0 && (size_t)need <= remain) {
@@ -1428,6 +1480,8 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
         }
     }
     *p = '\0';
+    free(high_perf);
+    free(perf);
     free(groups);
     return lines;
 }
@@ -2132,9 +2186,12 @@ static void* fps_thread(void* arg) {
     /* eBPF 状态 */
     ebpf_fps_ctx *ebpf_ctx = NULL;
     pid_t target_pid = -1;
+    bool ebpf_first_fps = true;
+    bool ebpf_pid_reported = false;
 
     /* Fallback 状态(包含 --latency + timestats) */
     fps_fallback_ctx *fallback_ctx = NULL;
+    bool fallback_first_fps = true;
 
     for (;;) {
         /* 轮询命令 */
@@ -2148,56 +2205,45 @@ static void* fps_thread(void* arg) {
 
                     build_str(pkg, sizeof(pkg), p, NULL);
                     monitoring = true;
+                    ebpf_first_fps = true;
+                    ebpf_pid_reported = false;
+                    fallback_first_fps = true;
 
                     /* 1. 探测 eBPF 能力 */
                     ebpf_cap_t cap = ebpf_fps_probe_capability();
                     printf("[FPS] 开始监测 %s, eBPF 能力: %s\n", pkg, ebpf_cap_str(cap));
 
                     if (cap == EBPF_CAP_OK) {
-                        /* 2. 找目标进程 PID */
+                        /* 2. 找目标进程 PID。游戏刚启动时 /proc/cmdline 可能短暂不可见, 等一小段时间。 */
                         target_pid = -1;
-                        int checked = 0;
-                        DIR *proc = opendir("/proc");
-                        if (proc) {
-                            struct dirent *ent;
-                            while ((ent = readdir(proc)) != NULL) {
-                                if (ent->d_type != DT_DIR) continue;
-                                char *endp;
-                                long pid = strtol(ent->d_name, &endp, 10);
-                                if (*endp != '\0' || pid <= 0) continue;
-
-                                char cmdline_path[64], cmdline[256];
-                                snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%ld/cmdline", pid);
-                                int fd = open(cmdline_path, O_RDONLY);
-                                if (fd < 0) continue;
-                                ssize_t n = read(fd, cmdline, sizeof(cmdline)-1);
-                                close(fd);
-                                if (n > 0) {
-                                    cmdline[n] = '\0';
-                                    checked++;
-                                    if (strstr(cmdline, pkg)) {
-                                        target_pid = (pid_t)pid;
-                                        break;
-                                    }
-                                }
+                        for (int attempt = 0; attempt < 30 && target_pid < 0; attempt++) {
+                            pid_t pids[64];
+                            size_t np = collect_pkg_pids(pkg, pids, 64);
+                            if (np > 0) {
+                                target_pid = pids[0];
+                                break;
                             }
-                            closedir(proc);
+                            usleep(100 * 1000);
                         }
                         if (target_pid < 0) {
-                            printf("[FPS] 遍历了 %d 个进程, 未找到包含 '%s' 的进程\n", checked, pkg);
+                            printf("[FPS] 等待约 3 秒仍未找到 %s 的进程, 尝试全局 eBPF 帧事件探测\n", pkg);
                         }
 
                         /* 3. 尝试 eBPF attach */
                         if (target_pid > 0) {
                             printf("[FPS] 目标进程 PID: %d, 尝试 eBPF uprobe...\n", target_pid);
-                            ebpf_ctx = ebpf_fps_start(FPS_BPF_OBJ, target_pid);
-                            if (ebpf_ctx) {
-                                printf("[FPS] eBPF 已激活, 锁定符号: %s\n", ebpf_fps_symbol(ebpf_ctx));
-                            } else {
-                                printf("[FPS] eBPF 初始化失败, 降级到 SF fallback\n");
-                            }
+                            ebpf_ctx = ebpf_fps_start(FPS_BPF_OBJ, target_pid, pkg);
                         } else {
-                            printf("[FPS] 未找到进程, 降级到 SF fallback\n");
+                            printf("[FPS] 未锁定包名 PID, 尝试 eBPF 全局 uprobe 探测屏幕帧事件...\n");
+                            ebpf_ctx = ebpf_fps_start(FPS_BPF_OBJ, (pid_t)-1, pkg);
+                        }
+
+                        if (ebpf_ctx) {
+                            printf("[FPS] eBPF 已激活, 锁定符号: %s\n", ebpf_fps_symbol(ebpf_ctx));
+                        } else {
+                            const char *err = ebpf_fps_last_error(NULL);
+                            printf("[FPS] eBPF 初始化失败: %s, 降级到 SF fallback\n",
+                                   (err && err[0]) ? err : "未知错误");
                         }
                     }
 
@@ -2227,9 +2273,13 @@ static void* fps_thread(void* arg) {
 
         /* === eBPF 模式: 高频轮询 RingBuf === */
         if (ebpf_ctx) {
-            static bool ebpf_first_fps = true;
             ebpf_fps_poll(ebpf_ctx);
             double fps = ebpf_fps_get(ebpf_ctx);
+            pid_t active_pid = ebpf_fps_pid(ebpf_ctx);
+            if (!ebpf_pid_reported && active_pid > 0) {
+                printf("[FPS] eBPF 当前帧事件 PID: %d\n", active_pid);
+                ebpf_pid_reported = true;
+            }
             if (ebpf_first_fps && fps > 0) {
                 printf("[FPS] eBPF 首次捕获到帧率: %.1f fps\n", fps);
                 ebpf_first_fps = false;
@@ -2241,7 +2291,6 @@ static void* fps_thread(void* arg) {
 
         /* === Fallback 模式: --latency 或 timestats === */
         if (fallback_ctx) {
-            static bool fallback_first_fps = true;
             double fps = fps_fallback_poll(fallback_ctx);
             if (fallback_first_fps && fps > 0) {
                 printf("[FPS] Fallback 首次捕获到帧率: %.1f fps\n", fps);

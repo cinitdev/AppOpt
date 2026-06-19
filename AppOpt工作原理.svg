@@ -73,11 +73,11 @@
 
   <!-- 线程列表 -->
   <rect x="310" y="210" width="420" height="140" rx="12" fill="#1e2d4a" stroke="#3a4a68" stroke-width="1.5"/>
-  <text x="520" y="235" text-anchor="middle" font-size="15" font-weight="700" fill="#eaf1fb">守护进程每 500ms 采样各线程 CPU 占用率</text>
-  <text x="520" y="265" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">UnityMain        → 平均 32.8%  最高 50.0%</text>
-  <text x="520" y="290" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">UnityGfxDeviceW  → 平均 21.8%  最高 31.5%</text>
-  <text x="520" y="315" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#F39C12">Job.worker*      → 平均 12.1%  最高 23.0%</text>
-  <text x="520" y="340" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#3498DB">其他线程         → 占比 &lt; 8% (兜底规则)</text>
+  <text x="520" y="235" text-anchor="middle" font-size="15" font-weight="700" fill="#eaf1fb">守护进程每 500ms 采样各线程 CPU 占用率(avg/max)</text>
+  <text x="520" y="265" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">线程组 Top1      → 平均 32.8%  最高 50.0%</text>
+  <text x="520" y="290" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">线程组 Top2      → 平均 21.8%  最高 31.5%</text>
+  <text x="520" y="315" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#F39C12">线程组 Top3      → 平均 12.1%  最高 23.0%</text>
+  <text x="520" y="340" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#3498DB">其他线程         → score 较低 (兜底规则)</text>
 
   <!-- 第2部分: 分析阶段 -->
   <g filter="url(#sh)">
@@ -92,20 +92,20 @@
   <!-- 大核档 -->
   <rect x="150" y="490" width="520" height="50" rx="8" fill="#2a1a1a" stroke="#E74C3C" stroke-width="2"/>
   <circle cx="172" cy="516" r="8" fill="url(#bigCore)"/>
-  <text x="195" y="515" font-size="16" font-weight="700" fill="#E74C3C">大核档 (高负载)</text>
-  <text x="195" y="530" font-size="13.5" fill="#c98a84">负载占比 > 25%  →  UnityMain (主线程/最重渲染)</text>
+  <text x="195" y="515" font-size="16" font-weight="700" fill="#E74C3C">大核档 (Top1 极重载)</text>
+  <text x="195" y="530" font-size="13.5" fill="#c98a84">Top1 avg≥25% 且 max≥35% → 大核 7</text>
 
   <!-- 高中核档 -->
   <rect x="150" y="550" width="520" height="50" rx="8" fill="#2a2018" stroke="#F39C12" stroke-width="2"/>
   <circle cx="172" cy="575" r="8" fill="url(#midCore)"/>
-  <text x="190" y="575" font-size="16" font-weight="700" fill="#F39C12">高中核档 (次重载)</text>
-  <text x="190" y="589" font-size="13.5" fill="#c9a884">15% > 占比 &lt; 25%  →  UnityGfxDevice (次重渲染/物理)</text>
+  <text x="190" y="575" font-size="16" font-weight="700" fill="#F39C12">高中核档 (重载放宽)</text>
+  <text x="190" y="589" font-size="13.5" fill="#c9a884">avg≥12% 或 max≥22% → 高中核+大核 5-7</text>
 
-  <!-- 低中核档 -->
+  <!-- 中大核档 -->
   <rect x="150" y="610" width="520" height="50" rx="8" fill="#1a2228" stroke="#3498DB" stroke-width="2"/>
   <circle cx="172" cy="636" r="8" fill="url(#littleCore)"/>
-  <text x="190" y="636" font-size="16" font-weight="700" fill="#3498DB">低中核档 (中载)</text>
-  <text x="190" y="650" font-size="13.5" fill="#84a9c9">8% > 占比 &lt; 15%  →  Job.worker (worker/音频线程)</text>
+  <text x="190" y="636" font-size="16" font-weight="700" fill="#3498DB">中大核档 (中载)</text>
+  <text x="190" y="650" font-size="13.5" fill="#84a9c9">avg≥6% 或 max≥12% → 中核+大核 3-7</text>
 
   <!-- 第3部分: 绑核阶段 -->
   <g filter="url(#sh)">
@@ -134,28 +134,29 @@
   <text x="485" y="878" text-anchor="middle" font-size="11" fill="#ffaaaa">3.2 GHz</text>
 
   <!-- 绑核箭头 -->
-  <!-- UnityMain → 大核 7 -->
+  <!-- Top1线程组 → 大核 7 或高中核+大核 -->
   <line x1="585" y1="920" x2="485" y2="920" stroke="#E74C3C" stroke-width="2.5"/>
   <line x1="485" y1="920" x2="485" y2="890" stroke="#E74C3C" stroke-width="2.5" marker-end="url(#arrowRed)"/>
-  <text x="590" y="925" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">UnityMain → 大核 7</text>
+  <text x="590" y="925" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">Top1线程组 → 极重载 7 / 否则 5-7</text>
 
-  <!-- UnityGfxDeviceW 和 Job.worker* 合并箭头指向中核 -->
+  <!-- 重载线程组合并箭头指向中大核 -->
   <line x1="585" y1="950" x2="500" y2="950" stroke="#E74C3C" stroke-width="2.5"/>
   <line x1="585" y1="980" x2="500" y2="980" stroke="#F39C12" stroke-width="2.5"/>
   <line x1="500" y1="950" x2="500" y2="980" stroke="#F39C12" stroke-width="2.5"/>
   <line x1="500" y1="965" x2="310" y2="965" stroke="#F39C12" stroke-width="2.5"/>
   <line x1="310" y1="965" x2="310" y2="890" stroke="#F39C12" stroke-width="2.5" marker-end="url(#arrowOrange)"/>
-  <text x="590" y="955" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">UnityGfxDeviceW → 高中核 5-6</text>
-  <text x="590" y="985" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#F39C12">Job.worker* → 低中核 3-4</text>
+  <text x="590" y="955" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">线程组 Top2 → 高中核+大核 5-7</text>
+  <text x="590" y="985" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#F39C12">线程组 Top3 → 中核+大核 3-7</text>
 
-  <!-- 其他线程 → 小核 0-2 -->
+  <!-- 其他线程 → 小核+中核 0-6 -->
   <line x1="585" y1="1010" x2="135" y2="1010" stroke="#3498DB" stroke-width="2.5"/>
   <line x1="135" y1="1010" x2="135" y2="890" stroke="#3498DB" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
-  <text x="590" y="1015" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#3498DB">其他线程 → 小核+低中核 0-4</text>
+  <line x1="310" y1="1010" x2="310" y2="890" stroke="#3498DB" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
+  <text x="590" y="1015" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#3498DB">其他线程 → 小核+中核 0-6</text>
 
   <!-- 持续监控 -->
   <rect x="90" y="1035" width="640" height="45" rx="10" fill="#1e2d4a" stroke="#2ECC71" stroke-width="2"/>
-  <text x="410" y="1062" text-anchor="middle" font-size="14" fill="#2ECC71" font-weight="700">规则生成后，守护进程每 2 秒扫描进程树，自动绑定匹配的线程</text>
+  <text x="410" y="1062" text-anchor="middle" font-size="14" fill="#2ECC71" font-weight="700">按 score 只生成 Top 6 线程规则，守护进程每 2 秒自动绑定</text>
 
   <!-- 优势说明 -->
   <text x="410" y="1110" text-anchor="middle" font-size="18" font-weight="700" fill="#eaf1fb">核心优势</text>

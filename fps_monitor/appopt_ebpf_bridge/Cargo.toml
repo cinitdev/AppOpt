@@ -1,0 +1,18 @@
+[package]
+name = "appopt-ebpf-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+aya = { path = "../aya/aya" }
+libc = "0.2"
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = true

@@ -1,6 +1,7 @@
 package top.suto.appopt
 
 import android.content.Intent
+import android.graphics.drawable.Drawable
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -23,6 +24,13 @@ class HistoryListActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityHistoryListBinding
 
+    private data class HistoryItem(
+        val pkg: String,
+        val mtime: Long,
+        val label: String,
+        val icon: Drawable?
+    )
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityHistoryListBinding.inflate(layoutInflater)
@@ -35,16 +43,22 @@ class HistoryListActivity : AppCompatActivity() {
                 DatabaseMigrator.migrateIfNeeded(this, e.pkg)
             }
 
-            // 2. 从数据库读取所有有记录的应用
+            // 2. 从数据库读取所有有记录的应用, 并在后台解析应用名/图标, 避免 UI 线程卡顿。
             val db = top.suto.appopt.db.AppOptDbHelper.getInstance(this)
-            val entries = db.getPackagesWithHistory().map {
-                DaemonBridge.HistoryEntry(it.pkg, it.lastTime / 1000)  // 毫秒→秒
+            val items = db.getPackagesWithHistory().map {
+                val pkg = it.pkg
+                HistoryItem(
+                    pkg = pkg,
+                    mtime = it.lastTime / 1000,
+                    label = appLabel(pkg),
+                    icon = loadIcon(pkg)
+                )
             }
-            runOnUiThread { render(entries) }
+            runOnUiThread { render(items) }
         }
     }
 
-    private fun render(entries: List<DaemonBridge.HistoryEntry>) {
+    private fun render(entries: List<HistoryItem>) {
         binding.listContainer.removeAllViews()
         if (entries.isEmpty()) {
             binding.listEmpty.visibility = View.VISIBLE
@@ -55,13 +69,12 @@ class HistoryListActivity : AppCompatActivity() {
         val inflater = LayoutInflater.from(this)
         for (e in entries) {
             val item = ItemHistoryAppBinding.inflate(inflater, binding.listContainer, false)
-            val label = appLabel(e.pkg)
-            item.hisName.text = label
+            item.hisName.text = e.label
             item.hisTime.text = "最近生成 ${fmt.format(Date(e.mtime * 1000))}"
-            loadIcon(e.pkg)?.let { item.hisIcon.setImageDrawable(it) }
+            e.icon?.let { item.hisIcon.setImageDrawable(it) }
                 ?: item.hisIcon.setImageResource(R.drawable.ic_launcher_foreground)
-            item.itemCard.setOnClickListener { openDetail(e.pkg, label) }
-            item.hisDelete.setOnClickListener { confirmDeleteApp(e.pkg, label) }
+            item.itemCard.setOnClickListener { openDetail(e.pkg, e.label) }
+            item.hisDelete.setOnClickListener { confirmDeleteApp(e.pkg, e.label) }
             binding.listContainer.addView(item.root)
         }
     }
@@ -80,7 +93,8 @@ class HistoryListActivity : AppCompatActivity() {
                     DaemonBridge.deleteHistory(pkg)
                     // 重新读取
                     val entries = db.getPackagesWithHistory().map {
-                        DaemonBridge.HistoryEntry(it.pkg, it.lastTime / 1000)
+                        val p = it.pkg
+                        HistoryItem(p, it.lastTime / 1000, appLabel(p), loadIcon(p))
                     }
                     runOnUiThread { render(entries) }
                 }

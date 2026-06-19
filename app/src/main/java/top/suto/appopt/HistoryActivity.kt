@@ -9,6 +9,8 @@ import kotlin.concurrent.thread
 import top.suto.appopt.databinding.ActivityHistoryBinding
 import top.suto.appopt.databinding.ItemCalibSessionBinding
 import top.suto.appopt.databinding.ItemThreadLoadBinding
+import top.suto.appopt.db.AppOptDbHelper
+import top.suto.appopt.db.ThreadData
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -43,7 +45,7 @@ class HistoryActivity : AppCompatActivity() {
         val id: Long,       // 数据库主键(作为序号,删除后不变)
         val epoch: Long,
         val rounds: Int,
-        val threads: List<ThreadLoad>
+        val threadCount: Int
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,21 +72,13 @@ class HistoryActivity : AppCompatActivity() {
 
     private fun reload() {
         thread {
-            val db = top.suto.appopt.db.AppOptDbHelper.getInstance(this)
-            val sessionsWithThreads = db.getSessionsByPackage(pkg)
-            val sessions = sessionsWithThreads.map { swt ->
+            val db = AppOptDbHelper.getInstance(this)
+            val sessions = db.getSessionSummariesByPackage(pkg).map { summary ->
                 Session(
-                    id = swt.id,
-                    epoch = swt.epoch,
-                    rounds = swt.rounds,
-                    threads = swt.threads.map { td ->
-                        ThreadLoad(
-                            name = td.name,
-                            avg = td.avg,
-                            max = td.max,
-                            series = td.series.split(',').mapNotNull { it.toFloatOrNull() }.toFloatArray()
-                        )
-                    }
+                    id = summary.id,
+                    epoch = summary.epoch,
+                    rounds = summary.rounds,
+                    threadCount = summary.threadCount
                 )
             }
             runOnUiThread { render(sessions) }
@@ -130,15 +124,7 @@ class HistoryActivity : AppCompatActivity() {
                 durationSec < 3600 -> "${durationSec / 60}m ${durationSec % 60}s"
                 else -> "${durationSec / 3600}h ${(durationSec % 3600) / 60}m"
             }
-            card.sessionMeta.text = "${s.threads.size} 线程 · $durationStr"
-            for (tl in s.threads) {
-                val row = ItemThreadLoadBinding.inflate(inflater, card.threadRows, false)
-                row.threadName.text = tl.name
-                row.threadStats.text =
-                    String.format(Locale.US, "AVG %.1f%%  MAX %.1f%%", tl.avg, tl.max)
-                row.threadSpark.setData(tl.series, colorFor(tl.avg), durationSec)
-                card.threadRows.addView(row.root)
-            }
+            card.sessionMeta.text = "${s.threadCount} 线程 · $durationStr"
             // 默认全部折叠; 点击头部展开本卡, 同时折叠上一张展开的卡(单展开互斥)
             setCardExpanded(card, false)
             card.sessionHeader.setOnClickListener {
@@ -147,6 +133,7 @@ class HistoryActivity : AppCompatActivity() {
                     expandedCard = null
                 } else {
                     expandedCard?.let { setCardExpanded(it, false) }
+                    ensureThreadsLoaded(card, s.id, durationSec)
                     setCardExpanded(card, true)
                     expandedCard = card
                 }
@@ -173,6 +160,44 @@ class HistoryActivity : AppCompatActivity() {
                 }
             }
             .show()
+    }
+
+    private fun ensureThreadsLoaded(card: ItemCalibSessionBinding, sessionId: Long, durationSec: Int) {
+        if (card.threadRows.childCount > 0) return
+        card.threadRows.removeAllViews()
+        val loading = android.widget.TextView(this).apply {
+            text = "加载中..."
+            setTextColor(resources.getColor(R.color.text_secondary, theme))
+            textSize = 13f
+            setPadding(0, 12, 0, 12)
+        }
+        card.threadRows.addView(loading)
+
+        thread {
+            val db = AppOptDbHelper.getInstance(this)
+            val loads = db.getThreadsBySessionId(sessionId).map { it.toThreadLoad() }
+            runOnUiThread {
+                card.threadRows.removeAllViews()
+                val inflater = LayoutInflater.from(this)
+                for (tl in loads) {
+                    val row = ItemThreadLoadBinding.inflate(inflater, card.threadRows, false)
+                    row.threadName.text = tl.name
+                    row.threadStats.text =
+                        String.format(Locale.US, "AVG %.1f%%  MAX %.1f%%", tl.avg, tl.max)
+                    row.threadSpark.setData(tl.series, colorFor(tl.avg), durationSec)
+                    card.threadRows.addView(row.root)
+                }
+            }
+        }
+    }
+
+    private fun ThreadData.toThreadLoad(): ThreadLoad {
+        return ThreadLoad(
+            name = name,
+            avg = avg,
+            max = max,
+            series = series.split(',').mapNotNull { it.toFloatOrNull() }.toFloatArray()
+        )
     }
 
     private fun toast(msg: String) {

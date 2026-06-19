@@ -1,121 +1,61 @@
-# fps_monitor —— AppOpt eBPF 游戏提交帧率采集模块
+# fps_monitor
 
-## 概述
+AppOpt 的 FPS 监测模块。当前 eBPF 路径由 C shim + Rust/aya bridge 组成。
 
-独立的 FPS 监测子系统,支持 eBPF uprobe(优先)+ timestats 回退。
+## 目录结构
 
-**设计目标**:
-- 在 libgui.so 的帧提交函数(`hook_queueBuffer`/`queueBuffer`)上挂 eBPF uprobe
-- 每次游戏提交一帧由内核记录时间戳,用户态计算瞬时 FPS
-- 不注入游戏、不依赖 tracefs、不写死 offset、支持 Android 12-16
-
-**架构**:
-```
-ebpf_fps.h/.c       —— 核心 eBPF 实现(自包含,不依赖 libbpf)
-fps_fallback.h/.c   —— timestats 回退(eBPF 不可用时兜底)
-bpf/queuebuffer_probe.bpf.c  —— BPF 内核侧程序
+```text
+ebpf_fps.h                    AppOpt.c 使用的 C API
+ebpf_fps.c                    C 适配层, 通过 FFI 调用 Rust/aya bridge
+fps_fallback.h/.c             SurfaceFlinger fallback
+bpf/queuebuffer_probe.bpf.c   内核侧 BPF 程序, 由 NDK clang 编译
+appopt_ebpf_bridge/           Rust staticlib, 负责加载 BPF、attach uprobe、读取 ringbuf
+aya/                          精简后的本地 vendored aya, 只保留 aya/aya-obj 和许可证
 ```
 
-## 文件说明
+旧的纯 C eBPF loader 已移除。四个 ABI 都链接 `ebpf_fps.c`
+和对应 ABI 的 `libappopt_ebpf_bridge.a`。
 
-### ebpf_fps.{h,c}
-完整的 eBPF uprobe FPS 采集实现,约 600 行。包含:
-- bpf() 系统调用封装
-- BPF 对象加载(ELF 解析 + map 创建 + 重定位 + prog load)
-- libgui 符号解析(从目标进程 maps + ELF .dynsym/.symtab)
-- uprobe attach (perf_event_open)
-- RingBuf 读取与 FPS 计算
+## 构建
 
-**候选符号表**(按优先级):
-1. `_ZN7android7Surface16hook_queueBufferE...` (最优,ANativeWindow 入口)
-2. `_ZN7android7Surface27hook_queueBuffer_DEPRECATEDE...` (旧版)
-3. `_ZN7android7Surface11queueBufferE...PNSE` (A14+ 新 ABI)
-4. `_ZN7android7Surface11queueBufferE...i` (A12-13 旧 ABI)
-5. `_ZN7android7Surface19queueBufferInternalE...` (内部实现)
+在项目根目录执行:
 
-运行时逐个尝试,第一个能产生事件的即锁定。
-
-### fps_fallback.{h,c}
-SurfaceFlinger timestats 回退实现。eBPF 失败时用 `dumpsys SurfaceFlinger --timestats` 获取 Layer FPS,精度低于 eBPF 但 A12-16 都能用。
-
-### bpf/queuebuffer_probe.bpf.c
-内核侧 BPF 程序,每次帧提交触发时记录:
-- `bpf_ktime_get_ns()` 时间戳
-- `bpf_get_current_pid_tgid()` PID/TID
-- 通过 RingBuf 传给用户态
-
-**无系统头文件依赖**:用 clang `-target bpf` 内建函数替代 `#include <linux/bpf.h>`,可在 NDK 环境直接编译。
-
-## 编译
-
-### BPF 程序
 ```bash
-cd fps_monitor
-./test_bpf_compile.sh   # 验证 NDK clang 可编译 BPF
+./build_module.sh
 ```
 
-或手动:
-```bash
-$NDK/toolchains/llvm/prebuilt/*/bin/clang \
-  -target bpf -O2 -c bpf/queuebuffer_probe.bpf.c \
-  -o bpf/queuebuffer_probe.bpf.o
+脚本会构建:
+
+- `queuebuffer_probe.bpf.o`
+- 每个 Android ABI 的 `appopt_ebpf_bridge`
+- `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` 的 AppOpt 二进制
+
+## 运行流程
+
+1. `AppOpt.c` 调用 `ebpf_fps_*` C API。
+2. `ebpf_fps.c` 转发到 Rust FFI。
+3. Rust/aya 加载 `queuebuffer_probe.bpf.o`。
+4. Rust/aya attach 到 `libgui.so` 的 queueBuffer 候选符号。
+5. BPF 程序把帧事件写入 `events` ringbuf。
+6. Rust/aya 轮询 ringbuf, 计算 FPS 后返回给 C 层。
+
+如果 eBPF 启动失败，AppOpt 会降级到 SurfaceFlinger fallback。
+
+## 与 auto 绑核的关系
+
+`fps_monitor` 只负责 FPS 数据源和 eBPF/fallback 监测，不负责生成 CPU 亲和性规则。
+`auto` 规则生成逻辑在 `AppOpt.c` 中。
+
+当前 `auto` 不按 `UnityMain`、`MainThread`、`RenderThread` 等线程名做白名单或黑名单判断。
+采样完成后会按线程组统计 `avg`、`max`, 并计算:
+
+```text
+score = avg * 0.65 + max * 0.35
 ```
 
-### 用户态(整合到 AppOpt)
-见父目录 `build_module.sh`,将编译 `ebpf_fps.c` + `fps_fallback.c` 并链接进 AppOpt 主二进制。
+规则只输出综合负载最高的 Top 6 线程组:
 
-## 使用
-
-```c
-#include "fps_monitor/ebpf_fps.h"
-
-// 1. 探测能力
-ebpf_cap_t cap = ebpf_fps_probe_capability();
-printf("eBPF: %s\n", ebpf_cap_str(cap));
-
-// 2. 启动监测
-ebpf_fps_ctx *ctx = ebpf_fps_start("/path/to/queuebuffer_probe.bpf.o", target_pid);
-if (!ctx) {
-    // 降级到 timestats
-    fps_fallback_enable();
-}
-
-// 3. 主循环
-while (monitoring) {
-    if (ctx) {
-        ebpf_fps_poll(ctx);          // 消费 RingBuf 事件
-        double fps = ebpf_fps_get(ctx);
-        printf("FPS: %.1f\n", fps);
-    } else {
-        long frames = fps_fallback_get_frames(pkg);
-        // 差分算 FPS...
-    }
-    usleep(100000);
-}
-
-// 4. 停止
-ebpf_fps_stop(ctx);
-fps_fallback_disable();
-```
-
-## 权限要求
-
-- root 权限(或 CAP_BPF + CAP_PERFMON)
-- 内核支持:
-  - `CONFIG_BPF_SYSCALL`
-  - `CONFIG_BPF_EVENTS`
-  - `CONFIG_UPROBE_EVENTS`
-  - `BPF_MAP_TYPE_RINGBUF`(内核 5.8+)
-- SELinux 允许 perf_event_open / bpf syscall
-
-大部分 Android 12+ GKI 内核满足条件。若不支持,自动回退到 timestats。
-
-## 设计文档
-
-完整设计见: `../AppOpt_FPS_eBPF_tracefs_libgui_symbol_design_v2.md`
-
-## 已知限制
-
-- 仅支持 64 位游戏(32 位需单独适配 `/system/lib/libgui.so`)
-- 不采集 x0 参数(Surface 指针),因此无多 Surface 分组
-- BPF 程序加 verifier log 输出到 stderr(可能刷屏,调试后可关闭 log_level)
+- Top1 且 `avg >= 25%`、`max >= 35%`: 绑定到大核。
+- `avg >= 12%` 或 `max >= 22%`: 绑定到高中核+大核。
+- `avg >= 6%` 或 `max >= 12%`: 绑定到中核+大核。
+- 包名兜底规则固定为小核+中核, 避免未知线程默认抢大核。

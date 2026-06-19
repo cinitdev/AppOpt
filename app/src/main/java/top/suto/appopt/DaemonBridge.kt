@@ -1,6 +1,8 @@
 package top.suto.appopt
 
 import java.io.DataOutputStream
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 与 C 守护进程的文件式 IPC 桥接。
@@ -21,6 +23,7 @@ object DaemonBridge {
     private const val HISTORY_DIR = "$MODULE_DIR/history"
     private const val LOG_FILE = "$MODULE_DIR/AppOpt.log"
     private const val FPS_CMD_FILE = "$MODULE_DIR/fps.cmd"
+    private const val ROOT_TIMEOUT_SECONDS = 15L
 
     /** 检测设备是否有可用的 root (su); 首次调用会触发 Magisk 授权弹窗 */
     fun hasRoot(): Boolean = runAsRoot("id -u").trim() == "0"
@@ -259,6 +262,27 @@ object DaemonBridge {
      */
     private val DEV_NULL = java.io.File("/dev/null")
 
+    private fun waitAndRead(process: Process): String {
+        val outRef = AtomicReference("")
+        val reader = Thread {
+            outRef.set(process.inputStream.bufferedReader().readText())
+        }.apply {
+            isDaemon = true
+            start()
+        }
+
+        val finished = process.waitFor(ROOT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroyForcibly()
+            reader.join(1000)
+            return ERR_MARK
+        }
+
+        reader.join(1000)
+        val out = outRef.get()
+        return if (process.exitValue() != 0) "$out$ERR_MARK" else out
+    }
+
     private fun runAsRoot(cmd: String): String {
         return try {
             // 把 stderr 重定向到 /dev/null: 没有无人读的 stderr 管道, 既避免
@@ -269,9 +293,7 @@ object DaemonBridge {
                 .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
                 .start()
             try {
-                val out = process.inputStream.bufferedReader().readText()
-                val code = process.waitFor()
-                if (code != 0) "$out$ERR_MARK" else out
+                waitAndRead(process)
             } finally {
                 process.destroy()
             }
@@ -292,9 +314,7 @@ object DaemonBridge {
                     os.writeBytes("exit\n")
                     os.flush()
                 }
-                val out = process.inputStream.bufferedReader().readText()
-                val code = process.waitFor()
-                if (code != 0) "$out$ERR_MARK" else out
+                waitAndRead(process)
             } finally {
                 process.destroy()
             }

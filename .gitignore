@@ -13,3 +13,7 @@
 .externalNativeBuild
 .cxx
 local.properties
+*.log
+*.zip
+__pycache__/
+app/build/

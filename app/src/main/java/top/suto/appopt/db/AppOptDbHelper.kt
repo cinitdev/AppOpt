@@ -8,6 +8,7 @@ import android.util.Base64
 import java.io.ByteArrayOutputStream
 import java.util.zip.Deflater
 import java.util.zip.Inflater
+import java.util.zip.DataFormatException
 
 /**
  * AppOpt 数据库助手 (原生 SQLite)
@@ -74,21 +75,26 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
          * 如果解压失败(数据损坏/格式错误)返回空字符串,避免崩溃
          */
         fun decompressSeries(compressed: String): String {
+            val inflater = Inflater()
             return try {
                 val input = Base64.decode(compressed, Base64.NO_WRAP)
-                val inflater = Inflater()
                 inflater.setInput(input)
                 val bos = ByteArrayOutputStream(input.size * 2)
                 val buffer = ByteArray(1024)
                 while (!inflater.finished()) {
                     val count = inflater.inflate(buffer)
+                    if (count == 0) {
+                        if (inflater.needsInput() || inflater.needsDictionary()) break
+                        throw DataFormatException("Inflater 无进展")
+                    }
                     bos.write(buffer, 0, count)
                 }
-                inflater.end()
-                bos.toString(Charsets.UTF_8.name())
+                if (!inflater.finished()) "" else bos.toString(Charsets.UTF_8.name())
             } catch (e: Exception) {
                 android.util.Log.e("AppOpt", "解压 series 失败(数据可能损坏): ${e.message}")
                 ""  // 返回空字符串,避免崩溃
+            } finally {
+                inflater.end()
             }
         }
     }
@@ -212,9 +218,41 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
     }
 
     /**
+     * 获取指定包名的会话概要(不读取线程 series), 用于历史页首屏快速渲染。
+     */
+    fun getSessionSummariesByPackage(pkg: String): List<SessionSummary> {
+        val db = readableDatabase
+        val sessions = mutableListOf<SessionSummary>()
+        val cursor = db.rawQuery(
+            """
+            SELECT s.$COL_SESSION_ID, s.$COL_EPOCH, s.$COL_ROUNDS, COUNT(t.$COL_THREAD_ID) AS thread_count
+            FROM $TABLE_SESSIONS s
+            LEFT JOIN $TABLE_THREADS t ON t.$COL_THREAD_SESSION_ID = s.$COL_SESSION_ID
+            WHERE s.$COL_PKG = ?
+            GROUP BY s.$COL_SESSION_ID, s.$COL_EPOCH, s.$COL_ROUNDS
+            ORDER BY s.$COL_SESSION_ID DESC
+            """.trimIndent(),
+            arrayOf(pkg)
+        )
+        cursor.use {
+            while (it.moveToNext()) {
+                sessions.add(
+                    SessionSummary(
+                        id = it.getLong(0),
+                        epoch = it.getLong(1),
+                        rounds = it.getInt(2),
+                        threadCount = it.getInt(3)
+                    )
+                )
+            }
+        }
+        return sessions
+    }
+
+    /**
      * 获取指定会话的所有线程
      */
-    private fun getThreadsBySessionId(sessionId: Long): List<ThreadData> {
+    fun getThreadsBySessionId(sessionId: Long): List<ThreadData> {
         val db = readableDatabase
         val threads = mutableListOf<ThreadData>()
 
@@ -332,6 +370,13 @@ data class SessionWithThreads(
     val epoch: Long,
     val rounds: Int,
     val threads: List<ThreadData>
+)
+
+data class SessionSummary(
+    val id: Long,
+    val epoch: Long,
+    val rounds: Int,
+    val threadCount: Int
 )
 
 /**
