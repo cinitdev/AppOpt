@@ -19,7 +19,7 @@
         android:orientation="horizontal">
 
         <ImageView
-            android:id="@+id/itemIcon"
+            android:id="@+id/addIcon"
             android:layout_width="42dp"
             android:layout_height="42dp"
             android:contentDescription="应用图标"
@@ -33,7 +33,7 @@
             android:orientation="vertical">
 
             <TextView
-                android:id="@+id/itemName"
+                android:id="@+id/addName"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:ellipsize="end"
@@ -43,7 +43,7 @@
                 android:textStyle="bold" />
 
             <TextView
-                android:id="@+id/itemPkg"
+                android:id="@+id/addPkg"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:ellipsize="middle"
@@ -53,25 +53,14 @@
         </LinearLayout>
 
         <ImageButton
-            android:id="@+id/btnStart"
+            android:id="@+id/btnAdd"
             android:layout_width="38dp"
             android:layout_height="38dp"
             android:layout_marginStart="10dp"
             android:background="@drawable/bg_add_button"
-            android:contentDescription="启动校准"
+            android:contentDescription="添加配置"
             android:padding="9dp"
             android:scaleType="center"
-            android:src="@drawable/ic_play_arrow" />
-
-        <ImageButton
-            android:id="@+id/btnDelete"
-            android:layout_width="38dp"
-            android:layout_height="38dp"
-            android:layout_marginStart="8dp"
-            android:background="@drawable/bg_icon_button_danger"
-            android:contentDescription="删除配置"
-            android:padding="9dp"
-            android:scaleType="center"
-            android:src="@drawable/ic_delete_red" />
+            android:src="@drawable/ic_add_plus" />
     </LinearLayout>
 </com.google.android.material.card.MaterialCardView>

@@ -19,7 +19,7 @@
         android:orientation="horizontal">
 
         <ImageView
-            android:id="@+id/itemIcon"
+            android:id="@+id/configIcon"
             android:layout_width="42dp"
             android:layout_height="42dp"
             android:contentDescription="应用图标"
@@ -33,7 +33,7 @@
             android:orientation="vertical">
 
             <TextView
-                android:id="@+id/itemName"
+                android:id="@+id/configName"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:ellipsize="end"
@@ -43,7 +43,7 @@
                 android:textStyle="bold" />
 
             <TextView
-                android:id="@+id/itemPkg"
+                android:id="@+id/configPkg"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:ellipsize="middle"
@@ -53,18 +53,18 @@
         </LinearLayout>
 
         <ImageButton
-            android:id="@+id/btnStart"
+            android:id="@+id/btnView"
             android:layout_width="38dp"
             android:layout_height="38dp"
             android:layout_marginStart="10dp"
-            android:background="@drawable/bg_add_button"
-            android:contentDescription="启动校准"
+            android:background="@drawable/bg_icon_button_soft"
+            android:contentDescription="查看配置"
             android:padding="9dp"
             android:scaleType="center"
-            android:src="@drawable/ic_play_arrow" />
+            android:src="@drawable/ic_visibility" />
 
         <ImageButton
-            android:id="@+id/btnDelete"
+            android:id="@+id/btnRemove"
             android:layout_width="38dp"
             android:layout_height="38dp"
             android:layout_marginStart="8dp"

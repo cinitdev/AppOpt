@@ -100,8 +100,6 @@
                     android:id="@+id/appSection"
                     layout="@layout/section_app_list" />
 
-                <include layout="@layout/section_help" />
-
             </LinearLayout>
         </LinearLayout>
         </androidx.core.widget.NestedScrollView>

@@ -22,6 +22,12 @@ android {
             keyAlias = "appopt"
             keyPassword = "appopt123"
         }
+        getByName("debug") {
+            storeFile = file("release.jks")
+            storePassword = "appopt123"
+            keyAlias = "appopt"
+            keyPassword = "appopt123"
+        }
     }
 
     buildTypes {
@@ -54,6 +60,7 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

@@ -41,6 +41,80 @@ object DaemonBridge {
         return out.trim() == "RUNNING"
     }
 
+    /**
+     * 在同一次 su 会话中精确检查一组非 APK 配置项是否为正在运行的进程。
+     * 用于 UI 区分 "系统组件" 与 "未安装/配置残留", 不参与守护进程规则应用。
+     */
+    fun findRunningProcessNames(names: Collection<String>): Set<String> {
+        val targets = names.map { it.trim().replace("'", "") }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (targets.isEmpty()) return emptySet()
+
+        val targetArgs = targets.joinToString(" ") { "'$it'" }
+        val cmd = """
+            nl='
+            '
+            targets="${'$'}nl"
+            for target in $targetArgs; do
+                targets="${'$'}targets${'$'}target${'$'}nl"
+            done
+            found="${'$'}nl"
+
+            contains_line() {
+                haystack="${'$'}1"
+                needle="${'$'}2"
+                case "${'$'}haystack" in
+                    *"${'$'}nl${'$'}needle${'$'}nl"*) return 0 ;;
+                    *) return 1 ;;
+                esac
+            }
+
+            emit_if_target() {
+                name="${'$'}1"
+                [ -z "${'$'}name" ] && return
+                contains_line "${'$'}targets" "${'$'}name" || return
+                contains_line "${'$'}found" "${'$'}name" && return
+                printf '%s\n' "${'$'}name"
+                found="${'$'}found${'$'}name${'$'}nl"
+            }
+
+            verify_pid_target() {
+                pid="${'$'}1"
+                target="${'$'}2"
+                case "${'$'}pid" in
+                    ''|*[!0-9]*) return 1 ;;
+                esac
+
+                comm=${'$'}(cat "/proc/${'$'}pid/comm" 2>/dev/null)
+                first=${'$'}(tr '\000' '\n' < "/proc/${'$'}pid/cmdline" 2>/dev/null | head -n 1)
+                base=${'$'}{first##*/}
+
+                if [ "${'$'}comm" = "${'$'}target" ] ||
+                   [ "${'$'}first" = "${'$'}target" ] ||
+                   [ "${'$'}base" = "${'$'}target" ]; then
+                    emit_if_target "${'$'}target"
+                    return 0
+                fi
+                return 1
+            }
+
+            for target in $targetArgs; do
+                pids="${'$'}(pidof "${'$'}target" 2>/dev/null) ${'$'}(pgrep -x "${'$'}target" 2>/dev/null)"
+                for pid in ${'$'}pids; do
+                    verify_pid_target "${'$'}pid" "${'$'}target" && break
+                done
+            done
+            true
+        """.trimIndent()
+        val out = runAsRoot(cmd)
+        val clean = out.substringBefore(ERR_MARK)
+        return clean.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+    }
+
     /** 下发开始采样命令 */
     fun startCalibration(pkg: String): Boolean {
         if (pkg.isBlank()) return false
@@ -127,10 +201,59 @@ object DaemonBridge {
         return result
     }
 
+    /** 读取配置文件中某包名的全部规则行, 包括 "=auto" 占位 */
+    fun readPkgConfigLines(pkg: String): List<String> {
+        val text = readConfigRaw()
+        if (text.isBlank()) return emptyList()
+        val result = ArrayList<String>()
+        for (raw in text.lineSequence()) {
+            val line = raw.trim()
+            if (lineBelongsToPackage(line, pkg)) result.add(line)
+        }
+        return result
+    }
+
     /** 读取配置文件原始内容; 读不到返回空串 */
     fun readConfigRaw(): String {
         val out = runAsRoot("cat $CONFIG_FILE 2>/dev/null")
         return if (out.isNotErrored()) out else ""
+    }
+
+    /** 把未配置应用追加为 "pkg=auto", 后续可从待配置应用里启动校准 */
+    fun addAutoPackage(pkg: String): Boolean {
+        val safe = pkg.replace("'", "")
+        if (safe.isBlank()) return false
+        return runAsRoot("printf '\\n%s=auto\\n' '$safe' >> $CONFIG_FILE").isNotErrored()
+    }
+
+    /** 删除 applist.conf 中某包名的所有配置行, 包括 pkg=... 和 pkg{thread}=... */
+    fun deleteConfigPackage(pkg: String): Boolean {
+        return deleteConfigPackages(listOf(pkg))
+    }
+
+    /** 删除 applist.conf 中多个包名/进程名的所有配置行。 */
+    fun deleteConfigPackages(pkgs: Collection<String>): Boolean {
+        val targets = pkgs.map { it.replace("'", "").trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (targets.isEmpty()) return false
+        val raw = readConfigRaw()
+        if (raw.isBlank()) return true
+        val kept = raw.lineSequence()
+            .filterNot { line -> targets.any { pkg -> lineBelongsToPackage(line, pkg) } }
+            .joinToString("\n")
+        return writeFileAsRoot(CONFIG_FILE, if (kept.isBlank()) "" else kept + "\n")
+    }
+
+    private fun lineBelongsToPackage(rawLine: String, pkg: String): Boolean {
+        val line = rawLine.trim()
+        if (line.isEmpty() || line.startsWith("#")) return false
+        val eq = line.indexOf('=')
+        if (eq <= 0) return false
+        var key = line.substring(0, eq).trim()
+        val brace = key.indexOf('{')
+        if (brace >= 0) key = key.substring(0, brace).trim()
+        return key == pkg
     }
 
     /** 读取某包名的历史线程负载记录原始内容; 读不到返回空串 */

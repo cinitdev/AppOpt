@@ -8,6 +8,12 @@
         <item name="android:statusBarColor">@color/brand_primary</item>
     </style>
 
+    <style name="Theme.AppOpt.Starting" parent="Theme.AppOpt">
+        <item name="android:windowSplashScreenBackground">@color/surface_app</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_splash_logo</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+    </style>
+
     <style name="AppCard" parent="Widget.Material3.CardView.Elevated">
         <item name="cardCornerRadius">18dp</item>
         <item name="cardElevation">2dp</item>
