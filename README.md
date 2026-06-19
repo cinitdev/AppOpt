@@ -41,20 +41,94 @@ AppOpt改版特色.md                 功能特色说明
 
 ## 环境准备
 
-### 基础环境
+### 推荐版本
 
-- Windows + Android Studio，或其它能运行 Android Gradle / Bash 脚本的环境。
+本项目当前按以下环境维护：
+
+- Windows + Android Studio。
 - JDK 17。
-- Android SDK。
-- Android SDK Build-Tools。
-- Android NDK，建议安装 Android Studio SDK Manager 中较新的 NDK。
-- Rust toolchain（`rustup` + `cargo`）。
-- Git Bash 或同类 Bash 环境，用于执行 `build_module.sh`。
+- Android Gradle Plugin 8.13.2。
+- Kotlin 2.0.21。
+- `compileSdk = 36`，`targetSdk = 36`，`minSdk = 31`。
+- Android SDK Platform 36。
+- Android SDK Build-Tools，建议安装 Android Studio SDK Manager 中的最新版。
+- Android NDK 28.x，当前验证环境为 `28.1.13356709`。
+- Rust stable toolchain，当前验证环境为 `rustc 1.96.0`。
+- Git Bash，用来执行 `build_module.sh`。
 
-不需要 WSL。当前脚本会优先读取 `local.properties` 中的 `sdk.dir`，读取不到时再使用
-`ANDROID_HOME` 或 `ANDROID_SDK_ROOT`。
+不需要 WSL。`build_module.sh` 会使用本机 Android SDK / NDK / Rust 工具链完成编译。
 
-### Rust target
+### 安装 Android Studio / SDK / NDK
+
+1. 安装 Android Studio。
+2. 打开 `Settings -> Languages & Frameworks -> Android SDK`。
+3. 在 `SDK Platforms` 中安装：
+   - `Android 16.0 / API 36`，也就是 `android-36`。
+4. 在 `SDK Tools` 中安装：
+   - `Android SDK Build-Tools`
+   - `Android SDK Platform-Tools`
+   - `Android SDK Command-line Tools`
+   - `NDK (Side by side)`
+   - `CMake` 可装可不装，当前 `build_module.sh` 不依赖 CMake。
+5. NDK 建议选择 `28.x`。脚本不是写死 NDK 版本，但会自动选择 `SDK/ndk/` 下版本号最高的一个。
+
+确认 SDK / NDK 目录：
+
+```text
+C:\Users\你的用户名\AppData\Local\Android\Sdk
+C:\Users\你的用户名\AppData\Local\Android\Sdk\ndk\28.1.13356709
+```
+
+Android Studio 通常会自动生成 `local.properties`：
+
+```properties
+sdk.dir=C\:\\Users\\你的用户名\\AppData\\Local\\Android\\Sdk
+```
+
+如果没有 `local.properties`，也可以使用环境变量：
+
+```bash
+export ANDROID_SDK_ROOT=/path/to/android/sdk
+export ANDROID_HOME=/path/to/android/sdk
+```
+
+如果安装了多个 NDK，并且不想让脚本自动选择最高版本，可以显式指定：
+
+```bash
+export ANDROID_NDK_HOME=/path/to/android/sdk/ndk/28.1.13356709
+```
+
+Windows PowerShell 对应写法：
+
+```powershell
+$env:ANDROID_SDK_ROOT = "C:\Users\你的用户名\AppData\Local\Android\Sdk"
+$env:ANDROID_NDK_HOME = "C:\Users\你的用户名\AppData\Local\Android\Sdk\ndk\28.1.13356709"
+```
+
+### 安装 Rust
+
+Windows 推荐用 `rustup-init.exe` 安装：
+
+1. 打开 <https://rustup.rs/>。
+2. 下载并运行 `rustup-init.exe`。
+3. 按默认选项安装 stable toolchain。
+4. 安装完成后重新打开 PowerShell 或 Git Bash。
+
+检查安装结果：
+
+```bash
+rustc --version
+cargo --version
+rustup --version
+```
+
+如果命令不存在，说明 Rust 没有加入 `PATH`，重新打开终端，或检查：
+
+```text
+C:\Users\你的用户名\.cargo\bin
+```
+
+### 安装 Rust Android targets
 
 原生模块会构建 4 个 Android ABI，需要安装这些 Rust target：
 
@@ -65,26 +139,49 @@ rustup target add x86_64-linux-android
 rustup target add i686-linux-android
 ```
 
-### Android SDK 路径
-
-Android Studio 通常会自动生成 `local.properties`：
-
-```properties
-sdk.dir=C\:\\Users\\你的用户名\\AppData\\Local\\Android\\Sdk
-```
-
-也可以使用环境变量：
+检查是否安装成功：
 
 ```bash
-export ANDROID_SDK_ROOT=/path/to/android/sdk
-export ANDROID_HOME=/path/to/android/sdk
+rustup target list --installed
 ```
 
-如果安装了多个 NDK，`build_module.sh` 会自动选择 `SDK/ndk/` 下版本号最高的一个。
-也可以显式指定：
+输出里应该包含：
+
+```text
+aarch64-linux-android
+armv7-linux-androideabi
+x86_64-linux-android
+i686-linux-android
+```
+
+### 安装 Git Bash
+
+Windows 下建议安装 Git for Windows，并使用 Git Bash 执行原生模块脚本：
+
+<https://git-scm.com/download/win>
+
+安装后确认：
 
 ```bash
-export ANDROID_NDK_HOME=/path/to/android/sdk/ndk/xx.x.xxxxxxx
+bash --version
+git --version
+```
+
+### 编译前检查
+
+在项目根目录检查 App 编译环境：
+
+```powershell
+.\gradlew.bat --version
+```
+
+在 Git Bash 中检查 Native 模块编译环境：
+
+```bash
+which cargo
+cargo --version
+rustup target list --installed
+ls "$ANDROID_SDK_ROOT/ndk"
 ```
 
 ## 编译 Android App
@@ -160,6 +257,31 @@ build/module/bin/<abi>/AppOpt          各 ABI native 二进制
 build/module/queuebuffer_probe.bpf.o   eBPF 对象
 build/AppOpt-增强版.zip                可刷入模块包
 ```
+
+### 常见编译错误
+
+`! 无法确定 Android SDK 目录`
+
+说明脚本没有读到 `local.properties`、`ANDROID_HOME` 或 `ANDROID_SDK_ROOT`。先确认
+`local.properties` 是否存在，或手动设置 SDK 环境变量。
+
+`! 找不到 Android NDK`
+
+说明 SDK 目录下没有 `ndk/`，或 `ANDROID_NDK_HOME` 指向了错误目录。用 Android Studio
+SDK Manager 安装 `NDK (Side by side)`，建议安装 NDK 28.x。
+
+`! 找不到 cargo`
+
+说明 Rust 没装好，或当前终端没有读取到 `%USERPROFILE%\.cargo\bin`。
+
+`! 未安装 Rust target: ...`
+
+执行 `rustup target add ...` 安装 README 上面列出的 4 个 Android target。
+
+`Aya 无法解析 BTF` 或 eBPF 加载失败
+
+BPF 对象需要保留 BTF。当前脚本已经给 BPF 编译保留 `-g`，同时通过路径映射避免写入本机绝对路径。
+如果手动改过编译参数，不要去掉 BPF 对象的 `-g`。
 
 ## 安装和使用
 
