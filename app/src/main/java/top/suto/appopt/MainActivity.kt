@@ -260,6 +260,23 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    private fun selectAppTab(tab: AppTab) {
+        appSearchRender?.let { binding.appSection.appRecycler.removeCallbacks(it) }
+        appSearchRender = null
+        binding.appSection.appRecycler.stopScroll()
+        if (appTab == tab) {
+            buildAppList()
+            return
+        }
+        appTab = tab
+        val target = binding.appSection.appTabs.getTabAt(tab.ordinal)
+        if (target != null) {
+            binding.appSection.appTabs.selectTab(target)
+        } else {
+            buildAppList()
+        }
+    }
+
     private fun setupAppSearch() {
         binding.appSection.appSearchBox.visibility = View.GONE
         binding.appSection.appSearchInput.addTextChangedListener(object : TextWatcher {
@@ -382,7 +399,7 @@ class MainActivity : AppCompatActivity() {
         item.addPkg.text = entry.pkg
         bindEntryIcon(item.addIcon, entry)
         item.btnAdd.isEnabled = hasRoot
-        item.btnAdd.setOnClickListener { addAutoConfig(entry.pkg) }
+        item.btnAdd.setOnClickListener { addAutoConfig(entry) }
     }
 
     private fun bindConfiguredAppItem(item: ItemConfiguredAppBinding, entry: AppEntry) {
@@ -603,12 +620,17 @@ class MainActivity : AppCompatActivity() {
         fun submit(newMode: AppTab, newItems: List<AppEntry>) {
             val oldMode = mode
             val oldItems = items
+            if (oldMode != newMode) {
+                mode = newMode
+                items = newItems
+                notifyDataSetChanged()
+                return
+            }
             val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
                 override fun getOldListSize(): Int = oldItems.size
                 override fun getNewListSize(): Int = newItems.size
                 override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
-                    return oldMode == newMode &&
-                        oldItems[oldItemPosition].pkg == newItems[newItemPosition].pkg
+                    return oldItems[oldItemPosition].pkg == newItems[newItemPosition].pkg
                 }
                 override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
                     return oldItems[oldItemPosition] == newItems[newItemPosition]
@@ -953,35 +975,51 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 把未配置应用写入 applist.conf, 形式为 "包名=auto" */
-    private fun addAutoConfig(pkg: String) {
+    private fun addAutoConfig(entry: AppEntry) {
         if (!hasRoot) {
             toast("请先授予 Root 权限")
             return
         }
+        val pkg = entry.pkg
+        val previousLists = appLists
+        val optimisticPending = (previousLists.pending + entry.copy(configPkgs = listOf(pkg)))
+            .distinctBy { it.pkg }
+            .sortedByInstallTime()
+        val optimisticLists = previousLists.copy(
+            pending = optimisticPending,
+            addable = removeConfiguredFromAddable(previousLists.addable, pkg)
+        )
+        appLists = optimisticLists
+        selectAppTab(AppTab.PENDING)
+
         thread {
             val ok = DaemonBridge.addAutoPackage(pkg)
             val config = if (ok) ConfigReader.readPackages() else null
             val resolvedNames = config?.let { resolveProcessComponentNames(it, hasRoot) } ?: processNames
-            val visibleLists = config?.let { buildConfiguredLists(it, resolvedNames) } ?: appLists
+            val visibleLists = config?.let {
+                buildConfiguredLists(it, resolvedNames).copy(
+                    addable = optimisticLists.addable
+                )
+            } ?: optimisticLists
             runOnUiThreadIfAlive {
                 if (ok) {
                     processNames = resolvedNames
                     appLists = visibleLists
-                    appTab = AppTab.PENDING
-                    binding.appSection.appTabs.getTabAt(AppTab.PENDING.ordinal)?.select()
                     buildAppList()
-                    toast("已添加到待校准")
                 } else {
+                    appLists = previousLists
+                    buildAppList()
                     toast("添加配置失败，请检查 Root 或模块权限")
                 }
             }
-            if (ok && config != null) {
-                val fullLists = buildAppLists(config, resolvedNames)
-                runOnUiThreadIfAlive {
-                    appLists = fullLists
-                    buildAppList()
-                }
-            }
+        }
+    }
+
+    private fun removeConfiguredFromAddable(addable: List<AppEntry>, pkg: String): List<AppEntry> {
+        val owner = configOwnerName(pkg)
+        val lookup = packageLookupName(pkg)
+        return addable.filterNot {
+            it.pkg == pkg || it.pkg == owner || it.pkg == lookup
         }
     }
 
@@ -1000,25 +1038,27 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val targets = configPkgs.distinct()
+        val view = DialogDeleteConfigBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(this)
+        view.deleteTitle.text = "删除 ${appLabel(displayPkg)}"
+        view.deletePkg.text = targets.joinToString("\n")
+        view.deleteRules.text = "正在读取当前规则..."
+        view.deleteCancel.setOnClickListener { dialog.dismiss() }
+        view.deleteConfirm.setOnClickListener {
+            dialog.dismiss()
+            deleteConfig(targets)
+        }
+        dialog.setContentView(view.root)
+        dialog.show()
+
         thread {
             val rules = targets.flatMap { DaemonBridge.readPkgConfigLines(it) }
             runOnUiThreadIfAlive {
-                val view = DialogDeleteConfigBinding.inflate(layoutInflater)
-                val dialog = BottomSheetDialog(this)
-                view.deleteTitle.text = "删除 ${appLabel(displayPkg)}"
-                view.deletePkg.text = targets.joinToString("\n")
                 view.deleteRules.text = if (rules.isEmpty()) {
                     "未读取到当前规则；确认后仍会删除这些配置项在 applist.conf 中的所有配置行。"
                 } else {
                     rules.joinToString("\n")
                 }
-                view.deleteCancel.setOnClickListener { dialog.dismiss() }
-                view.deleteConfirm.setOnClickListener {
-                    dialog.dismiss()
-                    deleteConfig(targets)
-                }
-                dialog.setContentView(view.root)
-                dialog.show()
             }
         }
     }
@@ -1029,11 +1069,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun deleteConfig(pkgs: List<String>) {
+        val previousLists = appLists
+        val targetSet = pkgs.toSet()
+        appLists = appLists.copy(
+            pending = appLists.pending.filterNot { entry ->
+                entry.configPkgs.any { it in targetSet } || entry.pkg in targetSet
+            },
+            configured = appLists.configured.filterNot { entry ->
+                entry.configPkgs.any { it in targetSet } || entry.pkg in targetSet
+            }
+        )
+        buildAppList()
+
         thread {
             val ok = DaemonBridge.deleteConfigPackages(pkgs)
             val config = if (ok) ConfigReader.readPackages() else null
             val resolvedNames = config?.let { resolveProcessComponentNames(it, hasRoot) } ?: processNames
-            val visibleLists = config?.let { buildConfiguredLists(it, resolvedNames) } ?: appLists
+            val visibleLists = config?.let {
+                buildConfiguredLists(it, resolvedNames).copy(addable = previousLists.addable)
+            } ?: appLists
             runOnUiThreadIfAlive {
                 if (ok) {
                     processNames = resolvedNames
@@ -1041,14 +1095,9 @@ class MainActivity : AppCompatActivity() {
                     buildAppList()
                     toast("已删除配置")
                 } else {
-                    toast("删除配置失败，请检查 Root 或模块权限")
-                }
-            }
-            if (ok && config != null) {
-                val fullLists = buildAppLists(config, resolvedNames)
-                runOnUiThreadIfAlive {
-                    appLists = fullLists
+                    appLists = previousLists
                     buildAppList()
+                    toast("删除配置失败，请检查 Root 或模块权限")
                 }
             }
         }
