@@ -13,14 +13,18 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.util.LruCache
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ImageView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.bottomsheet.BottomSheetDialog
@@ -32,6 +36,8 @@ import top.suto.appopt.databinding.DialogDeleteConfigBinding
 import top.suto.appopt.databinding.ItemAddAppBinding
 import top.suto.appopt.databinding.ItemAutoAppBinding
 import top.suto.appopt.databinding.ItemConfiguredAppBinding
+import java.util.Collections
+import java.util.concurrent.Executors
 
 /**
  * 引导授予悬浮窗权限, 并列出配置文件中写为 "包名=auto" 的应用。
@@ -45,11 +51,18 @@ class MainActivity : AppCompatActivity() {
     private var appTab = AppTab.PENDING
     private var appSearchQuery = ""
     private var appLists = AppLists()
+    private var environmentLoading = true
+    private var appListsLoading = true
     private var addableAppsLoading = true
     private var hideMissingConfigured = false
     private var appSearchRender: Runnable? = null
     private var processNames: Set<String> = emptySet()
     private val iconCache = LruCache<String, Drawable>(768)
+    private val pendingIconLoads = Collections.synchronizedSet(mutableSetOf<String>())
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val iconExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var activityDestroyed = false
+    private var firstResume = true
     private lateinit var appAdapter: AppAdapter
 
     private companion object {
@@ -91,9 +104,6 @@ class MainActivity : AppCompatActivity() {
         hideMissingConfigured = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getBoolean(PREF_HIDE_MISSING_CONFIGURED, false)
 
-        // 启动文件监听服务 (监听 .log 变化自动导入数据库)
-        startService(Intent(this, FileWatcherService::class.java))
-
         binding.statusSection.btnOverlay.setOnClickListener { requestOverlay() }
         binding.statusSection.btnUsage.setOnClickListener { requestUsageAccess() }
         binding.statusSection.btnHelp.setOnClickListener { showHelp() }
@@ -110,6 +120,8 @@ class MainActivity : AppCompatActivity() {
         setupAppSearch()
         setupConfiguredFilter()
         setupAppRecycler()
+        refresh()
+        buildAppList()
 
         // root 检测 + 读配置 + 批量导入旧 .log 放后台线程, 避免 su 弹窗阻塞 UI
         thread {
@@ -119,46 +131,71 @@ class MainActivity : AppCompatActivity() {
             val resolvedNames = resolveProcessComponentNames(config, r)
             val visibleLists = buildConfiguredLists(config, resolvedNames)
 
-            runOnUiThread {
+            runOnUiThreadIfAlive {
                 hasRoot = r
                 daemonRunning = running
+                environmentLoading = false
+                appListsLoading = false
                 processNames = resolvedNames
                 appLists = visibleLists
                 refresh()
                 buildAppList()
             }
 
-            // 首次启动/旧版升级时批量导入所有 .log 到数据库(epoch 去重,只导入新数据)
-            if (r && config.autoPackages.isNotEmpty()) {
-                android.util.Log.d("AppOpt", "启动时批量导入 ${config.autoPackages.size} 个应用的 .log")
-                for (pkg in config.autoPackages) {
-                    try {
-                        DatabaseMigrator.migrateIfNeeded(this, pkg)
-                    } catch (e: Exception) {
-                        android.util.Log.e("AppOpt", "导入 $pkg 失败: ${e.message}")
-                    }
-                }
-                android.util.Log.d("AppOpt", "批量导入完成")
-            }
-
             val fullLists = buildAppLists(config, resolvedNames)
-            runOnUiThread {
+            runOnUiThreadIfAlive {
                 addableAppsLoading = false
                 appLists = fullLists
                 buildAppList()
             }
+
+            migrateLogsLater(r, config)
         }
     }
 
     override fun onResume() {
         super.onResume()
         refresh()
-        // 守护进程可能在后台被重启/杀掉, 回到前台时后台重查一次(有 root 才有意义)
-        if (hasRoot) thread {
+        val shouldRefreshConfig = firstResume.not()
+        firstResume = false
+        // 守护进程和配置可能在后台变化, 回到前台时后台重查一次(有 root 才有意义)
+        if (hasRoot) refreshForegroundState(shouldRefreshConfig)
+    }
+
+    private fun refreshForegroundState(refreshConfig: Boolean) {
+        val previousAddable = appLists.addable
+        thread {
             val running = DaemonBridge.isDaemonRunning()
-            runOnUiThread {
+            val config = if (refreshConfig) ConfigReader.readPackages() else null
+            val resolvedNames = config?.let { resolveProcessComponentNames(it, true) } ?: processNames
+            val visibleLists = config?.let {
+                buildConfiguredLists(it, resolvedNames).copy(addable = previousAddable)
+            }
+            runOnUiThreadIfAlive {
                 daemonRunning = running
+                if (visibleLists != null) {
+                    appListsLoading = false
+                    processNames = resolvedNames
+                    appLists = visibleLists
+                    buildAppList()
+                }
                 refresh()
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        activityDestroyed = true
+        appSearchRender?.let { binding.appSection.appRecycler.removeCallbacks(it) }
+        pendingIconLoads.clear()
+        iconExecutor.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun runOnUiThreadIfAlive(action: () -> Unit) {
+        runOnUiThread {
+            if (!activityDestroyed && !isFinishing && !isDestroyed) {
+                action()
             }
         }
     }
@@ -176,6 +213,14 @@ class MainActivity : AppCompatActivity() {
         s.btnUsage.visibility = if (usage) View.GONE else View.VISIBLE
         s.usageState.text = if (usage) "已授予" else "未授予"
         setDot(s.dotUsage, if (usage) R.color.status_ok else R.color.status_warn)
+
+        if (environmentLoading) {
+            s.rootState.text = "检查中"
+            setDot(s.dotRoot, R.color.status_warn)
+            s.daemonState.text = "检查中"
+            setDot(s.dotDaemon, R.color.status_warn)
+            return
+        }
 
         s.rootState.text = if (hasRoot) "可用" else "不可用"
         setDot(s.dotRoot, if (hasRoot) R.color.status_ok else R.color.status_off)
@@ -270,14 +315,15 @@ class MainActivity : AppCompatActivity() {
             val config = if (hasRoot) ConfigReader.readPackages() else ConfigReader.ConfigPackages(emptyList(), emptyList())
             val resolvedNames = resolveProcessComponentNames(config, hasRoot)
             val visibleLists = buildConfiguredLists(config, resolvedNames).copy(addable = previousAddable)
-            runOnUiThread {
+            runOnUiThreadIfAlive {
+                appListsLoading = false
                 processNames = resolvedNames
                 appLists = visibleLists
                 buildAppList()
             }
 
             val fullLists = buildAppLists(config, resolvedNames)
-            runOnUiThread {
+            runOnUiThreadIfAlive {
                 addableAppsLoading = false
                 appLists = fullLists
                 buildAppList()
@@ -319,9 +365,7 @@ class MainActivity : AppCompatActivity() {
             ComponentKind.SYSTEM_COMPONENT -> "${entry.pkg} · 系统组件"
             ComponentKind.MISSING_APP -> "${entry.pkg} · 未安装/配置残留"
         }
-        item.itemIcon.setImageDrawable(
-            iconForEntry(entry)
-        )
+        bindEntryIcon(item.itemIcon, entry)
         item.btnStart.isEnabled = entry.installed
         item.btnStart.alpha = if (entry.installed) 1f else 0.42f
         item.btnStart.contentDescription = if (entry.installed) "启动校准" else "未安装，无法启动"
@@ -336,9 +380,7 @@ class MainActivity : AppCompatActivity() {
     private fun bindAddAppItem(item: ItemAddAppBinding, entry: AppEntry) {
         item.addName.text = entry.label
         item.addPkg.text = entry.pkg
-        item.addIcon.setImageDrawable(
-            iconForEntry(entry)
-        )
+        bindEntryIcon(item.addIcon, entry)
         item.btnAdd.isEnabled = hasRoot
         item.btnAdd.setOnClickListener { addAutoConfig(entry.pkg) }
     }
@@ -354,18 +396,96 @@ class MainActivity : AppCompatActivity() {
             ComponentKind.SYSTEM_COMPONENT -> "系统组件"
             ComponentKind.MISSING_APP -> "未安装/配置残留"
         }
-        item.configIcon.setImageDrawable(
-            iconForEntry(entry)
-        )
+        bindEntryIcon(item.configIcon, entry)
         item.btnView.isEnabled = hasRoot
         item.btnRemove.isEnabled = hasRoot
         item.btnView.setOnClickListener { showConfiguredRules(entry) }
         item.btnRemove.setOnClickListener { confirmDeleteConfig(entry) }
     }
 
-    private fun iconForEntry(entry: AppEntry): Drawable? {
-        val key = "v2:${entry.component}:${entry.pkg}"
-        iconCache.get(key)?.let { return it }
+    private fun migrateLogsLater(rootAvailable: Boolean, config: ConfigReader.ConfigPackages) {
+        if (!rootAvailable || config.autoPackages.isEmpty()) return
+        val appContext = applicationContext
+        thread {
+            try {
+                Thread.sleep(1200)
+            } catch (_: InterruptedException) {
+                return@thread
+            }
+            android.util.Log.d("AppOpt", "延后检查 ${config.autoPackages.size} 个待校准应用的历史 .log")
+            for (pkg in config.autoPackages) {
+                try {
+                    DatabaseMigrator.migrateIfNeeded(appContext, pkg)
+                } catch (e: Exception) {
+                    android.util.Log.e("AppOpt", "导入 $pkg 失败: ${e.message}")
+                }
+            }
+            android.util.Log.d("AppOpt", "延后历史 .log 检查完成")
+        }
+    }
+
+    private fun bindEntryIcon(view: ImageView, entry: AppEntry) {
+        val key = iconCacheKey(entry)
+        view.tag = key
+        cachedIcon(key)?.let {
+            view.setImageDrawable(it)
+            return
+        }
+
+        view.setImageDrawable(placeholderIcon(entry))
+        scheduleIconLoad(entry, key)
+    }
+
+    private fun scheduleIconLoad(entry: AppEntry, key: String) {
+        if (!pendingIconLoads.add(key)) return
+        try {
+            iconExecutor.execute {
+                try {
+                    loadIconForEntry(entry)
+                } finally {
+                    pendingIconLoads.remove(key)
+                }
+                if (!activityDestroyed && cachedIcon(key) != null) {
+                    mainHandler.post {
+                        if (!activityDestroyed) appAdapter.notifyIconChanged(key)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            pendingIconLoads.remove(key)
+        }
+    }
+
+    private fun iconCacheKey(entry: AppEntry): String {
+        return "v2:${entry.component}:${entry.pkg}"
+    }
+
+    private fun cachedIcon(key: String): Drawable? = synchronized(iconCache) {
+        iconCache.get(key)
+    }
+
+    private fun putCachedIcon(key: String, icon: Drawable) {
+        synchronized(iconCache) {
+            iconCache.put(key, icon)
+        }
+    }
+
+    private fun placeholderIcon(entry: AppEntry): Drawable? {
+        val key = "placeholder:${entry.component}"
+        cachedIcon(key)?.let { return it }
+        val resId = when (entry.component) {
+            ComponentKind.SYSTEM_COMPONENT -> R.drawable.ic_linux
+            ComponentKind.MISSING_APP -> R.drawable.ic_missing_app
+            ComponentKind.APP -> R.drawable.ic_launcher_foreground
+        }
+        val icon = ContextCompat.getDrawable(this, resId)?.let { makeRoundIcon(it.mutate()) }
+        if (icon != null) putCachedIcon(key, icon)
+        return icon
+    }
+
+    private fun loadIconForEntry(entry: AppEntry): Drawable? {
+        val key = iconCacheKey(entry)
+        cachedIcon(key)?.let { return it }
         val raw = when (entry.component) {
             ComponentKind.SYSTEM_COMPONENT -> ContextCompat.getDrawable(this, R.drawable.ic_linux)
             ComponentKind.MISSING_APP -> ContextCompat.getDrawable(this, R.drawable.ic_missing_app)
@@ -376,7 +496,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         val rounded = raw?.let { makeRoundIcon(it.mutate()) }
-        if (rounded != null) iconCache.put(key, rounded)
+        if (rounded != null) putCachedIcon(key, rounded)
         return rounded
     }
 
@@ -464,21 +584,12 @@ class MainActivity : AppCompatActivity() {
         return Rect(left, top, right + 1, bottom + 1)
     }
 
-    private fun prewarmIcons(lists: AppLists) {
-        prewarmIcons(lists.pending)
-        prewarmIcons(lists.addable)
-        prewarmIcons(lists.configured)
-    }
-
-    private fun prewarmIcons(entries: List<AppEntry>) {
-        for (entry in entries) iconForEntry(entry)
-    }
-
     private fun dp(value: Float): Int {
         return (value * resources.displayMetrics.density + 0.5f).toInt()
     }
 
     private inner class AppAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+        private val payloadIcon = "icon"
         private val viewTypeAdd = 1
         private val viewTypeNormal = 2
         private val viewTypeConfigured = 3
@@ -490,9 +601,27 @@ class MainActivity : AppCompatActivity() {
         }
 
         fun submit(newMode: AppTab, newItems: List<AppEntry>) {
+            val oldMode = mode
+            val oldItems = items
+            val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+                override fun getOldListSize(): Int = oldItems.size
+                override fun getNewListSize(): Int = newItems.size
+                override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                    return oldMode == newMode &&
+                        oldItems[oldItemPosition].pkg == newItems[newItemPosition].pkg
+                }
+                override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                    return oldItems[oldItemPosition] == newItems[newItemPosition]
+                }
+            })
             mode = newMode
             items = newItems
-            notifyDataSetChanged()
+            diff.dispatchUpdatesTo(this)
+        }
+
+        fun notifyIconChanged(key: String) {
+            val index = items.indexOfFirst { iconCacheKey(it) == key }
+            if (index >= 0) notifyItemChanged(index, payloadIcon)
         }
 
         override fun getItemViewType(position: Int): Int {
@@ -520,11 +649,37 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        override fun onBindViewHolder(
+            holder: RecyclerView.ViewHolder,
+            position: Int,
+            payloads: MutableList<Any>
+        ) {
+            if (payloads.contains(payloadIcon)) {
+                val entry = items[position]
+                when (holder) {
+                    is AddHolder -> bindEntryIcon(holder.binding.addIcon, entry)
+                    is ConfiguredHolder -> bindEntryIcon(holder.binding.configIcon, entry)
+                    is NormalHolder -> bindEntryIcon(holder.binding.itemIcon, entry)
+                }
+                return
+            }
+            super.onBindViewHolder(holder, position, payloads)
+        }
+
         override fun getItemCount(): Int = items.size
 
         override fun getItemId(position: Int): Long {
             val entry = items[position]
-            return 31L * mode.ordinal + entry.pkg.hashCode().toLong()
+            return stableItemId("${mode.name}:${entry.pkg}")
+        }
+
+        private fun stableItemId(value: String): Long {
+            var hash = -0x340d631b7bdddcdbL
+            for (ch in value) {
+                hash = hash xor ch.code.toLong()
+                hash *= 0x100000001b3L
+            }
+            return hash
         }
 
         inner class AddHolder(val binding: ItemAddAppBinding) : RecyclerView.ViewHolder(binding.root)
@@ -558,11 +713,19 @@ class MainActivity : AppCompatActivity() {
     )
 
     private fun emptyStateForCurrentTab(): EmptyState = when (appTab) {
-        AppTab.PENDING -> EmptyState(
-            R.drawable.ic_empty_pending,
-            "暂无待校准应用",
-            "可在「添加应用」中选择应用写入 auto 配置"
-        )
+        AppTab.PENDING -> if (appListsLoading) {
+            EmptyState(
+                R.drawable.ic_empty_pending,
+                "正在读取配置",
+                "待校准应用会在加载完成后显示"
+            )
+        } else {
+            EmptyState(
+                R.drawable.ic_empty_pending,
+                "暂无待校准应用",
+                "可在「添加应用」中选择应用写入 auto 配置"
+            )
+        }
         AppTab.ADD -> when {
             addableAppsLoading -> EmptyState(
                 R.drawable.ic_empty_add,
@@ -580,7 +743,13 @@ class MainActivity : AppCompatActivity() {
                 "试试应用名称或包名里的其他关键词"
             )
         }
-        AppTab.CONFIGURED -> if (hideMissingConfigured && appLists.configured.isNotEmpty()) {
+        AppTab.CONFIGURED -> if (appListsLoading) {
+            EmptyState(
+                R.drawable.ic_empty_configured,
+                "正在读取配置",
+                "已配置应用会在加载完成后显示"
+            )
+        } else if (hideMissingConfigured && appLists.configured.isNotEmpty()) {
             EmptyState(
                 R.drawable.ic_empty_configured,
                 "未安装应用已隐藏",
@@ -606,9 +775,7 @@ class MainActivity : AppCompatActivity() {
         val installed = installedLaunchableApps()
             .filter { it.pkg !in configuredSet }
             .sortedByInstallTime()
-        val lists = base.copy(addable = installed)
-        prewarmIcons(lists.addable)
-        return lists
+        return base.copy(addable = installed)
     }
 
     private fun buildConfiguredLists(
@@ -625,13 +792,10 @@ class MainActivity : AppCompatActivity() {
         val configured = configuredGroups
             .map { (pkg, configPkgs) -> appEntry(pkg, names, configPkgs.toList()) }
             .sortedByInstallTime()
-        val lists = AppLists(
+        return AppLists(
             pending = pending,
             configured = configured
         )
-        prewarmIcons(lists.pending)
-        prewarmIcons(lists.configured)
-        return lists
     }
 
     private fun installedLaunchableApps(): List<AppEntry> {
@@ -758,7 +922,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showHelp() {
-        val view = layoutInflater.inflate(R.layout.section_help, null, false)
+        val view = layoutInflater.inflate(R.layout.section_help, binding.root, false)
         val dialog = BottomSheetDialog(this)
         dialog.setContentView(view)
         dialog.show()
@@ -799,7 +963,7 @@ class MainActivity : AppCompatActivity() {
             val config = if (ok) ConfigReader.readPackages() else null
             val resolvedNames = config?.let { resolveProcessComponentNames(it, hasRoot) } ?: processNames
             val visibleLists = config?.let { buildConfiguredLists(it, resolvedNames) } ?: appLists
-            runOnUiThread {
+            runOnUiThreadIfAlive {
                 if (ok) {
                     processNames = resolvedNames
                     appLists = visibleLists
@@ -813,7 +977,7 @@ class MainActivity : AppCompatActivity() {
             }
             if (ok && config != null) {
                 val fullLists = buildAppLists(config, resolvedNames)
-                runOnUiThread {
+                runOnUiThreadIfAlive {
                     appLists = fullLists
                     buildAppList()
                 }
@@ -838,7 +1002,7 @@ class MainActivity : AppCompatActivity() {
         val targets = configPkgs.distinct()
         thread {
             val rules = targets.flatMap { DaemonBridge.readPkgConfigLines(it) }
-            runOnUiThread {
+            runOnUiThreadIfAlive {
                 val view = DialogDeleteConfigBinding.inflate(layoutInflater)
                 val dialog = BottomSheetDialog(this)
                 view.deleteTitle.text = "删除 ${appLabel(displayPkg)}"
@@ -870,7 +1034,7 @@ class MainActivity : AppCompatActivity() {
             val config = if (ok) ConfigReader.readPackages() else null
             val resolvedNames = config?.let { resolveProcessComponentNames(it, hasRoot) } ?: processNames
             val visibleLists = config?.let { buildConfiguredLists(it, resolvedNames) } ?: appLists
-            runOnUiThread {
+            runOnUiThreadIfAlive {
                 if (ok) {
                     processNames = resolvedNames
                     appLists = visibleLists
@@ -882,7 +1046,7 @@ class MainActivity : AppCompatActivity() {
             }
             if (ok && config != null) {
                 val fullLists = buildAppLists(config, resolvedNames)
-                runOnUiThread {
+                runOnUiThreadIfAlive {
                     appLists = fullLists
                     buildAppList()
                 }
@@ -907,7 +1071,7 @@ class MainActivity : AppCompatActivity() {
         val targets = configPkgs.distinct()
         thread {
             val rules = targets.flatMap { DaemonBridge.readPkgRules(it) }
-            runOnUiThread {
+            runOnUiThreadIfAlive {
                 val message = if (rules.isEmpty()) {
                     "未读取到 ${targets.joinToString(", ")} 的配置规则"
                 } else {

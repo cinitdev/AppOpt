@@ -1,23 +1,20 @@
 package top.suto.appopt
 
 import android.content.Context
+import android.net.LocalServerSocket
+import android.net.LocalSocket
 import android.os.FileObserver
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStreamReader
+import java.util.UUID
 
 /**
- * 真实帧率(FPS)接收器 —— 配合 C 守护进程的 perfetto frametimeline 方案。
+ * 真实帧率(FPS)接收器。
  *
- * 数据流:
- *   守护进程(root) 跑 perfetto 抓 surfaceflinger.frametimeline, 手写解析数出
- *   目标游戏每秒的真实渲染帧数, 覆盖写到本 app 私有目录的 fps 文件
- *   (/data/data/top.suto.appopt/files/fps), 并 chcon 成 app 可读。
- *   本类用 FileObserver 监听该文件的 CLOSE_WRITE 事件, 守护每写一次即回调一次,
- *   实时、省电(无轮询)。
- *
- * 与旧的屏幕刷新率方案的区别: 这里是**应用真实提交的渲染帧率**(掉帧会真实反映),
- * 不是面板刷新档位。读不到/未启动监测时回调不会触发, 胶囊保持上一次的值。
- *
- * 回调线程: FileObserver 的回调在其内部线程触发, 调用方需自行切回主线程刷新 UI。
+ * 优先使用 Android 本地 socket 接收 C 守护进程推送的 FPS 文本行, 失败时保留旧的
+ * fps 文件 + FileObserver 方案作为兜底。这样 socket 被 SELinux/ROM 行为拦住时,
+ * 悬浮球仍能继续显示文件通道输出。
  */
 class FrameRateMonitor(
     private val context: Context,
@@ -26,7 +23,15 @@ class FrameRateMonitor(
 
     private val fpsFile = File(context.filesDir, FPS_FILENAME)
     private var observer: FileObserver? = null
+    private var server: LocalServerSocket? = null
+    private var activeSocket: LocalSocket? = null
+    private var socketThread: Thread? = null
     @Volatile private var running = false
+
+    @Volatile var socketName: String? = null
+        private set
+    @Volatile var socketToken: String? = null
+        private set
 
     companion object {
         const val FPS_FILENAME = "fps"
@@ -36,42 +41,115 @@ class FrameRateMonitor(
         if (running) return
         running = true
 
-        // 确保文件存在, 否则 FileObserver 在文件被首次创建前监听不到。
-        // 守护进程用 O_TRUNC 覆盖写, 不删除重建, 故这里先建一个空文件占位。
-        try {
-            if (!fpsFile.exists()) fpsFile.createNewFile()
-        } catch (_: Exception) {
-            // 创建失败(极少见)不致命, 守护进程创建该文件后 CLOSE_WRITE 仍会触发
-        }
+        startFileFallback()
+        startSocketServer()
 
-        observer = buildObserver().also { it.startWatching() }
-
-        // 启动时先读一次当前值(可能守护进程已经写过), 避免胶囊一直空白
-        readAndEmit()
+        // 启动时先读一次当前值(可能守护进程已经写过), 避免胶囊一直空白。
+        readAndEmitFile()
     }
 
     fun stop() {
         running = false
         observer?.stopWatching()
         observer = null
+        closeSocketChannel()
+    }
+
+    private fun startFileFallback() {
+        try {
+            if (!fpsFile.exists()) fpsFile.createNewFile()
+        } catch (_: Exception) {
+            // 创建失败不致命, 守护进程能写文件时 FileObserver 仍可兜底。
+        }
+
+        observer = buildObserver().also { it.startWatching() }
+    }
+
+    private fun startSocketServer() {
+        val name = "appopt_fps_${android.os.Process.myPid()}_${System.nanoTime()}"
+        val token = UUID.randomUUID().toString().replace("-", "")
+        try {
+            val localServer = LocalServerSocket(name)
+            server = localServer
+            socketName = name
+            socketToken = token
+            socketThread = Thread({ socketAcceptLoop(localServer, token) }, "AppOptFpsSock").apply {
+                isDaemon = true
+                start()
+            }
+        } catch (_: Exception) {
+            socketName = null
+            socketToken = null
+            server = null
+        }
+    }
+
+    private fun socketAcceptLoop(localServer: LocalServerSocket, token: String) {
+        while (running) {
+            val socket = try {
+                localServer.accept()
+            } catch (_: Exception) {
+                break
+            }
+
+            if (!running) {
+                try { socket.close() } catch (_: Exception) {}
+                break
+            }
+
+            try {
+                activeSocket?.close()
+            } catch (_: Exception) {
+            }
+            activeSocket = socket
+            readSocket(socket, token)
+        }
+    }
+
+    private fun readSocket(socket: LocalSocket, token: String) {
+        try {
+            socket.soTimeout = 0
+            val reader = BufferedReader(InputStreamReader(socket.inputStream))
+            val hello = reader.readLine() ?: return
+            if (hello != "hello $token") return
+
+            while (running) {
+                val line = reader.readLine() ?: break
+                val fps = line.trim().toFloatOrNull() ?: continue
+                if (fps >= 0f) onFps(fps)
+            }
+        } catch (_: Exception) {
+        } finally {
+            if (activeSocket === socket) activeSocket = null
+            try { socket.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun closeSocketChannel() {
+        socketName = null
+        socketToken = null
+        try { activeSocket?.close() } catch (_: Exception) {}
+        activeSocket = null
+        try { server?.close() } catch (_: Exception) {}
+        server = null
+        socketThread = null
     }
 
     /**
      * 构造监听 fps 文件 CLOSE_WRITE 的 FileObserver。
      * Android 10(API29)+ 推荐用 File 构造器(老的 String 构造器已废弃)。
-     * 监听文件本身而非目录: 守护进程是覆盖写(open+write+close), CLOSE_WRITE 必触发。
      */
     private fun buildObserver(): FileObserver {
         return object : FileObserver(fpsFile, CLOSE_WRITE) {
             override fun onEvent(event: Int, path: String?) {
                 if (!running) return
-                if (event and CLOSE_WRITE != 0) readAndEmit()
+                if (event and CLOSE_WRITE != 0) readAndEmitFile()
             }
         }
     }
 
-    /** 读取 fps 文件内容并回调; 内容非法或读不到则忽略 */
-    private fun readAndEmit() {
+    /** 读取 fps 文件内容并回调; 内容非法或读不到则忽略。 */
+    private fun readAndEmitFile() {
         val fps = try {
             val text = fpsFile.readText().trim()
             if (text.isEmpty()) return

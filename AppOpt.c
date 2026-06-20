@@ -6,24 +6,36 @@
 #include <fnmatch.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/android/binder.h>   /* 直连 binder 取 SF dump(免 fork dumpsys) */
 #include <sys/system_properties.h>
 #define APPOPT_HAVE_BINDER 1
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0
+#endif
 /* 注: 不定义 BINDER_IPC_32BIT, binder_uintptr_t/size_t 在 32/64 位均为 __u64,
  * 结构体布局一致 -> 同一套代码可跨 ABI。现代 Android(12-16)内核均为 64 位
  * binder ABI(即便进程是 32 位)。极罕见的真 32 位内核上事务会失败, 自动回退
@@ -44,17 +56,23 @@
 #define HISTORY_DIR        MODULE_DIR "/history"
 
 /* ---- 真实帧率(FPS)监测 ----
- * App 写 FPS_CMD_FILE: "start <pkg>" / "stop"  通知守护开/关监测
- * 策略: eBPF uprobe(优先) -> timestats(回退)
+ * App 写 FPS_CMD_FILE: "start <pkg> [socket token]" / "stop"  通知守护开/关监测
+ * 策略: eBPF uprobe(优先) -> SurfaceFlinger --latency -> --timestats
  *   eBPF: 在目标进程 libgui::queueBuffer 挂 uprobe,逐帧精度
- *   timestats: dumpsys SurfaceFlinger --timestats, Layer 平均 FPS
- * 守护把每秒算出的 FPS 覆盖写到 app 私有目录(下方), 再 chcon 成 app 可读,
- * App 侧 FileObserver(CLOSE_WRITE) 收到即读取刷新悬浮球胶囊。 */
+ *   SF fallback: binder 直连读取 SurfaceFlinger 帧时间戳,必要时切 timestats
+ * 守护优先把每秒算出的 FPS 推到 App 创建的 Android 本地 socket;
+ * socket 不可用时再覆盖写 app 私有目录(下方), 由 App 侧 FileObserver 兜底读取。 */
 #define FPS_CMD_FILE       MODULE_DIR "/fps.cmd"
 #define FPS_OUT_DIR        "/data/data/top.suto.appopt/files"
 #define FPS_OUT_FILE       FPS_OUT_DIR "/fps"
 #define FPS_BPF_OBJ        MODULE_DIR "/queuebuffer_probe.bpf.o"  /* eBPF 字节码 */
 #define FPS_WINDOW_MS      1000           /* 出一个 FPS 的周期 */
+#define FPS_SOCKET_NAME_MAX 96
+#define FPS_SOCKET_TOKEN_MAX 64
+#define DAEMON_SOCKET_NAME "appopt_daemon_top.suto.appopt_v1"
+#define DAEMON_SOCKET_PING_PREFIX "appopt.ping top.suto.appopt v1"
+#define DAEMON_SOCKET_CALLBACK "appopt.callback top.suto.appopt v1"
+#define CALIB_MIN_ROUNDS 60
 
 typedef struct {
     char pkg[MAX_PKG_LEN];
@@ -114,7 +132,7 @@ typedef struct {
     atomic_int ref_count;
     AffinityRule* rules;
     size_t num_rules;
-    time_t mtime;
+    struct timespec mtime;
     CpuTopology topo;
     char** pkgs;
     size_t num_pkgs;
@@ -147,6 +165,11 @@ static _Atomic(AppConfig*) current_config = NULL;
 static pthread_mutex_t config_swap_lock = PTHREAD_MUTEX_INITIALIZER;
 static CpuTopology g_topo;                 /* 校准线程使用的全局拓扑快照 */
 static char g_config_file[4096] = "";      /* 校准线程回写用的配置文件路径 */
+static volatile sig_atomic_t shutdown_requested = 0;
+
+static void handle_shutdown_signal(int sig) {
+    shutdown_requested = sig;
+}
 
 static char* strtrim(char* s) {
     char* end;
@@ -161,6 +184,7 @@ static char* strtrim(char* s) {
 }
 
 static bool read_file(int dir_fd, const char* filename, char* buf, size_t buf_size) {
+    if (!filename || !buf || buf_size == 0) return false;
     int fd = openat(dir_fd, filename, O_RDONLY | O_CLOEXEC);
     if (fd == -1) return false;
     ssize_t n = read(fd, buf, buf_size - 1);
@@ -171,11 +195,23 @@ static bool read_file(int dir_fd, const char* filename, char* buf, size_t buf_si
 }
 
 static bool write_file(int dir_fd, const char* filename, const char* content, int flags) {
+    if (!filename || !content) return false;
     int fd = openat(dir_fd, filename, flags | O_CLOEXEC, 0644);
     if (fd == -1) return false;
-    ssize_t n = write(fd, content, strlen(content));
+    size_t len = strlen(content);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, content + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        close(fd);
+        return false;
+    }
     close(fd);
-    return (n == (ssize_t)strlen(content));
+    return true;
 }
 
 static int get_prop_first(char* out, size_t out_size, const char* const* keys, size_t key_count) {
@@ -194,6 +230,7 @@ static int get_prop_first(char* out, size_t out_size, const char* const* keys, s
 }
 
 static int build_str(char *dest, size_t dest_size, ...) {
+    if (!dest || dest_size == 0) return 0;
     va_list args;
     const char *segment;
     char *p = dest;
@@ -202,6 +239,7 @@ static int build_str(char *dest, size_t dest_size, ...) {
     while ((segment = va_arg(args, const char *)) != NULL) {
         size_t len = strlen(segment);
         if (len > remaining) {
+            *p = '\0';
             va_end(args);
             return 0;
         }
@@ -212,6 +250,108 @@ static int build_str(char *dest, size_t dest_size, ...) {
     *p = '\0';
     va_end(args);
     return 1;
+}
+
+static bool stat_mtime_equal(const struct stat* st, const struct timespec* ts) {
+    return st && ts && st->st_mtim.tv_sec == ts->tv_sec &&
+           st->st_mtim.tv_nsec == ts->tv_nsec;
+}
+
+static bool stat_same_size_mtime(const struct stat* a, const struct stat* b) {
+    return a && b && a->st_size == b->st_size &&
+           a->st_mtim.tv_sec == b->st_mtim.tv_sec &&
+           a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
+}
+
+static long long monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static bool file_mtime_recent(const struct stat* st) {
+    if (!st) return false;
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return false;
+    if (st->st_mtim.tv_sec > now.tv_sec) return true;
+    time_t ds = now.tv_sec - st->st_mtim.tv_sec;
+    if (ds <= 0) return true;
+    return ds == 1 && st->st_mtim.tv_nsec > now.tv_nsec;
+}
+
+static void safe_history_filename(const char* pkg, char* out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!pkg || !pkg[0]) {
+        build_str(out, out_sz, "unknown", NULL);
+        return;
+    }
+
+    size_t j = 0;
+    for (size_t i = 0; pkg[i] && j + 1 < out_sz; i++) {
+        unsigned char c = (unsigned char)pkg[i];
+        if (isalnum(c) || c == '.' || c == '_' || c == '-' || c == ':') {
+            out[j++] = (char)c;
+        } else {
+            out[j++] = '_';
+        }
+    }
+    out[j] = '\0';
+
+    if (j == 0 || strcmp(out, ".") == 0 || strcmp(out, "..") == 0) {
+        build_str(out, out_sz, "unknown", NULL);
+    }
+}
+
+static bool read_stable_command_file(const char* path, char* cmd_buf, size_t sz,
+                                     bool (*is_valid)(const char*)) {
+    if (!path || !cmd_buf || sz == 0 || !is_valid) return false;
+    cmd_buf[0] = '\0';
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return false;
+
+    struct stat before, after;
+    if (fstat(fd, &before) != 0) {
+        close(fd);
+        return false;
+    }
+
+    ssize_t n = read(fd, cmd_buf, sz - 1);
+    if (fstat(fd, &after) != 0) {
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    if (n <= 0) {
+        if (!file_mtime_recent(&after)) unlink(path);
+        return false;
+    }
+
+    cmd_buf[n] = '\0';
+    char* trimmed = strtrim(cmd_buf);
+    if (trimmed != cmd_buf) {
+        memmove(cmd_buf, trimmed, strlen(trimmed) + 1);
+    }
+
+    bool stable = stat_same_size_mtime(&before, &after);
+    bool complete = after.st_size >= 0 && (off_t)n >= after.st_size;
+    if (!stable) {
+        return false;
+    }
+    if (!complete) {
+        if (!file_mtime_recent(&after)) unlink(path);
+        return false;
+    }
+
+    if (!is_valid(cmd_buf)) {
+        if (!file_mtime_recent(&after)) unlink(path);
+        return false;
+    }
+
+    unlink(path);
+    return true;
 }
 
 static void parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
@@ -506,7 +646,7 @@ static CpuTopology init_cpu_topo(void) {
     return topo;
 }
 
-static AppConfig* load_config(const char* config_file, const CpuTopology* topo, time_t* last_mtime) {
+static AppConfig* load_config(const char* config_file, const CpuTopology* topo, struct timespec* last_mtime) {
     struct stat st;
     if (stat(config_file, &st)) return NULL;
     AppConfig* cfg = calloc(1, sizeof(AppConfig));
@@ -515,7 +655,7 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
     cfg->topo = *topo;
     build_str(cfg->config_file, sizeof(cfg->config_file), config_file, NULL);
 
-    if (last_mtime && *last_mtime == st.st_mtime && *last_mtime != -1) {
+    if (last_mtime && last_mtime->tv_sec != -1 && stat_mtime_equal(&st, last_mtime)) {
         free(cfg);
         return NULL;
     }
@@ -530,9 +670,10 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
     char** new_pkgs = NULL;
     char** new_auto = NULL;
     size_t rules_cnt = 0, pkgs_cnt = 0, auto_cnt = 0;
-    char line[256];
+    char* line = NULL;
+    size_t line_cap = 0;
 
-    while (fgets(line, sizeof(line), fp)) {
+    while (getline(&line, &line_cap, fp) != -1) {
         char* p = strtrim(line);
         if (*p == '#' || !*p) continue;
 
@@ -636,20 +777,22 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
         free(cfg->pkgs);
     }
 
-    if (last_mtime) *last_mtime = st.st_mtime;
+    if (last_mtime) *last_mtime = st.st_mtim;
     cfg->rules = new_rules;
     cfg->num_rules = rules_cnt;
     cfg->pkgs = new_pkgs;
     cfg->num_pkgs = pkgs_cnt;
     cfg->auto_pkgs = new_auto;
     cfg->num_auto_pkgs = auto_cnt;
-    cfg->mtime = st.st_mtime;
+    cfg->mtime = st.st_mtim;
 
     fclose(fp);
+    free(line);
     printf("配置文件解析完成，共加载 %zu 条规则, %zu 个待校准(auto)包\n", rules_cnt, auto_cnt);
     return cfg;
 
     error:
+    free(line);
     if (new_rules) free(new_rules);
     if (new_pkgs) {
         for (size_t i = 0; i < pkgs_cnt; i++) free(new_pkgs[i]);
@@ -714,18 +857,30 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
         char* name = strrchr(cmd, '/');
         name = name ? name + 1 : cmd;
 
-        bool found = false;
+        const char* matched_pkg = NULL;
+        size_t matched_len = 0;
         for (size_t j = 0; j < cfg->num_pkgs; j++) {
             size_t plen = strlen(cfg->pkgs[j]);
-            if (strcmp(name, cfg->pkgs[j]) == 0 ||
-                (strncmp(name, cfg->pkgs[j], plen) == 0 && name[plen] == ':')) {
-                found = true;
+            if (strcmp(name, cfg->pkgs[j]) == 0) {
+                matched_pkg = cfg->pkgs[j];
                 break;
             }
+            if (plen > matched_len && strncmp(name, cfg->pkgs[j], plen) == 0 && name[plen] == ':') {
+                matched_pkg = cfg->pkgs[j];
+                matched_len = plen;
+            }
         }
-        if (!found) {
+        if (!matched_pkg) {
             close(pid_fd);
             continue;
+        }
+
+        bool has_exact_pkg_rules = false;
+        for (size_t i = 0; i < cfg->num_rules; i++) {
+            if (strcmp(cfg->rules[i].pkg, name) == 0) {
+                has_exact_pkg_rules = true;
+                break;
+            }
         }
 
         if (*count >= cache->procs_cap) {
@@ -762,7 +917,13 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
 
         for (size_t i = 0; i < cfg->num_rules; i++) {
             const AffinityRule* rule = &cfg->rules[i];
-            if (strcmp(rule->pkg, proc->pkg) != 0) continue;
+            bool use_rule = strcmp(rule->pkg, proc->pkg) == 0;
+            /* 子进程没有独立规则时, 只继承主包进程级兜底, 不继承主进程线程规则。 */
+            if (!use_rule && !has_exact_pkg_rules &&
+                strcmp(rule->pkg, matched_pkg) == 0 && rule->thread[0] == '\0') {
+                use_rule = true;
+            }
+            if (!use_rule) continue;
 
             if (rule->thread[0]) {
                 if (proc->num_thread_rules >= proc->thread_rules_cap) {
@@ -993,7 +1154,7 @@ static void* config_loader_thread(void* arg) {
     free(arg);
     pthread_setname_np(pthread_self(), "ConfigLoader");
 
-    time_t last_mtime = -1;
+    struct timespec last_mtime = { .tv_sec = -1, .tv_nsec = -1 };
     while (1) {
         if (inotify_supported) {
             fd_set rfds;
@@ -1037,7 +1198,8 @@ static void* config_loader_thread(void* arg) {
                         if (cfg) {
                             inotify_rm_watch(inotify_fd, inotify_wd);
                             inotify_wd = inotify_add_watch(inotify_fd, cfg->config_file, IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF);
-                            last_mtime = -1;
+                            last_mtime.tv_sec = -1;
+                            last_mtime.tv_nsec = -1;
                             config_release(cfg);
                         }
                         if (inotify_wd < 0) {
@@ -1333,16 +1495,6 @@ static void calib_wildcard_base(const char* name, char* out, size_t out_sz) {
     }
 }
 
-static char* calib_merge_cpu_ranges(const CpuTopology* topo,
-                                    const char* a, const char* b) {
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    if (a && a[0]) parse_cpu_ranges(a, &set, &topo->present_cpus);
-    if (b && b[0]) parse_cpu_ranges(b, &set, &topo->present_cpus);
-    if (CPU_COUNT(&set) == 0) return NULL;
-    return cpu_set_to_str(&set);
-}
-
 /* 排序比较: busy 降序 */
 static int calib_cmp_busy(const void* a, const void* b) {
     const ThreadSample* x = a;
@@ -1369,6 +1521,10 @@ static void calib_thread_pct_stats(const ThreadSample* s, double* avg, double* m
     *max = mx;
 }
 
+static double calib_load_score(double avg_pct, double max_pct) {
+    return avg_pct * 0.65 + max_pct * 0.35;
+}
+
 /* 聚合后的通配组 */
 typedef struct {
     char base[MAX_THREAD_LEN];   /* 通配基名(可能含尾部 '*') */
@@ -1379,11 +1535,39 @@ typedef struct {
     bool is_wild;                /* base 是否含通配符 */
 } CalibGroup;
 
+static int calib_group_tier(const CalibGroup* g) {
+    if (!g) return 0;
+    if (g->avg_pct >= 13.0 || g->max_pct >= 22.0) return 2;  /* 高频中核 */
+    if (g->avg_pct >= 8.0 || g->max_pct >= 18.0) return 1;   /* 中核 */
+    return 0;
+}
+
+static bool calib_append_rule(char** out, size_t* remain, int* lines,
+                              const char* pkg, const char* thread,
+                              const char* tier) {
+    if (!out || !*out || !remain || !lines || !pkg || !tier || !tier[0]) return false;
+
+    char line[256];
+    int need;
+    if (thread && thread[0]) {
+        need = snprintf(line, sizeof(line), "%s{%s}=%s\n", pkg, thread, tier);
+    } else {
+        need = snprintf(line, sizeof(line), "%s=%s\n", pkg, tier);
+    }
+    if (need < 0 || (size_t)need > *remain) return false;
+
+    memcpy(*out, line, (size_t)need);
+    *out += need;
+    *remain -= (size_t)need;
+    (*lines)++;
+    return true;
+}
+
 /* 根据采样结果生成规则文本, 追加写入 out_buf (调用方保证足够大)。
  * 返回生成的规则行数。 */
 static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
                                 char* out_buf, size_t out_sz) {
-    if (data->count == 0) return 0;
+    if (data->count == 0 || out_sz == 0) return 0;
 
     /* 1) 按 busy 降序排序 */
     qsort(data->threads, data->count, sizeof(ThreadSample), calib_cmp_busy);
@@ -1420,7 +1604,7 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
 
     for (size_t g = 0; g < ng; g++) {
         if (groups[g].avg_pct > 100.0) groups[g].avg_pct = 100.0;
-        groups[g].score = groups[g].avg_pct * 0.65 + groups[g].max_pct * 0.35;
+        groups[g].score = calib_load_score(groups[g].avg_pct, groups[g].max_pct);
     }
 
     /* 组按 avg/max 综合评分降序, 峰值线程不会被累计 busy 掩盖。 */
@@ -1430,43 +1614,70 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
                 CalibGroup t = groups[b]; groups[b] = groups[b + 1]; groups[b + 1] = t;
             }
 
-    char* high_perf = calib_merge_cpu_ranges(topo,
-        topo->middle_high_str[0] ? topo->middle_high_str : topo->middle_str,
-        topo->big_str);
-    char* perf = calib_merge_cpu_ranges(topo, topo->middle_str, topo->big_str);
+    const char* high_mid = topo->middle_high_str[0] ? topo->middle_high_str :
+                           (topo->middle_str[0] ? topo->middle_str : topo->all_str);
+    const char* mid_perf = topo->middle_str[0] ? topo->middle_str : topo->all_str;
 
     /* 3) 按负载分级, 同时参考 avg 与 max:
-     *    - Top1 且 avg>=25% 且 max>=35%: 大核。
-     *    - avg>=12% 或 max>=22%: 高中核+大核。
-     *    - avg>=6%  或 max>=12%: 中核+大核。
+     *    - 单个线程综合负载第一, 且达到重载阈值: 独占最高性能簇, 并固定输出在第一行。
+     *    - avg>=13% 或 max>=22%: 高频中核。
+     *    - avg>=8%  或 max>=18%: 中核。
      *    - 其余由进程级兜底覆盖。
      *    不按线程名白名单/黑名单猜职责, 避免不同游戏命名差异导致误判。
-     *    只输出 Top N 线程规则, 避免生成过多静态绑核规则导致调度僵硬。 */
+     *    同档位先输出精确线程, 再输出通配组; 只保留 Top N, 避免规则过多。 */
+    char big_thread[MAX_THREAD_LEN] = {0};
+    double best_score = -1.0;
+    double best_avg = 0.0;
+    double best_max = 0.0;
+    for (size_t i = 0; i < data->count; i++) {
+        double avg_pct, max_pct;
+        calib_thread_pct_stats(&data->threads[i], &avg_pct, &max_pct);
+        double score = calib_load_score(avg_pct, max_pct);
+        if (score > best_score) {
+            best_score = score;
+            best_avg = avg_pct;
+            best_max = max_pct;
+            build_str(big_thread, sizeof(big_thread), data->threads[i].name, NULL);
+        }
+    }
+
     char* p = out_buf;
     size_t remain = out_sz - 1;
     int lines = 0;
     int thread_lines = 0;
     const int max_thread_lines = 6;
-    char line[256];
-    for (size_t g = 0; g < ng && thread_lines < max_thread_lines; g++) {
-        const char* tier = NULL;
-        double avg = groups[g].avg_pct;
-        double max = groups[g].max_pct;
-        if (g == 0 && avg >= 25.0 && max >= 35.0) {
-            tier = topo->big_str[0] ? topo->big_str : (high_perf ? high_perf : topo->all_str);
-        } else if (avg >= 12.0 || max >= 22.0) {
-            tier = high_perf ? high_perf : topo->all_str;
-        } else if (avg >= 6.0 || max >= 12.0) {
-            tier = perf ? perf : topo->all_str;
-        } else {
-            continue;
+    const bool has_big_thread = big_thread[0] && (best_avg >= 18.0 || best_max >= 30.0);
+    const char* big_tier = topo->big_str[0] ? topo->big_str :
+                           (high_mid ? high_mid : topo->all_str);
+
+    if (has_big_thread && big_tier && big_tier[0]) {
+        if (!calib_append_rule(&p, &remain, &lines, data->pkg, big_thread, big_tier))
+            goto finish;
+        thread_lines++;
+    }
+
+    for (int tier_pass = 2; tier_pass >= 1 && thread_lines < max_thread_lines; tier_pass--) {
+        for (int wild_pass = 0; wild_pass <= 1 && thread_lines < max_thread_lines; wild_pass++) {
+            for (size_t g = 0; g < ng && thread_lines < max_thread_lines; g++) {
+                if ((groups[g].is_wild ? 1 : 0) != wild_pass) continue;
+                if (calib_group_tier(&groups[g]) != tier_pass) continue;
+                if (has_big_thread) {
+                    if (groups[g].is_wild) {
+                        if (fnmatch(groups[g].base, big_thread, FNM_NOESCAPE) == 0) continue;
+                    } else if (strcmp(groups[g].base, big_thread) == 0) {
+                        continue;
+                    }
+                }
+
+                const char* tier = (tier_pass == 2) ?
+                    (high_mid ? high_mid : topo->all_str) :
+                    (mid_perf ? mid_perf : topo->all_str);
+                if (!tier || !tier[0]) continue;
+                if (!calib_append_rule(&p, &remain, &lines, data->pkg, groups[g].base, tier))
+                    goto finish;
+                thread_lines++;
+            }
         }
-        if (!tier || !tier[0]) continue;
-        int need = snprintf(line, sizeof(line), "%s{%s}=%s\n",
-                            data->pkg, groups[g].base, tier);
-        if (need < 0 || (size_t)need > remain) break;
-        memcpy(p, line, need);
-        p += need; remain -= need; lines++; thread_lines++;
     }
 
     /* 4) 进程级兜底规则: 使用小核+中核(e_core+p_core), 对齐作者预置规则里的 0-6。
@@ -1474,14 +1685,10 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     const char* base_tier = topo->nonbig_str[0] ? topo->nonbig_str :
                             (topo->all_str[0] ? topo->all_str : topo->base_str);
     if (base_tier[0]) {
-        int need = snprintf(line, sizeof(line), "%s=%s\n", data->pkg, base_tier);
-        if (need > 0 && (size_t)need <= remain) {
-            memcpy(p, line, need); p += need; remain -= need; lines++;
-        }
+        calib_append_rule(&p, &remain, &lines, data->pkg, NULL, base_tier);
     }
+finish:
     *p = '\0';
-    free(high_perf);
-    free(perf);
     free(groups);
     return lines;
 }
@@ -1502,8 +1709,7 @@ static void calib_write_history(const char* pkg, CalibData* data) {
 
     char path[512];
     char safe[MAX_PKG_LEN];
-    /* 包名作为文件名: 不含路径分隔符, 直接用 */
-    build_str(safe, sizeof(safe), pkg, NULL);
+    safe_history_filename(pkg, safe, sizeof(safe));
     build_str(path, sizeof(path), HISTORY_DIR, "/", safe, ".log", NULL);
 
     /* 1) 把本次会话格式化到内存缓冲: 段头 + 每线程(AVG MAX 名称|折线) */
@@ -1612,11 +1818,15 @@ static bool calib_write_back(const char* config_file, const char* pkg,
     FILE* out = fopen(tmp_path, "w");
     if (!out) { fclose(in); return false; }
 
-    char line[256];
+    char* line = NULL;
+    size_t line_cap = 0;
     bool replaced = false;
-    while (fgets(line, sizeof(line), in)) {
-        char copy[256];
-        build_str(copy, sizeof(copy), line, NULL);
+    while (getline(&line, &line_cap, in) != -1) {
+        char* copy = strdup(line);
+        if (!copy) {
+            fputs(line, out);
+            continue;
+        }
         char* t = strtrim(copy);
         bool is_target = false;
         if (*t != '#' && *t) {
@@ -1633,9 +1843,12 @@ static bool calib_write_back(const char* config_file, const char* pkg,
                 *eq = saved;
             }
         }
+        free(copy);
         if (is_target) {
-            fputs(rules_text, out);   /* 用生成规则替换该 auto 行 */
-            replaced = true;
+            if (!replaced) {
+                fputs(rules_text, out);   /* 用生成规则替换第一条 auto 行 */
+                replaced = true;
+            }
         } else {
             fputs(line, out);
         }
@@ -1643,6 +1856,7 @@ static bool calib_write_back(const char* config_file, const char* pkg,
     if (!replaced) {                  /* 原文件无对应 auto 行则追加 */
         fputs(rules_text, out);
     }
+    free(line);
     fclose(in);
     fclose(out);
     if (rename(tmp_path, config_file) != 0) {
@@ -1657,12 +1871,21 @@ static void calib_set_state(const char* state) {
     write_file(AT_FDCWD, CALIB_STATE_FILE, state, O_WRONLY | O_CREAT | O_TRUNC);
 }
 
+static bool is_start_command(const char* cmd) {
+    return cmd && strncmp(cmd, "start ", 6) == 0 && cmd[6] != '\0';
+}
+
+static bool is_stop_command(const char* cmd) {
+    return cmd && (strcmp(cmd, "stop") == 0 || strncmp(cmd, "stop ", 5) == 0);
+}
+
+static bool calib_cmd_valid(const char* cmd) {
+    return is_start_command(cmd) || is_stop_command(cmd);
+}
+
 /* 读取并清空命令文件; 返回是否读到内容。cmd_buf 收到形如 "start <pkg>" 的命令 */
 static bool calib_read_cmd(char* cmd_buf, size_t sz) {
-    if (!read_file(AT_FDCWD, CALIB_CMD_FILE, cmd_buf, sz)) return false;
-    unlink(CALIB_CMD_FILE);          /* 消费后删除, 避免重复触发 */
-    strtrim(cmd_buf);
-    return cmd_buf[0] != '\0';
+    return read_stable_command_file(CALIB_CMD_FILE, cmd_buf, sz, calib_cmd_valid);
 }
 
 static void calib_free(CalibData* d) {
@@ -1695,7 +1918,7 @@ static void* calib_thread(void* arg) {
 
     for (;;) {
         if (calib_read_cmd(cmd, sizeof(cmd))) {
-            if (strncmp(cmd, "start ", 6) == 0) {
+            if (is_start_command(cmd)) {
                 const char* pkg = strtrim(cmd + 6);
                 pid_t probe[8];
                 size_t np = collect_pkg_pids(pkg, probe, 8);
@@ -1711,16 +1934,16 @@ static void* calib_thread(void* arg) {
                 } else {
                     printf("[校准] 忽略 start: %s 未找到运行中的进程 (应用未启动?) 或包名过长\n", pkg);
                 }
-            } else if (strncmp(cmd, "stop", 4) == 0) {
+            } else if (is_stop_command(cmd)) {
                 if (sampling) {
                     sampling = false;
-                    printf("[校准] 收到停止命令: %s 共采样 %zu 轮, 捕获 %zu 个线程, 开始生成规则\n",
-                           data.pkg, data.round_count, data.tcount);
+                    printf("[校准] 收到停止命令: %s 共采样 %zu 轮, 记录 %zu 个线程名(跟踪 %zu 个TID), 开始生成规则\n",
+                           data.pkg, data.round_count, data.count, data.tcount);
 
-                    /* 最低采样要求: 至少 60 轮 (约 30 秒), 否则数据不足以反映真实负载 */
-                    if (data.round_count < 60) {
-                        printf("[校准] 警告: %s 采样时长不足 (仅 %zu 轮, 建议 >=60 轮), 未生成规则\n",
-                               data.pkg, data.round_count);
+                    /* 最低采样要求: 轮数不足时不生成规则, 否则数据不足以反映真实负载 */
+                    if (data.round_count < CALIB_MIN_ROUNDS) {
+                        printf("[校准] 警告: %s 采样时长不足 (仅 %zu 轮, 建议 >=%d 轮), 未生成规则\n",
+                               data.pkg, data.round_count, CALIB_MIN_ROUNDS);
                         /* 采样不足时不保存历史记录, 避免垃圾数据干扰分析 */
                         char st[MAX_PKG_LEN + 64];
                         snprintf(st, sizeof(st), "done %s;reason=short", data.pkg);
@@ -1760,8 +1983,17 @@ static void* calib_thread(void* arg) {
             if (!calib_sample_once(&data)) {
                 /* 进程消失, 用已采集数据直接出规则 */
                 sampling = false;
-                printf("[校准] %s 进程已退出, 用现有 %zu 轮/%zu 线程数据直接生成规则\n",
-                       data.pkg, data.round_count, data.tcount);
+                printf("[校准] %s 进程已退出, 用现有 %zu 轮/%zu 个线程名(跟踪 %zu 个TID)数据直接生成规则\n",
+                       data.pkg, data.round_count, data.count, data.tcount);
+                if (data.round_count < CALIB_MIN_ROUNDS) {
+                    printf("[校准] 警告: %s 进程退出时采样不足 (仅 %zu 轮, 建议 >=%d 轮), 未生成规则\n",
+                           data.pkg, data.round_count, CALIB_MIN_ROUNDS);
+                    char st[MAX_PKG_LEN + 64];
+                    snprintf(st, sizeof(st), "done %s;reason=short", data.pkg);
+                    calib_set_state(st);
+                    calib_free(&data);
+                    continue;
+                }
                 char rules[2048];
                 int n = calib_generate_rules(&data, &g_topo, rules, sizeof(rules));
                 calib_write_history(data.pkg, &data);
@@ -1786,8 +2018,8 @@ static void* calib_thread(void* arg) {
                 calib_free(&data);
             } else if (data.round_count != prev_rounds && data.round_count % 20 == 0) {
                 /* 每 20 轮(约 10s)报一次进度, 避免每 0.5s 刷屏 */
-                printf("[校准] %s 采样中... 已 %zu 轮, 当前 %zu 个线程\n",
-                       data.pkg, data.round_count, data.tcount);
+                printf("[校准] %s 采样中... 已 %zu 轮, 当前记录 %zu 个线程名(跟踪 %zu 个TID)\n",
+                       data.pkg, data.round_count, data.count, data.tcount);
             }
         }
         usleep(500 * 1000);   /* 0.5s 采样周期 */
@@ -1796,27 +2028,15 @@ static void* calib_thread(void* arg) {
 }
 
 /* =====================================================================
- * 真实帧率(FPS)监测模块  ——  dumpsys SurfaceFlinger --latency 方案
+ * 真实帧率(FPS)监测模块
  *
- * 背景: perfetto 的 android.surfaceflinger.frametimeline 在部分 ROM(MIUI 等)
- *   上抓不到游戏 SurfaceView 的渲染帧(合成路径被改), 实测只能拿到悬浮窗/Toast
- *   等覆盖层。改用历史更可靠的 SurfaceFlinger --latency:
+ * 优先使用 eBPF uprobe 监听 libgui queueBuffer 事件, 按目标 PID/包名过滤后
+ * 计算最近窗口 FPS。eBPF 不可用时, 降级为 SurfaceFlinger binder 直连 dump:
+ *   1) --latency: 差分读取目标 layer 的上屏时间戳, 不清空全局缓冲。
+ *   2) --timestats: Android 16 等 --latency 不再吐帧时间戳时的兜底。
  *
- *   1) dumpsys SurfaceFlinger --list  列出所有 layer 名(每行一个, 含 #NNN 后缀)。
- *      游戏主渲染层是含包名的 SurfaceView, 例如:
- *        SurfaceView[com.x/.../Activity](BLAST)#27973
- *      同包名还有 ActivityRecord/容器/Background 等层, 但它们 0 帧。
- *   2) 等一个窗口(FPS_WINDOW_MS)后, 对候选层执行
- *        dumpsys SurfaceFlinger --latency "<layer>"
- *      输出: 首行=刷新周期(ns); 之后每行 3 个 ns 时间戳, 第2列=实际上屏时间。
- *      跳过 0 与 INT64_MAX(未上屏)哨兵。差分读: 只统计上屏时间晚于上次基准的
- *      新帧, 并把基准推进到本次见到的最新帧。不调用 --latency-clear(那会清掉
- *      全局共享缓冲、干扰 Scene FAS 等同样读该缓冲的工具), 与 Scene 同法。
- *   3) 在所有含包名的候选层里取帧数最多的那个 = 主渲染面, 锁定其层名;
- *      之后每窗口只读该层。该层读到 0 帧多次(场景切换/层重建导致 #NNN 变化)
- *      则重新发现。FPS 覆盖写到 app 私有目录并 chcon 成 app 可读。
- *
- * 全程用 fork+execv(不经 shell), 层名含空格/括号也无引号/注入问题。
+ * 输出优先走 App 创建的本地 socket; socket 不可用才写 FPS_OUT_FILE。
+ * 对 App 的输出频率由 FPS_WINDOW_MS 控制, 避免悬浮胶囊数值跳动过快。
  * ===================================================================== */
 
 #define SF_MAX_CANDS  16
@@ -2129,9 +2349,374 @@ ssize_t sf_dump_binder(const char* const args[], int nargs,
 }
 #endif /* APPOPT_HAVE_BINDER */
 
-/* 把整型 fps 覆盖写到 app 私有目录的 fps 文件, 并修标签+权限让 app 能读。
+static bool socket_send_all(int fd, const char* data, size_t len, int flags) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, data + off, len - off, flags | MSG_NOSIGNAL);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+static int unix_connect_abstract(const char* name) {
+    if (!name || name[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    size_t name_len = strnlen(name, sizeof(addr.sun_path) - 1);
+    if (name_len == 0 || name_len >= sizeof(addr.sun_path)) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(addr.sun_path + 1, name, name_len);
+    socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
+
+    if (connect(fd, (struct sockaddr*)&addr, addr_len) != 0) {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;
+}
+
+static bool daemon_req_field(const char* req, const char* key, char* out, size_t out_sz) {
+    if (!req || !key || !out || out_sz == 0) return false;
+    out[0] = '\0';
+
+    char pattern[32];
+    int pn = snprintf(pattern, sizeof(pattern), "%s=", key);
+    if (pn < 0 || (size_t)pn >= sizeof(pattern)) return false;
+
+    const char* p = strstr(req, pattern);
+    if (!p) return false;
+    p += (size_t)pn;
+    if (*p == '\0') return false;
+
+    size_t n = 0;
+    while (p[n] && !isspace((unsigned char)p[n])) {
+        if (n + 1 >= out_sz) {
+            out[0] = '\0';
+            return false;
+        }
+        out[n] = p[n];
+        n++;
+    }
+    out[n] = '\0';
+    return n > 0;
+}
+
+static bool daemon_socket_send_callback(const char* name, const char* token) {
+    if (!name || !token || name[0] == '\0' || token[0] == '\0') return false;
+
+    int fd = unix_connect_abstract(name);
+    if (fd < 0) {
+        printf("[CTRL] daemon 反向验证回连失败: name=%s err=%s\n",
+               name, strerror(errno));
+        return false;
+    }
+
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    char resp[256];
+    int rn = snprintf(resp, sizeof(resp), "%s token=%s version=%s pid=%ld\n",
+                      DAEMON_SOCKET_CALLBACK, token, VERSION, (long)getpid());
+    if (rn < 0) {
+        close(fd);
+        return false;
+    }
+    if ((size_t)rn >= sizeof(resp)) rn = (int)sizeof(resp) - 1;
+
+    bool ok = socket_send_all(fd, resp, (size_t)rn, 0);
+    if (ok) {
+        printf("[CTRL] daemon 反向验证回连成功: name=%s version=%s pid=%ld\n",
+               name, VERSION, (long)getpid());
+    } else {
+        printf("[CTRL] daemon 反向验证回连发送失败: name=%s err=%s\n",
+               name, strerror(errno));
+    }
+    close(fd);
+    return ok;
+}
+
+static void daemon_socket_handle_client(int client_fd) {
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    char req_buf[160];
+    ssize_t n = recv(client_fd, req_buf, sizeof(req_buf) - 1, 0);
+    if (n <= 0) {
+        printf("[CTRL] daemon 验证 socket 收包失败: fd=%d err=%s\n",
+               client_fd, n < 0 ? strerror(errno) : "EOF");
+        return;
+    }
+    req_buf[n] = '\0';
+    char* req = strtrim(req_buf);
+
+    if (strncmp(req, DAEMON_SOCKET_PING_PREFIX, strlen(DAEMON_SOCKET_PING_PREFIX)) != 0) {
+        printf("[CTRL] daemon 验证 socket 收到未知请求: fd=%d req=%s\n", client_fd, req);
+        return;
+    }
+    char source[32] = "unknown";
+    char callback_name[FPS_SOCKET_NAME_MAX] = "";
+    char callback_token[FPS_SOCKET_TOKEN_MAX] = "";
+    (void)daemon_req_field(req, "source", source, sizeof(source));
+    bool has_callback =
+        daemon_req_field(req, "callback", callback_name, sizeof(callback_name)) &&
+        daemon_req_field(req, "token", callback_token, sizeof(callback_token));
+
+    if (!has_callback) {
+        printf("[CTRL] daemon 验证 socket 缺少反向验证参数: source=%s\n", source);
+        return;
+    }
+
+    static unsigned long ping_count = 0;
+    ping_count++;
+    printf("[CTRL] daemon 验证 socket 收到反向验证请求: #%lu source=%s version=%s pid=%ld\n",
+           ping_count, source, VERSION, (long)getpid());
+    (void)daemon_socket_send_callback(callback_name, callback_token);
+}
+
+static int daemon_socket_ping_client(const char* callback_name, const char* callback_token) {
+    if (!callback_name || !callback_token ||
+        callback_name[0] == '\0' || callback_token[0] == '\0') {
+        fprintf(stderr, "daemon ping 缺少反向验证 socket/token\n");
+        return 2;
+    }
+
+    int fd = unix_connect_abstract(DAEMON_SOCKET_NAME);
+    if (fd < 0) {
+        fprintf(stderr, "daemon ping 连接失败: @%s err=%s\n",
+                DAEMON_SOCKET_NAME, strerror(errno));
+        return 3;
+    }
+
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    char req[256];
+    int rn = snprintf(req, sizeof(req), "%s source=reverse callback=%s token=%s\n",
+                      DAEMON_SOCKET_PING_PREFIX, callback_name, callback_token);
+    if (rn < 0 || (size_t)rn >= sizeof(req) ||
+        !socket_send_all(fd, req, (size_t)rn, 0)) {
+        fprintf(stderr, "daemon ping 发送失败: %s\n", strerror(errno));
+        close(fd);
+        return 4;
+    }
+
+    close(fd);
+    return 0;
+}
+
+static void* daemon_socket_thread(void* arg) {
+    (void)arg;
+    pthread_setname_np(pthread_self(), "AppOptCtrl");
+
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        printf("[CTRL] daemon 验证 socket 创建失败: %s\n", strerror(errno));
+        return NULL;
+    }
+    (void)fcntl(server_fd, F_SETFD, FD_CLOEXEC);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    size_t name_len = strnlen(DAEMON_SOCKET_NAME, sizeof(addr.sun_path) - 1);
+    memcpy(addr.sun_path + 1, DAEMON_SOCKET_NAME, name_len);
+    socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
+
+    if (bind(server_fd, (struct sockaddr*)&addr, addr_len) != 0) {
+        printf("[CTRL] daemon 验证 socket 监听失败: @%s err=%s\n",
+               DAEMON_SOCKET_NAME, strerror(errno));
+        close(server_fd);
+        return NULL;
+    }
+
+    if (listen(server_fd, 8) != 0) {
+        printf("[CTRL] daemon 验证 socket listen 失败: @%s err=%s\n",
+               DAEMON_SOCKET_NAME, strerror(errno));
+        close(server_fd);
+        return NULL;
+    }
+
+    printf("[CTRL] daemon 验证 socket 已监听: @%s\n", DAEMON_SOCKET_NAME);
+
+    for (;;) {
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            printf("[CTRL] daemon 验证 socket accept 失败: %s\n", strerror(errno));
+            usleep(200 * 1000);
+            continue;
+        }
+        (void)fcntl(client_fd, F_SETFD, FD_CLOEXEC);
+        daemon_socket_handle_client(client_fd);
+        close(client_fd);
+    }
+    return NULL;
+}
+
+typedef struct {
+    int fd;
+    char name[FPS_SOCKET_NAME_MAX];
+    char token[FPS_SOCKET_TOKEN_MAX];
+    bool send_logged;
+    bool disabled;
+} FpsSocket;
+
+static FpsSocket g_fps_socket = { .fd = -1 };
+
+static void fps_socket_close(void) {
+    if (g_fps_socket.fd >= 0) close(g_fps_socket.fd);
+    g_fps_socket.fd = -1;
+}
+
+static void fps_socket_reset(void) {
+    fps_socket_close();
+    g_fps_socket.name[0] = '\0';
+    g_fps_socket.token[0] = '\0';
+    g_fps_socket.send_logged = false;
+    g_fps_socket.disabled = false;
+}
+
+static void fps_socket_configure(const char* name, const char* token) {
+    fps_socket_reset();
+    if (!name || !token || name[0] == '\0' || token[0] == '\0') return;
+    if (strlen(name) >= sizeof(g_fps_socket.name) ||
+        strlen(token) >= sizeof(g_fps_socket.token)) {
+        printf("[FPS] socket 参数过长, 回退文件通道\n");
+        return;
+    }
+    build_str(g_fps_socket.name, sizeof(g_fps_socket.name), name, NULL);
+    build_str(g_fps_socket.token, sizeof(g_fps_socket.token), token, NULL);
+    printf("[FPS] socket 数据通道已配置: name=%s name_len=%zu token_len=%zu\n",
+           g_fps_socket.name, strlen(g_fps_socket.name), strlen(g_fps_socket.token));
+}
+
+static bool fps_socket_is_configured(void) {
+    return g_fps_socket.name[0] != '\0' && g_fps_socket.token[0] != '\0';
+}
+
+static bool fps_socket_connect(void) {
+    if (!fps_socket_is_configured() || g_fps_socket.disabled) return false;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        g_fps_socket.disabled = true;
+        printf("[FPS] socket 数据通道创建失败: %s\n", strerror(errno));
+        return false;
+    }
+
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0'; /* Android LocalServerSocket(String) 使用 abstract namespace */
+    size_t name_len = strnlen(g_fps_socket.name, sizeof(addr.sun_path) - 1);
+    if (name_len == 0 || name_len >= sizeof(addr.sun_path)) {
+        close(fd);
+        g_fps_socket.disabled = true;
+        printf("[FPS] socket 数据通道名称无效: name_len=%zu\n", name_len);
+        return false;
+    }
+    memcpy(addr.sun_path + 1, g_fps_socket.name, name_len);
+    socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
+
+    printf("[FPS] socket 数据通道连接中: name=%s fd=%d\n", g_fps_socket.name, fd);
+    if (connect(fd, (struct sockaddr*)&addr, addr_len) != 0) {
+        int err = errno;
+        close(fd);
+        g_fps_socket.disabled = true;
+        printf("[FPS] socket 数据通道连接失败: name=%s err=%s, 回退文件通道\n",
+               g_fps_socket.name, strerror(err));
+        return false;
+    }
+
+    char hello[FPS_SOCKET_TOKEN_MAX + 16];
+    int hn = snprintf(hello, sizeof(hello), "hello %s\n", g_fps_socket.token);
+    if (hn < 0 || (size_t)hn >= sizeof(hello)) {
+        close(fd);
+        g_fps_socket.disabled = true;
+        printf("[FPS] socket 数据通道握手消息生成失败, 回退文件通道\n");
+        return false;
+    }
+    ssize_t hw = send(fd, hello, (size_t)hn, MSG_NOSIGNAL);
+    if (hw != hn) {
+        int err = errno;
+        close(fd);
+        g_fps_socket.disabled = true;
+        printf("[FPS] socket 数据通道握手失败: sent=%zd/%d err=%s, 回退文件通道\n",
+               hw, hn, strerror(err));
+        return false;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    g_fps_socket.fd = fd;
+    printf("[FPS] socket 数据通道已连接: name=%s fd=%d hello_len=%d\n",
+           g_fps_socket.name, fd, hn);
+    return true;
+}
+
+static bool fps_socket_send(double fps) {
+    if (!fps_socket_is_configured() || g_fps_socket.disabled) return false;
+    if (g_fps_socket.fd < 0 && !fps_socket_connect()) return false;
+
+    char val[24];
+    int n = snprintf(val, sizeof(val), "%.1f\n", fps);
+    if (n < 0) return false;
+    if ((size_t)n >= sizeof(val)) n = (int)sizeof(val) - 1;
+
+    ssize_t sent = send(g_fps_socket.fd, val, (size_t)n, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (sent == n) {
+        if (!g_fps_socket.send_logged) {
+            g_fps_socket.send_logged = true;
+            printf("[FPS] socket 数据通道开始发送 FPS: fd=%d first=%.1f bytes=%d\n",
+                   g_fps_socket.fd, fps, n);
+        }
+        return true;
+    }
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (!g_fps_socket.send_logged) {
+            printf("[FPS] socket 数据通道发送缓冲忙: fd=%d first=%.1f\n",
+                   g_fps_socket.fd, fps);
+        }
+        return true; /* App 暂时读不过来时丢本次帧率, 不切回文件造成额外 IO。 */
+    }
+
+    int err = errno;
+    int old_fd = g_fps_socket.fd;
+    fps_socket_close();
+    g_fps_socket.disabled = true;
+    printf("[FPS] socket 数据通道发送失败: fd=%d sent=%zd/%d err=%s, 回退文件通道\n",
+           old_fd, sent, n, sent < 0 ? strerror(err) : "partial write");
+    return false;
+}
+
+/* 把 fps 覆盖写到 app 私有目录的 fps 文件, 并修标签+权限让 app 能读。
  * 跨 SELinux 域: root(此进程)写完后给文件打 app_data_file 标签, app 才读得到。*/
-static void fps_write_out(double fps) {
+static void fps_write_file(double fps) {
+    static bool warn_logged = false;
     char val[24];
     int n = snprintf(val, sizeof(val), "%.1f", fps);
     /* snprintf 返回的是"本应写入"的长度, 截断时会 >= sizeof(val); 钳到实际缓冲
@@ -2142,9 +2727,21 @@ static void fps_write_out(double fps) {
     bool fresh = (access(FPS_OUT_FILE, F_OK) != 0);
     /* O_TRUNC 覆盖写; app 侧 FileObserver 监听 CLOSE_WRITE */
     int fd = open(FPS_OUT_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
-    if (fd < 0) return;
+    if (fd < 0) {
+        if (!warn_logged) {
+            warn_logged = true;
+            printf("[FPS] 文件兜底写入失败: path=%s err=%s\n", FPS_OUT_FILE, strerror(errno));
+        }
+        return;
+    }
     ssize_t w = write(fd, val, (size_t)n);
-    (void)w;
+    if (w != (ssize_t)n && !warn_logged) {
+        warn_logged = true;
+        printf("[FPS] 文件兜底写入不完整: path=%s written=%zd/%d err=%s\n",
+               FPS_OUT_FILE, w, n, w < 0 ? strerror(errno) : "short write");
+    } else if (w == (ssize_t)n) {
+        warn_logged = false;
+    }
     close(fd);
     /* chmod/chcon: app 进程(非 root)需可读。私有目录文件默认带创建者(root)上下文,
      * app 域读不到, 必须改成 app_data_file。O_TRUNC 覆盖写复用同一 inode, SELinux
@@ -2155,18 +2752,37 @@ static void fps_write_out(double fps) {
     }
 }
 
-/* 读取并消费 fps.cmd; cmd_buf 收到 "start <pkg>" / "stop"。无命令返回 false。*/
+static void fps_write_out(double fps) {
+    if (fps_socket_send(fps)) return;
+    fps_write_file(fps);
+}
+
+static void fps_write_out_windowed(double fps, long long* last_output_ms, bool force) {
+    long long now = monotonic_ms();
+    if (!force && last_output_ms && *last_output_ms > 0 && now > 0 &&
+        now - *last_output_ms < FPS_WINDOW_MS) {
+        return;
+    }
+    fps_write_out(fps);
+    if (last_output_ms) {
+        *last_output_ms = now > 0 ? now : *last_output_ms + FPS_WINDOW_MS;
+    }
+}
+
+static bool fps_cmd_valid(const char* cmd) {
+    return is_start_command(cmd) || is_stop_command(cmd);
+}
+
+/* 读取并消费 fps.cmd; cmd_buf 收到 "start <pkg> [socket token]" / "stop"。无命令返回 false。*/
 static bool fps_read_cmd(char* cmd_buf, size_t sz) {
-    if (!read_file(AT_FDCWD, FPS_CMD_FILE, cmd_buf, sz)) return false;
-    unlink(FPS_CMD_FILE);
-    strtrim(cmd_buf);
-    return cmd_buf[0] != '\0';
+    return read_stable_command_file(FPS_CMD_FILE, cmd_buf, sz, fps_cmd_valid);
 }
 
 /*
- * FPS 监测线程。协议(纯文本文件):
- *   App -> 守护: 写 FPS_CMD_FILE, 内容 "start <pkg>" / "stop"
- *   守护 -> App: 每窗口覆盖写 FPS_OUT_FILE(app 私有目录), 内容为浮点 FPS
+ * FPS 监测线程。控制协议仍走纯文本文件:
+ *   App -> 守护: 写 FPS_CMD_FILE, 内容 "start <pkg> [socket token]" / "stop"
+ *   守护 -> App: 优先向 App 的 Android 本地 socket 按行推送浮点 FPS;
+ *                socket 不可用时覆盖写 FPS_OUT_FILE(app 私有目录)兜底。
  *
  * 策略(自动回退):
  *   1) eBPF uprobe libgui::queueBuffer (最优, 逐帧精度)
@@ -2181,37 +2797,47 @@ static void* fps_thread(void* arg) {
 
     bool monitoring = false;
     char pkg[MAX_PKG_LEN] = "";
-    char cmd[256];
+    char cmd[384];
 
     /* eBPF 状态 */
     ebpf_fps_ctx *ebpf_ctx = NULL;
     pid_t target_pid = -1;
     bool ebpf_first_fps = true;
     bool ebpf_pid_reported = false;
+    int ebpf_poll_failures = 0;
 
     /* Fallback 状态(包含 --latency + timestats) */
     fps_fallback_ctx *fallback_ctx = NULL;
     bool fallback_first_fps = true;
+    long long last_fps_output_ms = 0;
 
     for (;;) {
         /* 轮询命令 */
         if (fps_read_cmd(cmd, sizeof(cmd))) {
-            if (strncmp(cmd, "start ", 6) == 0) {
+            if (is_start_command(cmd)) {
                 const char* p = strtrim(cmd + 6);
-                if (strlen(p) < MAX_PKG_LEN) {
+                char start_pkg[MAX_PKG_LEN] = "";
+                char socket_name[FPS_SOCKET_NAME_MAX] = "";
+                char socket_token[FPS_SOCKET_TOKEN_MAX] = "";
+                int parsed = sscanf(p, "%127s %95s %63s", start_pkg, socket_name, socket_token);
+                if (parsed >= 1 && strlen(start_pkg) < MAX_PKG_LEN) {
                     /* 清理旧状态 */
                     if (ebpf_ctx) { ebpf_fps_stop(ebpf_ctx); ebpf_ctx = NULL; }
                     if (fallback_ctx) { fps_fallback_stop(fallback_ctx); fallback_ctx = NULL; }
+                    fps_socket_reset();
 
-                    build_str(pkg, sizeof(pkg), p, NULL);
+                    build_str(pkg, sizeof(pkg), start_pkg, NULL);
+                    if (parsed >= 3) fps_socket_configure(socket_name, socket_token);
                     monitoring = true;
                     ebpf_first_fps = true;
                     ebpf_pid_reported = false;
+                    ebpf_poll_failures = 0;
                     fallback_first_fps = true;
+                    last_fps_output_ms = 0;
 
-                    /* 1. 探测 eBPF 能力 */
-                    ebpf_cap_t cap = ebpf_fps_probe_capability();
-                    printf("[FPS] 开始监测 %s, eBPF 能力: %s\n", pkg, ebpf_cap_str(cap));
+                    /* 1. eBPF 预检查。真正加载/attach 是否成功由 ebpf_fps_start 决定。 */
+                    ebpf_cap_t cap = ebpf_fps_probe_capability(FPS_BPF_OBJ);
+                    printf("[FPS] 开始监测 %s, eBPF: %s\n", pkg, ebpf_cap_str(cap));
 
                     if (cap == EBPF_CAP_OK) {
                         /* 2. 找目标进程 PID。游戏刚启动时 /proc/cmdline 可能短暂不可见, 等一小段时间。 */
@@ -2255,13 +2881,15 @@ static void* fps_thread(void* arg) {
                         }
                     }
                 }
-            } else if (strncmp(cmd, "stop", 4) == 0) {
+            } else if (is_stop_command(cmd)) {
                 if (monitoring) {
                     monitoring = false;
                     if (ebpf_ctx) { ebpf_fps_stop(ebpf_ctx); ebpf_ctx = NULL; }
                     if (fallback_ctx) { fps_fallback_stop(fallback_ctx); fallback_ctx = NULL; }
                     printf("[FPS] 停止监测 %s\n", pkg);
-                    fps_write_out(0);
+                    fps_write_out_windowed(0, &last_fps_output_ms, true);
+                    fps_socket_reset();
+                    last_fps_output_ms = 0;
                 }
             }
         }
@@ -2273,7 +2901,26 @@ static void* fps_thread(void* arg) {
 
         /* === eBPF 模式: 高频轮询 RingBuf === */
         if (ebpf_ctx) {
-            ebpf_fps_poll(ebpf_ctx);
+            int poll_rc = ebpf_fps_poll(ebpf_ctx);
+            if (poll_rc < 0) {
+                ebpf_poll_failures++;
+                if (ebpf_poll_failures >= 3) {
+                    const char* err = ebpf_fps_last_error(ebpf_ctx);
+                    printf("[FPS] eBPF 轮询连续失败 %d 次: %s, 切换到 SF fallback\n",
+                           ebpf_poll_failures, (err && err[0]) ? err : "未知错误");
+                    ebpf_fps_stop(ebpf_ctx);
+                    ebpf_ctx = NULL;
+                    fallback_first_fps = true;
+                    fallback_ctx = fps_fallback_start(pkg);
+                    if (!fallback_ctx) {
+                        printf("[FPS] 警告: fallback 启动失败\n");
+                    }
+                    usleep(100 * 1000);
+                    continue;
+                }
+            } else {
+                ebpf_poll_failures = 0;
+            }
             double fps = ebpf_fps_get(ebpf_ctx);
             pid_t active_pid = ebpf_fps_pid(ebpf_ctx);
             if (!ebpf_pid_reported && active_pid > 0) {
@@ -2284,7 +2931,7 @@ static void* fps_thread(void* arg) {
                 printf("[FPS] eBPF 首次捕获到帧率: %.1f fps\n", fps);
                 ebpf_first_fps = false;
             }
-            fps_write_out(fps);
+            fps_write_out_windowed(fps, &last_fps_output_ms, false);
             usleep(100 * 1000);  /* 100ms 轮询 */
             continue;
         }
@@ -2296,14 +2943,14 @@ static void* fps_thread(void* arg) {
                 printf("[FPS] Fallback 首次捕获到帧率: %.1f fps\n", fps);
                 fallback_first_fps = false;
             }
-            fps_write_out(fps);
-            usleep(1000 * 1000);  /* 1 秒窗口 */
+            fps_write_out_windowed(fps, &last_fps_output_ms, false);
+            usleep((useconds_t)FPS_WINDOW_MS * 1000);  /* 按 FPS_WINDOW_MS 更新悬浮胶囊 */
             continue;
         }
 
         /* 无可用数据源 */
         usleep(500 * 1000);
-        fps_write_out(0);
+        fps_write_out_windowed(0, &last_fps_output_ms, false);
     }
     return NULL;
 }
@@ -2314,6 +2961,7 @@ static void print_help(const char* prog_name) {
     printf("  -c <config_file>   指定配置文件 (默认: ./applist.conf)\n");
     printf("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)\n");
     printf("  -v                 显示程序版本\n");
+    printf("  -P, --ping-daemon <socket> <token>  请求守护进程反向验证 App\n");
     printf("  -h                 显示帮助信息\n");
     printf("\n示例:\n");
     printf("  %s -c /data/applist.conf -s 3\n", prog_name);
@@ -2326,6 +2974,20 @@ int main(int argc, char **argv) {
      * 必须在任何 printf(含下面 init_cpu_topo)之前设置。 */
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    signal(SIGTERM, handle_shutdown_signal);
+    signal(SIGINT, handle_shutdown_signal);
+    signal(SIGHUP, handle_shutdown_signal);
+    signal(SIGPIPE, SIG_IGN);
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ping-daemon") == 0 || strcmp(argv[i], "-P") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "--ping-daemon 需要 <socket> <token>\n");
+                return 2;
+            }
+            return daemon_socket_ping_client(argv[i + 1], argv[i + 2]);
+        }
+    }
 
     CpuTopology topo = init_cpu_topo();
     g_topo = topo;                     /* 校准线程使用的拓扑快照 */
@@ -2422,11 +3084,11 @@ int main(int argc, char **argv) {
         perror("校准线程创建失败");
     }
 
-    /* 启动真实帧率监测线程 (perfetto frametimeline, App 下发 start/stop) */
+    /* 启动真实帧率监测线程 (eBPF 优先, SurfaceFlinger 兜底) */
     pthread_t fps_tid;
     if (pthread_create(&fps_tid, NULL, fps_thread, NULL) == 0) {
         pthread_detach(fps_tid);
-        printf("启用真实帧率监测线程 (perfetto)\n");
+        printf("启用真实帧率监测线程 (eBPF/SF fallback)\n");
     } else {
         perror("帧率监测线程创建失败");
     }
@@ -2477,23 +3139,23 @@ int main(int argc, char **argv) {
 
         /* Android 版本 */
         if (get_prop_first(android_ver, sizeof(android_ver), android_ver_keys,sizeof(android_ver_keys) / sizeof(android_ver_keys[0]))) {
-            printf("Android 版本: %s", android_ver);
             /* API Level */
             if (get_prop_first(api_level, sizeof(api_level), api_level_keys,sizeof(api_level_keys) / sizeof(api_level_keys[0]))) {
-                printf(" (API %s)", api_level);
+                printf("Android 版本: %s (API %s)\n", android_ver, api_level);
+            } else {
+                printf("Android 版本: %s\n", android_ver);
             }
-            printf("\n");
         }
 
         /* 设备品牌和型号 */
         if (get_prop_first(brand, sizeof(brand), brand_keys,sizeof(brand_keys) / sizeof(brand_keys[0]))) {
-            printf("设备品牌: %s", brand);
             if (get_prop_first(model, sizeof(model), market_model_keys,sizeof(market_model_keys) / sizeof(market_model_keys[0]))) {
-                printf(" %s", model);
+                printf("设备品牌: %s %s\n", brand, model);
             } else if (get_prop_first(model, sizeof(model), cert_model_keys,sizeof(cert_model_keys) / sizeof(cert_model_keys[0]))) {
-                printf(" %s", model);
+                printf("设备品牌: %s %s\n", brand, model);
+            } else {
+                printf("设备品牌: %s\n", brand);
             }
-            printf("\n");
         } else if (get_prop_first(model, sizeof(model), market_model_keys,sizeof(market_model_keys) / sizeof(market_model_keys[0]))) {
             printf("设备型号: %s\n", model);
         } else if (get_prop_first(model, sizeof(model), cert_model_keys,sizeof(cert_model_keys) / sizeof(cert_model_keys[0]))) {
@@ -2507,7 +3169,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    for (;;) {
+    /* 启动守护进程身份验证 socket。App 用它确认这是 AppOpt 自己的守护进程, 不再只看进程名。 */
+    pthread_t daemon_sock_tid;
+    if (pthread_create(&daemon_sock_tid, NULL, daemon_socket_thread, NULL) == 0) {
+        pthread_detach(daemon_sock_tid);
+        printf("启用守护进程验证 socket\n");
+    } else {
+        perror("守护进程验证 socket 线程创建失败");
+    }
+
+    while (!shutdown_requested) {
         if (atomic_exchange(&config_updated, 0)) {
             cache.scan_all_proc = true;
             cache.last_proc_count = 0;
@@ -2525,4 +3196,6 @@ int main(int argc, char **argv) {
         }
         sleep(sleep_interval);
     }
+    printf("收到退出信号 %d, AppOpt 服务退出\n", shutdown_requested);
+    return 0;
 }

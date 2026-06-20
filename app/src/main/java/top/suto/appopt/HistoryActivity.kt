@@ -1,12 +1,18 @@
 package top.suto.appopt
 
+import android.content.ContentValues
 import android.graphics.Color
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.view.LayoutInflater
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.bottomsheet.BottomSheetDialog
 import kotlin.concurrent.thread
 import top.suto.appopt.databinding.ActivityHistoryBinding
+import top.suto.appopt.databinding.DialogSessionDeleteBinding
+import top.suto.appopt.databinding.DialogSessionManageBinding
 import top.suto.appopt.databinding.ItemCalibSessionBinding
 import top.suto.appopt.databinding.ItemThreadLoadBinding
 import top.suto.appopt.db.AppOptDbHelper
@@ -30,6 +36,7 @@ class HistoryActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_PKG = "pkg"
         const val EXTRA_LABEL = "label"
+        private const val THREAD_RENDER_BATCH_SIZE = 12
     }
 
     /** 单个线程的负载折线 */
@@ -42,7 +49,7 @@ class HistoryActivity : AppCompatActivity() {
 
     /** 一次校准会话 */
     private data class Session(
-        val id: Long,       // 数据库主键(作为序号,删除后不变)
+        val id: Long,       // 数据库主键, 仅用于内部查询/删除
         val epoch: Long,
         val rounds: Int,
         val threadCount: Int
@@ -55,6 +62,7 @@ class HistoryActivity : AppCompatActivity() {
 
         val pkg = intent.getStringExtra(EXTRA_PKG).orEmpty()
         val label = intent.getStringExtra(EXTRA_LABEL).orEmpty().ifBlank { pkg }
+        appLabel = label
         binding.historyTitle.text = label
 
         if (pkg.isBlank()) {
@@ -69,9 +77,13 @@ class HistoryActivity : AppCompatActivity() {
 
     /** 当前展示的包名(删除会话后重新加载用) */
     private var pkg: String = ""
+    private var appLabel: String = ""
+    private var reloadGeneration = 0
 
-    private fun reload() {
+    private fun reload(retryIfEmpty: Boolean = true) {
+        val generation = ++reloadGeneration
         thread {
+            DatabaseMigrator.migrateIfNeeded(applicationContext, pkg)
             val db = AppOptDbHelper.getInstance(this)
             val sessions = db.getSessionSummariesByPackage(pkg).map { summary ->
                 Session(
@@ -81,7 +93,23 @@ class HistoryActivity : AppCompatActivity() {
                     threadCount = summary.threadCount
                 )
             }
-            runOnUiThread { render(sessions) }
+            runOnUiThreadIfAlive {
+                if (generation != reloadGeneration) return@runOnUiThreadIfAlive
+                render(sessions)
+                if (sessions.isEmpty() && retryIfEmpty) {
+                    binding.root.postDelayed({
+                        if (!isFinishing && !isDestroyed) reload(retryIfEmpty = false)
+                    }, 1800)
+                }
+            }
+        }
+    }
+
+    private fun runOnUiThreadIfAlive(action: () -> Unit) {
+        runOnUiThread {
+            if (!isFinishing && !isDestroyed) {
+                action()
+            }
         }
     }
 
@@ -110,20 +138,14 @@ class HistoryActivity : AppCompatActivity() {
         binding.sessionContainer.visibility = View.VISIBLE
         binding.sessionContainer.removeAllViews()
         expandedCard = null
-        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
         val inflater = LayoutInflater.from(this)
 
         for (s in sessions) {
             val card = ItemCalibSessionBinding.inflate(inflater, binding.sessionContainer, false)
-            // 使用数据库 ID 作为序号(删除后不变)
-            card.sessionTime.text = "第 ${s.id} 次  ${fmt.format(Date(s.epoch * 1000))}"
+            card.sessionTime.text = formatHistoryTime(s.epoch)
             // round_count = 采样轮数, 每轮间隔 0.5 秒; 显示成采样时长
             val durationSec = s.rounds / 2
-            val durationStr = when {
-                durationSec < 60 -> "${durationSec}s"
-                durationSec < 3600 -> "${durationSec / 60}m ${durationSec % 60}s"
-                else -> "${durationSec / 3600}h ${(durationSec % 3600) / 60}m"
-            }
+            val durationStr = formatDuration(durationSec)
             card.sessionMeta.text = "${s.threadCount} 线程 · $durationStr"
             // 默认全部折叠; 点击头部展开本卡, 同时折叠上一张展开的卡(单展开互斥)
             setCardExpanded(card, false)
@@ -138,32 +160,153 @@ class HistoryActivity : AppCompatActivity() {
                     expandedCard = card
                 }
             }
-            // 使用数据库 ID 删除
-            card.sessionDelete.setOnClickListener { confirmDeleteSession(s.id) }
+            card.sessionManage.setOnClickListener { showSessionManageSheet(s) }
             binding.sessionContainer.addView(card.root)
         }
     }
 
-    /** 删除单次会话记录前先确认(不可恢复); 删完重新加载, 删空则回退到空状态 */
-    private fun confirmDeleteSession(sessionId: Long) {
-        androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("删除这次记录")
-            .setMessage("确定删除「第 $sessionId 次」校准记录吗？此操作不可恢复。")
-            .setNegativeButton("取消", null)
-            .setPositiveButton("删除") { _, _ ->
-                thread {
-                    val db = top.suto.appopt.db.AppOptDbHelper.getInstance(this)
-                    db.deleteSession(sessionId)
-                    runOnUiThread {
-                        reload()
-                    }
-                }
+    private fun showSessionManageSheet(session: Session) {
+        val view = DialogSessionManageBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(this)
+        dialog.setContentView(view.root)
+
+        val durationSec = session.rounds / 2
+        view.sessionManageTitle.text = "校准记录"
+        view.sessionManageMeta.text =
+            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 线程 · ${formatDuration(durationSec)}"
+
+        view.sessionManageCancel.setOnClickListener { dialog.dismiss() }
+        view.sessionManageExport.setOnClickListener {
+            dialog.dismiss()
+            exportSession(session)
+        }
+        view.sessionManageDelete.setOnClickListener {
+            dialog.dismiss()
+            showDeleteSessionConfirm(session)
+        }
+        dialog.show()
+    }
+
+    private fun showDeleteSessionConfirm(session: Session) {
+        val view = DialogSessionDeleteBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(this)
+        dialog.setContentView(view.root)
+
+        view.sessionDeleteTitle.text = "删除校准记录"
+        view.sessionDeleteMeta.text =
+            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 线程"
+        view.sessionDeleteCancel.setOnClickListener { dialog.dismiss() }
+        view.sessionDeleteConfirm.setOnClickListener {
+            dialog.dismiss()
+            deleteSession(session.id)
+        }
+        dialog.show()
+    }
+
+    private fun deleteSession(sessionId: Long) {
+        thread {
+            val db = AppOptDbHelper.getInstance(this)
+            db.deleteSession(sessionId)
+            runOnUiThreadIfAlive {
+                toast("已删除记录")
+                reload()
             }
-            .show()
+        }
+    }
+
+    private fun exportSession(session: Session) {
+        thread {
+            val db = AppOptDbHelper.getInstance(this)
+            val threads = db.getThreadsBySessionId(session.id)
+            val text = buildSessionExportText(session, threads)
+            val result = writeSessionExportFile(session, text)
+            runOnUiThreadIfAlive {
+                result.fold(
+                    onSuccess = { toast("已导出到 $it") },
+                    onFailure = { toast("导出失败: ${it.message ?: "无法写入 Download"}") }
+                )
+            }
+        }
+    }
+
+    private fun buildSessionExportText(session: Session, threads: List<ThreadData>): String {
+        val durationSec = session.rounds / 2
+        return buildString {
+            appendLine("AppOpt 历史记录导出")
+            appendLine("应用: $appLabel")
+            appendLine("包名: $pkg")
+            appendLine("时间: ${formatHistoryTime(session.epoch)}")
+            appendLine("采样轮数: ${session.rounds}")
+            appendLine("采样时长: ${formatDuration(durationSec)}")
+            appendLine("线程数: ${threads.size}")
+            appendLine()
+            appendLine("线程负载:")
+            appendLine("AVG%  MAX%  线程名")
+            for (t in threads) {
+                appendLine(String.format(Locale.US, "%.1f  %.1f  %s", t.avg, t.max, t.name))
+            }
+            appendLine()
+            appendLine("曲线数据:")
+            for (t in threads) {
+                appendLine("${t.name}|${t.series}")
+            }
+        }
+    }
+
+    private fun writeSessionExportFile(session: Session, text: String): Result<String> {
+        return runCatching {
+            val fileName = exportFileName(session)
+            val relativeDir = "${Environment.DIRECTORY_DOWNLOADS}/AppOpt"
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                put(MediaStore.Downloads.RELATIVE_PATH, relativeDir)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: error("创建导出文件失败")
+
+            try {
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(text.toByteArray(Charsets.UTF_8))
+                } ?: error("打开导出文件失败")
+
+                val done = ContentValues().apply {
+                    put(MediaStore.Downloads.IS_PENDING, 0)
+                }
+                contentResolver.update(uri, done, null, null)
+            } catch (e: Exception) {
+                contentResolver.delete(uri, null, null)
+                throw e
+            }
+
+            "$relativeDir/$fileName"
+        }
+    }
+
+    private fun exportFileName(session: Session): String {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+            .format(Date(session.epoch * 1000))
+        val safePkg = pkg.replace(Regex("[^A-Za-z0-9._-]"), "_")
+        return "AppOpt_${safePkg}_history_$stamp.txt"
+    }
+
+    private fun formatDuration(durationSec: Int): String {
+        return when {
+            durationSec < 60 -> "${durationSec}s"
+            durationSec < 3600 -> "${durationSec / 60}m ${durationSec % 60}s"
+            else -> "${durationSec / 3600}h ${(durationSec % 3600) / 60}m"
+        }
+    }
+
+    private fun formatHistoryTime(epochSeconds: Long): String {
+        return SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+            .format(Date(epochSeconds * 1000))
     }
 
     private fun ensureThreadsLoaded(card: ItemCalibSessionBinding, sessionId: Long, durationSec: Int) {
         if (card.threadRows.childCount > 0) return
+        val generation = reloadGeneration
         card.threadRows.removeAllViews()
         val loading = android.widget.TextView(this).apply {
             text = "加载中..."
@@ -176,19 +319,68 @@ class HistoryActivity : AppCompatActivity() {
         thread {
             val db = AppOptDbHelper.getInstance(this)
             val loads = db.getThreadsBySessionId(sessionId).map { it.toThreadLoad() }
-            runOnUiThread {
+            runOnUiThreadIfAlive {
+                if (generation != reloadGeneration) return@runOnUiThreadIfAlive
                 card.threadRows.removeAllViews()
                 val inflater = LayoutInflater.from(this)
-                for (tl in loads) {
-                    val row = ItemThreadLoadBinding.inflate(inflater, card.threadRows, false)
-                    row.threadName.text = tl.name
-                    row.threadStats.text =
-                        String.format(Locale.US, "AVG %.1f%%  MAX %.1f%%", tl.avg, tl.max)
-                    row.threadSpark.setData(tl.series, colorFor(tl.avg), durationSec)
-                    card.threadRows.addView(row.root)
-                }
+                renderThreadPage(card, inflater, loads, durationSec, 0, generation)
             }
         }
+    }
+
+    private fun renderThreadPage(
+        card: ItemCalibSessionBinding,
+        inflater: LayoutInflater,
+        loads: List<ThreadLoad>,
+        durationSec: Int,
+        startIndex: Int,
+        generation: Int
+    ) {
+        if (isThreadRenderStale(generation) || startIndex >= loads.size) return
+        renderThreadBatch(card, inflater, loads, durationSec, startIndex, loads.size, generation) {}
+    }
+
+    private fun renderThreadBatch(
+        card: ItemCalibSessionBinding,
+        inflater: LayoutInflater,
+        loads: List<ThreadLoad>,
+        durationSec: Int,
+        startIndex: Int,
+        endIndex: Int,
+        generation: Int,
+        onDone: () -> Unit
+    ) {
+        if (isThreadRenderStale(generation)) return
+        val nextIndex = minOf(startIndex + THREAD_RENDER_BATCH_SIZE, endIndex)
+        for (i in startIndex until nextIndex) {
+            val tl = loads[i]
+            val row = ItemThreadLoadBinding.inflate(inflater, card.threadRows, false)
+            row.threadName.text = tl.name
+            row.threadStats.text =
+                String.format(Locale.US, "AVG %.1f%%  MAX %.1f%%", tl.avg, tl.max)
+            row.threadSpark.setData(tl.series, colorFor(tl.avg, tl.max), durationSec)
+            card.threadRows.addView(row.root)
+        }
+        if (nextIndex < endIndex) {
+            card.threadRows.post {
+                renderThreadBatch(
+                    card,
+                    inflater,
+                    loads,
+                    durationSec,
+                    nextIndex,
+                    endIndex,
+                    generation,
+                    onDone
+                )
+            }
+        } else {
+            onDone()
+        }
+    }
+
+    private fun isThreadRenderStale(generation: Int): Boolean {
+        return isFinishing || isDestroyed || generation != reloadGeneration
     }
 
     private fun ThreadData.toThreadLoad(): ThreadLoad {
@@ -205,9 +397,9 @@ class HistoryActivity : AppCompatActivity() {
     }
 
     /** 按平均负载分档着色: 高=暖橙, 中=蓝, 低=青绿 */
-    private fun colorFor(avg: Float): Int = when {
-        avg >= 25f -> Color.parseColor("#E67E22")
-        avg >= 8f  -> Color.parseColor("#5B5BD6")
+    private fun colorFor(avg: Float, max: Float): Int = when {
+        avg >= 13f || max >= 22f -> Color.parseColor("#E67E22")
+        avg >= 8f || max >= 18f  -> Color.parseColor("#5B5BD6")
         else        -> Color.parseColor("#2ECC71")
     }
 

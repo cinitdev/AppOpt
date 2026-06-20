@@ -74,9 +74,9 @@
   <!-- 线程列表 -->
   <rect x="310" y="210" width="420" height="140" rx="12" fill="#1e2d4a" stroke="#3a4a68" stroke-width="1.5"/>
   <text x="520" y="235" text-anchor="middle" font-size="15" font-weight="700" fill="#eaf1fb">守护进程每 500ms 采样各线程 CPU 占用率(avg/max)</text>
-  <text x="520" y="265" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">线程组 Top1      → 平均 32.8%  最高 50.0%</text>
-  <text x="520" y="290" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">线程组 Top2      → 平均 21.8%  最高 31.5%</text>
-  <text x="520" y="315" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#F39C12">线程组 Top3      → 平均 12.1%  最高 23.0%</text>
+  <text x="520" y="265" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">单线程 Top1      → 平均 32.8%  最高 50.0%</text>
+  <text x="520" y="290" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">重载线程组      → 平均 21.8%  最高 31.5%</text>
+  <text x="520" y="315" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#F39C12">中载线程组      → 平均 12.1%  最高 23.0%</text>
   <text x="520" y="340" text-anchor="middle" font-size="14" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#3498DB">其他线程         → score 较低 (兜底规则)</text>
 
   <!-- 第2部分: 分析阶段 -->
@@ -92,20 +92,20 @@
   <!-- 大核档 -->
   <rect x="150" y="490" width="520" height="50" rx="8" fill="#2a1a1a" stroke="#E74C3C" stroke-width="2"/>
   <circle cx="172" cy="516" r="8" fill="url(#bigCore)"/>
-  <text x="195" y="515" font-size="16" font-weight="700" fill="#E74C3C">大核档 (Top1 极重载)</text>
-  <text x="195" y="530" font-size="13.5" fill="#c98a84">Top1 avg≥25% 且 max≥35% → 大核 7</text>
+  <text x="195" y="515" font-size="16" font-weight="700" fill="#E74C3C">超大核档 (Top1 单线程)</text>
+  <text x="195" y="530" font-size="13.5" fill="#c98a84">Top1 avg≥18% 或 max≥30% → 超大核 7</text>
 
   <!-- 高中核档 -->
   <rect x="150" y="550" width="520" height="50" rx="8" fill="#2a2018" stroke="#F39C12" stroke-width="2"/>
   <circle cx="172" cy="575" r="8" fill="url(#midCore)"/>
-  <text x="190" y="575" font-size="16" font-weight="700" fill="#F39C12">高中核档 (重载放宽)</text>
-  <text x="190" y="589" font-size="13.5" fill="#c9a884">avg≥12% 或 max≥22% → 高中核+大核 5-7</text>
+  <text x="190" y="575" font-size="16" font-weight="700" fill="#F39C12">高频中核档 (重载)</text>
+  <text x="190" y="589" font-size="13.5" fill="#c9a884">avg≥13% 或 max≥22% → 高频中核 5-6</text>
 
-  <!-- 中大核档 -->
+  <!-- 中核档 -->
   <rect x="150" y="610" width="520" height="50" rx="8" fill="#1a2228" stroke="#3498DB" stroke-width="2"/>
   <circle cx="172" cy="636" r="8" fill="url(#littleCore)"/>
-  <text x="190" y="636" font-size="16" font-weight="700" fill="#3498DB">中大核档 (中载)</text>
-  <text x="190" y="650" font-size="13.5" fill="#84a9c9">avg≥6% 或 max≥12% → 中核+大核 3-7</text>
+  <text x="190" y="636" font-size="16" font-weight="700" fill="#3498DB">中核档 (中载)</text>
+  <text x="190" y="650" font-size="13.5" fill="#84a9c9">avg≥8% 或 max≥18% → 中核 3-6</text>
 
   <!-- 第3部分: 绑核阶段 -->
   <g filter="url(#sh)">
@@ -134,19 +134,19 @@
   <text x="485" y="878" text-anchor="middle" font-size="11" fill="#ffaaaa">3.2 GHz</text>
 
   <!-- 绑核箭头 -->
-  <!-- Top1线程组 → 大核 7 或高中核+大核 -->
+  <!-- Top1 单线程 → 超大核 7 -->
   <line x1="585" y1="920" x2="485" y2="920" stroke="#E74C3C" stroke-width="2.5"/>
   <line x1="485" y1="920" x2="485" y2="890" stroke="#E74C3C" stroke-width="2.5" marker-end="url(#arrowRed)"/>
-  <text x="590" y="925" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">Top1线程组 → 极重载 7 / 否则 5-7</text>
+  <text x="590" y="925" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">Top1单线程 → 极重载独占 7</text>
 
-  <!-- 重载线程组合并箭头指向中大核 -->
+  <!-- 重载线程组指向中核 -->
   <line x1="585" y1="950" x2="500" y2="950" stroke="#E74C3C" stroke-width="2.5"/>
   <line x1="585" y1="980" x2="500" y2="980" stroke="#F39C12" stroke-width="2.5"/>
   <line x1="500" y1="950" x2="500" y2="980" stroke="#F39C12" stroke-width="2.5"/>
   <line x1="500" y1="965" x2="310" y2="965" stroke="#F39C12" stroke-width="2.5"/>
   <line x1="310" y1="965" x2="310" y2="890" stroke="#F39C12" stroke-width="2.5" marker-end="url(#arrowOrange)"/>
-  <text x="590" y="955" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">线程组 Top2 → 高中核+大核 5-7</text>
-  <text x="590" y="985" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#F39C12">线程组 Top3 → 中核+大核 3-7</text>
+  <text x="590" y="955" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#E74C3C">重载线程组 → 高频中核 5-6</text>
+  <text x="590" y="985" font-size="12.5" font-family="Noto Sans Mono CJK SC, Noto Sans CJK SC, monospace" fill="#F39C12">中载线程组 → 中核 3-6</text>
 
   <!-- 其他线程 → 小核+中核 0-6 -->
   <line x1="585" y1="1010" x2="135" y2="1010" stroke="#3498DB" stroke-width="2.5"/>
@@ -162,7 +162,7 @@
   <text x="410" y="1110" text-anchor="middle" font-size="18" font-weight="700" fill="#eaf1fb">核心优势</text>
 
   <circle cx="140" cy="1140" r="3" fill="#2ECC71"/>
-  <text x="155" y="1145" font-size="14" fill="#9fb0c8">关键渲染线程优先上大核，降低卡顿</text>
+  <text x="155" y="1145" font-size="14" fill="#9fb0c8">最重线程独占超大核，其他重载留在中核</text>
 
   <circle cx="140" cy="1168" r="3" fill="#5B8DEF"/>
   <text x="155" y="1173" font-size="14" fill="#9fb0c8">减少线程迁移，降低 CPU 调度开销</text>

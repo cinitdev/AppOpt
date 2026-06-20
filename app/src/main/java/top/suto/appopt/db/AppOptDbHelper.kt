@@ -22,7 +22,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
 ) {
     companion object {
         private const val DATABASE_NAME = "appopt.db"
-        private const val DATABASE_VERSION = 2  // 升级版本以支持 series 压缩
+        private const val DATABASE_VERSION = 4  // v4: 会话按 pkg+epoch 去重, 导入事务化
 
         // 表名
         private const val TABLE_SESSIONS = "sessions"
@@ -47,8 +47,17 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
         private var instance: AppOptDbHelper? = null
 
         fun getInstance(context: Context): AppOptDbHelper {
-            return instance ?: synchronized(this) {
-                instance ?: AppOptDbHelper(context).also { instance = it }
+            val appContext = context.applicationContext
+            return synchronized(this) {
+                val current = instance
+                if (current != null && !appContext.getDatabasePath(DATABASE_NAME).exists()) {
+                    try {
+                        current.close()
+                    } catch (_: Exception) {
+                    }
+                    instance = null
+                }
+                instance ?: AppOptDbHelper(appContext).also { instance = it }
             }
         }
 
@@ -124,9 +133,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
             )
         """)
 
-        // 索引
-        db.execSQL("CREATE INDEX idx_pkg ON $TABLE_SESSIONS($COL_PKG)")
-        db.execSQL("CREATE INDEX idx_session_id ON $TABLE_THREADS($COL_THREAD_SESSION_ID)")
+        createIndexes(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -147,6 +154,14 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
                 }
             }
             android.util.Log.d("AppOpt", "数据库升级完成")
+        }
+        if (oldVersion < 3) {
+            android.util.Log.d("AppOpt", "数据库版本 v$oldVersion -> v$newVersion: 历史序号功能已移除, 无需迁移")
+        }
+        if (oldVersion < 4) {
+            android.util.Log.d("AppOpt", "升级数据库 v$oldVersion -> v$newVersion: 增加会话去重约束")
+            removeDuplicateSessions(db)
+            createIndexes(db)
         }
     }
 
@@ -170,6 +185,56 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
     }
 
     /**
+     * 原子导入一次会话及其线程数据。
+     *
+     * sessions 上有 (pkg, epoch) 唯一索引; 已导入过的会话会被忽略, 不再写入重复线程。
+     * 任意线程插入失败都会回滚整次会话, 避免留下只有 session 没有完整线程的半条记录。
+     */
+    fun insertSessionWithThreadsIfAbsent(
+        pkg: String,
+        epoch: Long,
+        rounds: Int,
+        threads: List<ThreadImport>
+    ): Boolean {
+        val db = writableDatabase
+        db.beginTransaction()
+        return try {
+            val sessionValues = ContentValues().apply {
+                put(COL_PKG, pkg)
+                put(COL_EPOCH, epoch)
+                put(COL_ROUNDS, rounds)
+                put(COL_CREATED_AT, System.currentTimeMillis())
+            }
+            val sessionId = db.insertWithOnConflict(
+                TABLE_SESSIONS,
+                null,
+                sessionValues,
+                SQLiteDatabase.CONFLICT_IGNORE
+            )
+            if (sessionId == -1L) {
+                db.setTransactionSuccessful()
+                false
+            } else {
+                for (thread in threads) {
+                    val threadValues = ContentValues().apply {
+                        put(COL_THREAD_SESSION_ID, sessionId)
+                        put(COL_NAME, thread.name)
+                        put(COL_AVG, thread.avg)
+                        put(COL_MAX, thread.max)
+                        put(COL_SERIES, compressSeries(thread.series))
+                    }
+                    val threadId = db.insert(TABLE_THREADS, null, threadValues)
+                    check(threadId != -1L) { "插入线程数据失败: ${thread.name}" }
+                }
+                db.setTransactionSuccessful()
+                true
+            }
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    /**
      * 插入线程数据 (series 自动压缩)
      */
     fun insertThread(sessionId: Long, name: String, avg: Float, max: Float, series: String) {
@@ -185,9 +250,9 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
     }
 
     /**
-     * 获取指定包名的所有会话(按 ID 降序)
+     * 获取指定包名的所有会话(按记录生成时间降序)。
      */
-    fun getSessionsByPackage(pkg: String): List<SessionWithThreads> {
+    fun getSessionsByPackage(pkg: String, preserveOriginalThreadOrder: Boolean = false): List<SessionWithThreads> {
         val db = readableDatabase
         val sessions = mutableListOf<SessionWithThreads>()
 
@@ -198,7 +263,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
             "$COL_PKG = ?",
             arrayOf(pkg),
             null, null,
-            "$COL_SESSION_ID DESC"  // 按 ID 降序(最新的在前)
+            "$COL_EPOCH DESC, $COL_SESSION_ID DESC"  // 按记录生成时间降序
         )
 
         cursor.use {
@@ -208,7 +273,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
                 val rounds = it.getInt(it.getColumnIndexOrThrow(COL_ROUNDS))
 
                 // 查询该 session 的所有线程
-                val threads = getThreadsBySessionId(sessionId)
+                val threads = getThreadsBySessionId(sessionId, preserveOriginalThreadOrder)
 
                 sessions.add(SessionWithThreads(sessionId, pkg, epoch, rounds, threads))
             }
@@ -219,6 +284,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
 
     /**
      * 获取指定包名的会话概要(不读取线程 series), 用于历史页首屏快速渲染。
+     * 显示顺序按记录生成时间(epoch)倒序, 不受重新导入影响。
      */
     fun getSessionSummariesByPackage(pkg: String): List<SessionSummary> {
         val db = readableDatabase
@@ -230,7 +296,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
             LEFT JOIN $TABLE_THREADS t ON t.$COL_THREAD_SESSION_ID = s.$COL_SESSION_ID
             WHERE s.$COL_PKG = ?
             GROUP BY s.$COL_SESSION_ID, s.$COL_EPOCH, s.$COL_ROUNDS
-            ORDER BY s.$COL_SESSION_ID DESC
+            ORDER BY s.$COL_EPOCH DESC, s.$COL_SESSION_ID DESC
             """.trimIndent(),
             arrayOf(pkg)
         )
@@ -252,9 +318,14 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
     /**
      * 获取指定会话的所有线程
      */
-    fun getThreadsBySessionId(sessionId: Long): List<ThreadData> {
+    fun getThreadsBySessionId(sessionId: Long, preserveOriginalOrder: Boolean = false): List<ThreadData> {
         val db = readableDatabase
         val threads = mutableListOf<ThreadData>()
+        val orderBy = if (preserveOriginalOrder) {
+            "$COL_THREAD_ID ASC"  // 原版 .log 导出需要保持导入时的线程顺序
+        } else {
+            "$COL_AVG DESC"       // 历史详情 UI 按平均负载降序显示
+        }
 
         val cursor = db.query(
             TABLE_THREADS,
@@ -262,7 +333,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
             "$COL_THREAD_SESSION_ID = ?",
             arrayOf(sessionId.toString()),
             null, null,
-            "$COL_AVG DESC"  // 按平均负载降序
+            orderBy
         )
 
         cursor.use {
@@ -333,14 +404,14 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
     }
 
     /**
-     * 获取所有有记录的包名
+     * 获取所有有记录的包名, 最近生成过记录的应用排在前面。
      */
     fun getPackagesWithHistory(): List<PackageInfo> {
         val db = readableDatabase
         val packages = mutableListOf<PackageInfo>()
 
         val cursor = db.rawQuery("""
-            SELECT $COL_PKG, MAX($COL_CREATED_AT) as last_time
+            SELECT $COL_PKG, MAX($COL_EPOCH) as last_time
             FROM $TABLE_SESSIONS
             GROUP BY $COL_PKG
             ORDER BY last_time DESC
@@ -358,6 +429,31 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
         }
 
         return packages
+    }
+
+    private fun createIndexes(db: SQLiteDatabase) {
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_pkg ON $TABLE_SESSIONS($COL_PKG)")
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_pkg_epoch ON $TABLE_SESSIONS($COL_PKG, $COL_EPOCH)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_session_id ON $TABLE_THREADS($COL_THREAD_SESSION_ID)")
+    }
+
+    private fun removeDuplicateSessions(db: SQLiteDatabase) {
+        db.execSQL("""
+            DELETE FROM $TABLE_SESSIONS
+            WHERE $COL_SESSION_ID NOT IN (
+                SELECT keep_id FROM (
+                    SELECT MAX($COL_SESSION_ID) AS keep_id
+                    FROM $TABLE_SESSIONS
+                    GROUP BY $COL_PKG, $COL_EPOCH
+                )
+            )
+        """.trimIndent())
+        db.execSQL("""
+            DELETE FROM $TABLE_THREADS
+            WHERE $COL_THREAD_SESSION_ID NOT IN (
+                SELECT $COL_SESSION_ID FROM $TABLE_SESSIONS
+            )
+        """.trimIndent())
     }
 }
 
@@ -377,6 +473,13 @@ data class SessionSummary(
     val epoch: Long,
     val rounds: Int,
     val threadCount: Int
+)
+
+data class ThreadImport(
+    val name: String,
+    val avg: Float,
+    val max: Float,
+    val series: String
 )
 
 /**

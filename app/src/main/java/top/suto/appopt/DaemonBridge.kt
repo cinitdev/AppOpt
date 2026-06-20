@@ -1,18 +1,30 @@
 package top.suto.appopt
 
+import android.net.LocalServerSocket
+import java.io.BufferedReader
 import java.io.DataOutputStream
+import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import java.util.UUID
 
 /**
- * 与 C 守护进程的文件式 IPC 桥接。
+ * 与 C 守护进程的 IPC 桥接。
  *
  * 守护进程运行在 /data/adb/modules/AppOpt/ 下, 该目录普通应用无权限读写,
- * 因此命令/状态文件的读写全部通过 root (su) 执行。
+ * 因此命令/状态文件的读写全部通过 root (su) 执行; 高频数据和守护验证走 socket。
  *
- * 协议:
+ * 校准协议:
  *   App  -> 守护:  写 calibrate.cmd, 内容 "start <pkg>" / "stop <pkg>"
  *   守护 -> App:   写 calibrate.state, 内容 "idle" / "sampling <pkg>" / "done <pkg>"
+ *
+ * FPS 协议:
+ *   App  -> 守护:  写 fps.cmd, 内容 "start <pkg> [socket token]" / "stop"
+ *   守护 -> App:   优先通过 Android 本地 socket 推送 FPS; socket 不可用时回退 fps 文件。
+ *
+ * 守护验证:
+ *   App  -> su:    创建一次性本地 socket, 通过 root helper 把 socket 名和随机 token 发给守护
+ *   守护 -> App:   反连这个一次性 socket 并回传 token/版本/PID, 避免 App 直连 root daemon 被 SELinux 拦截。
  */
 object DaemonBridge {
 
@@ -23,6 +35,7 @@ object DaemonBridge {
     private const val HISTORY_DIR = "$MODULE_DIR/history"
     private const val LOG_FILE = "$MODULE_DIR/AppOpt.log"
     private const val FPS_CMD_FILE = "$MODULE_DIR/fps.cmd"
+    private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
 
     /** 检测设备是否有可用的 root (su); 首次调用会触发 Magisk 授权弹窗 */
@@ -30,15 +43,67 @@ object DaemonBridge {
 
     /**
      * 检测 C 守护进程是否在运行。
-     * 用 `pgrep -x AppOpt` 按精确进程名(comm)匹配, 而非 `pgrep -f <路径>`:
-     * 后者扫描完整命令行, 会把承载本检测命令的 su 父进程(其命令行恰好含该路径字符串)
-     * 误匹配进去, 导致未刷模块也显示"运行中"。按 comm 精确匹配则 su/pgrep 自身均不命中。
-     * 找不到时用 `|| echo` 兜底, 使命令本身 exit 0(否则会被 runAsRoot 误判为出错)。
-     * 注意: calibrate.state 文件即便守护进程已死也会残留, 故必须用 pgrep 判真实存活。
+     *
+     * 不再用 `pgrep -x AppOpt`: 项目开源后, 社区改版或旧二进制也可能叫 AppOpt。
+     * 这里必须让守护进程按随机 token 反连 App 的一次性 socket, 才视为本 App
+     * 可交互的 AppOpt 守护进程。
      */
-    fun isDaemonRunning(): Boolean {
-        val out = runAsRoot("pgrep -x AppOpt >/dev/null 2>&1 && echo RUNNING || echo STOPPED")
-        return out.trim() == "RUNNING"
+    fun isDaemonRunning(): Boolean = verifyDaemonSocketReverse()
+
+    private fun verifyDaemonSocketReverse(): Boolean {
+        val socketName = "appopt_verify_${android.os.Process.myPid()}_${System.nanoTime()}"
+        val token = UUID.randomUUID().toString().replace("-", "")
+        val callbackOk = AtomicReference(false)
+        var server: LocalServerSocket? = null
+
+        return try {
+            val localServer = LocalServerSocket(socketName)
+            server = localServer
+
+            val acceptThread = Thread({
+                try {
+                    localServer.accept().use { socket ->
+                        socket.soTimeout = 2500
+                        val line = BufferedReader(
+                            InputStreamReader(socket.inputStream, Charsets.UTF_8)
+                        ).readLine()?.trim().orEmpty()
+                        callbackOk.set(isValidDaemonCallback(line, token))
+                    }
+                } catch (_: Exception) {
+                    callbackOk.set(false)
+                }
+            }, "AppOptDaemonVerify").apply {
+                isDaemon = true
+                start()
+            }
+
+            val rootThread = Thread({
+                runAsRoot("'$MODULE_DIR/AppOpt' --ping-daemon '$socketName' '$token' 2>/dev/null")
+            }, "AppOptDaemonPing").apply {
+                isDaemon = true
+                start()
+            }
+
+            acceptThread.join(3000)
+            val ok = callbackOk.get() == true
+            if (!ok) {
+                try { localServer.close() } catch (_: Exception) {}
+                acceptThread.join(300)
+            }
+            rootThread.join(500)
+            ok
+        } catch (_: Exception) {
+            false
+        } finally {
+            try { server?.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun isValidDaemonCallback(line: String, token: String): Boolean {
+        return line.startsWith(DAEMON_SOCKET_CALLBACK_PREFIX) &&
+            line.contains("token=$token") &&
+            line.contains("version=") &&
+            line.contains("pid=")
     }
 
     /**
@@ -118,9 +183,10 @@ object DaemonBridge {
     /** 下发开始采样命令 */
     fun startCalibration(pkg: String): Boolean {
         if (pkg.isBlank()) return false
-        // 单引号包裹防注入; 包名本身不含单引号
-        val safe = pkg.replace("'", "")
-        return runAsRoot("printf '%s' 'start $safe' > $CMD_FILE").isNotErrored()
+        val safe = cleanCommandArg(pkg, allowColon = true)
+        if (safe.isBlank()) return false
+        val wrote = runAsRoot("printf '%s' 'start $safe' > $CMD_FILE").isNotErrored()
+        return wrote && waitForStatePackage("sampling", safe, timeoutMs = 2500)
     }
 
     /** 下发停止采样命令, 守护进程随后生成规则并回写配置 */
@@ -129,11 +195,19 @@ object DaemonBridge {
         return runAsRoot("printf '%s' 'stop $safe' > $CMD_FILE").isNotErrored()
     }
 
-    /** 通知守护进程开始真实帧率监测(perfetto), 每秒把 FPS 写到 app 私有目录 */
-    fun startFpsMonitor(pkg: String): Boolean {
+    /** 通知守护进程开始真实帧率监测, 优先让守护进程把 FPS 推到 App 的本地 socket。 */
+    fun startFpsMonitor(pkg: String, socketName: String? = null, socketToken: String? = null): Boolean {
         if (pkg.isBlank()) return false
-        val safe = pkg.replace("'", "")
-        return runAsRoot("printf '%s' 'start $safe' > $FPS_CMD_FILE").isNotErrored()
+        val safePkg = cleanCommandArg(pkg, allowColon = true)
+        if (safePkg.isBlank()) return false
+        val safeSocket = socketName?.let { cleanCommandArg(it, allowColon = false) }.orEmpty()
+        val safeToken = socketToken?.let { cleanCommandArg(it, allowColon = false) }.orEmpty()
+        val cmd = if (safeSocket.isNotBlank() && safeToken.isNotBlank()) {
+            "start $safePkg $safeSocket $safeToken"
+        } else {
+            "start $safePkg"
+        }
+        return runAsRoot("printf '%s' '$cmd' > $FPS_CMD_FILE").isNotErrored()
     }
 
     /** 通知守护进程停止帧率监测 */
@@ -160,10 +234,13 @@ object DaemonBridge {
      * 返回状态详情: null=超时, "ok"=成功, "short"=采样时长不足, "no_load"=负载不足, "write_fail"=写回失败
      */
     fun waitDone(pkg: String, timeoutMs: Long = 4000): String? {
+        val expected = cleanCommandArg(pkg, allowColon = true)
+        if (expected.isBlank()) return null
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             val st = readState()
-            if (st.startsWith("done")) {
+            val donePkg = statePackage(st, "done")
+            if (donePkg == expected) {
                 // 解析状态: "done pkg" 或 "done pkg;reason=xxx"
                 val parts = st.split(";")
                 if (parts.size > 1) {
@@ -175,6 +252,24 @@ object DaemonBridge {
             try { Thread.sleep(250) } catch (_: InterruptedException) { return null }
         }
         return null
+    }
+
+    private fun waitForStatePackage(prefix: String, pkg: String, timeoutMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (statePackage(readState(), prefix) == pkg) return true
+            try { Thread.sleep(250) } catch (_: InterruptedException) { return false }
+        }
+        return false
+    }
+
+    private fun statePackage(state: String, prefix: String): String? {
+        val marker = "$prefix "
+        if (!state.startsWith(marker)) return null
+        return state.substring(marker.length)
+            .substringBefore(";")
+            .trim()
+            .ifBlank { null }
     }
 
     /**
@@ -362,6 +457,11 @@ object DaemonBridge {
     private const val ERR_MARK = "__APPOPT_ERR__"
 
     private fun String.isNotErrored(): Boolean = !this.contains(ERR_MARK)
+
+    private fun cleanCommandArg(value: String, allowColon: Boolean): String {
+        val allowed = if (allowColon) Regex("[^A-Za-z0-9._:-]") else Regex("[^A-Za-z0-9._-]")
+        return value.trim().replace("'", "").replace(allowed, "")
+    }
 
     /**
      * 以 root 把内容写到指定路径。内容经 base64 传递再由 `base64 -d` 还原,

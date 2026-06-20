@@ -18,7 +18,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="待配置应用"
+            android:text="待校准"
             android:textColor="@color/text_primary"
             android:textSize="17sp"
             android:textStyle="bold" />

@@ -56,16 +56,16 @@
         </LinearLayout>
 
         <ImageView
-            android:id="@+id/hisDelete"
+            android:id="@+id/hisManage"
             android:layout_width="38dp"
             android:layout_height="38dp"
-            android:src="@drawable/ic_delete"
+            android:src="@drawable/ic_manage"
             app:tint="@color/text_secondary"
             android:scaleType="centerInside"
             android:padding="7dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:clickable="true"
             android:focusable="true"
-            android:contentDescription="删除该应用的历史记录" />
+            android:contentDescription="管理该应用的历史记录" />
     </LinearLayout>
 </com.google.android.material.card.MaterialCardView>

@@ -39,7 +39,9 @@ aya/                          精简后的本地 vendored aya, 只保留 aya/aya
 5. BPF 程序把帧事件写入 `events` ringbuf。
 6. Rust/aya 轮询 ringbuf, 计算 FPS 后返回给 C 层。
 
-如果 eBPF 启动失败，AppOpt 会降级到 SurfaceFlinger fallback。
+如果 eBPF 启动失败，AppOpt 会降级到 SurfaceFlinger fallback。FPS 传给 App 的通道不在
+`fps_monitor` 内实现: C 守护进程优先推送到 App 创建的 Android 本地 socket，socket
+不可用时再写 app 私有目录 `fps` 文件兜底。
 
 ## 与 auto 绑核的关系
 
@@ -55,7 +57,7 @@ score = avg * 0.65 + max * 0.35
 
 规则只输出综合负载最高的 Top 6 线程组:
 
-- Top1 且 `avg >= 25%`、`max >= 35%`: 绑定到大核。
-- `avg >= 12%` 或 `max >= 22%`: 绑定到高中核+大核。
-- `avg >= 6%` 或 `max >= 12%`: 绑定到中核+大核。
-- 包名兜底规则固定为小核+中核, 避免未知线程默认抢大核。
+- Top1 单线程且 `avg >= 18%` 或 `max >= 30%`: 绑定到最高性能簇，并固定输出在第一行。
+- `avg >= 13%` 或 `max >= 22%`: 绑定到高频中核档。
+- `avg >= 8%` 或 `max >= 18%`: 绑定到中核档。
+- 包名兜底规则固定为非最高性能簇, 避免未知线程默认抢大核。

@@ -24,12 +24,6 @@ import android.view.View
 class SparklineView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyle: Int = 0
 ) : View(context, attrs, defStyle) {
-
-    init {
-        // DashPathEffect 在硬件加速层个别设备/版本上可能不绘制虚线段, 用软件层确保表现一致。
-        setLayerType(LAYER_TYPE_SOFTWARE, null)
-    }
-
     private var values: FloatArray = FloatArray(0)
     // 本段采样的总时长(秒); >0 时在底部按 Scene 方式画时间刻度文字
     private var durationSec: Int = 0

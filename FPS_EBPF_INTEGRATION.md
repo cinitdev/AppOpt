@@ -31,6 +31,30 @@ fps_monitor/
 6. BPF 程序把帧事件写入 ringbuf。
 7. Rust bridge 计算 FPS, C 层通过 `ebpf_fps_get()` 读取。
 
+## App 通信路径
+
+FPS 数据源和 App 通信是两层逻辑:
+
+```text
+FPS 数据源:
+  eBPF uprobe
+    -> SurfaceFlinger --latency
+    -> SurfaceFlinger --timestats
+
+FPS 传给 App:
+  Android 本地 socket
+    -> app 私有目录 fps 文件兜底
+```
+
+App 启动悬浮胶囊时会先创建一次性本地 socket, 并把 socket 名和随机 token 写入
+`fps.cmd`。C 守护进程收到 `start <pkg> <socket> <token>` 后优先反连该 socket,
+握手成功后按行推送 FPS。socket 被 SELinux/ROM 行为拦住时, C 端才覆盖写
+`/data/data/top.suto.appopt/files/fps`, App 侧用 FileObserver 兜底读取。
+
+守护进程存活检测也走反向验证: App 创建一次性 socket, 通过 root helper 下发
+`--ping-daemon <socket> <token>`, C 守护进程连接回 App 并回传 token/版本/PID。
+这样 App 不再只靠进程名判断, 可以区分同名或二改版本。
+
 ## uprobe 符号策略
 
 当前符号列表在 `fps_monitor/appopt_ebpf_bridge/src/lib.rs` 中维护。
@@ -79,10 +103,10 @@ score = avg * 0.65 + max * 0.35
 
 线程组按 `score` 排序后最多输出 Top 6:
 
-- Top1 且 `avg >= 25%`、`max >= 35%`: 大核。
-- `avg >= 12%` 或 `max >= 22%`: 高中核+大核。
-- `avg >= 6%` 或 `max >= 12%`: 中核+大核。
-- 包名兜底规则: 小核+中核。
+- Top1 单线程且 `avg >= 18%` 或 `max >= 30%`: 最高性能簇, 固定输出在第一行。
+- `avg >= 13%` 或 `max >= 22%`: 高频中核档。
+- `avg >= 8%` 或 `max >= 18%`: 中核档。
+- 包名兜底规则: 非最高性能簇, 对齐常见 `0-6` 兜底。
 
 这样做的目的不是猜线程职责, 而是让不同游戏、不同引擎的线程命名差异只影响规则名字,
 不影响分级判断。
@@ -92,7 +116,7 @@ score = avg * 0.65 + max * 0.35
 eBPF 可用:
 
 ```text
-[FPS] 开始监测 com.tencent.tmgp.sgame, eBPF 能力: 可用
+[FPS] 开始监测 com.tencent.tmgp.sgame, eBPF: 尝试启动
 [FPS] 目标进程 PID: 12345, 尝试 eBPF uprobe...
 [FPS] eBPF 已激活, 锁定符号: _ZN7android7Surface11queueBufferEP19ANativeWindowBufferi
 [FPS] eBPF 当前帧事件 PID: 12345

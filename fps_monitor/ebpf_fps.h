@@ -25,7 +25,7 @@
 /* 不透明句柄: 内部实际持有 Rust/aya bridge 的上下文。 */
 typedef struct ebpf_fps_ctx ebpf_fps_ctx;
 
-/* eBPF 能力或初始化状态，用于日志/UI 展示。 */
+/* eBPF 预检查或初始化状态，用于日志/UI 展示。 */
 typedef enum {
     EBPF_CAP_OK = 0,            /* eBPF 路径可尝试启动 */
     EBPF_CAP_NO_BPF_SYSCALL,    /* bpf() 系统调用不可用或被禁用 */
@@ -37,11 +37,11 @@ typedef enum {
 
 /* 探测当前 eBPF 路径是否可以尝试启动。
  *
- * 现在真正的 BPF 加载和 uprobe attach 由 Rust/aya 在 ebpf_fps_start()
- * 内完成，因为 attach 需要具体目标 PID。这里保留接口用于兼容 AppOpt.c
- * 现有流程。
+ * 这里会先检查 BPF 对象是否存在、bpf() 系统调用是否可用、当前内核是否支持
+ * RingBuf。真正的 uprobe attach 仍由 Rust/aya 在 ebpf_fps_start() 内完成，
+ * 因为 attach 需要具体目标 PID。
  */
-ebpf_cap_t ebpf_fps_probe_capability(void);
+ebpf_cap_t ebpf_fps_probe_capability(const char *bpf_obj_path);
 
 /* 把 ebpf_cap_t 转成中文说明，供日志/UI 使用。 */
 const char *ebpf_cap_str(ebpf_cap_t cap);

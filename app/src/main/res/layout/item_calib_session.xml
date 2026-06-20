@@ -47,18 +47,18 @@
                 android:textSize="12sp" />
 
             <ImageView
-                android:id="@+id/sessionDelete"
+                android:id="@+id/sessionManage"
                 android:layout_width="34dp"
                 android:layout_height="34dp"
                 android:layout_marginStart="4dp"
-                android:src="@drawable/ic_delete"
+                android:src="@drawable/ic_manage"
                 app:tint="@color/text_secondary"
                 android:scaleType="centerInside"
                 android:padding="7dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:clickable="true"
                 android:focusable="true"
-                android:contentDescription="删除这次校准记录" />
+                android:contentDescription="管理这次校准记录" />
 
             <ImageView
                 android:id="@+id/sessionArrow"

@@ -5,7 +5,36 @@
  */
 #include "ebpf_fps.h"
 
+#include <errno.h>
+#include <linux/bpf.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef BPF_MAP_CREATE
+#define BPF_MAP_CREATE 0
+#endif
+
+#ifndef BPF_MAP_TYPE_RINGBUF
+#define BPF_MAP_TYPE_RINGBUF 27
+#endif
+
+#ifndef ENOTSUP
+#define ENOTSUP EOPNOTSUPP
+#endif
+
+#ifndef __NR_bpf
+#if defined(__aarch64__)
+#define __NR_bpf 280
+#elif defined(__arm__)
+#define __NR_bpf 386
+#elif defined(__i386__)
+#define __NR_bpf 357
+#elif defined(__x86_64__)
+#define __NR_bpf 321
+#endif
+#endif
 
 typedef struct AppOptEbpfCtx AppOptEbpfCtx;
 
@@ -23,18 +52,38 @@ struct ebpf_fps_ctx {
     AppOptEbpfCtx *inner;
 };
 
-ebpf_cap_t ebpf_fps_probe_capability(void) {
-    /*
-     * Rust bridge 会在启动时执行真正的 BPF 和 uprobe 检查，因为 attach
-     * 需要具体的目标 PID。这里返回 OK 是为了保持 AppOpt 现有的 fallback
-     * 流程：如果 start 失败，上层会降级到 SurfaceFlinger。
-     */
-    return EBPF_CAP_OK;
+ebpf_cap_t ebpf_fps_probe_capability(const char *bpf_obj_path) {
+    if (!bpf_obj_path || access(bpf_obj_path, R_OK) != 0) {
+        return EBPF_CAP_OBJ_NOT_FOUND;
+    }
+
+#ifndef __NR_bpf
+    return EBPF_CAP_NO_BPF_SYSCALL;
+#else
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_type = BPF_MAP_TYPE_RINGBUF;
+    attr.max_entries = 4096;
+
+    int fd = (int)syscall(__NR_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
+    if (fd >= 0) {
+        close(fd);
+        return EBPF_CAP_OK;
+    }
+
+    if (errno == ENOSYS) {
+        return EBPF_CAP_NO_BPF_SYSCALL;
+    }
+    if (errno == EINVAL || errno == EOPNOTSUPP || errno == ENOTSUP) {
+        return EBPF_CAP_NO_RINGBUF;
+    }
+    return EBPF_CAP_LOAD_FAILED;
+#endif
 }
 
 const char *ebpf_cap_str(ebpf_cap_t cap) {
     switch (cap) {
-        case EBPF_CAP_OK:             return "可用";
+        case EBPF_CAP_OK:             return "尝试启动";
         case EBPF_CAP_NO_BPF_SYSCALL: return "bpf 系统调用不可用";
         case EBPF_CAP_NO_RINGBUF:     return "内核不支持 RingBuf";
         case EBPF_CAP_NO_UPROBE:      return "不支持 uprobe";

@@ -55,6 +55,8 @@ class FloatingBallService : Service() {
 
     // 当前显示的结果卡片(同上, onDestroy 兜底清理)
     private var resultView: View? = null
+    private var capsuleAdded = false
+    @Volatile private var serviceDestroyed = false
 
     // 拖动状态
     private var initialX = 0
@@ -77,10 +79,17 @@ class FloatingBallService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        serviceDestroyed = false
         startForeground(NOTIF_ID, buildNotification())
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        // fpsMonitor 延迟到 onStartCommand 初始化(需要 targetPkg)
-        addCapsule()
+        // fpsMonitor 和悬浮窗延迟到 onStartCommand 初始化, 需要明确的 targetPkg。
+    }
+
+    private fun postIfAlive(action: () -> Unit) {
+        if (serviceDestroyed) return
+        mainHandler.post {
+            if (!serviceDestroyed) action()
+        }
     }
 
     private fun buildNotification(): Notification {
@@ -103,6 +112,7 @@ class FloatingBallService : Service() {
         ).toInt()
 
     private fun addCapsule() {
+        if (capsuleAdded) return
         capsule = TextView(this).apply {
             text = "0.0"
             setTextColor(resources.getColor(R.color.capsule_text, theme))
@@ -134,16 +144,19 @@ class FloatingBallService : Service() {
         }
 
         capsule.setOnTouchListener { _, event -> handleTouch(event) }
-        // START_STICKY 重建服务时悬浮窗权限可能已被撤销, addView 会抛 BadTokenException。
+        // 服务被系统重建或悬浮窗权限被撤销时, addView 会抛 BadTokenException。
         // 包裹后失败则直接 stopSelf, 避免崩溃 + 避免空跑一个看不见的服务。
         try {
             windowManager.addView(capsule, layoutParams)
+            capsuleAdded = true
         } catch (e: Exception) {
             stopSelf()
         }
     }
 
     private fun updateCapsuleText() {
+        if (serviceDestroyed) return
+        if (!::capsule.isInitialized) return
         // 显示游戏真实渲染帧率(带 1 位小数, 由守护进程直连 binder 解析 SF 帧时间戳得出);
         // 校准中加前缀红点。<=0 表示尚未收到数据或未在监测。
         val label = if (currentFps > 0f) String.format(Locale.US, "%.1f", currentFps) else "0.0"
@@ -191,7 +204,7 @@ class FloatingBallService : Service() {
             showBanner("● 开始记录线程负载\n请正常操作游戏, 完成后再次点击胶囊结束", durationMs = 3500)
             thread {
                 val ok = DaemonBridge.startCalibration(pkg)
-                if (!ok) mainHandler.post {
+                if (!ok) postIfAlive {
                     showBanner("下发失败, 请确认已授予 root", durationMs = 3000)
                     revertToYellow()
                 }
@@ -210,7 +223,7 @@ class FloatingBallService : Service() {
                 val status = if (ok) DaemonBridge.waitDone(pkg) else null
                 val rules = if (status == "ok") DaemonBridge.readPkgRules(pkg) else emptyList()
                 android.util.Log.d("AppOpt", "校准完成: ok=$ok, status=$status, rules.size=${rules.size}")
-                mainHandler.post {
+                postIfAlive {
                     if (ok && status == null) {
                         showBanner("等待守护进程响应超时\n规则可能未生成，请重试或检查日志", durationMs = 3200)
                         mainHandler.postDelayed({ stopSelf() }, 3000)
@@ -224,6 +237,7 @@ class FloatingBallService : Service() {
 
     /** 校准结束后, 在悬浮窗里展示生成的规则结果; 3 秒后自动关闭, 用户也可点「完成」提前关闭。 */
     private fun showResult(pkg: String, ok: Boolean, status: String?, rules: List<String>) {
+        if (serviceDestroyed) return
         // Service 的 Context 没有 Theme, 需要包装一个带主题的 ContextThemeWrapper
         val themedContext = android.view.ContextThemeWrapper(this, R.style.Theme_AppOpt)
         val view = OverlayResultBinding.inflate(LayoutInflater.from(themedContext))
@@ -297,15 +311,19 @@ class FloatingBallService : Service() {
     }
 
     private fun revertToYellow() {
+        if (serviceDestroyed) return
         calibrating = false
         capsule.setBackgroundResource(R.drawable.capsule_yellow)
         updateCapsuleText()
     }
 
     private fun removeCapsule() {
+        if (!capsuleAdded) return
         try {
             windowManager.removeView(capsule)
         } catch (_: Exception) {
+        } finally {
+            capsuleAdded = false
         }
     }
 
@@ -318,6 +336,7 @@ class FloatingBallService : Service() {
      * durationMs 后自动移除。
      */
     private fun showBanner(msg: String, durationMs: Long = 3200) {
+        if (serviceDestroyed) return
         val tv = TextView(this).apply {
             text = msg
             setTextColor(0xFFFFFFFF.toInt())
@@ -357,6 +376,7 @@ class FloatingBallService : Service() {
 
     private val foregroundWatcher = object : Runnable {
         override fun run() {
+            if (serviceDestroyed) return
             val pkg = targetPkg
             if (pkg.isNullOrBlank() || foregroundClosing) return
             // 没有使用情况访问权限时无法判断前台, 跳过自动关闭(退化为手动收起),
@@ -368,13 +388,14 @@ class FloatingBallService : Service() {
             }
             thread {
                 val fg = ForegroundDetector.isAppForeground(this@FloatingBallService, pkg)
-                mainHandler.post { onForegroundChecked(fg) }
+                postIfAlive { onForegroundChecked(fg) }
             }
             mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
         }
     }
 
     private fun onForegroundChecked(foreground: Boolean) {
+        if (serviceDestroyed) return
         if (foregroundClosing) return
         if (foreground) {
             hasAppearedForeground = true
@@ -396,6 +417,7 @@ class FloatingBallService : Service() {
      * 校准中则先停止采样; 关闭前显示明确横幅, 待横幅可见后再真正 stopSelf。
      */
     private fun closeByForeground(appeared: Boolean) {
+        if (serviceDestroyed) return
         if (foregroundClosing) return
         foregroundClosing = true
         mainHandler.removeCallbacks(foregroundWatcher)
@@ -419,7 +441,7 @@ class FloatingBallService : Service() {
                     else -> "已退出游戏，校准已停止\n(数据已保存到历史记录)"
                 }
 
-                mainHandler.post {
+                postIfAlive {
                     showBanner(msg, durationMs = 2600)
                     mainHandler.postDelayed({ stopSelf() }, 2600)
                 }
@@ -436,10 +458,11 @@ class FloatingBallService : Service() {
     }
 
     override fun onDestroy() {
+        serviceDestroyed = true
         mainHandler.removeCallbacksAndMessages(null)
         // fpsMonitor 在 onStartCommand 才初始化; 服务若在那之前被回收, 直接访问会崩
         if (::fpsMonitor.isInitialized) fpsMonitor.stop()
-        // 通知守护进程停止 perfetto 帧率监测(省电)。su 是独立进程,
+        // 通知守护进程停止 FPS 监测(省电)。su 是独立进程,
         // 即使本进程随后退出, 已 fork 的命令仍会执行完。
         thread { DaemonBridge.stopFpsMonitor() }
         removeCapsule()
@@ -454,11 +477,16 @@ class FloatingBallService : Service() {
         intent?.getStringExtra(EXTRA_TARGET_PKG)?.let {
             if (it.isNotBlank()) targetPkg = it
         }
-        // 初始化真实帧率接收器(FileObserver 监听守护进程写的 fps 文件)
+        if (targetPkg.isNullOrBlank()) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        addCapsule()
+        // 初始化真实帧率接收器: 优先本地 socket, 文件监听仅作兜底
         if (!::fpsMonitor.isInitialized) {
             fpsMonitor = FrameRateMonitor(this) { fps ->
                 currentFps = fps
-                mainHandler.post { updateCapsuleText() }
+                postIfAlive { updateCapsuleText() }
             }
             fpsMonitor.start()
         }
@@ -466,9 +494,11 @@ class FloatingBallService : Service() {
         // + 启动前台监测看门狗。
         if (!targetPkg.isNullOrBlank()) {
             val pkg = targetPkg!!
+            val fpsSocketName = fpsMonitor.socketName
+            val fpsSocketToken = fpsMonitor.socketToken
             thread {
-                if (!DaemonBridge.startFpsMonitor(pkg)) {
-                    mainHandler.post { toast("帧率监测下发失败, 请确认 root") }
+                if (!DaemonBridge.startFpsMonitor(pkg, fpsSocketName, fpsSocketToken)) {
+                    postIfAlive { toast("帧率监测下发失败, 请确认 root") }
                 }
             }
             // 重置前台检测状态(避免保留上次启动的残留值)
@@ -479,7 +509,7 @@ class FloatingBallService : Service() {
             mainHandler.removeCallbacks(foregroundWatcher)
             mainHandler.postDelayed(foregroundWatcher, FG_CHECK_INTERVAL)
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

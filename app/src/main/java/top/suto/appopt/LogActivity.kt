@@ -30,7 +30,11 @@ class LogActivity : AppCompatActivity() {
         binding.logEmpty.visibility = View.GONE
         thread {
             val log = DaemonBridge.readDaemonLog()
-            runOnUiThread { render(log) }
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) {
+                    render(log)
+                }
+            }
         }
     }
 
