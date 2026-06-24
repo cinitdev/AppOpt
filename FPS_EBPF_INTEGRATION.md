@@ -101,12 +101,59 @@ eBPF uprobe
 score = avg * 0.65 + max * 0.35
 ```
 
-线程组按 `score` 排序后最多输出 Top 6:
+阈值由 `/data/adb/modules/AppOpt/config/calib_policy.conf` 控制, App 的「设置 > 自动校准策略」
+会可视化读写这个文件。刷入新模块但未重启时, App 会读取
+`/data/adb/modules_update/AppOpt/config/calib_policy.conf` 并锁定编辑, 避免待生效更新覆盖用户设置。
 
-- Top1 单线程且 `avg >= 18%` 或 `max >= 30%`: 最高性能簇, 固定输出在第一行。
-- `avg >= 13%` 或 `max >= 22%`: 高频中核档。
-- `avg >= 8%` 或 `max >= 18%`: 中核档。
-- 包名兜底规则: 非最高性能簇, 对齐常见 `0-6` 兜底。
+线程组按 `score` 排序后默认最多输出 Top 6。每一档都可以在 App 设置里直接勾选
+CPU 核心, 保存后写入策略文件里的 `cores`:
+
+- Top1 单线程且 AVG 和 MAX 同时达到 `best_thread` 阈值: 最高性能簇, 固定输出在第一行。
+- AVG 和 MAX 同时达到 `group_high` 阈值: 高频中核档。
+- AVG 和 MAX 同时达到 `group_mid` 阈值: 中核档。
+- 包名兜底规则: 默认非最高性能簇, 对齐常见 `0-6` 兜底, 可在 App 设置里调整。
+- `cores:7`、`cores:5-6`、`cores:0-6`: 直接使用用户指定的连续核心范围。
+- `target:*` 已移除; 核心分配只看 `cores`。
+
+默认策略:
+
+```ini
+best_thread=avg:18,max:30,cores:7
+group_high=avg:13,max:22,cores:5-6
+group_mid=avg:8,max:18,cores:4-6
+wildcard_group=max_member
+max_thread_rules=6
+fallback=cores:0-6
+```
+
+`wildcard_group=max_member` 表示 `Thread-1/Thread-2`、`Job.worker 1/2` 这类相似线程
+会先合成 `Thread-*`、`Job.worker*` 一组, AVG 只取组内最忙的单个线程, MAX 取组内最高峰值。
+需要更激进时可在 App 设置中改为“平均负载相加”, 对应 `wildcard_group=sum`, 此时 AVG
+会累加组内所有线程。两种模式都只改变这组 AVG 的计算方式; 一旦入选, 规则名仍输出为
+`Job.worker*` 这类规则, 不会改成组内某个具体线程名。
+
+`fallback=cores:0-6` 对应 App 设置里的“进程兜底核心”。
+它只影响最后一行 `包名=...` 兜底规则, 不改变已经单独生成的线程规则。
+
+守护进程运行后会在 `calib_policy.conf` 写入当前设备拓扑。这里不再假设一定是
+“小/中/大”三段, 而是按 CPU 最大频率簇生成通用性能档位；同频簇不会再按 CPU 编号硬切,
+避免把 8 Gen 5 这类同频性能核误拆成两个档位。
+
+```ini
+# CPU 拓扑识别: 3 个性能簇, 全部=[0-7] 低性能=[0-3] 主性能=[4-6] 高性能=[5-6] 最高性能=[7] 非最高=[0-6]
+detected_low=0-3
+detected_main=4-6
+detected_high=5-6
+detected_non_top=0-6
+detected_top=7
+detected_all=0-7
+```
+
+示例规则:
+
+- 3 簇设备如 870: 低性能=`0-3`, 主性能/高性能=`4-6`, 最高性能=`7`。
+- 4 簇设备如 8 Gen 2: 低性能=`0-2`, 主性能=`3-6`, 高性能=`5-6`, 最高性能=`7`。
+- 2 簇设备如部分 8 Gen 5: 低性能/主性能/高性能=`0-5`, 最高性能=`6-7`。
 
 这样做的目的不是猜线程职责, 而是让不同游戏、不同引擎的线程命名差异只影响规则名字,
 不影响分级判断。

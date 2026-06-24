@@ -16,9 +16,11 @@ wait_sys_boot_completed
 
 MODDIR=${0%/*}
 cd "$MODDIR"
-BIN="$MODDIR/AppOpt"
-CONF="$MODDIR/applist.conf"
-LOG="$MODDIR/AppOpt.log"
+BIN="$MODDIR/config/bin/AppOpt"
+CONF="$MODDIR/config/applist.conf"
+LOG="$MODDIR/logs/AppOpt.log"
+
+mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" "$MODDIR/logs"
 
 # 二进制不存在直接退出
 [ -f "$BIN" ] || exit 0

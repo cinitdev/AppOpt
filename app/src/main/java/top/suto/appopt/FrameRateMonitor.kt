@@ -25,7 +25,6 @@ class FrameRateMonitor(
     private var observer: FileObserver? = null
     private var server: LocalServerSocket? = null
     private var activeSocket: LocalSocket? = null
-    private var socketThread: Thread? = null
     @Volatile private var running = false
 
     @Volatile var socketName: String? = null
@@ -73,7 +72,7 @@ class FrameRateMonitor(
             server = localServer
             socketName = name
             socketToken = token
-            socketThread = Thread({ socketAcceptLoop(localServer, token) }, "AppOptFpsSock").apply {
+            Thread({ socketAcceptLoop(localServer, token) }, "AppOptFpsSock").apply {
                 isDaemon = true
                 start()
             }
@@ -132,7 +131,6 @@ class FrameRateMonitor(
         activeSocket = null
         try { server?.close() } catch (_: Exception) {}
         server = null
-        socketThread = null
     }
 
     /**

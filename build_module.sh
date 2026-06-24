@@ -107,7 +107,8 @@ mkdir -p "$WORK"
 cp -r "$BASE_DIR/." "$WORK/"
 
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"
-BPF_OBJ="$WORK/queuebuffer_probe.bpf.o"
+mkdir -p "$WORK/config/ebpf"
+BPF_OBJ="$WORK/config/ebpf/queuebuffer_probe.bpf.o"
 [ -f "$BPF_SRC" ] || { echo "! 找不到 BPF 源码: $BPF_SRC"; exit 1; }
 
 CLANG="$BIN/clang"
@@ -136,10 +137,10 @@ SYSROOT="$TC/$HOST/sysroot"
 build_abi() {
     local triple="$1" abidir="$2" rust_target="$3"
     local cc="$BIN/${triple}${API}-clang${EXT}"
-    local dst="$WORK/bin/$abidir/AppOpt"
+    local dst="$WORK/config/bin/$abidir/AppOpt"
 
     [ -f "$cc" ] || { echo "! 找不到 $abidir 编译器: $cc"; exit 1; }
-    mkdir -p "$WORK/bin/$abidir"
+    mkdir -p "$WORK/config/bin/$abidir"
 
     build_rust_bridge "$rust_target" "$cc"
 

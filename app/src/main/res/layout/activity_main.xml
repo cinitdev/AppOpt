@@ -47,33 +47,6 @@
                         android:textSize="26sp"
                         android:textStyle="bold" />
 
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btnLogTop"
-                        style="@style/Widget.Material3.Button.IconButton"
-                        android:layout_width="48dp"
-                        android:layout_height="48dp"
-                        android:insetTop="0dp"
-                        android:insetBottom="0dp"
-                        android:contentDescription="守护进程日志"
-                        app:icon="@drawable/ic_log"
-                        app:iconSize="26dp"
-                        app:iconTint="#FFFFFF"
-                        app:iconGravity="textStart"
-                        app:iconPadding="0dp" />
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btnHistoryTop"
-                        style="@style/Widget.Material3.Button.IconButton"
-                        android:layout_width="48dp"
-                        android:layout_height="48dp"
-                        android:insetTop="0dp"
-                        android:insetBottom="0dp"
-                        android:contentDescription="历史记录"
-                        app:icon="@drawable/ic_history"
-                        app:iconSize="28dp"
-                        app:iconTint="#FFFFFF"
-                        app:iconGravity="textStart"
-                        app:iconPadding="0dp" />
                 </LinearLayout>
 
                 <TextView

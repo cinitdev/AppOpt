@@ -393,14 +393,15 @@ class HistoryActivity : AppCompatActivity() {
     }
 
     private fun toast(msg: String) {
-        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        AppToast.show(this, msg)
     }
 
     /** 按平均负载分档着色: 高=暖橙, 中=蓝, 低=青绿 */
     private fun colorFor(avg: Float, max: Float): Int = when {
-        avg >= 13f || max >= 22f -> Color.parseColor("#E67E22")
-        avg >= 8f || max >= 18f  -> Color.parseColor("#5B5BD6")
-        else        -> Color.parseColor("#2ECC71")
+        avg >= 18f && max >= 30f -> Color.parseColor("#E74C3C")
+        avg >= 13f && max >= 22f -> Color.parseColor("#E67E22")
+        avg >= 8f && max >= 18f -> Color.parseColor("#5B5BD6")
+        else -> Color.parseColor("#2ECC71")
     }
 
     /** 解析日志文本为会话列表, 最新一次排在前面; 会话内线程按 AVG 降序。 */

@@ -29,24 +29,85 @@ import java.util.UUID
 object DaemonBridge {
 
     private const val MODULE_DIR = "/data/adb/modules/AppOpt"
-    private const val CMD_FILE = "$MODULE_DIR/calibrate.cmd"
-    private const val STATE_FILE = "$MODULE_DIR/calibrate.state"
-    private const val CONFIG_FILE = "$MODULE_DIR/applist.conf"
+    private const val MODULE_UPDATE_DIR = "/data/adb/modules_update/AppOpt"
+    private const val CONFIG_DIR = "$MODULE_DIR/config"
+    private const val BIN_FILE = "$CONFIG_DIR/bin/AppOpt"
+    private const val LOG_DIR = "$MODULE_DIR/logs"
+    private const val UPDATE_CONFIG_DIR = "$MODULE_UPDATE_DIR/config"
+    private const val CMD_FILE = "$CONFIG_DIR/calibrate.cmd"
+    private const val STATE_FILE = "$CONFIG_DIR/calibrate.state"
+    private const val CONFIG_FILE = "$CONFIG_DIR/applist.conf"
+    private const val POLICY_FILE = "$CONFIG_DIR/calib_policy.conf"
+    private const val POLICY_LOCK_DIR = "$CONFIG_DIR/calib_policy.conf.lock"
+    private const val POLICY_UPDATE_FILE = "$UPDATE_CONFIG_DIR/calib_policy.conf"
     private const val HISTORY_DIR = "$MODULE_DIR/history"
-    private const val LOG_FILE = "$MODULE_DIR/AppOpt.log"
-    private const val FPS_CMD_FILE = "$MODULE_DIR/fps.cmd"
+    private const val LOG_FILE = "$LOG_DIR/AppOpt.log"
+    private const val FPS_CMD_FILE = "$CONFIG_DIR/fps.cmd"
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
+    const val REQUIRED_MODULE_VERSION_CODE = 171
+    const val REQUIRED_MODULE_VERSION_NAME = "1.7.1"
 
-    /** 检测设备是否有可用的 root (su); 首次调用会触发 Magisk 授权弹窗 */
+    /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
     fun hasRoot(): Boolean = runAsRoot("id -u").trim() == "0"
 
+    fun hasPendingModuleUpdate(): Boolean {
+        return runAsRoot("[ -d '$MODULE_UPDATE_DIR' ] && printf 1 || printf 0")
+            .trim() == "1"
+    }
+
+    data class ModuleVersion(
+        val versionName: String,
+        val versionCode: Int,
+        val binaryVersionName: String?,
+        val raw: String
+    )
+
     /**
-     * 检测 C 守护进程是否在运行。
+     * 读取已刷入模块版本。兼容性判断只看 module.prop 的 versionCode；
+     * C 二进制 `AppOpt -v` 仅作为辅助显示信息, 不决定模块版本是否合格。
+     */
+    fun readModuleVersion(): ModuleVersion? {
+        val cmd = """
+            prop="$MODULE_DIR/module.prop"
+            prop_code=
+            prop_version=
+            bin_version=
+            [ -f "${'$'}prop" ] && prop_code=${'$'}(sed -n 's/^versionCode=//p' "${'$'}prop" 2>/dev/null | head -n 1)
+            [ -f "${'$'}prop" ] && prop_version=${'$'}(sed -n 's/^version=//p' "${'$'}prop" 2>/dev/null | head -n 1)
+            if [ -x '$BIN_FILE' ]; then
+                bin_out=$('$BIN_FILE' -v 2>/dev/null)
+                bin_version=${'$'}(printf '%s\n' "${'$'}bin_out" | sed -n 's/.*AppOpt 版本[[:space:]]*//p' | tail -n 1)
+            fi
+            printf 'propCode=%s\npropVersion=%s\nbinVersion=%s\n' "${'$'}prop_code" "${'$'}prop_version" "${'$'}bin_version"
+        """.trimIndent()
+        val out = runAsRoot(cmd)
+        if (!out.isNotErrored()) return null
+        val values = out.lineSequence()
+            .mapNotNull { line ->
+                val index = line.indexOf('=')
+                if (index <= 0) null else line.substring(0, index) to line.substring(index + 1).trim()
+            }
+            .toMap()
+        val binVersion = values["binVersion"].orEmpty().removePrefix("v").trim()
+        val propVersion = values["propVersion"].orEmpty().removePrefix("v").trim()
+        val code = values["propCode"]?.toIntOrNull() ?: return null
+        val name = propVersion.takeIf { it.isNotBlank() }
+            ?: binVersion.takeIf { it.isNotBlank() }
+            ?: code.toString()
+        return ModuleVersion(
+            versionName = name,
+            versionCode = code,
+            binaryVersionName = binVersion.takeIf { it.isNotBlank() },
+            raw = out
+        )
+    }
+
+    /**
+     * 检测当前运行的守护进程是否确实是本 App 可交互的 AppOpt。
      *
-     * 不再用 `pgrep -x AppOpt`: 项目开源后, 社区改版或旧二进制也可能叫 AppOpt。
-     * 这里必须让守护进程按随机 token 反连 App 的一次性 socket, 才视为本 App
-     * 可交互的 AppOpt 守护进程。
+     * 这里不使用 pgrep 判断进程名，因为开源后二改版本也可能叫 AppOpt。
+     * 只有守护进程能按随机 token 反连 App 的一次性 socket，才认为验证通过。
      */
     fun isDaemonRunning(): Boolean = verifyDaemonSocketReverse()
 
@@ -78,7 +139,7 @@ object DaemonBridge {
             }
 
             val rootThread = Thread({
-                runAsRoot("'$MODULE_DIR/AppOpt' --ping-daemon '$socketName' '$token' 2>/dev/null")
+                runAsRoot("'$BIN_FILE' --ping-daemon '$socketName' '$token' 2>/dev/null")
             }, "AppOptDaemonPing").apply {
                 isDaemon = true
                 start()
@@ -103,12 +164,23 @@ object DaemonBridge {
         return line.startsWith(DAEMON_SOCKET_CALLBACK_PREFIX) &&
             line.contains("token=$token") &&
             line.contains("version=") &&
-            line.contains("pid=")
+            line.contains("pid=") &&
+            callbackVersionCode(line)?.let { it >= REQUIRED_MODULE_VERSION_CODE } == true
+    }
+
+    private fun callbackVersionCode(line: String): Int? {
+        val version = Regex("""(?:^|\s)version=([^\s]+)""")
+            .find(line)
+            ?.groupValues
+            ?.getOrNull(1)
+            .orEmpty()
+        return versionNameToCode(version)
     }
 
     /**
-     * 在同一次 su 会话中精确检查一组非 APK 配置项是否为正在运行的进程。
-     * 用于 UI 区分 "系统组件" 与 "未安装/配置残留", 不参与守护进程规则应用。
+     * 批量判断非 APK 配置项是否对应正在运行的系统进程。
+     * 用于 UI 区分“系统组件”和“未安装/配置残留”。匹配流程是 pidof + pgrep -x
+     * 获取候选 PID，然后反查 /proc/<pid>/comm 与 cmdline 做精确确认。
      */
     fun findRunningProcessNames(names: Collection<String>): Set<String> {
         val targets = names.map { it.trim().replace("'", "") }
@@ -180,22 +252,26 @@ object DaemonBridge {
             .toSet()
     }
 
-    /** 下发开始采样命令 */
+    /** 下发开始线程负载采样命令，并等待守护进程进入 sampling 状态。 */
     fun startCalibration(pkg: String): Boolean {
         if (pkg.isBlank()) return false
         val safe = cleanCommandArg(pkg, allowColon = true)
         if (safe.isBlank()) return false
-        val wrote = runAsRoot("printf '%s' 'start $safe' > $CMD_FILE").isNotErrored()
+        val wrote = runAsRoot("mkdir -p '$CONFIG_DIR'; printf '%s' 'start $safe' > $CMD_FILE").isNotErrored()
         return wrote && waitForStatePackage("sampling", safe, timeoutMs = 2500)
     }
 
-    /** 下发停止采样命令, 守护进程随后生成规则并回写配置 */
+    /** 下发停止采样命令，守护进程随后生成规则并回写 applist.conf。 */
     fun stopCalibration(pkg: String): Boolean {
         val safe = pkg.replace("'", "")
-        return runAsRoot("printf '%s' 'stop $safe' > $CMD_FILE").isNotErrored()
+        return runAsRoot("mkdir -p '$CONFIG_DIR'; printf '%s' 'stop $safe' > $CMD_FILE").isNotErrored()
     }
 
-    /** 通知守护进程开始真实帧率监测, 优先让守护进程把 FPS 推到 App 的本地 socket。 */
+    /**
+     * 通知守护进程开始真实帧率监测。
+     * socketName/socketToken 存在时优先使用 App 创建的本地 socket 推送 FPS；
+     * socket 不可用时，守护进程仍会回退写入 app 私有 fps 文件。
+     */
     fun startFpsMonitor(pkg: String, socketName: String? = null, socketToken: String? = null): Boolean {
         if (pkg.isBlank()) return false
         val safePkg = cleanCommandArg(pkg, allowColon = true)
@@ -207,31 +283,29 @@ object DaemonBridge {
         } else {
             "start $safePkg"
         }
-        return runAsRoot("printf '%s' '$cmd' > $FPS_CMD_FILE").isNotErrored()
+        return runAsRoot("mkdir -p '$CONFIG_DIR'; printf '%s' '$cmd' > $FPS_CMD_FILE").isNotErrored()
     }
 
-    /** 通知守护进程停止帧率监测 */
+    /** 通知守护进程停止帧率监测。 */
     fun stopFpsMonitor(): Boolean {
-        return runAsRoot("printf '%s' 'stop' > $FPS_CMD_FILE").isNotErrored()
+        return runAsRoot("mkdir -p '$CONFIG_DIR'; printf '%s' 'stop' > $FPS_CMD_FILE").isNotErrored()
     }
 
-    /** 读取守护进程当前状态; 读不到返回空串 */
+    /** 读取守护进程当前状态；读不到时返回空字符串。 */
     fun readState(): String {
         return runAsRoot("cat $STATE_FILE 2>/dev/null").trim()
     }
 
-    /**
-     * 读取守护进程运行日志 (service.sh 把 stdout/stderr 重定向到 AppOpt.log,
-     * 每次开机覆盖写, 故只含本次开机以来的日志)。只取最近 maxLines 行避免过大。
-     */
+    /** 读取本次开机以来的守护进程日志，只取最后 maxLines 行避免 UI 解析过大文件。 */
     fun readDaemonLog(maxLines: Int = 500): String {
         val out = runAsRoot("tail -n $maxLines $LOG_FILE 2>/dev/null")
         return if (out.isNotErrored()) out else ""
     }
 
     /**
-     * 轮询等待守护进程进入 "done ..." 状态 (规则已生成回写)。
-     * 返回状态详情: null=超时, "ok"=成功, "short"=采样时长不足, "no_load"=负载不足, "write_fail"=写回失败
+     * 等待守护进程完成校准。
+     * 返回值含义：null=超时；ok=成功；short=采样不足；
+     * no_load=负载不足；write_fail=写回失败。
      */
     fun waitDone(pkg: String, timeoutMs: Long = 4000): String? {
         val expected = cleanCommandArg(pkg, allowColon = true)
@@ -241,7 +315,7 @@ object DaemonBridge {
             val st = readState()
             val donePkg = statePackage(st, "done")
             if (donePkg == expected) {
-                // 解析状态: "done pkg" 或 "done pkg;reason=xxx"
+                // 状态格式: "done pkg" 或 "done pkg;reason=xxx"。
                 val parts = st.split(";")
                 if (parts.size > 1) {
                     val reasonPart = parts.firstOrNull { it.startsWith("reason=") }
@@ -273,8 +347,8 @@ object DaemonBridge {
     }
 
     /**
-     * 读取配置文件中某包名当前生效的规则行 (排除 "=auto" 占位)。
-     * 用于校准结束后向用户展示生成结果。
+     * 读取某包名当前生效的规则行。
+     * 会过滤掉 pkg=auto 占位，只返回真正生成或手写的核心绑定规则。
      */
     fun readPkgRules(pkg: String): List<String> {
         val text = readConfigRaw()
@@ -296,7 +370,7 @@ object DaemonBridge {
         return result
     }
 
-    /** 读取配置文件中某包名的全部规则行, 包括 "=auto" 占位 */
+    /** 读取某包名的全部配置行，包括 pkg=auto 占位。 */
     fun readPkgConfigLines(pkg: String): List<String> {
         val text = readConfigRaw()
         if (text.isBlank()) return emptyList()
@@ -308,25 +382,182 @@ object DaemonBridge {
         return result
     }
 
-    /** 读取配置文件原始内容; 读不到返回空串 */
+    /** 读取 applist.conf 原始内容；读不到时返回空字符串。 */
     fun readConfigRaw(): String {
         val out = runAsRoot("cat $CONFIG_FILE 2>/dev/null")
         return if (out.isNotErrored()) out else ""
     }
 
-    /** 把未配置应用追加为 "pkg=auto", 后续可从待配置应用里启动校准 */
+    /** 自动校准策略文件内容及来源状态。 */
+    data class PolicyFile(
+        val content: String,
+        val lockedByPendingUpdate: Boolean,
+        val path: String,
+        val exists: Boolean
+    )
+
+    /**
+     * 读取自动校准策略文件。
+     * 如果 /data/adb/modules_update/AppOpt/config/calib_policy.conf 存在，说明模块更新已刷入但未重启，
+     * 这时读取待生效文件并锁定 UI，避免用户改完后重启又被更新目录覆盖。
+     */
+    fun readCalibPolicyRaw(): PolicyFile {
+        val hasPending = runAsRoot("[ -f '$POLICY_UPDATE_FILE' ] && printf 1 || printf 0")
+            .trim() == "1"
+        val path = if (hasPending) POLICY_UPDATE_FILE else POLICY_FILE
+        val exists = runAsRoot("[ -f '$path' ] && printf 1 || printf 0")
+            .trim() == "1"
+        val out = runAsRoot("cat '$path' 2>/dev/null")
+        return PolicyFile(
+            content = if (out.isNotErrored()) out else "",
+            lockedByPendingUpdate = hasPending,
+            path = path,
+            exists = exists
+        )
+    }
+
+    /** 写入当前生效模块目录的自动校准策略；存在待生效更新时拒绝写入。 */
+    fun writeCalibPolicyRaw(content: String): Boolean {
+        val locked = runAsRoot("[ -f '$POLICY_UPDATE_FILE' ] && printf 1 || printf 0")
+            .trim() == "1"
+        if (locked) return false
+        return writePolicyFileAsRoot(content)
+    }
+
+    /**
+     * 调用 root shell 根据设备 CPU 频率拓扑生成默认校准策略。
+     * App 不写死 0-7 这类核心布局，而是让设备端根据 cpufreq policy 计算默认核心范围。
+     */
+    fun generateDefaultCalibPolicyRaw(): String? {
+        val cmd = """
+            format_cpu_ranges() {
+                [ -z "${'$'}{1// /}" ] && { cat /sys/devices/system/cpu/present 2>/dev/null; return; }
+                awk -v input="${'$'}1" 'BEGIN {
+                    n = split(input, arr, /[[:space:],]+/)
+                    j = 0
+                    for (i = 1; i <= n; i++) {
+                        token = arr[i]
+                        if (token == "") continue
+                        if (token ~ /^[0-9]+-[0-9]+$/) {
+                            split(token, range, "-")
+                            start = range[1] + 0
+                            end = range[2] + 0
+                            if (start > end) { t = start; start = end; end = t }
+                            for (cpu = start; cpu <= end; cpu++) {
+                                if (!seen[cpu]++) nums[++j] = cpu
+                            }
+                        } else if (token ~ /^[0-9]+$/) {
+                            cpu = token + 0
+                            if (!seen[cpu]++) nums[++j] = cpu
+                        }
+                    }
+                    n = j
+                    if (!n) exit
+                    for (i = 1; i < n; i++) {
+                        min = i
+                        for (j = i + 1; j <= n; j++) if (nums[j] < nums[min]) min = j
+                        if (min != i) { t = nums[i]; nums[i] = nums[min]; nums[min] = t }
+                    }
+                    start = last = nums[1]
+                    for (i = 2; i <= n; i++) {
+                        if (nums[i] == last + 1) { last = nums[i]; continue }
+                        printf "%s%s", sep, (start == last ? start : start "-" last)
+                        sep = ","
+                        start = last = nums[i]
+                    }
+                    printf "%s", sep
+                    printf (start == last ? start : start "-" last)
+                }'
+            }
+            sorted_groups=${'$'}(
+                for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+                    [ -d "${'$'}policy" ] || continue
+                    cpus=${'$'}(cat "${'$'}policy/related_cpus" 2>/dev/null)
+                    freq=${'$'}(cat "${'$'}policy/cpuinfo_max_freq" 2>/dev/null)
+                    [ -z "${'$'}cpus" ] || [ -z "${'$'}freq" ] && continue
+                    echo "${'$'}freq:${'$'}cpus"
+                done | sort -n -t: -k1,1 | awk -F: '
+                ${'$'}1 == prev { cores = cores " " ${'$'}2; next }
+                prev != "" { print prev ":" cores; cores = "" }
+                { prev = ${'$'}1; cores = ${'$'}2 }
+                END { if (prev != "") print prev ":" cores }'
+            )
+            eval "${'$'}(echo "${'$'}sorted_groups" | awk -F: '
+            BEGIN {
+                e_core = ""; p_core = ""; p_high_core = ""; hp_core = ""
+                total_groups = 0
+            }
+            {
+                cpus_arr[NR] = ${'$'}2
+                total_groups = NR
+            }
+            END {
+                if (total_groups == 0) {
+                    print "e_core=\"\"; p_core=\"\"; p_high_core=\"\"; hp_core=\"\"; total_groups=0;"
+                    exit
+                }
+                e_core = cpus_arr[1]
+                if (total_groups >= 2) hp_core = cpus_arr[total_groups]
+                if (total_groups >= 3) {
+                    for (i = 2; i < total_groups; i++) {
+                        p_core = p_core (p_core == "" ? "" : " ") cpus_arr[i]
+                    }
+                    p_high_core = cpus_arr[total_groups - 1]
+                }
+                printf "e_core=\"%s\"; p_core=\"%s\"; p_high_core=\"%s\"; hp_core=\"%s\"; total_groups=%d;",
+                    e_core, p_core, p_high_core, hp_core, total_groups
+            }')"
+            all_core=${'$'}(cat /sys/devices/system/cpu/present 2>/dev/null)
+            [ -n "${'$'}all_core" ] || all_core="0-7"
+            best=${'$'}(format_cpu_ranges "${'$'}hp_core")
+            [ -n "${'$'}best" ] || best=${'$'}(format_cpu_ranges "${'$'}all_core")
+            main=${'$'}(format_cpu_ranges "${'$'}p_core")
+            [ -n "${'$'}main" ] || main=${'$'}(format_cpu_ranges "${'$'}e_core")
+            [ -n "${'$'}main" ] || main=${'$'}(format_cpu_ranges "${'$'}all_core")
+            high=${'$'}(format_cpu_ranges "${'$'}p_high_core")
+            [ -n "${'$'}high" ] || high="${'$'}main"
+            non_top=${'$'}(format_cpu_ranges "${'$'}e_core ${'$'}p_core")
+            [ -n "${'$'}non_top" ] || non_top=${'$'}(format_cpu_ranges "${'$'}all_core")
+            low_range=${'$'}(format_cpu_ranges "${'$'}e_core")
+            main_range=${'$'}(format_cpu_ranges "${'$'}p_core")
+            [ -n "${'$'}main_range" ] || main_range="${'$'}low_range"
+            high_range=${'$'}(format_cpu_ranges "${'$'}p_high_core")
+            [ -n "${'$'}high_range" ] || high_range="${'$'}main_range"
+            top_range=${'$'}(format_cpu_ranges "${'$'}hp_core")
+            [ -n "${'$'}top_range" ] || top_range=${'$'}(format_cpu_ranges "${'$'}all_core")
+            non_top_range=${'$'}(format_cpu_ranges "${'$'}e_core ${'$'}p_core")
+            [ -n "${'$'}non_top_range" ] || non_top_range=${'$'}(format_cpu_ranges "${'$'}all_core")
+            all_range=${'$'}(format_cpu_ranges "${'$'}all_core")
+            cat <<EOF
+version=1
+best_thread=avg:18,max:30,cores:${'$'}best
+group_high=avg:13,max:22,cores:${'$'}high
+group_mid=avg:8,max:18,cores:${'$'}main
+wildcard_group=max_member
+max_thread_rules=6
+fallback=cores:${'$'}non_top
+EOF
+        """.trimIndent()
+        val out = runAsRoot(cmd)
+        return out.takeIf { it.isNotErrored() }
+            ?.trim()
+            ?.takeIf { it.contains("best_thread=") && it.contains("fallback=") }
+    }
+
+    /** 把应用追加为 pkg=auto，占位后可在“待校准”里启动采样。 */
     fun addAutoPackage(pkg: String): Boolean {
         val safe = pkg.replace("'", "")
         if (safe.isBlank()) return false
-        return runAsRoot("printf '\\n%s=auto\\n' '$safe' >> $CONFIG_FILE").isNotErrored()
+        val blocks = parseConfigBlocks(readConfigRaw())
+        val group = configGroupName(safe)
+        if (blocks.any { safe in it.owners || it.group == group }) {
+            return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(blocks))
+        }
+        blocks.add(ConfigBlock(group, mutableListOf("$safe=auto"), mutableSetOf(safe)))
+        return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(blocks))
     }
 
-    /** 删除 applist.conf 中某包名的所有配置行, 包括 pkg=... 和 pkg{thread}=... */
-    fun deleteConfigPackage(pkg: String): Boolean {
-        return deleteConfigPackages(listOf(pkg))
-    }
-
-    /** 删除 applist.conf 中多个包名/进程名的所有配置行。 */
+    /** 批量删除 applist.conf 中多个包名或进程名的全部配置行。 */
     fun deleteConfigPackages(pkgs: Collection<String>): Boolean {
         val targets = pkgs.map { it.replace("'", "").trim() }
             .filter { it.isNotEmpty() }
@@ -334,12 +565,91 @@ object DaemonBridge {
         if (targets.isEmpty()) return false
         val raw = readConfigRaw()
         if (raw.isBlank()) return true
-        val kept = raw.lineSequence()
-            .filterNot { line -> targets.any { pkg -> lineBelongsToPackage(line, pkg) } }
-            .joinToString("\n")
-        return writeFileAsRoot(CONFIG_FILE, if (kept.isBlank()) "" else kept + "\n")
+        val targetSet = targets.toSet()
+        val targetGroups = targets.map { configGroupName(it) }.toSet()
+        val kept = parseConfigBlocks(raw)
+            .filterNot { block -> block.group in targetGroups || block.owners.any { it in targetSet } }
+        return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(kept))
     }
 
+    private data class ConfigBlock(
+        val group: String,
+        val lines: MutableList<String>,
+        val owners: MutableSet<String>
+    )
+
+    /**
+     * 把 applist.conf 规整成“同一应用一块, 不同应用之间空一行”。
+     *
+     * 这样无论原文件尾部有没有换行, 添加/删除配置都不会把两个应用挤在一起,
+     * 也不会因为重复操作不断累积多余空行。
+     */
+    private fun parseConfigBlocks(text: String): MutableList<ConfigBlock> {
+        val blocks = mutableListOf<ConfigBlock>()
+        val pendingComments = mutableListOf<String>()
+        var current: ConfigBlock? = null
+
+        for (raw in text.lineSequence()) {
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            val owner = configLineOwner(line)
+            if (owner == null) {
+                pendingComments.add(line)
+                continue
+            }
+
+            val group = configGroupName(owner)
+            val block = if (current?.group == group) {
+                current!!
+            } else {
+                ConfigBlock(group, mutableListOf(), mutableSetOf()).also {
+                    blocks.add(it)
+                    current = it
+                }
+            }
+            if (pendingComments.isNotEmpty()) {
+                block.lines.addAll(pendingComments)
+                pendingComments.clear()
+            }
+            block.lines.add(line)
+            block.owners.add(owner)
+        }
+
+        if (pendingComments.isNotEmpty()) {
+            val block = current ?: ConfigBlock("", mutableListOf(), mutableSetOf()).also { blocks.add(it) }
+            block.lines.addAll(pendingComments)
+        }
+        return blocks
+    }
+
+    private fun formatConfigBlocks(blocks: List<ConfigBlock>): String {
+        val text = blocks
+            .map { block -> block.lines.joinToString("\n") }
+            .filter { it.isNotBlank() }
+            .joinToString("\n\n")
+        return if (text.isBlank()) "" else "$text\n"
+    }
+
+    private fun configLineOwner(rawLine: String): String? {
+        val line = rawLine.trim()
+        if (line.isEmpty() || line.startsWith("#")) return null
+        val eq = line.indexOf('=')
+        if (eq <= 0) return null
+        var key = line.substring(0, eq).trim()
+        val brace = key.indexOf('{')
+        if (brace >= 0) key = key.substring(0, brace).trim()
+        return key.ifBlank { null }
+    }
+
+    private fun configGroupName(pkg: String): String {
+        val base = pkg.substringBefore(':')
+        return if (base != pkg && base.contains('.')) base else pkg
+    }
+
+    /**
+     * 判断 applist.conf 的一行是否属于指定包名/进程名。
+     * 支持 pkg=...、pkg{thread}=... 和 pkg:child=...; 注释行和空行不会匹配。
+     */
     private fun lineBelongsToPackage(rawLine: String, pkg: String): Boolean {
         val line = rawLine.trim()
         if (line.isEmpty() || line.startsWith("#")) return false
@@ -351,89 +661,28 @@ object DaemonBridge {
         return key == pkg
     }
 
-    /** 读取某包名的历史线程负载记录原始内容; 读不到返回空串 */
+    /** 读取某包名的原版历史 .log 内容；读不到时返回空字符串。 */
     fun readHistory(pkg: String): String {
         val safe = pkg.replace("'", "")
         val out = runAsRoot("cat '$HISTORY_DIR/$safe.log' 2>/dev/null")
         return if (out.isNotErrored()) out else ""
     }
 
-    /** 删除某包名的整个历史记录文件(应用列表里"删除"该应用的全部历史) */
+    /** 删除某包名的整份历史 .log 文件。 */
     fun deleteHistory(pkg: String): Boolean {
         val safe = pkg.replace("'", "")
         if (safe.isBlank()) return false
-        return runAsRoot("rm -f '$HISTORY_DIR/$safe.log'").isNotErrored()
+        return runAsRoot("rm -f '$HISTORY_DIR/$safe.log'; rmdir '$HISTORY_DIR' 2>/dev/null; true").isNotErrored()
     }
 
-    /**
-     * 删除某包名历史中的单次会话(按 epoch 定位)。
-     * 日志是单文件多段格式, 故读出全文 -> 过滤掉以 "# <epoch> ..." 开头的那一段 -> 写回。
-     * 删完若文件已空, 则连同文件一起删除。
-     * 返回是否成功(包括"该会话本就不存在"也视为成功)。
-     */
-    fun deleteSession(pkg: String, epoch: Long): Boolean {
-        val safe = pkg.replace("'", "")
-        if (safe.isBlank()) return false
-        val raw = readHistory(pkg)
-        if (raw.isBlank()) return true
-
-        // 调试日志: 打印要删除的 epoch 和文件中的所有段头
-        android.util.Log.d("AppOpt", "deleteSession: 要删除 epoch=$epoch")
-        raw.lineSequence().filter { it.trim().startsWith("#") }.forEach {
-            android.util.Log.d("AppOpt", "deleteSession: 文件中的段头: $it")
-        }
-
-        val out = StringBuilder()
-        var skipping = false
-        var removedAny = false
-        for (line in raw.lineSequence()) {
-            val t = line.trim()
-            if (t.startsWith("#")) {
-                // 段头: 解析 epoch 决定是否进入"跳过本段"状态
-                val first = t.removePrefix("#").trim().split(Regex("\\s+")).getOrNull(0)?.toLongOrNull()
-                skipping = (first == epoch)   // 每次遇到新段头都重新判断
-                android.util.Log.d("AppOpt", "deleteSession: 段头 epoch=$first, 匹配=${first==epoch}, skipping=$skipping")
-                if (skipping) {
-                    removedAny = true
-                    continue   // 跳过这个段头
-                }
-            }
-            if (!skipping) out.append(line).append('\n')
-        }
-        android.util.Log.d("AppOpt", "deleteSession: removedAny=$removedAny, 剩余${out.length}字符")
-        if (!removedAny) return true   // 没找到该会话, 不必写回
-        val remaining = out.toString().trim()
-
-        val result = if (remaining.isEmpty()) {
-            android.util.Log.d("AppOpt", "deleteSession: 删空了,删除整个文件")
-            deleteHistory(pkg)         // 删空了, 整文件移除
-        } else {
-            android.util.Log.d("AppOpt", "deleteSession: 写回文件,剩余内容行数=${remaining.lines().size}")
-            val writeOk = writeFileAsRoot("$HISTORY_DIR/$safe.log", remaining + "\n")
-            android.util.Log.d("AppOpt", "deleteSession: 写入结果=$writeOk")
-
-            // 验证写入: 读回文件检查
-            val verify = readHistory(pkg)
-            val verifyLines = verify.lines().filter { it.trim().startsWith("#") }
-            android.util.Log.d("AppOpt", "deleteSession: 验证读回,段头数=${verifyLines.size}")
-            verifyLines.forEach { android.util.Log.d("AppOpt", "deleteSession: 验证段头: $it") }
-
-            writeOk
-        }
-        android.util.Log.d("AppOpt", "deleteSession: 最终返回=$result")
-        return result
-    }
-
-    /** 一条历史记录的概要: 包名 + 最近一次生成时间(epoch 秒, 取文件 mtime) */
+    /** history 目录下的一份历史记录文件概要。 */
     data class HistoryEntry(val pkg: String, val mtime: Long)
 
     /**
-     * 枚举 history/ 目录下所有 *.log, 返回 (包名, 最近修改时间) 列表, 按时间倒序。
-     * 不依赖配置中的 auto —— 即使配置已被生成的规则替换, 历史依旧可见。
-     * 用 `ls` 一次性拿到时间戳与文件名, 避免多次 su 调用。
+     * 枚举 history 目录下的 .log 文件。
+     * 只通过一次 su 调用获取文件名和 mtime，避免历史列表打开时频繁创建 root 进程。
      */
     fun listHistoryEntries(): List<HistoryEntry> {
-        // %Y=mtime(epoch), %n=文件名; 仅取 .log
         val out = runAsRoot(
             "for f in $HISTORY_DIR/*.log; do [ -e \"\$f\" ] && stat -c '%Y %n' \"\$f\"; done 2>/dev/null"
         )
@@ -458,33 +707,65 @@ object DaemonBridge {
 
     private fun String.isNotErrored(): Boolean = !this.contains(ERR_MARK)
 
+    private fun versionNameToCode(version: String): Int? {
+        val nums = version.trim()
+            .removePrefix("v")
+            .split('.')
+            .mapNotNull { it.toIntOrNull() }
+        if (nums.isEmpty()) return null
+        val major = nums.getOrElse(0) { 0 }
+        val minor = nums.getOrElse(1) { 0 }
+        val patch = nums.getOrElse(2) { 0 }
+        return major * 100 + minor * 10 + patch
+    }
+
     private fun cleanCommandArg(value: String, allowColon: Boolean): String {
         val allowed = if (allowColon) Regex("[^A-Za-z0-9._:-]") else Regex("[^A-Za-z0-9._-]")
         return value.trim().replace("'", "").replace(allowed, "")
     }
 
     /**
-     * 以 root 把内容写到指定路径。内容经 base64 传递再由 `base64 -d` 还原,
-     * 彻底规避 shell 转义/注入(内容里的引号、$、换行都不会被解释)。
-     * 路径由调用方用固定常量拼出(仅含包名 safe 化), 不含用户可控的危险字符。
-     *
-     * 对于大内容(>100KB),使用 heredoc 避免命令行参数长度限制。
+     * 以 root 写入文件。
+     * 内容先 base64，再通过 heredoc 在设备端还原，避免 shell 转义和长文本换行问题。
      */
     private fun writeFileAsRoot(path: String, content: String): Boolean {
         val b64 = android.util.Base64.encodeToString(
             content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
         )
-        // 使用 heredoc 避免参数长度限制
-        val cmd = "base64 -d > '$path' << 'EOF_BASE64'\n$b64\nEOF_BASE64"
+        val parent = path.substringBeforeLast("/", "")
+        val mkdir = if (parent.isNotBlank()) "mkdir -p '$parent'; " else ""
+        val cmd = "${mkdir}base64 -d > '$path' << 'EOF_BASE64'\n$b64\nEOF_BASE64"
         return runAsRoot(cmd).isNotErrored()
     }
 
-    /**
-     * 通过 su 执行一条 shell 命令, 返回 stdout。出错时返回值包含 ERR_MARK。
-     * 每条命令起一个短命的 su 进程, 简单可靠, 频率为秒级不构成性能问题。
-     */
+    /** 带简易锁写入 calib_policy.conf，避免 App 与守护进程同时改策略文件。 */
+    private fun writePolicyFileAsRoot(content: String): Boolean {
+        val b64 = android.util.Base64.encodeToString(
+            content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
+        )
+        val cmd = """
+            lock='$POLICY_LOCK_DIR'
+            target='$POLICY_FILE'
+            tmp='$POLICY_FILE.tmp'
+            mkdir -p '$CONFIG_DIR'
+            waited=0
+            while ! mkdir "${'$'}lock" 2>/dev/null; do
+                waited=${'$'}((waited + 1))
+                [ "${'$'}waited" -ge 5 ] && exit 1
+                sleep 1
+            done
+            trap 'rm -f "${'$'}tmp"; rmdir "${'$'}lock" 2>/dev/null' EXIT
+            base64 -d > "${'$'}tmp" << 'EOF_BASE64'
+            $b64
+            EOF_BASE64
+            mv "${'$'}tmp" "${'$'}target"
+        """.trimIndent()
+        return runAsRoot(cmd).isNotErrored()
+    }
+
     private val DEV_NULL = java.io.File("/dev/null")
 
+    /** 等待 root 子进程结束，并读取 stdout；超时或非零退出会附加错误标记。 */
     private fun waitAndRead(process: Process): String {
         val outRef = AtomicReference("")
         val reader = Thread {
@@ -506,6 +787,10 @@ object DaemonBridge {
         return if (process.exitValue() != 0) "$out$ERR_MARK" else out
     }
 
+    /**
+     * 通过 su -c 执行命令。
+     * stderr 重定向到 /dev/null，避免无人读取的错误管道写满后卡住 root 子进程。
+     */
     private fun runAsRoot(cmd: String): String {
         return try {
             // 把 stderr 重定向到 /dev/null: 没有无人读的 stderr 管道, 既避免
@@ -526,10 +811,11 @@ object DaemonBridge {
         }
     }
 
+    /** 兼容不支持 su -c 的实现，退回到 stdin 写入命令。 */
     private fun runViaStdin(cmd: String): String {
         return try {
             val process = ProcessBuilder("su")
-                .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))   // 同理: 弃 stderr 防死锁
+                .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
                 .start()
             try {
                 DataOutputStream(process.outputStream).use { os ->

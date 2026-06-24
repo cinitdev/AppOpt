@@ -328,7 +328,7 @@ class FloatingBallService : Service() {
     }
 
     private fun toast(msg: String) {
-        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        AppToast.show(this, msg)
     }
 
     /**

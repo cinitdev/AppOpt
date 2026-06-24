@@ -13,14 +13,18 @@ AppOpt 是一个面向 Root Android 设备的 CPU 线程绑核优化模块，并
 - FPS 监测：优先使用 eBPF uprobe 捕获 `libgui.so` queueBuffer 帧事件。
 - eBPF 不可用时自动降级到 SurfaceFlinger fallback。
 - 历史记录：按 `pkg + epoch` 去重保存线程负载、FPS 会话和折线数据，按记录生成时间倒序显示。
-- 配套 Android App：悬浮窗、环境自检、规则管理、历史记录查看。
+- 配套 Android App：悬浮窗、环境自检、规则管理、历史/日志查看和自动校准策略设置。
 - 守护进程看门狗：Native daemon 异常退出后自动拉起。
 
 ## 工作原理
 
 Native 守护进程读取配置文件后，持续扫描目标进程和线程，并按规则设置 CPU affinity
 与 cpuset。`auto` 校准会采样线程 CPU 使用率，将相似线程名归组，按 `avg/max/score`
-排序，只给 Top 重载线程生成规则，再追加包名兜底规则，避免生成过多静态规则。
+和 `calib_policy.conf` 策略排序，只给 Top 重载线程生成规则，再追加包名兜底规则，
+避免生成过多静态规则。App 设置页可像 Scene 一样勾选每一档要使用的 CPU 核心，
+保存后写入 `7`、`5-6`、`0-6` 这类连续核心范围。默认通配组按组内最高单线程判断，
+避免多个低负载线程累加误升档。CPU 档位按最大频率簇识别，不把同频核心按编号硬拆，
+以兼容 2 簇、3 簇、4 簇等不同处理器布局。
 
 FPS 监测优先通过 Rust/aya 加载 eBPF 程序，并 attach 到 `libgui.so` 的 queueBuffer
 候选符号。设备内核、ROM 策略、符号或目标 ABI 不满足条件时，会自动降级到
@@ -259,7 +263,7 @@ cd /c/Users/你的用户名/AndroidStudioProjects/AppOpt
 ```text
 build/module/                         模块工作目录
 build/module/bin/<abi>/AppOpt          各 ABI native 二进制
-build/module/queuebuffer_probe.bpf.o   eBPF 对象
+build/module/config/ebpf/queuebuffer_probe.bpf.o   eBPF 对象
 build/AppOpt-增强版.zip                可刷入模块包
 ```
 

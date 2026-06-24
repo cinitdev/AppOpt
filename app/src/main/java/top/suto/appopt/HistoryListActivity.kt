@@ -236,7 +236,7 @@ class HistoryListActivity : AppCompatActivity() {
     }
 
     private fun toast(msg: String) {
-        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        AppToast.show(this, msg)
     }
 
     private fun openDetail(pkg: String, label: String) {

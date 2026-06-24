@@ -28,6 +28,7 @@ import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.tabs.TabLayout
 import kotlin.concurrent.thread
 import top.suto.appopt.databinding.ActivityMainBinding
@@ -48,6 +49,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var hasRoot = false
     private var daemonRunning = false
+    private var moduleVersion: DaemonBridge.ModuleVersion? = null
+    private var moduleCompatible = false
+    private var pendingModuleUpdate = false
+    private var moduleWarningShown = false
     private var appTab = AppTab.PENDING
     private var appSearchQuery = ""
     private var appLists = AppLists()
@@ -106,12 +111,8 @@ class MainActivity : AppCompatActivity() {
 
         binding.statusSection.btnOverlay.setOnClickListener { requestOverlay() }
         binding.statusSection.btnUsage.setOnClickListener { requestUsageAccess() }
-        binding.statusSection.btnHelp.setOnClickListener { showHelp() }
-        binding.btnHistoryTop.setOnClickListener {
-            startActivity(Intent(this, HistoryListActivity::class.java))
-        }
-        binding.btnLogTop.setOnClickListener {
-            startActivity(Intent(this, LogActivity::class.java))
+        binding.statusSection.btnSettings.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
         }
         binding.appRefresh.setOnRefreshListener {
             refreshAppList()
@@ -126,13 +127,20 @@ class MainActivity : AppCompatActivity() {
         // root 检测 + 读配置 + 批量导入旧 .log 放后台线程, 避免 su 弹窗阻塞 UI
         thread {
             val r = DaemonBridge.hasRoot()
-            val running = if (r) DaemonBridge.isDaemonRunning() else false
-            val config = if (r) ConfigReader.readPackages() else ConfigReader.ConfigPackages(emptyList(), emptyList())
-            val resolvedNames = resolveProcessComponentNames(config, r)
-            val visibleLists = buildConfiguredLists(config, resolvedNames)
+            val pendingUpdate = if (r) DaemonBridge.hasPendingModuleUpdate() else false
+            val version = if (r && !pendingUpdate) DaemonBridge.readModuleVersion() else null
+            val compatible = isCompatibleModule(version)
+            val running = if (r && compatible && !pendingUpdate) DaemonBridge.isDaemonRunning() else false
+            val enabled = r && compatible && running
+            val config = if (enabled) ConfigReader.readPackages() else ConfigReader.ConfigPackages(emptyList(), emptyList())
+            val resolvedNames = resolveProcessComponentNames(config, enabled)
+            val visibleLists = if (enabled) buildConfiguredLists(config, resolvedNames) else AppLists()
 
             runOnUiThreadIfAlive {
                 hasRoot = r
+                pendingModuleUpdate = pendingUpdate
+                moduleVersion = version
+                moduleCompatible = compatible
                 daemonRunning = running
                 environmentLoading = false
                 appListsLoading = false
@@ -140,16 +148,17 @@ class MainActivity : AppCompatActivity() {
                 appLists = visibleLists
                 refresh()
                 buildAppList()
+                showModuleWarningIfNeeded()
             }
 
-            val fullLists = buildAppLists(config, resolvedNames)
+            val fullLists = if (enabled) buildAppLists(config, resolvedNames) else AppLists()
             runOnUiThreadIfAlive {
                 addableAppsLoading = false
                 appLists = fullLists
                 buildAppList()
             }
 
-            migrateLogsLater(r, config)
+            migrateLogsLater(enabled, config)
         }
     }
 
@@ -165,13 +174,22 @@ class MainActivity : AppCompatActivity() {
     private fun refreshForegroundState(refreshConfig: Boolean) {
         val previousAddable = appLists.addable
         thread {
-            val running = DaemonBridge.isDaemonRunning()
-            val config = if (refreshConfig) ConfigReader.readPackages() else null
-            val resolvedNames = config?.let { resolveProcessComponentNames(it, true) } ?: processNames
-            val visibleLists = config?.let {
-                buildConfiguredLists(it, resolvedNames).copy(addable = previousAddable)
+            val pendingUpdate = DaemonBridge.hasPendingModuleUpdate()
+            val version = if (!pendingUpdate) DaemonBridge.readModuleVersion() else null
+            val compatible = isCompatibleModule(version)
+            val running = if (compatible && !pendingUpdate) DaemonBridge.isDaemonRunning() else false
+            val enabled = compatible && running
+            val config = if (enabled && refreshConfig) ConfigReader.readPackages() else null
+            val resolvedNames = config?.let { resolveProcessComponentNames(it, enabled) } ?: processNames
+            val visibleLists = when {
+                !enabled -> AppLists()
+                config != null -> buildConfiguredLists(config, resolvedNames).copy(addable = previousAddable)
+                else -> null
             }
             runOnUiThreadIfAlive {
+                pendingModuleUpdate = pendingUpdate
+                moduleVersion = version
+                moduleCompatible = compatible
                 daemonRunning = running
                 if (visibleLists != null) {
                     appListsLoading = false
@@ -180,6 +198,8 @@ class MainActivity : AppCompatActivity() {
                     buildAppList()
                 }
                 refresh()
+                if (!enabled) buildAppList()
+                showModuleWarningIfNeeded()
             }
         }
     }
@@ -202,9 +222,41 @@ class MainActivity : AppCompatActivity() {
 
     private fun hasOverlay(): Boolean = Settings.canDrawOverlays(this)
 
+    private fun isCompatibleModule(version: DaemonBridge.ModuleVersion?): Boolean {
+        return version?.versionCode?.let { it >= DaemonBridge.REQUIRED_MODULE_VERSION_CODE } == true
+    }
+
+    private fun canUseModuleFeatures(): Boolean {
+        return hasRoot && !pendingModuleUpdate && moduleCompatible && daemonRunning
+    }
+
+    private fun moduleVersionLabel(): String {
+        val version = moduleVersion ?: return "未检测到"
+        return "${version.versionName} (${version.versionCode})"
+    }
+
+    private fun showModuleWarningIfNeeded() {
+        if (moduleWarningShown || environmentLoading || !hasRoot || pendingModuleUpdate || moduleCompatible) return
+        moduleWarningShown = true
+        MaterialAlertDialogBuilder(this)
+            .setTitle("模块版本不兼容")
+            .setMessage(
+                "当前模块版本：${moduleVersionLabel()}\n\n" +
+                    "请刷入 v${DaemonBridge.REQUIRED_MODULE_VERSION_NAME} " +
+                    "(${DaemonBridge.REQUIRED_MODULE_VERSION_CODE}) 或更高版本模块后重启。"
+            )
+            .setPositiveButton("知道了", null)
+            .show()
+    }
+
     private fun refresh() {
         val overlay = hasOverlay()
         val s = binding.statusSection
+        s.btnSettings.visibility = if (!environmentLoading && hasRoot && (pendingModuleUpdate || !moduleCompatible)) {
+            View.GONE
+        } else {
+            View.VISIBLE
+        }
         s.btnOverlay.visibility = if (overlay) View.GONE else View.VISIBLE
         s.overlayState.text = if (overlay) "已授予" else "未授予"
         setDot(s.dotOverlay, if (overlay) R.color.status_ok else R.color.status_warn)
@@ -230,6 +282,14 @@ class MainActivity : AppCompatActivity() {
             !hasRoot -> {
                 s.daemonState.text = "未知"
                 setDot(s.dotDaemon, R.color.status_off)
+            }
+            pendingModuleUpdate -> {
+                s.daemonState.text = "待重启"
+                setDot(s.dotDaemon, R.color.status_warn)
+            }
+            !moduleCompatible -> {
+                s.daemonState.text = "模块需更新"
+                setDot(s.dotDaemon, R.color.status_warn)
             }
             daemonRunning -> {
                 s.daemonState.text = "运行中"
@@ -323,6 +383,14 @@ class MainActivity : AppCompatActivity() {
 
     /** 下拉刷新: 重新读取配置文件并更新应用列表 */
     private fun refreshAppList() {
+        if (!canUseModuleFeatures()) {
+            appListsLoading = false
+            addableAppsLoading = false
+            appLists = AppLists()
+            buildAppList()
+            binding.appRefresh.isRefreshing = false
+            return
+        }
         val previousAddable = appLists.addable
         addableAppsLoading = true
         if (appTab == AppTab.ADD && previousAddable.isEmpty()) {
@@ -344,6 +412,12 @@ class MainActivity : AppCompatActivity() {
                 addableAppsLoading = false
                 appLists = fullLists
                 buildAppList()
+                if (appTab == AppTab.ADD) {
+                    binding.appSection.appRecycler.stopScroll()
+                    binding.appSection.appRecycler.post {
+                        binding.appSection.appRecycler.scrollToPosition(0)
+                    }
+                }
                 binding.appRefresh.isRefreshing = false
             }
         }
@@ -351,8 +425,25 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildAppList() {
         val a = binding.appSection
+        val blocked = blockedState()
+        if (blocked != null) {
+            a.appTitle.text = "应用功能不可用"
+            a.appCount.text = ""
+            a.appTabs.visibility = View.GONE
+            a.appSearchBox.visibility = View.GONE
+            a.configuredFilterRow.visibility = View.GONE
+            a.appRecycler.visibility = View.GONE
+            a.emptyState.visibility = View.VISIBLE
+            a.emptyIcon.setImageResource(blocked.iconRes)
+            a.emptyTitle.text = blocked.title
+            a.emptyDesc.text = blocked.desc
+            appAdapter.submit(appTab, emptyList())
+            return
+        }
+
         val entries = entriesForCurrentTab()
         a.appTitle.text = appTab.title
+        a.appTabs.visibility = View.VISIBLE
         a.appSearchBox.visibility = if (appTab == AppTab.ADD) View.VISIBLE else View.GONE
         a.configuredFilterRow.visibility = if (appTab == AppTab.CONFIGURED) View.VISIBLE else View.GONE
         a.appCount.text = if (entries.isEmpty()) "" else "${entries.size} 个"
@@ -383,14 +474,15 @@ class MainActivity : AppCompatActivity() {
             ComponentKind.MISSING_APP -> "${entry.pkg} · 未安装/配置残留"
         }
         bindEntryIcon(item.itemIcon, entry)
-        item.btnStart.isEnabled = entry.installed
-        item.btnStart.alpha = if (entry.installed) 1f else 0.42f
+        val usable = canUseModuleFeatures()
+        item.btnStart.isEnabled = entry.installed && usable
+        item.btnStart.alpha = if (entry.installed && usable) 1f else 0.42f
         item.btnStart.contentDescription = if (entry.installed) "启动校准" else "未安装，无法启动"
         item.btnStart.setOnClickListener {
             if (entry.installed) startAppWithBall(entry.pkg)
         }
-        item.btnDelete.isEnabled = hasRoot
-        item.btnDelete.alpha = if (hasRoot) 1f else 0.42f
+        item.btnDelete.isEnabled = usable
+        item.btnDelete.alpha = if (usable) 1f else 0.42f
         item.btnDelete.setOnClickListener { confirmDeleteConfig(entry.pkg) }
     }
 
@@ -398,7 +490,7 @@ class MainActivity : AppCompatActivity() {
         item.addName.text = entry.label
         item.addPkg.text = entry.pkg
         bindEntryIcon(item.addIcon, entry)
-        item.btnAdd.isEnabled = hasRoot
+        item.btnAdd.isEnabled = canUseModuleFeatures()
         item.btnAdd.setOnClickListener { addAutoConfig(entry) }
     }
 
@@ -414,8 +506,9 @@ class MainActivity : AppCompatActivity() {
             ComponentKind.MISSING_APP -> "未安装/配置残留"
         }
         bindEntryIcon(item.configIcon, entry)
-        item.btnView.isEnabled = hasRoot
-        item.btnRemove.isEnabled = hasRoot
+        val usable = canUseModuleFeatures()
+        item.btnView.isEnabled = usable
+        item.btnRemove.isEnabled = usable
         item.btnView.setOnClickListener { showConfiguredRules(entry) }
         item.btnRemove.setOnClickListener { confirmDeleteConfig(entry) }
     }
@@ -734,6 +827,39 @@ class MainActivity : AppCompatActivity() {
         val desc: String
     )
 
+    private fun blockedState(): EmptyState? {
+        if (environmentLoading) {
+            return EmptyState(
+                R.drawable.ic_empty_pending,
+                "正在检测运行环境",
+                "正在确认 Root、模块版本和守护进程状态"
+            )
+        }
+        return when {
+            !hasRoot -> EmptyState(
+                R.drawable.ic_error,
+                "Root 权限不可用",
+                "应用列表、校准和配置修改需要 Root 权限"
+            )
+            pendingModuleUpdate -> EmptyState(
+                R.drawable.ic_warning,
+                "模块更新待重启",
+                "已检测到待生效模块更新\n请重启设备后再使用应用列表和自动校准"
+            )
+            !moduleCompatible -> EmptyState(
+                R.drawable.ic_warning,
+                "模块版本不兼容",
+                "当前模块版本：${moduleVersionLabel()}\n请刷入 v${DaemonBridge.REQUIRED_MODULE_VERSION_NAME} (${DaemonBridge.REQUIRED_MODULE_VERSION_CODE}) 或更高版本模块后重启"
+            )
+            !daemonRunning -> EmptyState(
+                R.drawable.ic_warning,
+                "守护进程未运行",
+                "请确认模块已启用并重启设备\n仍异常可在「设置」中查看守护进程日志"
+            )
+            else -> null
+        }
+    }
+
     private fun emptyStateForCurrentTab(): EmptyState = when (appTab) {
         AppTab.PENDING -> if (appListsLoading) {
             EmptyState(
@@ -943,39 +1069,63 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showHelp() {
-        val view = layoutInflater.inflate(R.layout.section_help, binding.root, false)
-        val dialog = BottomSheetDialog(this)
-        dialog.setContentView(view)
-        dialog.show()
-    }
-
     /** 启动目标应用并显示悬浮球, 把目标包名传给服务用于校准 */
     private fun startAppWithBall(pkg: String) {
+        if (!canUseModuleFeatures()) {
+            toast(blockedState()?.title ?: "模块不可用")
+            buildAppList()
+            return
+        }
         if (!hasOverlay()) {
             toast("请先授予悬浮窗权限")
             refresh()
             return
         }
-        // 先拉起悬浮球服务 (带目标包名)
-        val svc = Intent(this, FloatingBallService::class.java)
-            .putExtra(FloatingBallService.EXTRA_TARGET_PKG, pkg)
-        startForegroundService(svc)
+        if (!ForegroundDetector.hasUsageAccess(this)) {
+            toast("请先授予使用情况访问权限")
+            refresh()
+            return
+        }
 
-        // 再拉起目标应用
         val launchPkg = packageLookupName(pkg)
         val launch = packageManager.getLaunchIntentForPackage(launchPkg)
         if (launch != null) {
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(launch)
+            try {
+                ForegroundDetector.reset()
+                startActivity(launch)
+                waitForLaunchThenShowBall(pkg, launchPkg)
+            } catch (_: Exception) {
+                toast("启动 $launchPkg 失败")
+            }
         } else {
             toast("未找到 $launchPkg 的启动入口, 请手动进入应用")
-            moveTaskToBack(true)
         }
+    }
+
+    private fun waitForLaunchThenShowBall(pkg: String, launchPkg: String, attempt: Int = 0) {
+        mainHandler.postDelayed({
+            if (activityDestroyed || isFinishing || isDestroyed) return@postDelayed
+            val foreground = ForegroundDetector.isAppForeground(this, launchPkg, initialLookbackMs = 8_000L)
+            if (foreground) {
+                val svc = Intent(this, FloatingBallService::class.java)
+                    .putExtra(FloatingBallService.EXTRA_TARGET_PKG, pkg)
+                startForegroundService(svc)
+            } else if (attempt < 15) {
+                waitForLaunchThenShowBall(pkg, launchPkg, attempt + 1)
+            } else {
+                toast("未检测到目标应用启动，已取消显示悬浮球")
+            }
+        }, 500L)
     }
 
     /** 把未配置应用写入 applist.conf, 形式为 "包名=auto" */
     private fun addAutoConfig(entry: AppEntry) {
+        if (!canUseModuleFeatures()) {
+            toast(blockedState()?.title ?: "模块不可用")
+            buildAppList()
+            return
+        }
         if (!hasRoot) {
             toast("请先授予 Root 权限")
             return
@@ -1033,6 +1183,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun confirmDeleteConfig(displayPkg: String, configPkgs: List<String>) {
+        if (!canUseModuleFeatures()) {
+            toast(blockedState()?.title ?: "模块不可用")
+            buildAppList()
+            return
+        }
         if (!hasRoot) {
             toast("请先授予 Root 权限")
             return
@@ -1069,9 +1224,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun deleteConfig(pkgs: List<String>) {
+        if (!canUseModuleFeatures()) {
+            toast(blockedState()?.title ?: "模块不可用")
+            buildAppList()
+            return
+        }
         val previousLists = appLists
         val targetSet = pkgs.toSet()
-        appLists = appLists.copy(
+        val optimisticLists = appLists.copy(
             pending = appLists.pending.filterNot { entry ->
                 entry.configPkgs.any { it in targetSet } || entry.pkg in targetSet
             },
@@ -1079,15 +1239,16 @@ class MainActivity : AppCompatActivity() {
                 entry.configPkgs.any { it in targetSet } || entry.pkg in targetSet
             }
         )
+        appLists = optimisticLists.copy(
+            addable = addDeletedBackToAddable(previousLists.addable, pkgs, optimisticLists)
+        )
         buildAppList()
 
         thread {
             val ok = DaemonBridge.deleteConfigPackages(pkgs)
             val config = if (ok) ConfigReader.readPackages() else null
             val resolvedNames = config?.let { resolveProcessComponentNames(it, hasRoot) } ?: processNames
-            val visibleLists = config?.let {
-                buildConfiguredLists(it, resolvedNames).copy(addable = previousLists.addable)
-            } ?: appLists
+            val visibleLists = config?.let { buildAppLists(it, resolvedNames) } ?: appLists
             runOnUiThreadIfAlive {
                 if (ok) {
                     processNames = resolvedNames
@@ -1103,6 +1264,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun addDeletedBackToAddable(
+        addable: List<AppEntry>,
+        deletedPkgs: List<String>,
+        currentLists: AppLists
+    ): List<AppEntry> {
+        val blocked = (currentLists.pending + currentLists.configured)
+            .flatMap { it.configPkgs + it.pkg }
+            .flatMap { listOf(it, configOwnerName(it), packageLookupName(it)) }
+            .toHashSet()
+        val merged = LinkedHashMap<String, AppEntry>()
+        for (entry in addable) merged[entry.pkg] = entry
+        for (pkg in deletedPkgs) {
+            val owner = configOwnerName(pkg)
+            val lookup = packageLookupName(owner)
+            if (owner in blocked || lookup in blocked || owner in merged) continue
+            if (isInstalled(owner)) {
+                merged[owner] = appEntry(owner)
+            }
+        }
+        return merged.values.toList().sortedByInstallTime()
+    }
+
     /** 查看已配置应用当前生效规则 */
     private fun showConfiguredRules(entry: AppEntry) {
         showConfiguredRules(entry.pkg, entry.configPkgs)
@@ -1113,6 +1296,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showConfiguredRules(displayPkg: String, configPkgs: List<String>) {
+        if (!canUseModuleFeatures()) {
+            toast(blockedState()?.title ?: "模块不可用")
+            buildAppList()
+            return
+        }
         if (!hasRoot) {
             toast("请先授予 Root 权限")
             return
@@ -1140,6 +1328,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toast(msg: String) {
-        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        AppToast.show(this, msg)
     }
 }

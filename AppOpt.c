@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -45,14 +46,19 @@
 #include "ebpf_fps.h"
 #include "fps_fallback.h"
 
-#define VERSION            "1.7.0"
+#define VERSION            "1.7.1"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
 #define MAX_CLUSTERS       8
 #define MODULE_DIR         "/data/adb/modules/AppOpt"
-#define CALIB_CMD_FILE     MODULE_DIR "/calibrate.cmd"
-#define CALIB_STATE_FILE   MODULE_DIR "/calibrate.state"
+#define CONFIG_DIR         MODULE_DIR "/config"
+#define LOG_DIR            MODULE_DIR "/logs"
+#define EBPF_DIR           CONFIG_DIR "/ebpf"
+#define CALIB_CMD_FILE     CONFIG_DIR "/calibrate.cmd"
+#define CALIB_STATE_FILE   CONFIG_DIR "/calibrate.state"
+#define CALIB_POLICY_FILE  CONFIG_DIR "/calib_policy.conf"
+#define CALIB_POLICY_LOCK  CONFIG_DIR "/calib_policy.conf.lock"
 #define HISTORY_DIR        MODULE_DIR "/history"
 
 /* ---- 真实帧率(FPS)监测 ----
@@ -62,10 +68,10 @@
  *   SF fallback: binder 直连读取 SurfaceFlinger 帧时间戳,必要时切 timestats
  * 守护优先把每秒算出的 FPS 推到 App 创建的 Android 本地 socket;
  * socket 不可用时再覆盖写 app 私有目录(下方), 由 App 侧 FileObserver 兜底读取。 */
-#define FPS_CMD_FILE       MODULE_DIR "/fps.cmd"
+#define FPS_CMD_FILE       CONFIG_DIR "/fps.cmd"
 #define FPS_OUT_DIR        "/data/data/top.suto.appopt/files"
 #define FPS_OUT_FILE       FPS_OUT_DIR "/fps"
-#define FPS_BPF_OBJ        MODULE_DIR "/queuebuffer_probe.bpf.o"  /* eBPF 字节码 */
+#define FPS_BPF_OBJ        EBPF_DIR "/queuebuffer_probe.bpf.o"  /* eBPF 字节码 */
 #define FPS_WINDOW_MS      1000           /* 出一个 FPS 的周期 */
 #define FPS_SOCKET_NAME_MAX 96
 #define FPS_SOCKET_TOKEN_MAX 64
@@ -114,18 +120,18 @@ typedef struct {
     char mems_str[32];
     bool cpuset_enabled;
     int base_cpuset_fd;
-    /* 自动识别的核心分级 */
+    /* 自动识别的性能档位。字段名保留 little/middle/big 是为了少改调用点;
+     * 对外日志与策略使用更中性的低性能/主性能/高性能/最高性能描述。 */
     CpuCluster clusters[MAX_CLUSTERS];
     int num_clusters;       /* 按 max_freq 升序排列后的簇数量 */
-    char little_str[64];    /* 小核范围字符串,如 "0-2" */
-    char middle_str[64];    /* 中核范围字符串,如 "3-6" (完整中核,向后兼容) */
-    char big_str[64];       /* 大核范围字符串,如 "7" */
+    char little_str[64];    /* 最低频性能簇,如 "0-2" */
+    char middle_str[64];    /* 主性能范围: 排除最高频簇后的主要性能核心,如 "3-6" */
+    char big_str[64];       /* 最高频性能簇/Prime 簇,如 "7" 或 "6-7" */
     char all_str[64];       /* 全部核心范围,如 "0-7" */
-    char nonbig_str[64];    /* 排除大核的范围(小核+中核),如 "0-6", 用作进程级兜底 */
-    /* 动态细分的中核档位(仅当中核>=4个时有效,否则与 middle_str 相同) */
-    char middle_high_str[64];  /* 中核高频段,如 "5-6" (给次重载线程) */
-    char middle_low_str[64];   /* 中核低频段,如 "3-4" (给中载线程) */
-    char base_str[64];         /* 兜底范围(小核+低中核),如 "0-4", 用于更严格的隔离 */
+    char nonbig_str[64];    /* 非最高频簇范围,如 "0-6", 用作进程级兜底 */
+    char middle_high_str[64];  /* 非最高频范围中的高性能部分,如 "5-6" */
+    char middle_low_str[64];   /* 非最高频范围中的低性能部分,如 "3-4" */
+    char base_str[64];         /* 更保守兜底范围,如 "0-4", 用于更严格的隔离 */
 } CpuTopology;
 
 typedef struct {
@@ -452,9 +458,9 @@ static bool create_cpuset_dir(const char *path, const char *cpus, const char *me
 
 /*
  * 通过 sysfs 读取每个在线 CPU 的 cpuinfo_max_freq, 按最大频率把相同频率的
- * 连续核心聚成簇, 再按频率升序排列。最低频簇视为小核, 最高频簇视为大核,
- * 中间所有簇合并视为中核。结果以 "a-b" / "a,b" 形式写入 topo 的字符串字段,
- * 供 com.xxx=auto 校准完成后生成规则使用。
+ * 连续核心聚成簇, 再按频率升序排列。最低频簇作为低性能档, 最高频簇作为
+ * 最高性能/Prime 档, 其余与低性能档共同组成非最高性能池。
+ * 这样可兼容 3 簇、4 簇、2 簇等 SoC, 不强行假设一定存在“小/中/大核”。
  */
 static void classify_topology(CpuTopology* topo) {
     topo->num_clusters = 0;
@@ -520,7 +526,7 @@ static void classify_topology(CpuTopology* topo) {
 
     int nc = topo->num_clusters;
     if (nc == 1) {
-        /* 单一簇: 大中小都用全部核心 */
+        /* 单一簇: 所有档位都只能用全部核心 */
         build_str(topo->little_str, sizeof(topo->little_str), topo->all_str, NULL);
         build_str(topo->middle_str, sizeof(topo->middle_str), topo->all_str, NULL);
         build_str(topo->big_str, sizeof(topo->big_str), topo->all_str, NULL);
@@ -530,13 +536,13 @@ static void classify_topology(CpuTopology* topo) {
         build_str(topo->middle_low_str, sizeof(topo->middle_low_str), topo->all_str, NULL);
         build_str(topo->base_str, sizeof(topo->base_str), topo->all_str, NULL);
     } else {
-        /* 最低频 = 小核, 最高频 = 大核 */
+        /* 最低频 = 低性能档, 最高频 = 最高性能/Prime 档 */
         char* lo = cpu_set_to_str(&topo->clusters[0].cpus);
         char* hi = cpu_set_to_str(&topo->clusters[nc - 1].cpus);
         if (lo) { build_str(topo->little_str, sizeof(topo->little_str), lo, NULL); free(lo); }
         if (hi) { build_str(topo->big_str, sizeof(topo->big_str), hi, NULL); free(hi); }
 
-        /* 中核 = 除首尾外所有簇的并集; 只有两簇时中核退化为小核范围 */
+        /* 主性能范围 = 除首尾外所有簇的并集; 只有两簇时退化为低性能/非最高性能范围 */
         cpu_set_t mid;
         CPU_ZERO(&mid);
         for (int k = 1; k < nc - 1; k++) CPU_OR(&mid, &mid, &topo->clusters[k].cpus);
@@ -547,38 +553,31 @@ static void classify_topology(CpuTopology* topo) {
             if (m) { build_str(topo->middle_str, sizeof(topo->middle_str), m, NULL); free(m); }
         }
 
-        /* 中核细分: 如果中核>=4个,按核心编号分为高低两档(高频一半 vs 低频一半)。
-         * 用于更精细的负载分配——次重载线程用高中核,中载线程用低中核。 */
-        int mid_count = CPU_COUNT(&mid);
-        if (mid_count >= 4) {
-            cpu_set_t mid_high, mid_low;
-            CPU_ZERO(&mid_high);
-            CPU_ZERO(&mid_low);
-            int half = mid_count / 2;
-            int cnt = 0;
-            for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-                if (CPU_ISSET(cpu, &mid)) {
-                    if (cnt < half) {
-                        CPU_SET(cpu, &mid_low);
-                    } else {
-                        CPU_SET(cpu, &mid_high);
-                    }
-                    cnt++;
+        /* 主性能范围只按频率簇细分, 同频簇不能按 CPU 编号硬切。 */
+        cpu_set_t mid_high, mid_low;
+        CPU_ZERO(&mid_high);
+        CPU_ZERO(&mid_low);
+        if (nc >= 3) {
+            CPU_OR(&mid_high, &mid_high, &topo->clusters[nc - 2].cpus);
+            if (nc >= 4) {
+                for (int k = 1; k < nc - 2; k++) {
+                    CPU_OR(&mid_low, &mid_low, &topo->clusters[k].cpus);
                 }
+            } else {
+                CPU_OR(&mid_low, &mid_low, &mid_high);
             }
-            char* mh = cpu_set_to_str(&mid_high);
-            char* ml = cpu_set_to_str(&mid_low);
-            if (mh) { build_str(topo->middle_high_str, sizeof(topo->middle_high_str), mh, NULL); free(mh); }
-            if (ml) { build_str(topo->middle_low_str, sizeof(topo->middle_low_str), ml, NULL); free(ml); }
         } else {
-            /* 中核<4个,不细分,高低档都用完整中核 */
-            build_str(topo->middle_high_str, sizeof(topo->middle_high_str), topo->middle_str, NULL);
-            build_str(topo->middle_low_str, sizeof(topo->middle_low_str), topo->middle_str, NULL);
+            CPU_OR(&mid_high, &mid_high, &topo->clusters[0].cpus);
+            CPU_OR(&mid_low, &mid_low, &topo->clusters[0].cpus);
         }
+        char* mh = cpu_set_to_str(&mid_high);
+        char* ml = cpu_set_to_str(&mid_low);
+        if (mh) { build_str(topo->middle_high_str, sizeof(topo->middle_high_str), mh, NULL); free(mh); }
+        if (ml) { build_str(topo->middle_low_str, sizeof(topo->middle_low_str), ml, NULL); free(ml); }
 
-        /* 兜底范围 = 全部核心 - 最高频(大核)簇, 即小核+中核。
-         * 这样进程整体与未点名的杂线程都不占用超大核, 把大核留给被显式绑定的重载线程,
-         * 避免杂线程争抢/迁移污染大核, 提升关键重载线程的稳定性(对齐原模块 "=0-6" 的策略)。 */
+        /* 兜底范围 = 全部核心 - 最高频/Prime 簇。
+         * 这样进程整体与未点名的杂线程都不占用最高性能核心, 把最高性能核心留给
+         * 被显式绑定的重载线程, 避免杂线程争抢/迁移污染最高性能核心。 */
         cpu_set_t nonbig;
         CPU_ZERO(&nonbig);
         for (int k = 0; k < nc - 1; k++) CPU_OR(&nonbig, &nonbig, &topo->clusters[k].cpus);
@@ -589,32 +588,27 @@ static void classify_topology(CpuTopology* topo) {
             if (nb) { build_str(topo->nonbig_str, sizeof(topo->nonbig_str), nb, NULL); free(nb); }
         }
 
-        /* base 兜底(小核+低中核): 用于最轻量线程,进一步排除高中核和大核的干扰。
-         * 如果中核未细分,则 base == nonbig。 */
+        /* base 兜底(低性能+主性能低段): 用于最轻量线程,进一步排除主性能高段和最高性能核心。
+         * 如果主性能范围未细分,则 base == nonbig。 */
         cpu_set_t base;
         CPU_ZERO(&base);
-        CPU_OR(&base, &base, &topo->clusters[0].cpus);  /* 小核 */
-        if (mid_count >= 4) {
-            /* 加低中核 */
-            for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-                if (CPU_ISSET(cpu, &mid)) {
-                    int cnt = 0;
-                    for (int c = 0; c < CPU_SETSIZE; c++) {
-                        if (CPU_ISSET(c, &mid) && c < cpu) cnt++;
-                    }
-                    if (cnt < mid_count / 2) CPU_SET(cpu, &base);
-                }
+        if (nc >= 4) {
+            for (int k = 0; k < nc - 2; k++) {
+                CPU_OR(&base, &base, &topo->clusters[k].cpus);
             }
         } else {
-            /* 中核未细分,base = 小核+完整中核 = nonbig */
-            CPU_OR(&base, &base, &mid);
+            for (int k = 0; k < nc - 1; k++) {
+                CPU_OR(&base, &base, &topo->clusters[k].cpus);
+            }
         }
+        if (CPU_COUNT(&base) == 0) CPU_OR(&base, &base, &topo->present_cpus);
         char* bs = cpu_set_to_str(&base);
         if (bs) { build_str(topo->base_str, sizeof(topo->base_str), bs, NULL); free(bs); }
     }
 
-    printf("CPU 拓扑识别: %d 个簇, 小核=[%s] 中核=[%s] 大核=[%s]\n",
-           nc, topo->little_str, topo->middle_str, topo->big_str);
+    printf("CPU 拓扑识别: %d 个性能簇:\n全部=[%s] 低性能=[%s] 主性能=[%s] 高性能=[%s] 最高性能=[%s] 非最高=[%s]\n",
+           nc, topo->all_str, topo->little_str, topo->middle_str,
+           topo->middle_high_str, topo->big_str, topo->nonbig_str);
 }
 
 static CpuTopology init_cpu_topo(void) {
@@ -1476,22 +1470,81 @@ static bool calib_sample_once(CalibData* data) {
     return any;
 }
 
-/* 求线程名的"通配基名": 找到第一个数字, 截断(连同数字前的尾部空格)并加 '*'。
- * 例如 "Job.worker 0" -> "Job.worker*", "Thread-12" -> "Thread-*",
- * "GameLoop" 无数字 -> 原样返回(不加通配)。out 至少 MAX_THREAD_LEN 字节。 */
-static void calib_wildcard_base(const char* name, char* out, size_t out_sz) {
-    size_t i = 0;
-    for (; name[i] && i < out_sz - 2; i++) {
-        if (isdigit((unsigned char)name[i])) break;
-        out[i] = name[i];
+static bool calib_rule_name_syntax_ok(const char* name) {
+    if (!name || !name[0] || strcmp(name, "*") == 0) return false;
+    for (size_t i = 0; name[i]; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '{' || c == '}' || c == '=' || c == '/' || c == '\\' ||
+            c == '*' || c == '\n' || c == '\r') {
+            return false;
+        }
     }
-    if (name[i] && isdigit((unsigned char)name[i])) {
-        /* 去掉数字前的尾部空格, 让通配符紧贴前缀: "Job.worker *" -> "Job.worker*" */
-        while (i > 0 && out[i - 1] == ' ') i--;
-        out[i] = '*';
-        out[i + 1] = '\0';
-    } else {
-        out[i] = '\0';
+    return true;
+}
+
+static bool calib_wildcard_name_syntax_ok(const char* name) {
+    if (!name || !name[0] || strcmp(name, "*") == 0) return false;
+    bool has_wildcard = false;
+    for (size_t i = 0; name[i]; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '{' || c == '}' || c == '=' || c == '/' || c == '\\' ||
+            c == '\n' || c == '\r') {
+            return false;
+        }
+        if (c == '*') has_wildcard = true;
+    }
+    return has_wildcard;
+}
+
+static bool calib_wildcard_candidate(const char* name, char* out, size_t out_sz) {
+    if (!name || !out || out_sz == 0 || !calib_rule_name_syntax_ok(name)) return false;
+    out[0] = '\0';
+
+    size_t digit_pos = 0;
+    while (name[digit_pos] && !isdigit((unsigned char)name[digit_pos])) digit_pos++;
+    if (!name[digit_pos]) return false;
+
+    size_t prefix_len = digit_pos;
+    while (prefix_len > 0 && isspace((unsigned char)name[prefix_len - 1])) prefix_len--;
+
+    int alpha = 0;
+    for (size_t i = 0; i < prefix_len; i++) {
+        if (isalpha((unsigned char)name[i])) alpha++;
+    }
+    if (prefix_len < 4 || alpha < 2 || prefix_len + 2 > out_sz) return false;
+
+    memcpy(out, name, prefix_len);
+    out[prefix_len] = '*';
+    out[prefix_len + 1] = '\0';
+    return calib_wildcard_name_syntax_ok(out);
+}
+
+static int calib_wildcard_candidate_count(const CalibData* data, const char* candidate) {
+    if (!data || !candidate || !candidate[0]) return 0;
+    int count = 0;
+    for (size_t i = 0; i < data->count; i++) {
+        char other[MAX_THREAD_LEN];
+        if (calib_wildcard_candidate(data->threads[i].name, other, sizeof(other)) &&
+            strcmp(other, candidate) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void calib_rule_base_for_thread(const CalibData* data, size_t idx, char* out, size_t out_sz) {
+    if (!data || idx >= data->count || !out || out_sz == 0) return;
+    out[0] = '\0';
+
+    char candidate[MAX_THREAD_LEN];
+    if (calib_wildcard_candidate(data->threads[idx].name, candidate, sizeof(candidate)) &&
+        calib_wildcard_candidate_count(data, candidate) >= 2) {
+        build_str(out, out_sz, candidate, NULL);
+        return;
+    }
+
+    if (calib_rule_name_syntax_ok(data->threads[idx].name)) {
+        build_str(out, out_sz, data->threads[idx].name, NULL);
     }
 }
 
@@ -1525,20 +1578,506 @@ static double calib_load_score(double avg_pct, double max_pct) {
     return avg_pct * 0.65 + max_pct * 0.35;
 }
 
+typedef enum {
+    CALIB_WILDCARD_MAX_MEMBER = 0,
+    CALIB_WILDCARD_SUM = 1
+} CalibWildcardMode;
+
+typedef enum {
+    CALIB_CORE_BIG = 0,
+    CALIB_CORE_MIDDLE_HIGH = 1,
+    CALIB_CORE_MIDDLE = 2,
+    CALIB_CORE_NONBIG = 3
+} CalibCoreTier;
+
+typedef struct {
+    double best_avg;
+    double best_max;
+    CalibCoreTier best_tier;
+    char best_cores[64];
+    double high_avg;
+    double high_max;
+    CalibCoreTier high_tier;
+    char high_cores[64];
+    double mid_avg;
+    double mid_max;
+    CalibCoreTier mid_tier;
+    char mid_cores[64];
+    int max_thread_rules;
+    CalibWildcardMode wildcard_mode;
+    CalibCoreTier fallback_tier;
+    char fallback_cores[64];
+} CalibPolicy;
+
+static CalibPolicy calib_default_policy(void) {
+    CalibPolicy p;
+    p.best_avg = 18.0;
+    p.best_max = 30.0;
+    p.best_tier = CALIB_CORE_BIG;
+    p.best_cores[0] = '\0';
+    p.high_avg = 13.0;
+    p.high_max = 22.0;
+    p.high_tier = CALIB_CORE_MIDDLE_HIGH;
+    p.high_cores[0] = '\0';
+    p.mid_avg = 8.0;
+    p.mid_max = 18.0;
+    p.mid_tier = CALIB_CORE_MIDDLE;
+    p.mid_cores[0] = '\0';
+    p.max_thread_rules = 6;
+    p.wildcard_mode = CALIB_WILDCARD_MAX_MEMBER;
+    p.fallback_tier = CALIB_CORE_NONBIG;
+    p.fallback_cores[0] = '\0';
+    return p;
+}
+
+static double calib_clamp_pct(double v, double fallback) {
+    if (v < 0.0 || v > 100.0) return fallback;
+    return v;
+}
+
+static double calib_rule_number(const char* rule, const char* name, double fallback) {
+    if (!rule || !name) return fallback;
+    char key[32];
+    snprintf(key, sizeof(key), "%s:", name);
+    const char* p = strstr(rule, key);
+    if (!p) return fallback;
+    p += strlen(key);
+    char* end = NULL;
+    double v = strtod(p, &end);
+    if (end == p) return fallback;
+    return calib_clamp_pct(v, fallback);
+}
+
+static bool calib_rule_text(const char* rule, const char* name, char* out, size_t out_sz) {
+    if (!rule || !name || !out || out_sz == 0) return false;
+    char key[32];
+    snprintf(key, sizeof(key), "%s:", name);
+    const char* p = strstr(rule, key);
+    if (!p) return false;
+    p += strlen(key);
+    const char* end = NULL;
+    if (strcmp(name, "cores") == 0) {
+        const char* markers[] = { ",avg:", ",max:", ",cores:" };
+        for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+            const char* m = strstr(p, markers[i]);
+            if (m && (!end || m < end)) end = m;
+        }
+    } else {
+        end = strchr(p, ',');
+    }
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    while (len > 0 && isspace((unsigned char)p[len - 1])) len--;
+    while (len > 0 && isspace((unsigned char)*p)) { p++; len--; }
+    if (len == 0 || len >= out_sz) return false;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool calib_core_range_normalize(const char* s, char* out, size_t out_sz) {
+    if (!s || !*s || !out || out_sz == 0) return false;
+    if (strcmp(s, "auto") == 0) return false;
+
+    char buf[64];
+    build_str(buf, sizeof(buf), s, NULL);
+    unsigned char seen[CPU_SETSIZE] = {0};
+    int min_cpu = INT_MAX;
+    int max_cpu = -1;
+    int count = 0;
+
+    char* part = strtok(buf, ",");
+    while (part) {
+        if (!*part) return false;
+        char* dash = strchr(part, '-');
+        long start;
+        long end;
+        char* ep = NULL;
+        if (dash) {
+            if (strchr(dash + 1, '-')) return false;
+            *dash = '\0';
+            start = strtol(part, &ep, 10);
+            if (*ep != '\0') return false;
+            end = strtol(dash + 1, &ep, 10);
+            if (*ep != '\0') return false;
+        } else {
+            start = strtol(part, &ep, 10);
+            if (*ep != '\0') return false;
+            end = start;
+        }
+        if (start < 0 || end < start || end >= CPU_SETSIZE) return false;
+        for (long cpu = start; cpu <= end; cpu++) {
+            if (!seen[cpu]) {
+                seen[cpu] = 1;
+                count++;
+                if ((int)cpu < min_cpu) min_cpu = (int)cpu;
+                if ((int)cpu > max_cpu) max_cpu = (int)cpu;
+            }
+        }
+        part = strtok(NULL, ",");
+    }
+
+    if (count <= 0 || min_cpu == INT_MAX || max_cpu < min_cpu) return false;
+    if (count != max_cpu - min_cpu + 1) return false;
+    if (min_cpu == max_cpu) {
+        snprintf(out, out_sz, "%d", min_cpu);
+    } else {
+        snprintf(out, out_sz, "%d-%d", min_cpu, max_cpu);
+    }
+    return true;
+}
+
+static bool calib_core_range_usable(const CpuTopology* topo, const char* s) {
+    char normalized[64];
+    if (!s || !*s) return false;
+    if (!calib_core_range_normalize(s, normalized, sizeof(normalized))) return false;
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    parse_cpu_ranges(normalized, &set, NULL);
+    if (CPU_COUNT(&set) == 0) return false;
+
+    if (topo && CPU_COUNT(&topo->present_cpus) > 0) {
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+            if (CPU_ISSET(cpu, &set) && !CPU_ISSET(cpu, &topo->present_cpus)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void calib_set_core_range(char* dst, size_t dst_sz, const char* src) {
+    if (!dst || dst_sz == 0 || !src) return;
+    char tmp[64];
+    size_t j = 0;
+    for (const char* p = src; *p && j + 1 < sizeof(tmp); p++) {
+        if (!isspace((unsigned char)*p)) tmp[j++] = (char)tolower((unsigned char)*p);
+    }
+    tmp[j] = '\0';
+    char normalized[64];
+    if (!calib_core_range_normalize(tmp, normalized, sizeof(normalized))) return;
+    build_str(dst, dst_sz, normalized, NULL);
+}
+
+static const char* calib_auto_core_range(const CpuTopology* topo, CalibCoreTier tier) {
+    if (!topo) return "";
+    switch (tier) {
+        case CALIB_CORE_BIG:
+            return topo->big_str[0] ? topo->big_str :
+                   (topo->middle_high_str[0] ? topo->middle_high_str : topo->all_str);
+        case CALIB_CORE_MIDDLE_HIGH:
+            return topo->middle_high_str[0] ? topo->middle_high_str :
+                   (topo->middle_str[0] ? topo->middle_str : topo->all_str);
+        case CALIB_CORE_MIDDLE:
+            return topo->middle_str[0] ? topo->middle_str : topo->all_str;
+        case CALIB_CORE_NONBIG:
+            return topo->nonbig_str[0] ? topo->nonbig_str :
+                   (topo->all_str[0] ? topo->all_str : topo->base_str);
+        default:
+            return topo->all_str;
+    }
+}
+
+static const char* calib_policy_core_range(const CpuTopology* topo,
+                                           CalibCoreTier tier,
+                                           const char* override_cores) {
+    if (calib_core_range_usable(topo, override_cores)) {
+        return override_cores;
+    }
+    return calib_auto_core_range(topo, tier);
+}
+
+static const char* calib_core_tier_label(CalibCoreTier tier) {
+    switch (tier) {
+        case CALIB_CORE_BIG: return "最高性能核心";
+        case CALIB_CORE_MIDDLE_HIGH: return "高性能核心";
+        case CALIB_CORE_MIDDLE: return "主性能核心";
+        case CALIB_CORE_NONBIG: return "非最高性能核心";
+        default: return "全部核心";
+    }
+}
+
+static const char* calib_core_source_label(const CpuTopology* topo, const char* override_cores) {
+    if (override_cores && override_cores[0]) {
+        return calib_core_range_usable(topo, override_cores) ? "用户指定" : "用户指定无效, 已回退";
+    }
+    return "自动识别";
+}
+
+static void calib_log_policy_rule(const CpuTopology* topo,
+                                  const char* key,
+                                  const char* meaning,
+                                  double avg,
+                                  double max,
+                                  CalibCoreTier tier,
+                                  const char* cores,
+                                  bool require_both) {
+    const char* resolved = calib_policy_core_range(topo, tier, cores);
+    printf("[校准策略] %s: %s; 条件=AVG>=%.1f%% %s MAX>=%.1f%%; 档位=%s; 核心=%s (%s)\n",
+           key, meaning, avg, require_both ? "且" : "或", max, calib_core_tier_label(tier),
+           resolved && resolved[0] ? resolved : "-", calib_core_source_label(topo, cores));
+}
+
+static void calib_log_policy(const CalibPolicy* p, const CpuTopology* topo,
+                             const char* path, const struct stat* st) {
+    static bool logged_missing = false;
+    static bool logged_once = false;
+    static struct timespec last_mtime = { .tv_sec = -1, .tv_nsec = -1 };
+    static off_t last_size = -1;
+
+    if (!p || !topo || !path || !st) {
+        if (!logged_missing) {
+            printf("[校准策略] 未读取到 %s, 使用内置默认策略\n",
+                   path ? path : CALIB_POLICY_FILE);
+            logged_missing = true;
+        }
+        return;
+    }
+
+    if (logged_once && stat_mtime_equal(st, &last_mtime) && last_size == st->st_size) return;
+    logged_once = true;
+    logged_missing = false;
+    last_mtime = st->st_mtim;
+    last_size = st->st_size;
+
+    printf("[校准策略] 已读取配置文件: %s (size=%lld, mtime=%ld.%09ld)\n",
+           path, (long long)st->st_size,
+           (long)st->st_mtim.tv_sec, (long)st->st_mtim.tv_nsec);
+    printf("[校准策略] CPU 拓扑: %d 个性能簇, 低性能=%s, 主性能=%s, 高性能=%s, 最高性能=%s, 非最高=%s, 全部=%s\n",
+           topo->num_clusters,
+           topo->little_str[0] ? topo->little_str : "-",
+           topo->middle_str[0] ? topo->middle_str : "-",
+           topo->middle_high_str[0] ? topo->middle_high_str : "-",
+           topo->big_str[0] ? topo->big_str : "-",
+           topo->nonbig_str[0] ? topo->nonbig_str : "-",
+           topo->all_str[0] ? topo->all_str : "-");
+    calib_log_policy_rule(topo, "best_thread",
+                          "只挑负载最高且平均与峰值都达到阈值的 1 个线程生成第一条单独线程规则",
+                          p->best_avg, p->best_max, p->best_tier, p->best_cores, true);
+    calib_log_policy_rule(topo, "group_high",
+                          "较重线程或相似线程组平均与峰值都达到阈值后生成第二档线程规则",
+                          p->high_avg, p->high_max, p->high_tier, p->high_cores, true);
+    calib_log_policy_rule(topo, "group_mid",
+                          "中等负载线程或相似线程组平均与峰值都达到阈值后生成第三档线程规则",
+                          p->mid_avg, p->mid_max, p->mid_tier, p->mid_cores, true);
+    printf("[校准策略] wildcard_group: %s; %s\n",
+           p->wildcard_mode == CALIB_WILDCARD_SUM ? "sum" : "max_member",
+           p->wildcard_mode == CALIB_WILDCARD_SUM ?
+           "同名通配线程组会累加平均负载, 更激进" :
+           "通配线程组只按组内最高单线程平均负载判断, 避免低负载线程累加误升档");
+    printf("[校准策略] max_thread_rules: %d; 最多生成 %d 条线程级规则, 其余线程走包名兜底\n",
+           p->max_thread_rules, p->max_thread_rules);
+    printf("[校准策略] fallback: 没有单独线程规则的线程使用包名兜底; 档位=%s; 核心=%s (%s)\n",
+           calib_core_tier_label(p->fallback_tier),
+           calib_policy_core_range(topo, p->fallback_tier, p->fallback_cores),
+           calib_core_source_label(topo, p->fallback_cores));
+}
+
+#define CALIB_TOPO_BEGIN "# AppOpt detected CPU topology begin"
+#define CALIB_TOPO_END   "# AppOpt detected CPU topology end"
+
+static bool calib_policy_lock_acquire(void) {
+    const int timeout_ms = 5000;
+    const int step_us = 50000;
+    int waited_us = 0;
+    while (!shutdown_requested && waited_us <= timeout_ms * 1000) {
+        if (mkdir(CALIB_POLICY_LOCK, 0777) == 0) return true;
+        if (errno != EEXIST) {
+            printf("[校准策略] 获取配置锁失败: %s err=%s\n", CALIB_POLICY_LOCK, strerror(errno));
+            return false;
+        }
+
+        struct stat st;
+        time_t now = time(NULL);
+        if (stat(CALIB_POLICY_LOCK, &st) == 0 && now > st.st_mtime + 30) {
+            if (rmdir(CALIB_POLICY_LOCK) == 0) {
+                printf("[校准策略] 已清理过期配置锁: %s\n", CALIB_POLICY_LOCK);
+                continue;
+            }
+        }
+        usleep(step_us);
+        waited_us += step_us;
+    }
+    printf("[校准策略] 等待配置锁超时: %s\n", CALIB_POLICY_LOCK);
+    return false;
+}
+
+static void calib_policy_lock_release(void) {
+    if (rmdir(CALIB_POLICY_LOCK) != 0 && errno != ENOENT) {
+        printf("[校准策略] 释放配置锁失败: %s err=%s\n", CALIB_POLICY_LOCK, strerror(errno));
+    }
+}
+
+static void calib_sync_policy_topology(const CpuTopology* topo) {
+    if (!topo) return;
+    if (!calib_policy_lock_acquire()) return;
+
+    char content[32768];
+    FILE* f = fopen(CALIB_POLICY_FILE, "r");
+    if (!f) {
+        calib_policy_lock_release();
+        return;
+    }
+    size_t used = fread(content, 1, sizeof(content) - 1, f);
+    fclose(f);
+    content[used] = '\0';
+
+    char cleaned[32768];
+    size_t clen = 0;
+    bool in_block = false;
+    const char* p = content;
+    while (*p && clen + 2 < sizeof(cleaned)) {
+        const char* nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        bool skip = false;
+        if (strncmp(p, CALIB_TOPO_BEGIN, strlen(CALIB_TOPO_BEGIN)) == 0) {
+            in_block = true;
+            skip = true;
+        } else if (strncmp(p, CALIB_TOPO_END, strlen(CALIB_TOPO_END)) == 0) {
+            in_block = false;
+            skip = true;
+        } else if (in_block || strncmp(p, "detected_", 9) == 0 ||
+                   strncmp(p, "# CPU 拓扑识别:", strlen("# CPU 拓扑识别:")) == 0) {
+            skip = true;
+        }
+        if (!skip && clen + len + 1 < sizeof(cleaned)) {
+            memcpy(cleaned + clen, p, len);
+            clen += len;
+            cleaned[clen++] = '\n';
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    while (clen > 0 && (cleaned[clen - 1] == '\n' || cleaned[clen - 1] == '\r')) clen--;
+    cleaned[clen++] = '\n';
+    cleaned[clen] = '\0';
+
+    char block[1024];
+    snprintf(block, sizeof(block),
+             "\n%s\n"
+             "# CPU 拓扑识别: %d 个性能簇, 全部=[%s] 低性能=[%s] 主性能=[%s] 高性能=[%s] 最高性能=[%s] 非最高=[%s]\n"
+             "detected_clusters=%d\n"
+             "detected_low=%s\n"
+             "detected_main=%s\n"
+             "detected_high=%s\n"
+             "detected_non_top=%s\n"
+             "detected_top=%s\n"
+             "detected_all=%s\n"
+             "%s\n",
+             CALIB_TOPO_BEGIN,
+             topo->num_clusters, topo->all_str, topo->little_str, topo->middle_str,
+             topo->middle_high_str, topo->big_str, topo->nonbig_str,
+             topo->num_clusters,
+             topo->little_str, topo->middle_str, topo->middle_high_str,
+             topo->nonbig_str, topo->big_str, topo->all_str,
+             CALIB_TOPO_END);
+
+    char next[32768];
+    snprintf(next, sizeof(next), "%s%s", cleaned, block);
+    if (strcmp(content, next) == 0) {
+        calib_policy_lock_release();
+        return;
+    }
+
+    char tmp_path[PATH_MAX];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", CALIB_POLICY_FILE);
+    FILE* out = fopen(tmp_path, "w");
+    if (!out) {
+        calib_policy_lock_release();
+        return;
+    }
+    fputs(next, out);
+    if (fclose(out) != 0 || rename(tmp_path, CALIB_POLICY_FILE) != 0) {
+        printf("[校准策略] 写入拓扑信息失败: %s err=%s\n", CALIB_POLICY_FILE, strerror(errno));
+        unlink(tmp_path);
+    }
+    calib_policy_lock_release();
+}
+
+static CalibPolicy calib_load_policy(const CpuTopology* topo) {
+    CalibPolicy p = calib_default_policy();
+    calib_sync_policy_topology(topo);
+    struct stat policy_st;
+    bool have_policy_stat = (stat(CALIB_POLICY_FILE, &policy_st) == 0);
+    FILE* f = fopen(CALIB_POLICY_FILE, "r");
+    if (!f) {
+        calib_log_policy(&p, topo, CALIB_POLICY_FILE, NULL);
+        return p;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char* comment = strchr(line, '#');
+        if (comment) *comment = '\0';
+        char* t = strtrim(line);
+        if (!*t) continue;
+        char* eq = strchr(t, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char* key = strtrim(t);
+        char* val = strtrim(eq + 1);
+        if (strcmp(key, "best_thread") == 0) {
+            p.best_avg = calib_rule_number(val, "avg", p.best_avg);
+            p.best_max = calib_rule_number(val, "max", p.best_max);
+            char text[64];
+            if (calib_rule_text(val, "cores", text, sizeof(text))) {
+                calib_set_core_range(p.best_cores, sizeof(p.best_cores), text);
+            }
+        } else if (strcmp(key, "group_high") == 0) {
+            p.high_avg = calib_rule_number(val, "avg", p.high_avg);
+            p.high_max = calib_rule_number(val, "max", p.high_max);
+            char text[64];
+            if (calib_rule_text(val, "cores", text, sizeof(text))) {
+                calib_set_core_range(p.high_cores, sizeof(p.high_cores), text);
+            }
+        } else if (strcmp(key, "group_mid") == 0) {
+            p.mid_avg = calib_rule_number(val, "avg", p.mid_avg);
+            p.mid_max = calib_rule_number(val, "max", p.mid_max);
+            char text[64];
+            if (calib_rule_text(val, "cores", text, sizeof(text))) {
+                calib_set_core_range(p.mid_cores, sizeof(p.mid_cores), text);
+            }
+        } else if (strcmp(key, "max_thread_rules") == 0) {
+            int n = atoi(val);
+            if (n >= 1 && n <= 12) p.max_thread_rules = n;
+        } else if (strcmp(key, "wildcard_group") == 0) {
+            if (strcmp(val, "sum") == 0) {
+                p.wildcard_mode = CALIB_WILDCARD_SUM;
+            } else {
+                p.wildcard_mode = CALIB_WILDCARD_MAX_MEMBER;
+            }
+        } else if (strcmp(key, "fallback") == 0) {
+            char text[64];
+            if (calib_rule_text(val, "cores", text, sizeof(text))) {
+                calib_set_core_range(p.fallback_cores, sizeof(p.fallback_cores), text);
+            } else if (!strchr(val, ':')) {
+                calib_set_core_range(p.fallback_cores, sizeof(p.fallback_cores), val);
+            }
+        }
+    }
+    fclose(f);
+    calib_log_policy(&p, topo, CALIB_POLICY_FILE, have_policy_stat ? &policy_st : NULL);
+    return p;
+}
+
 /* 聚合后的通配组 */
 typedef struct {
     char base[MAX_THREAD_LEN];   /* 通配基名(可能含尾部 '*') */
     unsigned long long busy;     /* 组内线程 busy 之和 */
-    double avg_pct;              /* 组内线程平均占比之和 */
+    double avg_pct;              /* 组内线程平均占比, 通配组按策略取最高成员或累加 */
     double max_pct;              /* 组内最高瞬时占比 */
     double score;                /* 综合评分, 用于 Top N 排序 */
     bool is_wild;                /* base 是否含通配符 */
 } CalibGroup;
 
-static int calib_group_tier(const CalibGroup* g) {
-    if (!g) return 0;
-    if (g->avg_pct >= 13.0 || g->max_pct >= 22.0) return 2;  /* 高频中核 */
-    if (g->avg_pct >= 8.0 || g->max_pct >= 18.0) return 1;   /* 中核 */
+static int calib_group_tier(const CalibGroup* g, const CalibPolicy* p) {
+    if (!g || !p) return 0;
+    if (g->avg_pct >= p->high_avg && g->max_pct >= p->high_max) {
+        return 2;  /* 高频中核 */
+    }
+    if (g->avg_pct >= p->mid_avg && g->max_pct >= p->mid_max) {
+        return 1;  /* 中核 */
+    }
     return 0;
 }
 
@@ -1568,6 +2107,7 @@ static bool calib_append_rule(char** out, size_t* remain, int* lines,
 static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
                                 char* out_buf, size_t out_sz) {
     if (data->count == 0 || out_sz == 0) return 0;
+    CalibPolicy policy = calib_load_policy(topo);
 
     /* 1) 按 busy 降序排序 */
     qsort(data->threads, data->count, sizeof(ThreadSample), calib_cmp_busy);
@@ -1580,7 +2120,8 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     for (size_t i = 0; i < data->count; i++) {
         total += data->threads[i].busy;
         char base[MAX_THREAD_LEN];
-        calib_wildcard_base(data->threads[i].name, base, sizeof(base));
+        calib_rule_base_for_thread(data, i, base, sizeof(base));
+        if (!base[0]) continue;
         long gi = -1;
         for (size_t g = 0; g < ng; g++) {
             if (strcmp(groups[g].base, base) == 0) { gi = (long)g; break; }
@@ -1597,7 +2138,11 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
         groups[gi].busy += data->threads[i].busy;
         double avg_pct, max_pct;
         calib_thread_pct_stats(&data->threads[i], &avg_pct, &max_pct);
-        groups[gi].avg_pct += avg_pct;
+        if (groups[gi].is_wild && policy.wildcard_mode == CALIB_WILDCARD_MAX_MEMBER) {
+            if (avg_pct > groups[gi].avg_pct) groups[gi].avg_pct = avg_pct;
+        } else {
+            groups[gi].avg_pct += avg_pct;
+        }
         if (max_pct > groups[gi].max_pct) groups[gi].max_pct = max_pct;
     }
     if (total == 0) { free(groups); return 0; }
@@ -1614,14 +2159,10 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
                 CalibGroup t = groups[b]; groups[b] = groups[b + 1]; groups[b + 1] = t;
             }
 
-    const char* high_mid = topo->middle_high_str[0] ? topo->middle_high_str :
-                           (topo->middle_str[0] ? topo->middle_str : topo->all_str);
-    const char* mid_perf = topo->middle_str[0] ? topo->middle_str : topo->all_str;
-
     /* 3) 按负载分级, 同时参考 avg 与 max:
-     *    - 单个线程综合负载第一, 且达到重载阈值: 独占最高性能簇, 并固定输出在第一行。
-     *    - avg>=13% 或 max>=22%: 高频中核。
-     *    - avg>=8%  或 max>=18%: 中核。
+     *    - 单个线程综合负载第一, 且 avg/max 都达到策略重载阈值: 独占最高性能簇, 并固定输出在第一行。
+     *    - avg 与 max 同时达到 group_high 阈值: 高频中核。
+     *    - avg 与 max 同时达到 group_mid 阈值: 中核。
      *    - 其余由进程级兜底覆盖。
      *    不按线程名白名单/黑名单猜职责, 避免不同游戏命名差异导致误判。
      *    同档位先输出精确线程, 再输出通配组; 只保留 Top N, 避免规则过多。 */
@@ -1630,6 +2171,7 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     double best_avg = 0.0;
     double best_max = 0.0;
     for (size_t i = 0; i < data->count; i++) {
+        if (!calib_rule_name_syntax_ok(data->threads[i].name)) continue;
         double avg_pct, max_pct;
         calib_thread_pct_stats(&data->threads[i], &avg_pct, &max_pct);
         double score = calib_load_score(avg_pct, max_pct);
@@ -1645,10 +2187,10 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     size_t remain = out_sz - 1;
     int lines = 0;
     int thread_lines = 0;
-    const int max_thread_lines = 6;
-    const bool has_big_thread = big_thread[0] && (best_avg >= 18.0 || best_max >= 30.0);
-    const char* big_tier = topo->big_str[0] ? topo->big_str :
-                           (high_mid ? high_mid : topo->all_str);
+    const int max_thread_lines = policy.max_thread_rules;
+    const bool has_big_thread = big_thread[0] &&
+        (best_avg >= policy.best_avg && best_max >= policy.best_max);
+    const char* big_tier = calib_policy_core_range(topo, policy.best_tier, policy.best_cores);
 
     if (has_big_thread && big_tier && big_tier[0]) {
         if (!calib_append_rule(&p, &remain, &lines, data->pkg, big_thread, big_tier))
@@ -1660,7 +2202,7 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
         for (int wild_pass = 0; wild_pass <= 1 && thread_lines < max_thread_lines; wild_pass++) {
             for (size_t g = 0; g < ng && thread_lines < max_thread_lines; g++) {
                 if ((groups[g].is_wild ? 1 : 0) != wild_pass) continue;
-                if (calib_group_tier(&groups[g]) != tier_pass) continue;
+                if (calib_group_tier(&groups[g], &policy) != tier_pass) continue;
                 if (has_big_thread) {
                     if (groups[g].is_wild) {
                         if (fnmatch(groups[g].base, big_thread, FNM_NOESCAPE) == 0) continue;
@@ -1670,8 +2212,8 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
                 }
 
                 const char* tier = (tier_pass == 2) ?
-                    (high_mid ? high_mid : topo->all_str) :
-                    (mid_perf ? mid_perf : topo->all_str);
+                    calib_policy_core_range(topo, policy.high_tier, policy.high_cores) :
+                    calib_policy_core_range(topo, policy.mid_tier, policy.mid_cores);
                 if (!tier || !tier[0]) continue;
                 if (!calib_append_rule(&p, &remain, &lines, data->pkg, groups[g].base, tier))
                     goto finish;
@@ -1680,10 +2222,9 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
         }
     }
 
-    /* 4) 进程级兜底规则: 使用小核+中核(e_core+p_core), 对齐作者预置规则里的 0-6。
-     *    不再使用更窄的 base_str(如 0-4), 避免未知关键线程被压到低档核心。 */
-    const char* base_tier = topo->nonbig_str[0] ? topo->nonbig_str :
-                            (topo->all_str[0] ? topo->all_str : topo->base_str);
+    /* 4) 进程级兜底规则: 默认使用小核+中核(e_core+p_core), 对齐常见 0-6。
+     *    用户也可在策略中改为中核/中高性能核心/全部核心。 */
+    const char* base_tier = calib_policy_core_range(topo, policy.fallback_tier, policy.fallback_cores);
     if (base_tier[0]) {
         calib_append_rule(&p, &remain, &lines, data->pkg, NULL, base_tier);
     }
@@ -2958,13 +3499,13 @@ static void* fps_thread(void* arg) {
 static void print_help(const char* prog_name) {
     printf("Usage: %s [OPTIONS]\n", prog_name);
     printf("Options:\n");
-    printf("  -c <config_file>   指定配置文件 (默认: ./applist.conf)\n");
+    printf("  -c <config_file>   指定配置文件 (默认: /data/adb/modules/AppOpt/config/applist.conf)\n");
     printf("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)\n");
     printf("  -v                 显示程序版本\n");
     printf("  -P, --ping-daemon <socket> <token>  请求守护进程反向验证 App\n");
     printf("  -h                 显示帮助信息\n");
     printf("\n示例:\n");
-    printf("  %s -c /data/applist.conf -s 3\n", prog_name);
+    printf("  %s -c /data/adb/modules/AppOpt/config/applist.conf -s 3\n", prog_name);
 }
 
 int main(int argc, char **argv) {
@@ -2990,8 +3531,12 @@ int main(int argc, char **argv) {
     }
 
     CpuTopology topo = init_cpu_topo();
+    mkdir(CONFIG_DIR, 0755);
+    mkdir(LOG_DIR, 0755);
+    mkdir(EBPF_DIR, 0755);
+    (void)calib_load_policy(&topo);
     g_topo = topo;                     /* 校准线程使用的拓扑快照 */
-    char config_file[4096] = "./applist.conf";
+    char config_file[4096] = CONFIG_DIR "/applist.conf";
     int sleep_interval = 2;
     int opt;
     while ((opt = getopt(argc, argv, "c:s:hv")) != -1) {
@@ -3178,7 +3723,14 @@ int main(int argc, char **argv) {
         perror("守护进程验证 socket 线程创建失败");
     }
 
+    time_t last_policy_sync = 0;
     while (!shutdown_requested) {
+        time_t now = time(NULL);
+        if (now - last_policy_sync >= 5) {
+            calib_sync_policy_topology(&topo);
+            last_policy_sync = now;
+        }
+
         if (atomic_exchange(&config_updated, 0)) {
             cache.scan_all_proc = true;
             cache.last_proc_count = 0;

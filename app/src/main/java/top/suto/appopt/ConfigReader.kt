@@ -3,13 +3,13 @@ package top.suto.appopt
 /**
  * 读取模块配置文件 applist.conf, 提取待配置和已配置应用。
  *
- * 配置文件位于 /data/adb/modules/AppOpt/applist.conf, 普通应用无权限读取,
+ * 配置文件位于 /data/adb/modules/AppOpt/config/applist.conf, 普通应用无权限读取,
  * 故经由 root (su) 读取。改版守护进程支持 "<包名>=auto" 语法:
  * 仅给出包名、不指定大小核, 由本 App 启动悬浮球做实时校准。
  */
 object ConfigReader {
 
-    private const val CONFIG_FILE = "/data/adb/modules/AppOpt/applist.conf"
+    private const val CONFIG_FILE = "/data/adb/modules/AppOpt/config/applist.conf"
 
     data class ConfigPackages(
         val autoPackages: List<String>,
