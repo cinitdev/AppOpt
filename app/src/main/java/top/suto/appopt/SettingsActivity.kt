@@ -29,6 +29,8 @@ class SettingsActivity : AppCompatActivity() {
     private var hasRoot = false
     private var moduleVersion: DaemonBridge.ModuleVersion? = null
     private var firstResume = true
+    private var updateBusy = false
+    private var cachedUpdateInfo: ModuleUpdater.UpdateInfo? = null
     private var policyEditable = false
     private var suppressPolicyChange = false
     private var currentWildcardGroup = CalibPolicy.WildcardGroup.MAX_MEMBER
@@ -60,6 +62,11 @@ class SettingsActivity : AppCompatActivity() {
         binding.settingsLogRow.setOnClickListener {
             startActivity(Intent(this, LogActivity::class.java))
         }
+        binding.settingsUpdateButton.setOnClickListener {
+            cachedUpdateInfo?.let { update ->
+                showModuleUpdateDialog(update)
+            } ?: checkModuleUpdate(manual = true)
+        }
         binding.settingsHelpRow.setOnClickListener { showHelp() }
         binding.wildcardModeRow.setOnClickListener {
             if (policyEditable) showWildcardModeDialog()
@@ -72,8 +79,12 @@ class SettingsActivity : AppCompatActivity() {
 
         setPolicyInputsEnabled(false)
         setPolicyStatus("正在读取策略")
+        setUpdateStatus("正在获取远程更新信息")
         binding.root.post {
-            if (!isFinishing && !isDestroyed) loadPolicy()
+            if (!isFinishing && !isDestroyed) {
+                loadPolicy()
+                checkModuleUpdate(manual = false)
+            }
         }
     }
 
@@ -96,7 +107,6 @@ class SettingsActivity : AppCompatActivity() {
             val version = if (root) DaemonBridge.readModuleVersion() else null
             val file = if (root) DaemonBridge.readCalibPolicyRaw() else null
             val rawPolicy = file?.content?.takeIf { it.isNotBlank() }
-                ?: if (root) DaemonBridge.generateDefaultCalibPolicyRaw() else null
             val policy = rawPolicy
                 ?.takeIf { it.isNotBlank() }
                 ?.let { CalibPolicy.parse(it) }
@@ -105,6 +115,9 @@ class SettingsActivity : AppCompatActivity() {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 hasRoot = root
                 moduleVersion = version
+                binding.updateLocalVersion.text = version?.let {
+                    versionLabel(it.versionName, it.versionCode)
+                } ?: "未知"
                 lockedByPendingUpdate = file?.lockedByPendingUpdate == true
                 val moduleOk = version?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
                 val moduleLabel = version?.let { "${it.versionName} (${it.versionCode})" }
@@ -280,24 +293,15 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun restoreModuleDefaultPolicy() {
-        val fallback = moduleDefaultPolicy()
-        setPolicyStatus("正在生成默认策略")
+        val policy = moduleDefaultPolicy()
+        setPolicyStatus("默认策略已生成，正在保存")
         setPolicyInputsEnabled(false)
-        thread {
-            val generated = DaemonBridge.generateDefaultCalibPolicyRaw()
-                ?.let { CalibPolicy.parse(it) }
-            val policy = generated ?: fallback
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                bindPolicy(policy)
-                val moduleOk = moduleVersion?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
-                policyEditable = hasRoot && moduleOk && !lockedByPendingUpdate
-                setPolicyInputsEnabled(policyEditable)
-                setPolicyStatus("默认策略已生成，正在保存")
-                val seq = ++saveSeq
-                savePolicy(policy, seq, successMessage = "已恢复默认策略")
-            }
-        }
+        bindPolicy(policy)
+        val moduleOk = moduleVersion?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
+        policyEditable = hasRoot && moduleOk && !lockedByPendingUpdate
+        setPolicyInputsEnabled(policyEditable)
+        val seq = ++saveSeq
+        savePolicy(policy, seq, successMessage = "已恢复默认策略")
     }
 
     private fun moduleDefaultPolicy(): CalibPolicy {
@@ -334,6 +338,97 @@ class SettingsActivity : AppCompatActivity() {
                     toast("自动保存失败，请检查 Root 或模块状态")
                 }
             }
+        }
+    }
+
+    private fun checkModuleUpdate(manual: Boolean) {
+        if (updateBusy) {
+            if (manual) toast("正在处理更新")
+            return
+        }
+        setUpdateBusy(true)
+        setUpdateStatus("正在获取远程更新信息")
+        binding.updateRemoteVersion.text = "获取中"
+        if (manual) toast("正在检查更新")
+        thread {
+            val result = ModuleUpdater.checkForUpdate()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                bindUpdateResult(result)
+                when (result) {
+                    is ModuleUpdater.CheckResult.UpdateAvailable -> {
+                        if (manual) {
+                            showModuleUpdateDialog(result.update)
+                        } else {
+                            setUpdateBusy(false)
+                        }
+                    }
+                    is ModuleUpdater.CheckResult.NoUpdate -> {
+                        setUpdateBusy(false)
+                        if (manual) toast(result.message)
+                    }
+                    is ModuleUpdater.CheckResult.Failed -> {
+                        setUpdateBusy(false)
+                        if (manual) toast(result.message)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun setUpdateBusy(busy: Boolean) {
+        updateBusy = busy
+        binding.settingsUpdateRow.isEnabled = !busy
+        binding.settingsUpdateButton.isEnabled = !busy
+        binding.settingsUpdateRow.alpha = if (busy) 0.55f else 1f
+    }
+
+    private fun bindUpdateResult(result: ModuleUpdater.CheckResult) {
+        when (result) {
+            is ModuleUpdater.CheckResult.UpdateAvailable -> {
+                cachedUpdateInfo = result.update
+                binding.updateLocalVersion.text = versionLabel(
+                    result.update.localVersion,
+                    result.update.localVersionCode
+                )
+                binding.updateRemoteVersion.text = versionLabel(
+                    result.update.remoteVersion,
+                    result.update.remoteVersionCode
+                )
+                setUpdateStatus("发现新版本，可查看更新日志并刷入")
+                binding.settingsUpdateButton.text = "查看更新"
+            }
+            is ModuleUpdater.CheckResult.NoUpdate -> {
+                cachedUpdateInfo = null
+                binding.updateLocalVersion.text = versionLabel(result.localVersion, result.localVersionCode)
+                binding.updateRemoteVersion.text = versionLabel(result.remoteVersion, result.remoteVersionCode)
+                setUpdateStatus(result.message)
+                binding.settingsUpdateButton.text = "检查更新"
+            }
+            is ModuleUpdater.CheckResult.Failed -> {
+                cachedUpdateInfo = null
+                binding.updateLocalVersion.text = versionLabel(result.localVersion, result.localVersionCode)
+                binding.updateRemoteVersion.text = versionLabel(result.remoteVersion, result.remoteVersionCode)
+                setUpdateStatus(result.message)
+                binding.settingsUpdateButton.text = "重试"
+            }
+        }
+    }
+
+    private fun versionLabel(version: String?, code: Int?): String {
+        val name = version?.takeIf { it.isNotBlank() }
+        return when {
+            name != null && code != null -> "$name ($code)"
+            name != null -> name
+            code != null -> code.toString()
+            else -> "未知"
+        }
+    }
+
+    private fun showModuleUpdateDialog(update: ModuleUpdater.UpdateInfo) {
+        setUpdateBusy(true)
+        ModuleUpdateDialog.show(this, update) {
+            setUpdateBusy(false)
         }
     }
 
@@ -640,6 +735,11 @@ class SettingsActivity : AppCompatActivity() {
     private fun setPolicyStatus(text: String) {
         binding.policyStatus.setTextColor(getColor(R.color.text_secondary))
         binding.policyStatus.text = text
+    }
+
+    private fun setUpdateStatus(text: String) {
+        binding.updateStatus.setTextColor(getColor(R.color.text_secondary))
+        binding.updateStatus.text = text
     }
 
     private fun showCoreWarning(view: TextView, message: String) {

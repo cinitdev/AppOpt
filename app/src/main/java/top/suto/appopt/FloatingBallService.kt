@@ -57,6 +57,8 @@ class FloatingBallService : Service() {
     private var resultView: View? = null
     private var capsuleAdded = false
     @Volatile private var serviceDestroyed = false
+    private val foregroundTracker = ForegroundDetector.Tracker()
+    private var usageAccessMissingCount = 0
 
     // 拖动状态
     private var initialX = 0
@@ -68,13 +70,17 @@ class FloatingBallService : Service() {
     companion object {
         private const val CHANNEL_ID = "appopt_floating"
         private const val NOTIF_ID = 1001
-        private const val DRAG_THRESHOLD = 12f
+        private const val DRAG_THRESHOLD_DP = 12f
         const val EXTRA_TARGET_PKG = "target_pkg"
 
         // 前台监测周期与离开阈值
         private const val FG_CHECK_INTERVAL = 3000L   // 每 3s 检查一次目标应用是否在前台
         private const val FG_ABSENT_LIMIT = 2         // 连续 2 次(约6s)不在前台才判定离开, 避免下拉通知栏等短暂切换误关
         private const val FG_APPEAR_GRACE = 15        // 启动后等待应用出现的宽限次数(约45s)
+        private const val FG_USAGE_ACCESS_MISSING_LIMIT = 3
+        private const val MANUAL_STOP_TIMEOUT_MS = 18_000L
+        private const val MANUAL_STOP_CLOSE_DELAY_MS = 20_000L
+        private const val MANUAL_WAIT_DONE_MS = 22_000L
     }
 
     override fun onCreate() {
@@ -175,16 +181,30 @@ class FloatingBallService : Service() {
             MotionEvent.ACTION_MOVE -> {
                 val dx = event.rawX - touchX
                 val dy = event.rawY - touchY
-                if (abs(dx) > DRAG_THRESHOLD || abs(dy) > DRAG_THRESHOLD) {
+                val baseThreshold = dp(DRAG_THRESHOLD_DP).toFloat()
+                val dragThreshold = if (calibrating) baseThreshold * 2f else baseThreshold
+                if (abs(dx) > dragThreshold || abs(dy) > dragThreshold) {
                     dragged = true
                     layoutParams.x = initialX + dx.toInt()
                     layoutParams.y = initialY + dy.toInt()
-                    windowManager.updateViewLayout(capsule, layoutParams)
+                    try {
+                        windowManager.updateViewLayout(capsule, layoutParams)
+                    } catch (_: Exception) {
+                        stopSelf()
+                    }
                 }
                 return true
             }
             MotionEvent.ACTION_UP -> {
-                if (!dragged) onCapsuleClick()
+                val dx = event.rawX - touchX
+                val dy = event.rawY - touchY
+                val stopClickThreshold = dp(DRAG_THRESHOLD_DP).toFloat() * 2.5f
+                val isStopTap = calibrating && abs(dx) <= stopClickThreshold && abs(dy) <= stopClickThreshold
+                if (!dragged || isStopTap) onCapsuleClick()
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                dragged = false
                 return true
             }
         }
@@ -218,13 +238,32 @@ class FloatingBallService : Service() {
             mainHandler.removeCallbacks(foregroundWatcher)
             removeCapsule()
             showBanner("正在分析线程负载并生成规则…", durationMs = 3500)
+            var stopTimedOut = false
+            var timeoutClose: Runnable? = null
+            var timeoutStopSelf: Runnable? = null
+            val stopTimeout = Runnable {
+                stopTimedOut = true
+                showBanner("已请求停止，守护进程仍在生成规则\n完成后会自动显示结果", durationMs = 4200)
+                val close = Runnable {
+                    showBanner("校准收尾时间过长\n可稍后在历史记录或日志里查看结果", durationMs = 3200)
+                    val stop = Runnable { stopSelf() }
+                    timeoutStopSelf = stop
+                    mainHandler.postDelayed(stop, 3200)
+                }
+                timeoutClose = close
+                mainHandler.postDelayed(close, MANUAL_STOP_CLOSE_DELAY_MS)
+            }
+            mainHandler.postDelayed(stopTimeout, MANUAL_STOP_TIMEOUT_MS)
             thread {
                 val ok = DaemonBridge.stopCalibration(pkg)
-                val status = if (ok) DaemonBridge.waitDone(pkg) else null
+                val status = if (ok) DaemonBridge.waitDone(pkg, timeoutMs = MANUAL_WAIT_DONE_MS) else null
                 val rules = if (status == "ok") DaemonBridge.readPkgRules(pkg) else emptyList()
                 android.util.Log.d("AppOpt", "校准完成: ok=$ok, status=$status, rules.size=${rules.size}")
                 postIfAlive {
-                    if (ok && status == null) {
+                    mainHandler.removeCallbacks(stopTimeout)
+                    timeoutClose?.let { mainHandler.removeCallbacks(it) }
+                    timeoutStopSelf?.let { mainHandler.removeCallbacks(it) }
+                    if (ok && status == null && !stopTimedOut) {
                         showBanner("等待守护进程响应超时\n规则可能未生成，请重试或检查日志", durationMs = 3200)
                         mainHandler.postDelayed({ stopSelf() }, 3000)
                     } else {
@@ -261,6 +300,11 @@ class FloatingBallService : Service() {
             view.resultIcon.setImageResource(R.drawable.ic_error)
             view.resultTitle.text = "写入失败"
             view.resultSummary.text = "规则生成成功但写回配置文件失败\n请检查模块权限或查看日志"
+            view.rulesContainer.visibility = android.view.View.GONE
+        } else if (status == null) {
+            view.resultIcon.setImageResource(R.drawable.ic_warning)
+            view.resultTitle.text = "等待超时"
+            view.resultSummary.text = "已请求停止采样，但未收到守护进程完成状态\n请稍后查看历史记录或日志"
             view.rulesContainer.visibility = android.view.View.GONE
         } else if (rules.isEmpty()) {
             view.resultIcon.setImageResource(R.drawable.ic_info)
@@ -379,15 +423,19 @@ class FloatingBallService : Service() {
             if (serviceDestroyed) return
             val pkg = targetPkg
             if (pkg.isNullOrBlank() || foregroundClosing) return
-            // 没有使用情况访问权限时无法判断前台, 跳过自动关闭(退化为手动收起),
-            // 否则会误判"不在前台"导致宽限期后把悬浮球错误关掉。仍排下次检查,
-            // 以便用户在设置里补授权后能自动恢复监测。
+            // 没有使用情况访问权限时无法判断前台。短暂不可用先重试, 连续不可用则收尾关闭,
+            // 避免悬浮球在权限被系统回收或用户关闭后长期残留。
             if (!ForegroundDetector.hasUsageAccess(this@FloatingBallService)) {
-                mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
+                if (++usageAccessMissingCount >= FG_USAGE_ACCESS_MISSING_LIMIT) {
+                    closeByUsageAccessLost()
+                } else {
+                    mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
+                }
                 return
             }
+            usageAccessMissingCount = 0
             thread {
-                val fg = ForegroundDetector.isAppForeground(this@FloatingBallService, pkg)
+                val fg = foregroundTracker.isAppForeground(this@FloatingBallService, pkg)
                 postIfAlive { onForegroundChecked(fg) }
             }
             mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
@@ -410,6 +458,31 @@ class FloatingBallService : Service() {
         }
         // 曾在前台, 现在离开: 累计到阈值即关闭
         if (++absentCount >= FG_ABSENT_LIMIT) closeByForeground(appeared = true)
+    }
+
+    private fun closeByUsageAccessLost() {
+        if (serviceDestroyed) return
+        if (foregroundClosing) return
+        foregroundClosing = true
+        mainHandler.removeCallbacks(foregroundWatcher)
+        removeCapsule()
+
+        val pkg = targetPkg ?: ""
+        val wasCalibrating = calibrating
+        calibrating = false
+
+        if (wasCalibrating && pkg.isNotBlank()) {
+            thread {
+                DaemonBridge.stopCalibration(pkg)
+                postIfAlive {
+                    showBanner("使用情况访问权限不可用\n校准已停止，悬浮球已关闭", durationMs = 2800)
+                    mainHandler.postDelayed({ stopSelf() }, 2600)
+                }
+            }
+        } else {
+            showBanner("使用情况访问权限不可用\n悬浮球已关闭", durationMs = 2800)
+            mainHandler.postDelayed({ stopSelf() }, 2600)
+        }
     }
 
     /**
@@ -458,13 +531,18 @@ class FloatingBallService : Service() {
     }
 
     override fun onDestroy() {
+        val pkgToStop = targetPkg?.takeIf { it.isNotBlank() && calibrating }
+        calibrating = false
         serviceDestroyed = true
         mainHandler.removeCallbacksAndMessages(null)
         // fpsMonitor 在 onStartCommand 才初始化; 服务若在那之前被回收, 直接访问会崩
         if (::fpsMonitor.isInitialized) fpsMonitor.stop()
         // 通知守护进程停止 FPS 监测(省电)。su 是独立进程,
         // 即使本进程随后退出, 已 fork 的命令仍会执行完。
-        thread { DaemonBridge.stopFpsMonitor() }
+        thread {
+            if (pkgToStop != null) DaemonBridge.stopCalibration(pkgToStop)
+            DaemonBridge.stopFpsMonitor()
+        }
         removeCapsule()
         bannerView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
         bannerView = null
@@ -504,8 +582,9 @@ class FloatingBallService : Service() {
             // 重置前台检测状态(避免保留上次启动的残留值)
             hasAppearedForeground = false
             absentCount = 0
+            usageAccessMissingCount = 0
             appearGraceLeft = FG_APPEAR_GRACE
-            ForegroundDetector.reset()   // 清上一轮残留的前台跟踪状态(单例跨启动保留)
+            foregroundTracker.reset()   // 清上一轮残留的前台跟踪状态
             mainHandler.removeCallbacks(foregroundWatcher)
             mainHandler.postDelayed(foregroundWatcher, FG_CHECK_INTERVAL)
         }

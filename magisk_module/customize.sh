@@ -1,4 +1,12 @@
 SKIPUNZIP=0
+APPOPT_IN_APP_UPDATE_MARKER="config/app/.appopt_in_app_update"
+APPOPT_IN_APP_UPDATE_FLAG="/data/adb/appopt_in_app_update"
+is_appopt_in_app_update() {
+	[ "$APPOPT_IN_APP_UPDATE" = "1" ] && return 0
+	[ -n "$MODPATH" ] && [ -f "$MODPATH/$APPOPT_IN_APP_UPDATE_MARKER" ] && return 0
+	[ -f "$APPOPT_IN_APP_UPDATE_FLAG" ] && return 0
+	return 1
+}
 check_magisk_version() {
 	ui_print "- Magisk version: $MAGISK_VER_CODE"
 	ui_print "- Module version: $(grep_prop version "${TMPDIR}/module.prop")"
@@ -43,6 +51,134 @@ extract_bin() {
 	if ! $MODPATH/config/bin/AppOpt -v; then
 		abort "! 主程序验证失败，请检查模块zip文件是否损坏"
 	fi
+}
+
+run_pkg_helper() {
+	local OUT="$1"
+	shift
+	local HELPER="$MODPATH/config/app/tools/appopt_pkg_helper.sh"
+	local HELPER_DIR="$MODPATH/config/app/tools"
+	if [ ! -f "$HELPER" ]; then
+		echo "ok=0" > "$OUT"
+		echo "error=找不到内置安装器脚本" >> "$OUT"
+		return 1
+	fi
+	APP_OPT_HELPER_DIR="$HELPER_DIR" \
+	APP_OPT_PACKAGE="${APP_OPT_PACKAGE:-}" \
+	APP_OPT_VERSION_CODE="${APP_OPT_VERSION_CODE:-}" \
+	APP_OPT_VERSION_NAME="${APP_OPT_VERSION_NAME:-}" \
+	sh "$HELPER" "$@" > "$OUT" 2>&1
+	return $?
+}
+
+print_helper_error() {
+	local TITLE="$1"
+	local OUT="$2"
+	ui_print "- $TITLE"
+	[ -f "$OUT" ] || return
+	sed -n '1,4p' "$OUT" | while IFS= read -r line; do
+		[ -n "$line" ] && ui_print "  $line"
+	done
+}
+
+install_or_update_app() {
+	local APP_META="$MODPATH/config/app/app.prop"
+	[ -f "$APP_META" ] || return
+
+	if is_appopt_in_app_update; then
+		ui_print "- App 内刷入模块：跳过当前会话内安装 App"
+		ui_print "- 已保留随附 App，重启后将自动更新 App"
+		return
+	fi
+
+	local APP_PKG APP_NAME APP_APK APP_VERSION_CODE APP_VERSION_NAME APP_VARIANT APP_DISPLAY INSTALLED_VERSION_CODE INSTALLED_VERSION_NAME
+	local FORCE_APP_INSTALL=0
+	local APP_INFO INSTALL_INFO
+	APP_PKG="$(grep_prop package "$APP_META")"
+	APP_NAME="$(grep_prop name "$APP_META")"
+	APP_APK="$MODPATH/config/app/$(grep_prop apk "$APP_META")"
+	APP_VERSION_CODE="$(grep_prop versionCode "$APP_META")"
+	APP_VERSION_NAME="$(grep_prop versionName "$APP_META")"
+	APP_VARIANT="$(grep_prop variant "$APP_META")"
+	[ -n "$APP_NAME" ] || APP_NAME="AppOpt"
+	APP_DISPLAY="$APP_NAME $APP_VERSION_NAME ($APP_VERSION_CODE)"
+
+	[ -n "$APP_PKG" ] || APP_PKG="top.suto.appopt"
+	if [ ! -f "$APP_APK" ]; then
+		ui_print "- 未找到随附应用，跳过安装"
+		return
+	fi
+	if [ -z "$APP_VERSION_CODE" ]; then
+		ui_print "- 随附应用缺少版本信息，跳过安装"
+		return
+	fi
+
+	chmod 0644 "$APP_APK" 2>/dev/null || true
+
+	APP_INFO="${TMPDIR:-/dev/tmp}/appopt_app_info.prop"
+	INSTALL_INFO="${TMPDIR:-/dev/tmp}/appopt_install_info.prop"
+
+	if run_pkg_helper "$APP_INFO" app-info "$APP_PKG" && [ "$(grep_prop ok "$APP_INFO")" = "1" ]; then
+		if [ "$(grep_prop installed "$APP_INFO")" = "1" ]; then
+			INSTALLED_VERSION_CODE="$(grep_prop versionCode "$APP_INFO")"
+			INSTALLED_VERSION_NAME="$(grep_prop versionName "$APP_INFO")"
+			ui_print "- 已安装 App：$APP_NAME ${INSTALLED_VERSION_NAME:-未知} ($INSTALLED_VERSION_CODE)"
+		else
+			INSTALLED_VERSION_CODE=""
+			INSTALLED_VERSION_NAME=""
+			ui_print "- 未检测到已安装 App，准备安装随附版本"
+		fi
+	else
+		print_helper_error "读取已安装 App 版本失败，跳过自动安装" "$APP_INFO"
+		return
+	fi
+
+	if [ -n "$INSTALLED_VERSION_CODE" ] &&
+		[ "$INSTALLED_VERSION_CODE" = "$APP_VERSION_CODE" ] &&
+		{ [ -z "$INSTALLED_VERSION_NAME" ] || [ "$INSTALLED_VERSION_NAME" = "$APP_VERSION_NAME" ]; }; then
+		if [ "$APP_VARIANT" = "debug" ]; then
+			FORCE_APP_INSTALL=1
+			ui_print "- Debug 应用包：版本相同，仍然执行覆盖安装"
+		else
+			ui_print "- 应用已是最新版本，跳过安装"
+			return
+		fi
+	fi
+
+	if [ -n "$INSTALLED_VERSION_CODE" ]; then
+		if [ "$FORCE_APP_INSTALL" = "1" ]; then
+			ui_print "- 覆盖安装 App：$APP_VERSION_NAME ($APP_VERSION_CODE)"
+		elif [ "$INSTALLED_VERSION_CODE" -lt "$APP_VERSION_CODE" ] 2>/dev/null; then
+			ui_print "- $APP_NAME 版本过低，准备更新"
+		elif [ "$INSTALLED_VERSION_CODE" -gt "$APP_VERSION_CODE" ] 2>/dev/null; then
+			ui_print "- $APP_NAME 已安装版本高于随附版本，跳过安装"
+			return
+		else
+			ui_print "- $APP_NAME 已安装版本不同，准备更新"
+		fi
+		if [ "$FORCE_APP_INSTALL" != "1" ]; then
+			ui_print "- 更新 App：${INSTALLED_VERSION_NAME:-未知} ($INSTALLED_VERSION_CODE) -> $APP_VERSION_NAME ($APP_VERSION_CODE)"
+		fi
+	else
+		ui_print "- 安装 App：$APP_DISPLAY"
+	fi
+
+	if APP_OPT_PACKAGE="$APP_PKG" APP_OPT_VERSION_CODE="$APP_VERSION_CODE" APP_OPT_VERSION_NAME="$APP_VERSION_NAME" run_pkg_helper "$INSTALL_INFO" install "$APP_APK" && [ "$(grep_prop ok "$INSTALL_INFO")" = "1" ]; then
+		ui_print "- 应用安装完成"
+	else
+		print_helper_error "内置安装器执行失败" "$INSTALL_INFO"
+		ui_print "! App 安装未完成，请手动安装模块内的 $APP_NAME.apk"
+	fi
+}
+cleanup_embedded_app() {
+	local APP_DIR="$MODPATH/config/app"
+	[ -d "$APP_DIR" ] || return
+	if is_appopt_in_app_update && [ -f "$APP_DIR/app.prop" ]; then
+		ui_print "- 已保留临时 App 安装文件，重启后自动更新"
+		return
+	fi
+	rm -rf "$APP_DIR"
+	ui_print "- 已清理临时 App 安装文件"
 }
 remove_sys_perf_config() {
 	for SYSPERFCONFIG in $(ls /system/vendor/bin/msm_irqbalance); do
@@ -192,11 +328,11 @@ add_default_rules() {
 	local LEGACY_CONFIG="/data/adb/modules/AppOpt/applist.conf"
 	if [ -f "$ACTIVE_CONFIG" ]; then
 		cp -f "$ACTIVE_CONFIG" "$CONFIG_FILE"
-		ui_print "- 已保留现有线程规则配置"
+		ui_print "- 线程规则配置：已保留"
 		return
 	elif [ -f "$LEGACY_CONFIG" ]; then
 		cp -f "$LEGACY_CONFIG" "$CONFIG_FILE"
-		ui_print "- 已从旧路径迁移线程规则配置"
+		ui_print "- 线程规则配置：已从旧路径迁移"
 		return
 	fi
 
@@ -301,10 +437,10 @@ prepare_calib_policy() {
 	local PENDING_POLICY="$MODPATH/config/calib_policy.conf"
 	if [ -f "$ACTIVE_POLICY" ]; then
 		cp -f "$ACTIVE_POLICY" "$PENDING_POLICY"
-		ui_print "- 已保留自动校准策略配置"
+		ui_print "- 自动校准策略：已保留"
 	elif [ -f "$LEGACY_POLICY" ]; then
 		cp -f "$LEGACY_POLICY" "$PENDING_POLICY"
-		ui_print "- 已从旧路径迁移自动校准策略配置"
+		ui_print "- 自动校准策略：已从旧路径迁移"
 	else
 		local BEST_CORES HIGH_CORES MID_CORES FALLBACK_CORES
 		BEST_CORES="$(format_cpu_ranges "$hp_core")"
@@ -340,3 +476,6 @@ add_default_rules
 prepare_calib_policy
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOpt" 0 2000 0755 0755 u:object_r:magisk_file:s0
+[ -d "$MODPATH/config/app/tools" ] && chmod 0755 "$MODPATH/config/app/tools" "$MODPATH/config/app/tools"/*.sh 2>/dev/null
+install_or_update_app
+cleanup_embedded_app

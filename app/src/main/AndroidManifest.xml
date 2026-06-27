@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 在线更新: 读取 updateJson、changelog 并交给系统 DownloadManager 下载模块 zip -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- Android 11+ 包可见性: 需要读取任意应用的名称/图标并能拉起它们 -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
@@ -48,6 +50,10 @@
 
         <activity
             android:name=".SettingsActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".UpdateInstallActivity"
             android:exported="false" />
 
         <service

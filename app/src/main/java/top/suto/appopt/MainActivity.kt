@@ -3,6 +3,7 @@ package top.suto.appopt
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.animation.ObjectAnimator
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
@@ -15,12 +16,15 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.util.LruCache
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
+import android.view.animation.LinearInterpolator
 import android.widget.ImageView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -41,8 +45,8 @@ import java.util.Collections
 import java.util.concurrent.Executors
 
 /**
- * 引导授予悬浮窗权限, 并列出配置文件中写为 "包名=auto" 的应用。
- * 每个应用项显示图标/名称, 提供「启动」(拉起目标 App 并显示悬浮球) 与「历史」两项操作。
+ * 引导授予悬浮窗权限，并列出配置文件中的待校准、可添加和已配置应用。
+ * 每个应用项显示图标/名称，并按当前模块状态启用启动、查看、删除等操作。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -53,6 +57,8 @@ class MainActivity : AppCompatActivity() {
     private var moduleCompatible = false
     private var pendingModuleUpdate = false
     private var moduleWarningShown = false
+    private var startupUpdateCheckStarted = false
+    private var startupUpdateDialogShowing = false
     private var appTab = AppTab.PENDING
     private var appSearchQuery = ""
     private var appLists = AppLists()
@@ -60,7 +66,9 @@ class MainActivity : AppCompatActivity() {
     private var appListsLoading = true
     private var addableAppsLoading = true
     private var hideMissingConfigured = false
+    private var environmentLoadingShownAt = 0L
     private var appSearchRender: Runnable? = null
+    private var emptyIconAnimator: ObjectAnimator? = null
     private var processNames: Set<String> = emptySet()
     private val iconCache = LruCache<String, Drawable>(768)
     private val pendingIconLoads = Collections.synchronizedSet(mutableSetOf<String>())
@@ -73,6 +81,7 @@ class MainActivity : AppCompatActivity() {
     private companion object {
         const val PREFS_NAME = "appopt_prefs"
         const val PREF_HIDE_MISSING_CONFIGURED = "hide_missing_configured"
+        const val MIN_ENV_LOADING_MS = 1800L
     }
 
     private enum class AppTab(val title: String) {
@@ -106,6 +115,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        environmentLoadingShownAt = SystemClock.uptimeMillis()
         hideMissingConfigured = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getBoolean(PREF_HIDE_MISSING_CONFIGURED, false)
 
@@ -124,7 +134,7 @@ class MainActivity : AppCompatActivity() {
         refresh()
         buildAppList()
 
-        // root 检测 + 读配置 + 批量导入旧 .log 放后台线程, 避免 su 弹窗阻塞 UI
+        // root 检测 + 读配置 + 批量导入旧 .log 放后台线程，避免 su 弹窗阻塞 UI
         thread {
             val r = DaemonBridge.hasRoot()
             val pendingUpdate = if (r) DaemonBridge.hasPendingModuleUpdate() else false
@@ -137,18 +147,28 @@ class MainActivity : AppCompatActivity() {
             val visibleLists = if (enabled) buildConfiguredLists(config, resolvedNames) else AppLists()
 
             runOnUiThreadIfAlive {
-                hasRoot = r
-                pendingModuleUpdate = pendingUpdate
-                moduleVersion = version
-                moduleCompatible = compatible
-                daemonRunning = running
-                environmentLoading = false
-                appListsLoading = false
-                processNames = resolvedNames
-                appLists = visibleLists
-                refresh()
-                buildAppList()
-                showModuleWarningIfNeeded()
+                runAfterEnvironmentLoadingMinimum {
+                    hasRoot = r
+                    pendingModuleUpdate = pendingUpdate
+                    moduleVersion = version
+                    moduleCompatible = compatible
+                    daemonRunning = running
+                    environmentLoading = false
+                    appListsLoading = false
+                    processNames = resolvedNames
+                    appLists = if (addableAppsLoading) {
+                        visibleLists
+                    } else {
+                        appLists.copy(
+                            pending = visibleLists.pending,
+                            configured = visibleLists.configured
+                        )
+                    }
+                    refresh()
+                    buildAppList()
+                    showModuleWarningIfNeeded()
+                    maybeCheckStartupUpdate()
+                }
             }
 
             val fullLists = if (enabled) buildAppLists(config, resolvedNames) else AppLists()
@@ -162,12 +182,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun runAfterEnvironmentLoadingMinimum(action: () -> Unit) {
+        val remain = MIN_ENV_LOADING_MS - (SystemClock.uptimeMillis() - environmentLoadingShownAt)
+        if (remain <= 0L) {
+            action()
+            return
+        }
+        mainHandler.postDelayed({
+            if (!activityDestroyed && !isFinishing && !isDestroyed) {
+                action()
+            }
+        }, remain)
+    }
+
+
     override fun onResume() {
         super.onResume()
         refresh()
         val shouldRefreshConfig = firstResume.not()
         firstResume = false
-        // 守护进程和配置可能在后台变化, 回到前台时后台重查一次(有 root 才有意义)
+        // 守护进程和配置可能在后台变化，回到前台时后台重查一次（有 root 才有意义）
         if (hasRoot) refreshForegroundState(shouldRefreshConfig)
     }
 
@@ -207,6 +241,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         activityDestroyed = true
         appSearchRender?.let { binding.appSection.appRecycler.removeCallbacks(it) }
+        updateEmptyAnimation(false)
         pendingIconLoads.clear()
         iconExecutor.shutdownNow()
         super.onDestroy()
@@ -249,6 +284,30 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun maybeCheckStartupUpdate() {
+        if (startupUpdateCheckStarted || activityDestroyed || !hasRoot || pendingModuleUpdate) return
+        startupUpdateCheckStarted = true
+        thread(name = "AppOptStartupUpdateCheck") {
+            val result = try {
+                ModuleUpdater.checkForUpdate()
+            } catch (_: Exception) {
+                null
+            }
+            runOnUiThreadIfAlive {
+                val update = (result as? ModuleUpdater.CheckResult.UpdateAvailable)?.update ?: return@runOnUiThreadIfAlive
+                if (startupUpdateDialogShowing) return@runOnUiThreadIfAlive
+                startupUpdateDialogShowing = true
+                ModuleUpdateDialog.show(
+                    activity = this,
+                    update = update,
+                    requireExplicitDismiss = true
+                ) {
+                    startupUpdateDialogShowing = false
+                }
+            }
+        }
+    }
+
     private fun refresh() {
         val overlay = hasOverlay()
         val s = binding.statusSection
@@ -277,7 +336,7 @@ class MainActivity : AppCompatActivity() {
         s.rootState.text = if (hasRoot) "可用" else "不可用"
         setDot(s.dotRoot, if (hasRoot) R.color.status_ok else R.color.status_off)
 
-        // 守护进程: 无 root 时无从判断, 显示"未知"(灰); 有 root 时按 pgrep 结果显示
+        // 守护进程：无 root 时无从判断，显示“未知”；有 root 时按当前模块验证结果显示
         when {
             !hasRoot -> {
                 s.daemonState.text = "未知"
@@ -343,7 +402,7 @@ class MainActivity : AppCompatActivity() {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                 appSearchQuery = s?.toString().orEmpty().trim()
-                if (appTab == AppTab.ADD) {
+                if (supportsAppSearch()) {
                     appSearchRender?.let { binding.appSection.appRecycler.removeCallbacks(it) }
                     appSearchRender = Runnable { buildAppList() }
                     binding.appSection.appRecycler.postDelayed(appSearchRender, 180)
@@ -381,7 +440,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 下拉刷新: 重新读取配置文件并更新应用列表 */
+    /** 下拉刷新：重新读取配置文件并更新应用列表 */
     private fun refreshAppList() {
         if (!canUseModuleFeatures()) {
             appListsLoading = false
@@ -437,6 +496,7 @@ class MainActivity : AppCompatActivity() {
             a.emptyIcon.setImageResource(blocked.iconRes)
             a.emptyTitle.text = blocked.title
             a.emptyDesc.text = blocked.desc
+            updateEmptyAnimation(blocked.animated)
             appAdapter.submit(appTab, emptyList())
             return
         }
@@ -444,7 +504,7 @@ class MainActivity : AppCompatActivity() {
         val entries = entriesForCurrentTab()
         a.appTitle.text = appTab.title
         a.appTabs.visibility = View.VISIBLE
-        a.appSearchBox.visibility = if (appTab == AppTab.ADD) View.VISIBLE else View.GONE
+        a.appSearchBox.visibility = if (supportsAppSearch()) View.VISIBLE else View.GONE
         a.configuredFilterRow.visibility = if (appTab == AppTab.CONFIGURED) View.VISIBLE else View.GONE
         a.appCount.text = if (entries.isEmpty()) "" else "${entries.size} 个"
         a.appRecycler.visibility = if (entries.isEmpty()) View.GONE else View.VISIBLE
@@ -455,6 +515,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         a.emptyState.visibility = View.GONE
+        updateEmptyAnimation(false)
         appAdapter.submit(appTab, entries)
     }
 
@@ -464,6 +525,29 @@ class MainActivity : AppCompatActivity() {
         a.emptyIcon.setImageResource(state.iconRes)
         a.emptyTitle.text = state.title
         a.emptyDesc.text = state.desc
+        updateEmptyAnimation(state.animated)
+    }
+
+    private fun updateEmptyAnimation(active: Boolean) {
+        val icon = binding.appSection.emptyIcon
+        if (!active) {
+            emptyIconAnimator?.cancel()
+            emptyIconAnimator = null
+            icon.rotation = 0f
+            icon.scaleX = 1f
+            icon.scaleY = 1f
+            icon.alpha = 0.88f
+            return
+        }
+        if (emptyIconAnimator?.isRunning == true) return
+        icon.setImageResource(R.drawable.ic_loading_ring)
+        icon.alpha = 1f
+        emptyIconAnimator = ObjectAnimator.ofFloat(icon, View.ROTATION, 0f, 360f).apply {
+            duration = 900L
+            repeatCount = ObjectAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            start()
+        }
     }
 
     private fun bindAppItem(item: ItemAutoAppBinding, entry: AppEntry, mode: AppTab) {
@@ -808,15 +892,27 @@ class MainActivity : AppCompatActivity() {
         AppTab.CONFIGURED -> filteredConfiguredApps()
     }
 
+    private fun supportsAppSearch(): Boolean {
+        return appTab == AppTab.ADD || appTab == AppTab.CONFIGURED
+    }
+
     private fun filteredConfiguredApps(): List<AppEntry> {
-        if (!hideMissingConfigured) return appLists.configured
-        return appLists.configured.filter { it.component != ComponentKind.MISSING_APP }
+        val base = if (hideMissingConfigured) {
+            appLists.configured.filter { it.component != ComponentKind.MISSING_APP }
+        } else {
+            appLists.configured
+        }
+        return filterAppsBySearch(base)
     }
 
     private fun filteredAddableApps(): List<AppEntry> {
+        return filterAppsBySearch(appLists.addable)
+    }
+
+    private fun filterAppsBySearch(entries: List<AppEntry>): List<AppEntry> {
         val q = appSearchQuery.lowercase()
-        if (q.isBlank()) return appLists.addable
-        return appLists.addable.filter {
+        if (q.isBlank()) return entries
+        return entries.filter {
             it.label.lowercase().contains(q) || it.pkg.lowercase().contains(q)
         }
     }
@@ -824,15 +920,17 @@ class MainActivity : AppCompatActivity() {
     private data class EmptyState(
         val iconRes: Int,
         val title: String,
-        val desc: String
+        val desc: String,
+        val animated: Boolean = false
     )
 
     private fun blockedState(): EmptyState? {
         if (environmentLoading) {
             return EmptyState(
-                R.drawable.ic_empty_pending,
+                R.drawable.ic_loading_ring,
                 "正在检测运行环境",
-                "正在确认 Root、模块版本和守护进程状态"
+                "正在确认 Root、模块版本和守护进程状态",
+                animated = true
             )
         }
         return when {
@@ -863,9 +961,10 @@ class MainActivity : AppCompatActivity() {
     private fun emptyStateForCurrentTab(): EmptyState = when (appTab) {
         AppTab.PENDING -> if (appListsLoading) {
             EmptyState(
-                R.drawable.ic_empty_pending,
+                R.drawable.ic_loading_ring,
                 "正在读取配置",
-                "待校准应用会在加载完成后显示"
+                "待校准应用会在加载完成后显示",
+                animated = true
             )
         } else {
             EmptyState(
@@ -876,9 +975,10 @@ class MainActivity : AppCompatActivity() {
         }
         AppTab.ADD -> when {
             addableAppsLoading -> EmptyState(
-                R.drawable.ic_empty_add,
+                R.drawable.ic_loading_ring,
                 "正在加载应用",
-                "应用较多时需要稍等片刻"
+                "应用较多时需要稍等片刻",
+                animated = true
             )
             appSearchQuery.isBlank() -> EmptyState(
                 R.drawable.ic_empty_add,
@@ -891,20 +991,24 @@ class MainActivity : AppCompatActivity() {
                 "试试应用名称或包名里的其他关键词"
             )
         }
-        AppTab.CONFIGURED -> if (appListsLoading) {
-            EmptyState(
-                R.drawable.ic_empty_configured,
+        AppTab.CONFIGURED -> when {
+            appListsLoading -> EmptyState(
+                R.drawable.ic_loading_ring,
                 "正在读取配置",
-                "已配置应用会在加载完成后显示"
+                "已配置应用会在加载完成后显示",
+                animated = true
             )
-        } else if (hideMissingConfigured && appLists.configured.isNotEmpty()) {
-            EmptyState(
+            appSearchQuery.isNotBlank() -> EmptyState(
+                R.drawable.ic_empty_configured,
+                "没有匹配的已配置应用",
+                "试试应用名称或包名里的其他关键词"
+            )
+            hideMissingConfigured && appLists.configured.isNotEmpty() -> EmptyState(
                 R.drawable.ic_empty_configured,
                 "未安装应用已隐藏",
                 "关闭「隐藏未安装应用」可查看配置残留项"
             )
-        } else {
-            EmptyState(
+            else -> EmptyState(
                 R.drawable.ic_empty_configured,
                 "未发现已配置应用",
                 "完成 auto 校准后会在这里显示生成规则的应用"
@@ -1033,7 +1137,7 @@ class MainActivity : AppCompatActivity() {
         return if (base != pkg && base.contains('.')) base else pkg
     }
 
-    /** 包名 -> 应用显示名; 未安装则回退为包名 */
+    /** 包名 -> 应用显示名；未安装则回退为包名 */
     private fun appLabel(pkg: String): String {
         return try {
             val pm = packageManager
@@ -1053,10 +1157,10 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /** 跳转系统「使用情况访问」设置页, 让用户为本应用授予 PACKAGE_USAGE_STATS */
+    /** 跳转系统「使用情况访问」设置页，让用户为本应用授予 PACKAGE_USAGE_STATS */
     private fun requestUsageAccess() {
         val intent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
-        // 部分 ROM 支持直接定位到本应用条目; 失败则回退到列表页
+        // 部分 ROM 支持直接定位到本应用条目；失败则回退到列表页
         try {
             intent.data = Uri.parse("package:$packageName")
             startActivity(intent)
@@ -1069,7 +1173,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 启动目标应用并显示悬浮球, 把目标包名传给服务用于校准 */
+    /** 启动目标应用并显示悬浮球，把目标包名传给服务用于校准 */
     private fun startAppWithBall(pkg: String) {
         if (!canUseModuleFeatures()) {
             toast(blockedState()?.title ?: "模块不可用")
@@ -1099,7 +1203,7 @@ class MainActivity : AppCompatActivity() {
                 toast("启动 $launchPkg 失败")
             }
         } else {
-            toast("未找到 $launchPkg 的启动入口, 请手动进入应用")
+            toast("未找到 $launchPkg 的启动入口，请手动进入应用")
         }
     }
 
@@ -1119,7 +1223,7 @@ class MainActivity : AppCompatActivity() {
         }, 500L)
     }
 
-    /** 把未配置应用写入 applist.conf, 形式为 "包名=auto" */
+    /** 把未配置应用写入 applist.conf，形式为 "包名=auto" */
     private fun addAutoConfig(entry: AppEntry) {
         if (!canUseModuleFeatures()) {
             toast(blockedState()?.title ?: "模块不可用")
@@ -1173,7 +1277,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 删除前展示该包名当前配置规则, 确认后再删除 */
+    /** 删除前展示该包名当前配置规则，确认后再删除 */
     private fun confirmDeleteConfig(entry: AppEntry) {
         confirmDeleteConfig(entry.pkg, entry.configPkgs)
     }
@@ -1307,22 +1411,94 @@ class MainActivity : AppCompatActivity() {
         }
         val targets = configPkgs.distinct()
         thread {
-            val rules = targets.flatMap { DaemonBridge.readPkgRules(it) }
+            val rules = DaemonBridge.readPkgRules(targets)
             runOnUiThreadIfAlive {
-                val message = if (rules.isEmpty()) {
-                    "未读取到 ${targets.joinToString(", ")} 的配置规则"
-                } else {
-                    rules.joinToString("\n")
-                }
                 val view = DialogConfigRulesBinding.inflate(layoutInflater)
                 view.rulesTitle.text = appLabel(displayPkg)
                 view.rulesPkg.text = targets.joinToString("\n")
                 view.rulesCount.text = if (rules.isEmpty()) "暂无规则" else "${rules.size} 条规则"
-                view.rulesText.text = message
+                view.rulesEditor.setText(rules.joinToString("\n"))
                 val dialog = BottomSheetDialog(this)
                 dialog.setContentView(view.root)
                 view.rulesClose.setOnClickListener { dialog.dismiss() }
+                view.rulesSave.setOnClickListener {
+                    val edited = view.rulesEditor.text?.toString().orEmpty()
+                    saveConfiguredRules(dialog, view, targets, edited)
+                }
                 dialog.show()
+            }
+        }
+    }
+
+    private fun saveConfiguredRules(
+        dialog: BottomSheetDialog,
+        view: DialogConfigRulesBinding,
+        targets: List<String>,
+        edited: String
+    ) {
+        val lines = edited.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+            .toList()
+        if (lines.isEmpty()) {
+            view.rulesInputBox.error = "至少保留一条当前应用的配置规则"
+            return
+        }
+        val editedRules = lines.joinToString("\n")
+        val quickCheck = DaemonBridge.validateConfigRulesForPackages(targets, editedRules)
+        when {
+            quickCheck.invalidLines.isNotEmpty() -> {
+                view.rulesInputBox.error = "存在格式错误的规则：${quickCheck.invalidLines.first()}"
+                return
+            }
+            quickCheck.foreignLines.isNotEmpty() -> {
+                view.rulesInputBox.error = "不能保存其他应用的规则：${quickCheck.foreignLines.first()}"
+                return
+            }
+            quickCheck.invalidCoreLines.isNotEmpty() -> {
+                view.rulesInputBox.error = "核心范围不合理：${quickCheck.invalidCoreLines.first()}"
+                return
+            }
+            quickCheck.validLines.isEmpty() -> {
+                view.rulesInputBox.error = "至少保留一条当前应用的配置规则"
+                return
+            }
+        }
+        view.rulesInputBox.error = null
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+            ?.hideSoftInputFromWindow(view.rulesEditor.windowToken, 0)
+        view.rulesSave.isEnabled = false
+        view.rulesClose.isEnabled = false
+        view.rulesSave.text = "保存中"
+        thread {
+            val allowedCpus = DaemonBridge.readConfigAllowedCpus().takeIf { it.isNotEmpty() }
+            val check = DaemonBridge.validateConfigRulesForPackages(targets, editedRules, allowedCpus)
+            val ok = check.ok && DaemonBridge.replaceConfigRules(
+                targets,
+                check.validLines.joinToString("\n"),
+                allowedCpus
+            )
+            val config = if (ok) ConfigReader.readPackages() else null
+            val fullLists = config?.let { buildAppLists(it, processNames) }
+            runOnUiThreadIfAlive {
+                view.rulesSave.isEnabled = true
+                view.rulesClose.isEnabled = true
+                view.rulesSave.text = "保存"
+                if (ok && fullLists != null) {
+                    appLists = fullLists
+                    buildAppList()
+                    dialog.dismiss()
+                    toast("配置已保存")
+                } else {
+                    view.rulesInputBox.error = when {
+                        check.invalidLines.isNotEmpty() -> "存在格式错误的规则：${check.invalidLines.first()}"
+                        check.foreignLines.isNotEmpty() -> "不能保存其他应用的规则：${check.foreignLines.first()}"
+                        check.invalidCoreLines.isNotEmpty() -> "核心范围不合理：${check.invalidCoreLines.first()}"
+                        check.validLines.isEmpty() -> "至少保留一条当前应用的配置规则"
+                        else -> "保存失败，请确认规则属于当前应用并检查 Root 权限"
+                    }
+                    toast("保存配置失败")
+                }
             }
         }
     }

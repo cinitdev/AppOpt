@@ -73,30 +73,63 @@
         android:textColor="@color/text_secondary"
         android:textSize="12sp" />
 
-    <ScrollView
+    <com.google.android.material.textfield.TextInputLayout
+        android:id="@+id/rulesInputBox"
+        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
         android:layout_width="match_parent"
-        android:layout_height="240dp"
+        android:layout_height="wrap_content"
         android:layout_marginTop="10dp"
-        android:background="@drawable/bg_code_block"
-        android:padding="12dp">
+        android:hint="配置规则"
+        app:boxBackgroundColor="@color/card_bg">
 
-        <TextView
-            android:id="@+id/rulesText"
+        <com.google.android.material.textfield.TextInputEditText
+            android:id="@+id/rulesEditor"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
+            android:layout_height="240dp"
             android:fontFamily="monospace"
+            android:gravity="top|start"
+            android:inputType="textMultiLine|textNoSuggestions"
             android:lineSpacingExtra="3dp"
+            android:maxLines="16"
+            android:minLines="8"
+            android:overScrollMode="ifContentScrolls"
+            android:scrollbars="vertical"
             android:textColor="@color/text_primary"
-            android:textIsSelectable="true"
             android:textSize="12sp" />
-    </ScrollView>
+    </com.google.android.material.textfield.TextInputLayout>
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/rulesClose"
-        style="@style/Widget.Material3.Button"
+    <TextView
+        android:id="@+id/rulesHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="只会保存当前应用对应的规则行；空行和注释不会写入。"
+        android:textColor="@color/text_secondary"
+        android:textSize="12sp" />
+
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="14dp"
-        android:text="关闭"
-        app:cornerRadius="12dp" />
+        android:orientation="horizontal">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/rulesClose"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:layout_weight="1"
+            android:text="取消"
+            app:cornerRadius="12dp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/rulesSave"
+            style="@style/Widget.Material3.Button"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="保存"
+            app:cornerRadius="12dp" />
+    </LinearLayout>
 </LinearLayout>

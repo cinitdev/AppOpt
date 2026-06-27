@@ -14,6 +14,7 @@
 .cxx
 local.properties
 *.log
+*.md
 *.zip
 __pycache__/
 app/build/

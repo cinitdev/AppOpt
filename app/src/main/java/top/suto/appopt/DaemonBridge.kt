@@ -45,8 +45,8 @@ object DaemonBridge {
     private const val FPS_CMD_FILE = "$CONFIG_DIR/fps.cmd"
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 171
-    const val REQUIRED_MODULE_VERSION_NAME = "1.7.1"
+    const val REQUIRED_MODULE_VERSION_CODE = 172
+    const val REQUIRED_MODULE_VERSION_NAME = "1.7.2"
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
     fun hasRoot(): Boolean = runAsRoot("id -u").trim() == "0"
@@ -62,6 +62,37 @@ object DaemonBridge {
         val binaryVersionName: String?,
         val raw: String
     )
+
+    data class RootCommandResult(
+        val output: String,
+        val success: Boolean
+    )
+
+    fun readRootFile(path: String): String? {
+        val out = runAsRoot("cat ${shellQuote(path)} 2>/dev/null")
+        return if (out.isNotErrored()) out else null
+    }
+
+    fun rootFileExists(path: String): Boolean {
+        return runAsRoot("[ -f ${shellQuote(path)} ] && printf 1 || printf 0")
+            .trim() == "1"
+    }
+
+    fun runRootCommand(cmd: String, timeoutSeconds: Long = 15L): RootCommandResult {
+        val out = runAsRoot(cmd, timeoutSeconds.coerceAtLeast(1L))
+        return RootCommandResult(
+            output = out.substringBefore(ERR_MARK),
+            success = out.isNotErrored()
+        )
+    }
+
+    fun runRootCommandStreaming(
+        cmd: String,
+        timeoutSeconds: Long = 15L,
+        onOutput: (String) -> Unit
+    ): RootCommandResult {
+        return runAsRootStreaming(cmd, timeoutSeconds.coerceAtLeast(1L), onOutput)
+    }
 
     /**
      * 读取已刷入模块版本。兼容性判断只看 module.prop 的 versionCode；
@@ -351,8 +382,16 @@ object DaemonBridge {
      * 会过滤掉 pkg=auto 占位，只返回真正生成或手写的核心绑定规则。
      */
     fun readPkgRules(pkg: String): List<String> {
+        return readPkgRules(listOf(pkg))
+    }
+
+    fun readPkgRules(pkgs: Collection<String>): List<String> {
         val text = readConfigRaw()
         if (text.isBlank()) return emptyList()
+        val targets = pkgs.map { it.replace("'", "").trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (targets.isEmpty()) return emptyList()
         val result = ArrayList<String>()
         for (raw in text.lineSequence()) {
             val line = raw.trim()
@@ -363,11 +402,11 @@ object DaemonBridge {
             val brace = key.indexOf('{')
             if (brace >= 0) key = key.substring(0, brace).trim()
             val value = line.substring(eq + 1).trim()
-            if (key == pkg && !value.equals("auto", ignoreCase = true)) {
+            if (key in targets && !value.equals("auto", ignoreCase = true)) {
                 result.add(line)
             }
         }
-        return result
+        return sortConfigRuleLines(result)
     }
 
     /** 读取某包名的全部配置行，包括 pkg=auto 占位。 */
@@ -424,126 +463,6 @@ object DaemonBridge {
         return writePolicyFileAsRoot(content)
     }
 
-    /**
-     * 调用 root shell 根据设备 CPU 频率拓扑生成默认校准策略。
-     * App 不写死 0-7 这类核心布局，而是让设备端根据 cpufreq policy 计算默认核心范围。
-     */
-    fun generateDefaultCalibPolicyRaw(): String? {
-        val cmd = """
-            format_cpu_ranges() {
-                [ -z "${'$'}{1// /}" ] && { cat /sys/devices/system/cpu/present 2>/dev/null; return; }
-                awk -v input="${'$'}1" 'BEGIN {
-                    n = split(input, arr, /[[:space:],]+/)
-                    j = 0
-                    for (i = 1; i <= n; i++) {
-                        token = arr[i]
-                        if (token == "") continue
-                        if (token ~ /^[0-9]+-[0-9]+$/) {
-                            split(token, range, "-")
-                            start = range[1] + 0
-                            end = range[2] + 0
-                            if (start > end) { t = start; start = end; end = t }
-                            for (cpu = start; cpu <= end; cpu++) {
-                                if (!seen[cpu]++) nums[++j] = cpu
-                            }
-                        } else if (token ~ /^[0-9]+$/) {
-                            cpu = token + 0
-                            if (!seen[cpu]++) nums[++j] = cpu
-                        }
-                    }
-                    n = j
-                    if (!n) exit
-                    for (i = 1; i < n; i++) {
-                        min = i
-                        for (j = i + 1; j <= n; j++) if (nums[j] < nums[min]) min = j
-                        if (min != i) { t = nums[i]; nums[i] = nums[min]; nums[min] = t }
-                    }
-                    start = last = nums[1]
-                    for (i = 2; i <= n; i++) {
-                        if (nums[i] == last + 1) { last = nums[i]; continue }
-                        printf "%s%s", sep, (start == last ? start : start "-" last)
-                        sep = ","
-                        start = last = nums[i]
-                    }
-                    printf "%s", sep
-                    printf (start == last ? start : start "-" last)
-                }'
-            }
-            sorted_groups=${'$'}(
-                for policy in /sys/devices/system/cpu/cpufreq/policy*; do
-                    [ -d "${'$'}policy" ] || continue
-                    cpus=${'$'}(cat "${'$'}policy/related_cpus" 2>/dev/null)
-                    freq=${'$'}(cat "${'$'}policy/cpuinfo_max_freq" 2>/dev/null)
-                    [ -z "${'$'}cpus" ] || [ -z "${'$'}freq" ] && continue
-                    echo "${'$'}freq:${'$'}cpus"
-                done | sort -n -t: -k1,1 | awk -F: '
-                ${'$'}1 == prev { cores = cores " " ${'$'}2; next }
-                prev != "" { print prev ":" cores; cores = "" }
-                { prev = ${'$'}1; cores = ${'$'}2 }
-                END { if (prev != "") print prev ":" cores }'
-            )
-            eval "${'$'}(echo "${'$'}sorted_groups" | awk -F: '
-            BEGIN {
-                e_core = ""; p_core = ""; p_high_core = ""; hp_core = ""
-                total_groups = 0
-            }
-            {
-                cpus_arr[NR] = ${'$'}2
-                total_groups = NR
-            }
-            END {
-                if (total_groups == 0) {
-                    print "e_core=\"\"; p_core=\"\"; p_high_core=\"\"; hp_core=\"\"; total_groups=0;"
-                    exit
-                }
-                e_core = cpus_arr[1]
-                if (total_groups >= 2) hp_core = cpus_arr[total_groups]
-                if (total_groups >= 3) {
-                    for (i = 2; i < total_groups; i++) {
-                        p_core = p_core (p_core == "" ? "" : " ") cpus_arr[i]
-                    }
-                    p_high_core = cpus_arr[total_groups - 1]
-                }
-                printf "e_core=\"%s\"; p_core=\"%s\"; p_high_core=\"%s\"; hp_core=\"%s\"; total_groups=%d;",
-                    e_core, p_core, p_high_core, hp_core, total_groups
-            }')"
-            all_core=${'$'}(cat /sys/devices/system/cpu/present 2>/dev/null)
-            [ -n "${'$'}all_core" ] || all_core="0-7"
-            best=${'$'}(format_cpu_ranges "${'$'}hp_core")
-            [ -n "${'$'}best" ] || best=${'$'}(format_cpu_ranges "${'$'}all_core")
-            main=${'$'}(format_cpu_ranges "${'$'}p_core")
-            [ -n "${'$'}main" ] || main=${'$'}(format_cpu_ranges "${'$'}e_core")
-            [ -n "${'$'}main" ] || main=${'$'}(format_cpu_ranges "${'$'}all_core")
-            high=${'$'}(format_cpu_ranges "${'$'}p_high_core")
-            [ -n "${'$'}high" ] || high="${'$'}main"
-            non_top=${'$'}(format_cpu_ranges "${'$'}e_core ${'$'}p_core")
-            [ -n "${'$'}non_top" ] || non_top=${'$'}(format_cpu_ranges "${'$'}all_core")
-            low_range=${'$'}(format_cpu_ranges "${'$'}e_core")
-            main_range=${'$'}(format_cpu_ranges "${'$'}p_core")
-            [ -n "${'$'}main_range" ] || main_range="${'$'}low_range"
-            high_range=${'$'}(format_cpu_ranges "${'$'}p_high_core")
-            [ -n "${'$'}high_range" ] || high_range="${'$'}main_range"
-            top_range=${'$'}(format_cpu_ranges "${'$'}hp_core")
-            [ -n "${'$'}top_range" ] || top_range=${'$'}(format_cpu_ranges "${'$'}all_core")
-            non_top_range=${'$'}(format_cpu_ranges "${'$'}e_core ${'$'}p_core")
-            [ -n "${'$'}non_top_range" ] || non_top_range=${'$'}(format_cpu_ranges "${'$'}all_core")
-            all_range=${'$'}(format_cpu_ranges "${'$'}all_core")
-            cat <<EOF
-version=1
-best_thread=avg:18,max:30,cores:${'$'}best
-group_high=avg:13,max:22,cores:${'$'}high
-group_mid=avg:8,max:18,cores:${'$'}main
-wildcard_group=max_member
-max_thread_rules=6
-fallback=cores:${'$'}non_top
-EOF
-        """.trimIndent()
-        val out = runAsRoot(cmd)
-        return out.takeIf { it.isNotErrored() }
-            ?.trim()
-            ?.takeIf { it.contains("best_thread=") && it.contains("fallback=") }
-    }
-
     /** 把应用追加为 pkg=auto，占位后可在“待校准”里启动采样。 */
     fun addAutoPackage(pkg: String): Boolean {
         val safe = pkg.replace("'", "")
@@ -570,6 +489,95 @@ EOF
         val kept = parseConfigBlocks(raw)
             .filterNot { block -> block.group in targetGroups || block.owners.any { it in targetSet } }
         return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(kept))
+    }
+
+    data class ConfigRuleValidation(
+        val validLines: List<String>,
+        val invalidLines: List<String>,
+        val foreignLines: List<String>,
+        val invalidCoreLines: List<String>
+    ) {
+        val ok: Boolean
+            get() = validLines.isNotEmpty() &&
+                invalidLines.isEmpty() &&
+                foreignLines.isEmpty() &&
+                invalidCoreLines.isEmpty()
+    }
+
+    /** 校验编辑后的规则是否只属于当前应用/同组子进程。 */
+    fun validateConfigRulesForPackages(
+        pkgs: Collection<String>,
+        editedText: String,
+        allowedCpus: Set<Int>? = null
+    ): ConfigRuleValidation {
+        val targets = pkgs.map { it.replace("'", "").trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (targets.isEmpty()) {
+            return ConfigRuleValidation(emptyList(), emptyList(), emptyList(), emptyList())
+        }
+
+        val targetSet = targets.toSet()
+        val targetGroups = targets.map { configGroupName(it) }.toSet()
+        val valid = ArrayList<String>()
+        val invalid = ArrayList<String>()
+        val foreign = ArrayList<String>()
+        val invalidCore = ArrayList<String>()
+
+        for (line in editedText.lineSequence().map { it.trim() }) {
+            if (line.isEmpty() || line.startsWith("#")) continue
+            val owner = configLineOwner(line)
+            val value = line.substringAfter("=", "").trim()
+            if (owner == null || value.isEmpty()) {
+                invalid.add(line)
+                continue
+            }
+            val cpus = parseConfigRuleCpusStrict(value)
+            if (cpus == null || (allowedCpus != null && !allowedCpus.containsAll(cpus))) {
+                invalidCore.add(line)
+                continue
+            }
+            if (owner in targetSet || configGroupName(owner) in targetGroups) {
+                valid.add(line)
+            } else {
+                foreign.add(line)
+            }
+        }
+
+        return ConfigRuleValidation(
+            sortConfigRuleLines(valid.distinct()),
+            invalid.distinct(),
+            foreign.distinct(),
+            invalidCore.distinct()
+        )
+    }
+
+    /** 替换指定应用/子进程的配置规则; 只接受属于 targets 的规则行, 避免误改其他应用。 */
+    fun replaceConfigRules(
+        pkgs: Collection<String>,
+        editedText: String,
+        allowedCpus: Set<Int>? = null
+    ): Boolean {
+        val targets = pkgs.map { it.replace("'", "").trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (targets.isEmpty()) return false
+
+        val presentCpus = allowedCpus ?: readConfigAllowedCpus().takeIf { it.isNotEmpty() }
+        val check = validateConfigRulesForPackages(targets, editedText, presentCpus)
+        if (!check.ok) return false
+        val newLines = sortConfigRuleLines(check.validLines)
+        if (newLines.isEmpty()) return false
+
+        val targetSet = targets.toSet()
+        val targetGroups = targets.map { configGroupName(it) }.toSet()
+        val blocks = parseConfigBlocks(readConfigRaw())
+            .filterNot { block -> block.group in targetGroups || block.owners.any { it in targetSet } }
+            .toMutableList()
+        val group = configGroupName(targets.first())
+        val owners = newLines.mapNotNull { configLineOwner(it) }.toMutableSet()
+        blocks.add(ConfigBlock(group, newLines.toMutableList(), owners))
+        return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(blocks))
     }
 
     private data class ConfigBlock(
@@ -628,6 +636,99 @@ EOF
             .filter { it.isNotBlank() }
             .joinToString("\n\n")
         return if (text.isBlank()) "" else "$text\n"
+    }
+
+    private fun sortConfigRuleLines(lines: List<String>): List<String> {
+        return lines.withIndex()
+            .sortedWith(
+                compareBy<IndexedValue<String>> { if (configRuleIsFallback(it.value)) 1 else 0 }
+                    .thenByDescending { configRuleMaxCpu(it.value) }
+                    .thenByDescending { configRuleMinCpu(it.value) }
+                    .thenBy { it.index }
+            )
+            .map { it.value }
+    }
+
+    private fun configRuleIsFallback(line: String): Boolean {
+        val left = line.substringBefore("=").trim()
+        return !left.contains("{") && !left.contains(":")
+    }
+
+    private fun configRuleMaxCpu(line: String): Int {
+        return parseConfigRuleCpus(line).maxOrNull() ?: -1
+    }
+
+    private fun configRuleMinCpu(line: String): Int {
+        return parseConfigRuleCpus(line).minOrNull() ?: -1
+    }
+
+    private fun parseConfigRuleCpus(line: String): Set<Int> {
+        return parseConfigRuleCpusStrict(line.substringAfter("=", "").trim()).orEmpty()
+    }
+
+    private fun parseConfigRuleCpusStrict(value: String): Set<Int>? {
+        val cpus = linkedSetOf<Int>()
+        if (value.isBlank()) return null
+        fun parseCpuToken(text: String): Int? {
+            if (text.isEmpty()) return null
+            if (text.length > 1 && text.startsWith("0")) return null
+            if (!text.all { it.isDigit() }) return null
+            return text.toIntOrNull()?.takeIf { it >= 0 && it <= 1024 }
+        }
+        val token = value.trim()
+        if (token.contains(",")) return null
+        val dash = token.indexOf('-')
+        if (dash >= 0) {
+            if (token.indexOf('-', dash + 1) >= 0) return null
+            val start = parseCpuToken(token.substring(0, dash)) ?: return null
+            val end = parseCpuToken(token.substring(dash + 1)) ?: return null
+            if (start >= end) return null
+            for (cpu in start..end) {
+                cpus.add(cpu)
+            }
+        } else {
+            val cpu = parseCpuToken(token) ?: return null
+            cpus.add(cpu)
+        }
+        return cpus
+    }
+
+    fun readPresentCpus(): Set<Int> {
+        val out = runAsRoot("cat /sys/devices/system/cpu/present 2>/dev/null")
+        return parseCpuRangeList(out.trim())
+    }
+
+    fun readConfigAllowedCpus(): Set<Int> {
+        val present = readPresentCpus()
+        if (present.isNotEmpty()) return present
+
+        val policy = readCalibPolicyRaw().content
+        for (line in policy.lineSequence()) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith("detected_all=")) {
+                return parseCpuRangeList(trimmed.substringAfter("=").trim())
+            }
+        }
+        return emptySet()
+    }
+
+    private fun parseCpuRangeList(text: String): Set<Int> {
+        val cpus = linkedSetOf<Int>()
+        for (part in text.split(',')) {
+            val token = part.trim()
+            if (token.isEmpty()) continue
+            val dash = token.indexOf('-')
+            if (dash >= 0) {
+                val start = token.substring(0, dash).toIntOrNull()
+                val end = token.substring(dash + 1).toIntOrNull()
+                if (start != null && end != null && start <= end) {
+                    for (cpu in start..end) cpus.add(cpu)
+                }
+            } else {
+                token.toIntOrNull()?.let { cpus.add(it) }
+            }
+        }
+        return cpus
     }
 
     private fun configLineOwner(rawLine: String): String? {
@@ -724,6 +825,10 @@ EOF
         return value.trim().replace("'", "").replace(allowed, "")
     }
 
+    private fun shellQuote(value: String): String {
+        return "'" + value.replace("'", "'\"'\"'") + "'"
+    }
+
     /**
      * 以 root 写入文件。
      * 内容先 base64，再通过 heredoc 在设备端还原，避免 shell 转义和长文本换行问题。
@@ -766,7 +871,7 @@ EOF
     private val DEV_NULL = java.io.File("/dev/null")
 
     /** 等待 root 子进程结束，并读取 stdout；超时或非零退出会附加错误标记。 */
-    private fun waitAndRead(process: Process): String {
+    private fun waitAndRead(process: Process, timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS): String {
         val outRef = AtomicReference("")
         val reader = Thread {
             outRef.set(process.inputStream.bufferedReader().readText())
@@ -775,7 +880,7 @@ EOF
             start()
         }
 
-        val finished = process.waitFor(ROOT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
         if (!finished) {
             process.destroyForcibly()
             reader.join(1000)
@@ -787,11 +892,53 @@ EOF
         return if (process.exitValue() != 0) "$out$ERR_MARK" else out
     }
 
+    private fun waitAndStream(
+        process: Process,
+        timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS,
+        onOutput: (String) -> Unit
+    ): RootCommandResult {
+        val out = StringBuilder()
+        val reader = Thread {
+            try {
+                BufferedReader(InputStreamReader(process.inputStream)).use { br ->
+                    while (true) {
+                        val line = br.readLine() ?: break
+                        val chunk = "$line\n"
+                        synchronized(out) {
+                            out.append(chunk)
+                        }
+                        onOutput(chunk)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+
+        val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroyForcibly()
+            reader.join(1000)
+            return RootCommandResult(
+                output = synchronized(out) { out.toString() },
+                success = false
+            )
+        }
+
+        reader.join(1000)
+        return RootCommandResult(
+            output = synchronized(out) { out.toString() },
+            success = process.exitValue() == 0
+        )
+    }
+
     /**
      * 通过 su -c 执行命令。
      * stderr 重定向到 /dev/null，避免无人读取的错误管道写满后卡住 root 子进程。
      */
-    private fun runAsRoot(cmd: String): String {
+    private fun runAsRoot(cmd: String, timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS): String {
         return try {
             // 把 stderr 重定向到 /dev/null: 没有无人读的 stderr 管道, 既避免
             // "stderr 写满管道缓冲(~64KB)->子进程阻塞写、父进程阻塞读 stdout"的死锁,
@@ -801,18 +948,18 @@ EOF
                 .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
                 .start()
             try {
-                waitAndRead(process)
+                waitAndRead(process, timeoutSeconds)
             } finally {
                 process.destroy()
             }
         } catch (e: Exception) {
             // 某些 su 实现不支持 "su -c", 回退到管道写入方式
-            runViaStdin(cmd)
+            runViaStdin(cmd, timeoutSeconds)
         }
     }
 
     /** 兼容不支持 su -c 的实现，退回到 stdin 写入命令。 */
-    private fun runViaStdin(cmd: String): String {
+    private fun runViaStdin(cmd: String, timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS): String {
         return try {
             val process = ProcessBuilder("su")
                 .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
@@ -823,12 +970,55 @@ EOF
                     os.writeBytes("exit\n")
                     os.flush()
                 }
-                waitAndRead(process)
+                waitAndRead(process, timeoutSeconds)
             } finally {
                 process.destroy()
             }
         } catch (e: Exception) {
             "$ERR_MARK"
+        }
+    }
+
+    private fun runAsRootStreaming(
+        cmd: String,
+        timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS,
+        onOutput: (String) -> Unit
+    ): RootCommandResult {
+        return try {
+            val process = ProcessBuilder("su", "-c", cmd)
+                .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
+                .start()
+            try {
+                waitAndStream(process, timeoutSeconds, onOutput)
+            } finally {
+                process.destroy()
+            }
+        } catch (_: Exception) {
+            runViaStdinStreaming(cmd, timeoutSeconds, onOutput)
+        }
+    }
+
+    private fun runViaStdinStreaming(
+        cmd: String,
+        timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS,
+        onOutput: (String) -> Unit
+    ): RootCommandResult {
+        return try {
+            val process = ProcessBuilder("su")
+                .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
+                .start()
+            try {
+                DataOutputStream(process.outputStream).use { os ->
+                    os.writeBytes("$cmd\n")
+                    os.writeBytes("exit\n")
+                    os.flush()
+                }
+                waitAndStream(process, timeoutSeconds, onOutput)
+            } finally {
+                process.destroy()
+            }
+        } catch (_: Exception) {
+            RootCommandResult(output = "", success = false)
         }
     }
 }

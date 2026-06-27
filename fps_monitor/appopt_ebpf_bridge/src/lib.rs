@@ -99,15 +99,15 @@ fn pid_matches_pkg(pid: u32, pkg: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
-fn on_frame(ctx: &mut AppOptEbpfCtx, event: FrameEvent) {
+fn on_frame(ctx: &mut AppOptEbpfCtx, event: FrameEvent) -> bool {
     if ctx.pid > 0 && event.pid != ctx.pid as u32 {
-        return;
+        return false;
     }
 
     if ctx.pid <= 0 {
         if let Some(pkg) = ctx.target_pkg.as_deref() {
             if !pid_matches_pkg(event.pid, pkg) {
-                return;
+                return false;
             }
         }
         ctx.pid = event.pid as i32;
@@ -133,6 +133,7 @@ fn on_frame(ctx: &mut AppOptEbpfCtx, event: FrameEvent) {
     }
 
     ctx.last_ts = event.timestamp_ns;
+    true
 }
 
 fn poll_inner(ctx: &mut AppOptEbpfCtx) -> Result<i32, String> {
@@ -152,12 +153,14 @@ fn poll_inner(ctx: &mut AppOptEbpfCtx) -> Result<i32, String> {
         }
     }
 
-    let consumed = events.len() as i32;
+    let mut accepted = 0;
     for event in events {
-        on_frame(ctx, event);
+        if on_frame(ctx, event) {
+            accepted += 1;
+        }
     }
 
-    Ok(consumed)
+    Ok(accepted)
 }
 
 fn attach_first_symbol(bpf: &mut Ebpf, pid: i32) -> Result<CString, String> {

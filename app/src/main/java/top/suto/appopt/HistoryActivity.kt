@@ -155,9 +155,9 @@ class HistoryActivity : AppCompatActivity() {
                     expandedCard = null
                 } else {
                     expandedCard?.let { setCardExpanded(it, false) }
-                    ensureThreadsLoaded(card, s.id, durationSec)
                     setCardExpanded(card, true)
                     expandedCard = card
+                    ensureThreadsLoaded(card, s.id, durationSec)
                 }
             }
             card.sessionManage.setOnClickListener { showSessionManageSheet(s) }
@@ -320,7 +320,7 @@ class HistoryActivity : AppCompatActivity() {
             val db = AppOptDbHelper.getInstance(this)
             val loads = db.getThreadsBySessionId(sessionId).map { it.toThreadLoad() }
             runOnUiThreadIfAlive {
-                if (generation != reloadGeneration) return@runOnUiThreadIfAlive
+                if (isThreadRenderStale(card, generation)) return@runOnUiThreadIfAlive
                 card.threadRows.removeAllViews()
                 val inflater = LayoutInflater.from(this)
                 renderThreadPage(card, inflater, loads, durationSec, 0, generation)
@@ -336,7 +336,7 @@ class HistoryActivity : AppCompatActivity() {
         startIndex: Int,
         generation: Int
     ) {
-        if (isThreadRenderStale(generation) || startIndex >= loads.size) return
+        if (isThreadRenderStale(card, generation) || startIndex >= loads.size) return
         renderThreadBatch(card, inflater, loads, durationSec, startIndex, loads.size, generation) {}
     }
 
@@ -350,7 +350,7 @@ class HistoryActivity : AppCompatActivity() {
         generation: Int,
         onDone: () -> Unit
     ) {
-        if (isThreadRenderStale(generation)) return
+        if (isThreadRenderStale(card, generation)) return
         val nextIndex = minOf(startIndex + THREAD_RENDER_BATCH_SIZE, endIndex)
         for (i in startIndex until nextIndex) {
             val tl = loads[i]
@@ -363,16 +363,18 @@ class HistoryActivity : AppCompatActivity() {
         }
         if (nextIndex < endIndex) {
             card.threadRows.post {
-                renderThreadBatch(
-                    card,
-                    inflater,
-                    loads,
-                    durationSec,
-                    nextIndex,
-                    endIndex,
-                    generation,
-                    onDone
-                )
+                if (!isThreadRenderStale(card, generation)) {
+                    renderThreadBatch(
+                        card,
+                        inflater,
+                        loads,
+                        durationSec,
+                        nextIndex,
+                        endIndex,
+                        generation,
+                        onDone
+                    )
+                }
             }
         } else {
             onDone()
@@ -381,6 +383,10 @@ class HistoryActivity : AppCompatActivity() {
 
     private fun isThreadRenderStale(generation: Int): Boolean {
         return isFinishing || isDestroyed || generation != reloadGeneration
+    }
+
+    private fun isThreadRenderStale(card: ItemCalibSessionBinding, generation: Int): Boolean {
+        return isThreadRenderStale(generation) || card.threadRows.visibility != View.VISIBLE
     }
 
     private fun ThreadData.toThreadLoad(): ThreadLoad {

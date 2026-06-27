@@ -46,7 +46,7 @@
 #include "ebpf_fps.h"
 #include "fps_fallback.h"
 
-#define VERSION            "1.7.1"
+#define VERSION            "1.7.2"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -73,6 +73,8 @@
 #define FPS_OUT_FILE       FPS_OUT_DIR "/fps"
 #define FPS_BPF_OBJ        EBPF_DIR "/queuebuffer_probe.bpf.o"  /* eBPF 字节码 */
 #define FPS_WINDOW_MS      1000           /* 出一个 FPS 的周期 */
+#define FPS_EBPF_STALE_MS  2500           /* 目标 PID 长时间无帧时不继续推旧 FPS */
+#define FPS_EBPF_RESTART_COOLDOWN_MS 3000 /* PID 变化后重启 eBPF 的最小间隔 */
 #define FPS_SOCKET_NAME_MAX 96
 #define FPS_SOCKET_TOKEN_MAX 64
 #define DAEMON_SOCKET_NAME "appopt_daemon_top.suto.appopt_v1"
@@ -2167,6 +2169,8 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
      *    不按线程名白名单/黑名单猜职责, 避免不同游戏命名差异导致误判。
      *    同档位先输出精确线程, 再输出通配组; 只保留 Top N, 避免规则过多。 */
     char big_thread[MAX_THREAD_LEN] = {0};
+    char big_rule[MAX_THREAD_LEN] = {0};
+    size_t best_idx = SIZE_MAX;
     double best_score = -1.0;
     double best_avg = 0.0;
     double best_max = 0.0;
@@ -2179,8 +2183,12 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
             best_score = score;
             best_avg = avg_pct;
             best_max = max_pct;
+            best_idx = i;
             build_str(big_thread, sizeof(big_thread), data->threads[i].name, NULL);
         }
+    }
+    if (best_idx != SIZE_MAX) {
+        calib_rule_base_for_thread(data, best_idx, big_rule, sizeof(big_rule));
     }
 
     char* p = out_buf;
@@ -2188,12 +2196,13 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     int lines = 0;
     int thread_lines = 0;
     const int max_thread_lines = policy.max_thread_rules;
-    const bool has_big_thread = big_thread[0] &&
+    const bool big_rule_is_wild = (strchr(big_rule, '*') != NULL);
+    const bool has_big_thread = big_thread[0] && big_rule[0] && !big_rule_is_wild &&
         (best_avg >= policy.best_avg && best_max >= policy.best_max);
     const char* big_tier = calib_policy_core_range(topo, policy.best_tier, policy.best_cores);
 
     if (has_big_thread && big_tier && big_tier[0]) {
-        if (!calib_append_rule(&p, &remain, &lines, data->pkg, big_thread, big_tier))
+        if (!calib_append_rule(&p, &remain, &lines, data->pkg, big_rule, big_tier))
             goto finish;
         thread_lines++;
     }
@@ -2204,7 +2213,10 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
                 if ((groups[g].is_wild ? 1 : 0) != wild_pass) continue;
                 if (calib_group_tier(&groups[g], &policy) != tier_pass) continue;
                 if (has_big_thread) {
-                    if (groups[g].is_wild) {
+                    if (strcmp(groups[g].base, big_rule) == 0) continue;
+                    if (strchr(big_rule, '*') != NULL && !groups[g].is_wild) {
+                        if (fnmatch(big_rule, groups[g].base, FNM_NOESCAPE) == 0) continue;
+                    } else if (groups[g].is_wild) {
                         if (fnmatch(groups[g].base, big_thread, FNM_NOESCAPE) == 0) continue;
                     } else if (strcmp(groups[g].base, big_thread) == 0) {
                         continue;
@@ -2348,8 +2360,155 @@ static void calib_write_history(const char* pkg, CalibData* data) {
     free(cur);
 }
 
-/* 把生成的规则写回配置文件: 逐行复制原文件, 遇到 "pkg=auto" 行替换为 rules_text,
- * 其余行原样保留。成功返回 true。 */
+static bool calib_write_line_normalized(FILE* out, const char* text) {
+    if (!out || !text) return false;
+    size_t len = strlen(text);
+    if (len > 0 && fwrite(text, 1, len, out) != len) return false;
+    if (len == 0 || text[len - 1] != '\n') {
+        if (fputc('\n', out) == EOF) return false;
+    }
+    return true;
+}
+
+static bool calib_write_rules_block(FILE* out, const char* rules_text) {
+    if (!out || !rules_text) return false;
+    size_t len = strlen(rules_text);
+    while (len > 0 && (rules_text[len - 1] == '\n' || rules_text[len - 1] == '\r')) len--;
+    if (len == 0) return false;
+    if (fwrite(rules_text, 1, len, out) != len) return false;
+    return fputc('\n', out) != EOF;
+}
+
+static bool calib_line_is_blank(const char* line) {
+    if (!line) return true;
+    for (const char* p = line; *p; p++) {
+        if (*p == '\n' || *p == '\r') continue;
+        if (!isspace((unsigned char)*p)) return false;
+    }
+    return true;
+}
+
+typedef struct {
+    char** lines;
+    size_t count;
+    size_t cap;
+    char group[MAX_PKG_LEN];
+    bool has_owner;
+} CalibConfigBlock;
+
+static void calib_config_block_clear(CalibConfigBlock* block) {
+    if (!block) return;
+    for (size_t i = 0; i < block->count; i++) free(block->lines[i]);
+    free(block->lines);
+    memset(block, 0, sizeof(*block));
+}
+
+static bool calib_config_block_add(CalibConfigBlock* block, const char* raw_line) {
+    if (!block || !raw_line) return false;
+    char* copy = strdup(raw_line);
+    if (!copy) return false;
+    char* trimmed = strtrim(copy);
+    char* line = strdup(trimmed);
+    free(copy);
+    if (!line) return false;
+    if (line[0] == '\0') { free(line); return true; }
+
+    if (block->count == block->cap) {
+        size_t next = block->cap ? block->cap * 2 : 8;
+        char** grown = realloc(block->lines, next * sizeof(char*));
+        if (!grown) { free(line); return false; }
+        block->lines = grown;
+        block->cap = next;
+    }
+    block->lines[block->count++] = line;
+    return true;
+}
+
+static void calib_config_group_name(const char* owner, char* out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!owner || !owner[0]) return;
+
+    char tmp[MAX_PKG_LEN];
+    build_str(tmp, sizeof(tmp), owner, NULL);
+    char* colon = strchr(tmp, ':');
+    if (colon) {
+        *colon = '\0';
+        if (strchr(tmp, '.')) {
+            build_str(out, out_sz, tmp, NULL);
+            return;
+        }
+    }
+    build_str(out, out_sz, owner, NULL);
+}
+
+static bool calib_config_line_group(const char* raw_line, char* out, size_t out_sz) {
+    if (!raw_line || !out || out_sz == 0) return false;
+    out[0] = '\0';
+
+    char* copy = strdup(raw_line);
+    if (!copy) return false;
+    char* t = strtrim(copy);
+    if (*t == '\0' || *t == '#') { free(copy); return false; }
+
+    char* eq = strchr(t, '=');
+    if (!eq) { free(copy); return false; }
+    *eq = '\0';
+    char* owner = strtrim(t);
+    char* brace = strchr(owner, '{');
+    if (brace) {
+        *brace = '\0';
+        owner = strtrim(owner);
+    }
+    if (*owner == '\0') { free(copy); return false; }
+
+    calib_config_group_name(owner, out, out_sz);
+    free(copy);
+    return out[0] != '\0';
+}
+
+static bool calib_write_config_block(FILE* out, const CalibConfigBlock* block, bool* wrote_any) {
+    if (!out || !block || block->count == 0) return true;
+    if (wrote_any && *wrote_any) {
+        if (fputc('\n', out) == EOF) return false;
+    }
+    for (size_t i = 0; i < block->count; i++) {
+        if (!calib_write_line_normalized(out, block->lines[i])) return false;
+    }
+    if (wrote_any) *wrote_any = true;
+    return true;
+}
+
+static bool calib_write_rules_block_separated(FILE* out, const char* rules_text, bool* wrote_any) {
+    if (!out || !rules_text) return false;
+    if (wrote_any && *wrote_any) {
+        if (fputc('\n', out) == EOF) return false;
+    }
+    if (!calib_write_rules_block(out, rules_text)) return false;
+    if (wrote_any) *wrote_any = true;
+    return true;
+}
+
+static bool calib_flush_config_block(FILE* out, CalibConfigBlock* block,
+                                     const char* target_group, const char* rules_text,
+                                     bool* wrote_any, bool* inserted) {
+    if (!block || block->count == 0) return true;
+    bool is_target = block->has_owner && target_group && strcmp(block->group, target_group) == 0;
+    bool ok = true;
+    if (is_target) {
+        if (inserted && !*inserted) {
+            ok = calib_write_rules_block_separated(out, rules_text, wrote_any);
+            *inserted = ok;
+        }
+    } else {
+        ok = calib_write_config_block(out, block, wrote_any);
+    }
+    calib_config_block_clear(block);
+    return ok;
+}
+
+/* 把生成的规则写回配置文件: 同一应用/子进程视为一块, 自动校准完成后整体替换该应用旧块。
+ * 这样可以清理重复 auto/旧规则, 并把应用块之间规整为一空行。成功返回 true。 */
 static bool calib_write_back(const char* config_file, const char* pkg,
                              const char* rules_text) {
     FILE* in = fopen(config_file, "r");
@@ -2359,47 +2518,56 @@ static bool calib_write_back(const char* config_file, const char* pkg,
     FILE* out = fopen(tmp_path, "w");
     if (!out) { fclose(in); return false; }
 
+    char target_group[MAX_PKG_LEN];
+    calib_config_group_name(pkg, target_group, sizeof(target_group));
+
     char* line = NULL;
     size_t line_cap = 0;
-    bool replaced = false;
-    while (getline(&line, &line_cap, in) != -1) {
-        char* copy = strdup(line);
-        if (!copy) {
-            fputs(line, out);
-            continue;
-        }
-        char* t = strtrim(copy);
-        bool is_target = false;
-        if (*t != '#' && *t) {
-            char* eq = strchr(t, '=');
-            if (eq) {
-                char saved = *eq;
-                *eq = '\0';
-                char* lpkg = strtrim(t);
-                char* lval = strtrim(eq + 1);
-                if (!strchr(lpkg, '{') && strcmp(lpkg, pkg) == 0
-                    && strcmp(lval, "auto") == 0) {
-                    is_target = true;
+    CalibConfigBlock block = {0};
+    bool inserted = false;
+    bool wrote_any = false;
+    bool write_ok = true;
+    while (write_ok && getline(&line, &line_cap, in) != -1) {
+        if (calib_line_is_blank(line)) continue;
+
+        char line_group[MAX_PKG_LEN];
+        bool has_owner = calib_config_line_group(line, line_group, sizeof(line_group));
+        if (has_owner) {
+            if (block.count > 0) {
+                if (!block.has_owner || strcmp(block.group, line_group) != 0) {
+                    write_ok = calib_flush_config_block(out, &block, target_group, rules_text,
+                                                        &wrote_any, &inserted);
+                    if (!write_ok) break;
                 }
-                *eq = saved;
             }
-        }
-        free(copy);
-        if (is_target) {
-            if (!replaced) {
-                fputs(rules_text, out);   /* 用生成规则替换第一条 auto 行 */
-                replaced = true;
+            if (block.count == 0) {
+                block.has_owner = true;
+                build_str(block.group, sizeof(block.group), line_group, NULL);
             }
-        } else {
-            fputs(line, out);
+        } else if (block.count > 0 && block.has_owner) {
+            write_ok = calib_flush_config_block(out, &block, target_group, rules_text,
+                                                &wrote_any, &inserted);
+            if (!write_ok) break;
         }
+
+        write_ok = calib_config_block_add(&block, line);
     }
-    if (!replaced) {                  /* 原文件无对应 auto 行则追加 */
-        fputs(rules_text, out);
+    if (write_ok) {
+        write_ok = calib_flush_config_block(out, &block, target_group, rules_text,
+                                            &wrote_any, &inserted);
+    } else {
+        calib_config_block_clear(&block);
+    }
+    if (write_ok && !inserted) {
+        write_ok = calib_write_rules_block_separated(out, rules_text, &wrote_any);
     }
     free(line);
     fclose(in);
-    fclose(out);
+    if (fclose(out) != 0) write_ok = false;
+    if (!write_ok) {
+        unlink(tmp_path);
+        return false;
+    }
     if (rename(tmp_path, config_file) != 0) {
         unlink(tmp_path);
         return false;
@@ -2538,23 +2706,23 @@ static void* calib_thread(void* arg) {
                 char rules[2048];
                 int n = calib_generate_rules(&data, &g_topo, rules, sizeof(rules));
                 calib_write_history(data.pkg, &data);
+                char st[MAX_PKG_LEN + 64];
                 if (n > 0) {
                     AppConfig* cfg = get_config();
                     const char* cf = cfg ? cfg->config_file : g_config_file;
                     if (calib_write_back(cf, data.pkg, rules)) {
                         printf("[校准] 已为 %s 生成 %d 条规则:\n%s", data.pkg, n, rules);
                         atomic_store(&config_updated, 1);
+                        snprintf(st, sizeof(st), "done %s", data.pkg);
                     } else {
                         printf("[校准] 警告: %s 规则写回配置失败 (路径 %s)\n", data.pkg, cf);
+                        snprintf(st, sizeof(st), "done %s;reason=write_fail", data.pkg);
                     }
                     if (cfg) config_release(cfg);
                 } else {
                     printf("[校准] 警告: %s 未能生成规则 (线程负载样本不足?)\n", data.pkg);
+                    snprintf(st, sizeof(st), "done %s;reason=no_load", data.pkg);
                 }
-                /* 进程退出也算完成一次校准并已生成规则, 与 stop 分支保持一致写 done,
-                 * 否则 App 侧 waitDone() 会因状态停留在 idle 而误判超时。 */
-                char st[MAX_PKG_LEN + 16];
-                snprintf(st, sizeof(st), "done %s", data.pkg);
                 calib_set_state(st);
                 calib_free(&data);
             } else if (data.round_count != prev_rounds && data.round_count % 20 == 0) {
@@ -3319,6 +3487,34 @@ static bool fps_read_cmd(char* cmd_buf, size_t sz) {
     return read_stable_command_file(FPS_CMD_FILE, cmd_buf, sz, fps_cmd_valid);
 }
 
+static pid_t fps_wait_pkg_pid(const char* pkg, int attempts, useconds_t delay_us) {
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        pid_t pids[64];
+        size_t np = collect_pkg_pids(pkg, pids, 64);
+        if (np > 0) return pids[0];
+        if (delay_us > 0) usleep(delay_us);
+    }
+    return (pid_t)-1;
+}
+
+static bool fps_pid_in_list(pid_t pid, const pid_t* pids, size_t count) {
+    if (pid <= 0) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (pids[i] == pid) return true;
+    }
+    return false;
+}
+
+static ebpf_fps_ctx* fps_start_ebpf_ctx(const char* pkg, pid_t target_pid) {
+    if (target_pid > 0) {
+        printf("[FPS] 目标进程 PID: %d, 尝试 eBPF uprobe...\n", target_pid);
+        return ebpf_fps_start(FPS_BPF_OBJ, target_pid, pkg);
+    }
+
+    printf("[FPS] 未锁定包名 PID, 尝试 eBPF 全局 uprobe 探测屏幕帧事件...\n");
+    return ebpf_fps_start(FPS_BPF_OBJ, (pid_t)-1, pkg);
+}
+
 /*
  * FPS 监测线程。控制协议仍走纯文本文件:
  *   App -> 守护: 写 FPS_CMD_FILE, 内容 "start <pkg> [socket token]" / "stop"
@@ -3346,6 +3542,11 @@ static void* fps_thread(void* arg) {
     bool ebpf_first_fps = true;
     bool ebpf_pid_reported = false;
     int ebpf_poll_failures = 0;
+    bool ebpf_seen_frames = false;
+    bool ebpf_stale_zero_sent = false;
+    long long ebpf_last_frame_ms = 0;
+    long long ebpf_last_pid_check_ms = 0;
+    long long ebpf_last_restart_ms = 0;
 
     /* Fallback 状态(包含 --latency + timestats) */
     fps_fallback_ctx *fallback_ctx = NULL;
@@ -3373,6 +3574,11 @@ static void* fps_thread(void* arg) {
                     ebpf_first_fps = true;
                     ebpf_pid_reported = false;
                     ebpf_poll_failures = 0;
+                    ebpf_seen_frames = false;
+                    ebpf_stale_zero_sent = false;
+                    ebpf_last_frame_ms = monotonic_ms();
+                    ebpf_last_pid_check_ms = 0;
+                    ebpf_last_restart_ms = ebpf_last_frame_ms;
                     fallback_first_fps = true;
                     last_fps_output_ms = 0;
 
@@ -3382,28 +3588,13 @@ static void* fps_thread(void* arg) {
 
                     if (cap == EBPF_CAP_OK) {
                         /* 2. 找目标进程 PID。游戏刚启动时 /proc/cmdline 可能短暂不可见, 等一小段时间。 */
-                        target_pid = -1;
-                        for (int attempt = 0; attempt < 30 && target_pid < 0; attempt++) {
-                            pid_t pids[64];
-                            size_t np = collect_pkg_pids(pkg, pids, 64);
-                            if (np > 0) {
-                                target_pid = pids[0];
-                                break;
-                            }
-                            usleep(100 * 1000);
-                        }
+                        target_pid = fps_wait_pkg_pid(pkg, 30, 100 * 1000);
                         if (target_pid < 0) {
                             printf("[FPS] 等待约 3 秒仍未找到 %s 的进程, 尝试全局 eBPF 帧事件探测\n", pkg);
                         }
 
                         /* 3. 尝试 eBPF attach */
-                        if (target_pid > 0) {
-                            printf("[FPS] 目标进程 PID: %d, 尝试 eBPF uprobe...\n", target_pid);
-                            ebpf_ctx = ebpf_fps_start(FPS_BPF_OBJ, target_pid, pkg);
-                        } else {
-                            printf("[FPS] 未锁定包名 PID, 尝试 eBPF 全局 uprobe 探测屏幕帧事件...\n");
-                            ebpf_ctx = ebpf_fps_start(FPS_BPF_OBJ, (pid_t)-1, pkg);
-                        }
+                        ebpf_ctx = fps_start_ebpf_ctx(pkg, target_pid);
 
                         if (ebpf_ctx) {
                             printf("[FPS] eBPF 已激活, 锁定符号: %s\n", ebpf_fps_symbol(ebpf_ctx));
@@ -3427,6 +3618,9 @@ static void* fps_thread(void* arg) {
                     monitoring = false;
                     if (ebpf_ctx) { ebpf_fps_stop(ebpf_ctx); ebpf_ctx = NULL; }
                     if (fallback_ctx) { fps_fallback_stop(fallback_ctx); fallback_ctx = NULL; }
+                    target_pid = -1;
+                    ebpf_seen_frames = false;
+                    ebpf_stale_zero_sent = false;
                     printf("[FPS] 停止监测 %s\n", pkg);
                     fps_write_out_windowed(0, &last_fps_output_ms, true);
                     fps_socket_reset();
@@ -3462,6 +3656,12 @@ static void* fps_thread(void* arg) {
             } else {
                 ebpf_poll_failures = 0;
             }
+            long long now_ms = monotonic_ms();
+            if (poll_rc > 0) {
+                ebpf_seen_frames = true;
+                ebpf_stale_zero_sent = false;
+                ebpf_last_frame_ms = now_ms;
+            }
             double fps = ebpf_fps_get(ebpf_ctx);
             pid_t active_pid = ebpf_fps_pid(ebpf_ctx);
             if (!ebpf_pid_reported && active_pid > 0) {
@@ -3472,7 +3672,57 @@ static void* fps_thread(void* arg) {
                 printf("[FPS] eBPF 首次捕获到帧率: %.1f fps\n", fps);
                 ebpf_first_fps = false;
             }
-            fps_write_out_windowed(fps, &last_fps_output_ms, false);
+
+            bool fps_is_stale = ebpf_seen_frames && now_ms > 0 &&
+                now_ms - ebpf_last_frame_ms >= FPS_EBPF_STALE_MS;
+            if (fps_is_stale) {
+                if (!ebpf_stale_zero_sent) {
+                    printf("[FPS] eBPF %.1f 秒未收到目标帧, 暂停沿用旧 FPS\n",
+                           (double)(now_ms - ebpf_last_frame_ms) / 1000.0);
+                    fps_write_out_windowed(0, &last_fps_output_ms, true);
+                    ebpf_stale_zero_sent = true;
+                }
+
+                if (now_ms - ebpf_last_pid_check_ms >= 1000 &&
+                    now_ms - ebpf_last_restart_ms >= FPS_EBPF_RESTART_COOLDOWN_MS) {
+                    ebpf_last_pid_check_ms = now_ms;
+                    pid_t pids[64];
+                    size_t np = collect_pkg_pids(pkg, pids, 64);
+                    pid_t next_pid = np > 0 ? pids[0] : (pid_t)-1;
+                    if (next_pid > 0 && !fps_pid_in_list(active_pid, pids, np)) {
+                        printf("[FPS] 目标进程已切换: old=%d new=%d, 重启 eBPF 监测\n",
+                               active_pid, next_pid);
+                        ebpf_fps_stop(ebpf_ctx);
+                        ebpf_ctx = fps_start_ebpf_ctx(pkg, next_pid);
+                        target_pid = next_pid;
+                        ebpf_first_fps = true;
+                        ebpf_pid_reported = false;
+                        ebpf_poll_failures = 0;
+                        ebpf_seen_frames = false;
+                        ebpf_stale_zero_sent = false;
+                        ebpf_last_frame_ms = now_ms;
+                        ebpf_last_restart_ms = now_ms;
+                        if (ebpf_ctx) {
+                            printf("[FPS] eBPF 已重启, 锁定符号: %s\n", ebpf_fps_symbol(ebpf_ctx));
+                        } else {
+                            const char *err = ebpf_fps_last_error(NULL);
+                            printf("[FPS] eBPF 重启失败: %s, 切换到 SF fallback\n",
+                                   (err && err[0]) ? err : "未知错误");
+                            fallback_first_fps = true;
+                            fallback_ctx = fps_fallback_start(pkg);
+                            if (!fallback_ctx) {
+                                printf("[FPS] 警告: fallback 启动失败\n");
+                            }
+                        }
+                        usleep(100 * 1000);
+                        continue;
+                    }
+                }
+            }
+
+            if (!fps_is_stale) {
+                fps_write_out_windowed(fps, &last_fps_output_ms, false);
+            }
             usleep(100 * 1000);  /* 100ms 轮询 */
             continue;
         }

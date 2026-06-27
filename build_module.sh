@@ -10,6 +10,27 @@ FPS_MON="$ROOT/fps_monitor"
 RUST_BRIDGE="$FPS_MON/appopt_ebpf_bridge"
 BASE_DIR="$ROOT/magisk_module"
 WORK="$ROOT/build/module"
+APP_PACKAGE="top.suto.appopt"
+APP_NAME="AppOpt 线程优化"
+
+usage() {
+    cat <<EOF
+Usage: ./build_module.sh [release|debug|no]
+
+  release  build release APK and embed it into module (default)
+  debug    build debug APK and embed it into module
+  no       build module only
+EOF
+}
+
+APP_VARIANT="${1:-release}"
+case "$APP_VARIANT" in
+    release) APP_VARIANT="release" ;;
+    debug) APP_VARIANT="debug" ;;
+    no|module) APP_VARIANT="" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "! Unknown command: $APP_VARIANT"; usage; exit 1 ;;
+esac
 ZIP="$ROOT/build/AppOpt-增强版.zip"
 
 [ -d "$BASE_DIR" ] || { echo "! 找不到模块基底目录: $BASE_DIR"; exit 1; }
@@ -67,6 +88,98 @@ path_for_cargo() {
 
 RUST_NO_LOCATION_FLAGS="-Zlocation-detail=none -C debuginfo=0"
 
+latest_dir() {
+    ls -d "$1"/*/ 2>/dev/null | sort -V | tail -n1 | sed 's:/*$::'
+}
+
+run_gradle_task() {
+    local task="$1"
+    if [ -x "$ROOT/gradlew" ]; then
+        (cd "$ROOT" && ./gradlew --no-daemon "-Dkotlin.incremental=false" "$task")
+    elif [ -f "$ROOT/gradlew.bat" ]; then
+        (cd "$ROOT" && ./gradlew.bat --no-daemon "-Dkotlin.incremental=false" "$task")
+    else
+        echo "! Gradle Wrapper not found"
+        exit 1
+    fi
+}
+
+build_pkg_helper() {
+    local android_platform android_jar build_tools d8_jar helper_src helper_build helper_classes helper_dex tools_dir
+    android_platform="$(latest_dir "$SDK_DIR/platforms")"
+    android_jar="$android_platform/android.jar"
+    build_tools="$(latest_dir "$SDK_DIR/build-tools")"
+    d8_jar="$build_tools/lib/d8.jar"
+    helper_src="$ROOT/tools/appopt_pkg_helper/src"
+    helper_build="$ROOT/build/pkg-helper"
+    helper_classes="$helper_build/classes"
+    helper_dex="$helper_build/dex"
+    tools_dir="$WORK/config/app/tools"
+
+    [ -f "$android_jar" ] || { echo "! android.jar not found: $android_jar"; exit 1; }
+    [ -f "$d8_jar" ] || { echo "! d8.jar not found: $d8_jar"; exit 1; }
+    command -v javac >/dev/null 2>&1 || { echo "! javac not found"; exit 1; }
+    command -v jar >/dev/null 2>&1 || { echo "! jar not found"; exit 1; }
+
+    rm -rf "$helper_build"
+    mkdir -p "$helper_classes" "$helper_dex" "$tools_dir"
+
+    echo "- Build package helper dex jar"
+    javac -encoding UTF-8 --release 11 \
+        -classpath "$android_jar" \
+        -d "$helper_classes" \
+        $(find "$helper_src" -name '*.java' | sort)
+
+    java -cp "$d8_jar" com.android.tools.r8.D8 \
+        --release --min-api 31 \
+        --output "$helper_dex" \
+        $(find "$helper_classes" -name '*.class' | sort)
+
+    (cd "$helper_dex" && jar cf "$tools_dir/appopt_pkg_helper.jar" classes.dex)
+    [ -s "$tools_dir/appopt_pkg_helper.jar" ] || { echo "! package helper jar build failed"; exit 1; }
+}
+
+read_app_version_code() {
+    grep -E 'versionCode[[:space:]]*=' "$ROOT/app/build.gradle.kts" | head -n1 | sed -E 's/.*=[[:space:]]*([0-9]+).*/\1/'
+}
+
+read_app_version_name() {
+    grep -E 'versionName[[:space:]]*=' "$ROOT/app/build.gradle.kts" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
+build_and_embed_app() {
+    [ -n "$APP_VARIANT" ] || return 0
+
+    local task apk app_dir version_code version_name
+    case "$APP_VARIANT" in
+        debug) task="assembleDebug"; apk="$ROOT/app/build/outputs/apk/debug/app-debug.apk" ;;
+        release) task="assembleRelease"; apk="$ROOT/app/build/outputs/apk/release/app-release.apk" ;;
+    esac
+
+    echo "- Build Android App: $task"
+    run_gradle_task "$task"
+    [ -f "$apk" ] || { echo "! APK not found: $apk"; exit 1; }
+
+    app_dir="$WORK/config/app"
+    mkdir -p "$app_dir"
+    cp -f "$apk" "$app_dir/AppOpt.apk"
+
+    version_code="$(read_app_version_code)"
+    version_name="$(read_app_version_name)"
+    [ -n "$version_code" ] || { echo "! Cannot read App versionCode"; exit 1; }
+    [ -n "$version_name" ] || { echo "! Cannot read App versionName"; exit 1; }
+
+    cat > "$app_dir/app.prop" <<EOF
+package=$APP_PACKAGE
+name=$APP_NAME
+variant=$APP_VARIANT
+versionCode=$version_code
+versionName=$version_name
+apk=AppOpt.apk
+EOF
+    echo "- Embedded App: $APP_VARIANT v$version_name ($version_code)"
+}
+
 build_rust_bridge() {
     local rust_target="$1" cc="$2"
     RUST_BRIDGE_LIB=""
@@ -105,6 +218,8 @@ echo "- 准备模块工作目录: $WORK"
 rm -rf "$WORK"
 mkdir -p "$WORK"
 cp -r "$BASE_DIR/." "$WORK/"
+build_pkg_helper
+build_and_embed_app
 
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"
 mkdir -p "$WORK/config/ebpf"
@@ -164,8 +279,8 @@ build_abi i686-linux-android       x86           i686-linux-android
 
 VER=$(grep -E '#define[[:space:]]+VERSION' "$SRC" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
 if [ -n "$VER" ] && [ -f "$WORK/module.prop" ]; then
-    sed -i -E "s/^version=.*/version=${VER}-增强版/" "$WORK/module.prop"
-    echo "- module.prop 版本: ${VER}-增强版"
+    #sed -i -E "s/^version=.*/version=${VER}-增强版/" "$WORK/module.prop"
+    echo "- module.prop 版本: ${VER}"
 fi
 
 rm -f "$ZIP"

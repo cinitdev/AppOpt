@@ -1,6 +1,6 @@
 {
-  "version": "v1.7.1",
-  "versionCode": 171,
-  "zipUrl": "",
-  "changelog": ""
+  "version": "v1.7.2",
+  "versionCode": 172,
+  "zipUrl": "https://github.com/cinitdev/AppOpt/releases/download/v1.7.2/AppOpt.zip",
+  "changelog": "https://github.com/cinitdev/AppOpt/releases/download/v1.7.2/changelog.md"
 }

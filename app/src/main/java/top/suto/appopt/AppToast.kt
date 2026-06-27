@@ -38,6 +38,13 @@ object AppToast {
             return
         }
 
+        hideRunnable?.let { mainHandler.removeCallbacks(it) }
+        hideRunnable = null
+        currentView?.let { old ->
+            (old.parent as? ViewGroup)?.removeView(old)
+        }
+        currentView = null
+
         val appContext = context.applicationContext
         val density = appContext.resources.displayMetrics.density
         fun dp(value: Float): Int = (value * density + 0.5f).toInt()
