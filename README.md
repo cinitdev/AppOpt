@@ -233,7 +233,7 @@ app/build/outputs/apk/release/app-release.apk
 
 ## 编译 Native / Magisk 模块
 
-在项目根目录执行：
+在项目根目录执行，默认会编译 release APK 并打包进模块：
 
 ```bash
 ./build_module.sh
@@ -246,10 +246,48 @@ cd /c/Users/你的用户名/AndroidStudioProjects/AppOpt
 ./build_module.sh
 ```
 
+脚本参数：
+
+```text
+./build_module.sh [release|debug|no|publish] [--publish]
+```
+
+常用命令：
+
+```bash
+# 编译 release APK 并打包进模块，默认行为
+./build_module.sh
+./build_module.sh release
+
+# 编译 debug APK 并打包进模块
+./build_module.sh debug
+
+# 只编译模块，不打包 App
+./build_module.sh no
+
+# 编译 release 模块，并发布 AppOpt.zip 和 changelog.md 到 GitHub Release
+./build_module.sh publish
+
+# 等价写法
+./build_module.sh release --publish
+```
+
+发布功能会调用 GitHub CLI。首次使用前需要安装并登录：
+
+```bash
+gh auth login
+```
+
+Release tag 会自动读取当前模块版本，优先使用 `magisk_module/module.prop` 中的
+`version`，例如 `v1.7.2`；如果模块版本为空，则读取 App 的 `versionName`。
+如果对应 Release 已存在，脚本会更新 Release 说明并覆盖上传资源。
+
 脚本会完成：
 
 - 编译 `fps_monitor/bpf/queuebuffer_probe.bpf.c` 为 BPF 对象。
 - 编译 Rust/aya bridge 静态库。
+- 按参数编译 release/debug APK，并复制到模块的 `config/app/`。
+- 编译 App 安装辅助工具，并打包到模块的 `config/app/tools/`。
 - 编译 4 个 ABI 的 `AppOpt` native 二进制：
   - `arm64-v8a`
   - `armeabi-v7a`
@@ -262,9 +300,9 @@ cd /c/Users/你的用户名/AndroidStudioProjects/AppOpt
 
 ```text
 build/module/                         模块工作目录
-build/module/bin/<abi>/AppOpt          各 ABI native 二进制
+build/module/config/bin/<abi>/AppOpt   各 ABI native 二进制
 build/module/config/ebpf/queuebuffer_probe.bpf.o   eBPF 对象
-build/AppOpt-增强版.zip                可刷入模块包
+build/AppOpt.zip                       可刷入模块包
 ```
 
 ### 常见编译错误

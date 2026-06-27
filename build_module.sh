@@ -15,15 +15,15 @@ APP_NAME="AppOpt 线程优化"
 
 usage() {
     cat <<EOF
-Usage: ./build_module.sh [release|debug|no|publish] [--publish]
+用法: ./build_module.sh [release|debug|no|publish] [--publish]
 
-  release  build release APK and embed it into module (default)
-  debug    build debug APK and embed it into module
-  no       build module only
-  publish  build release module and publish AppOpt.zip + changelog.md to GitHub Release
+  release  编译 release APK 并打包进模块（默认）
+  debug    编译 debug APK 并打包进模块
+  no       只编译模块，不打包 App
+  publish  编译 release 模块，并发布 AppOpt.zip + changelog.md 到 GitHub Release
 
-Options:
-  --publish  publish release build artifacts after building
+选项:
+  --publish  构建完成后发布 release 产物
 EOF
 }
 
