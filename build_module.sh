@@ -15,23 +15,47 @@ APP_NAME="AppOpt 线程优化"
 
 usage() {
     cat <<EOF
-Usage: ./build_module.sh [release|debug|no]
+Usage: ./build_module.sh [release|debug|no|publish] [--publish]
 
   release  build release APK and embed it into module (default)
   debug    build debug APK and embed it into module
   no       build module only
+  publish  build release module and publish AppOpt.zip + changelog.md to GitHub Release
+
+Options:
+  --publish  publish release build artifacts after building
 EOF
 }
 
 APP_VARIANT="${1:-release}"
+PUBLISH_GITHUB_RELEASE=0
+if [ "$#" -gt 0 ]; then
+    shift
+fi
+
 case "$APP_VARIANT" in
     release) APP_VARIANT="release" ;;
     debug) APP_VARIANT="debug" ;;
     no|module) APP_VARIANT="" ;;
+    publish|release-publish) APP_VARIANT="release"; PUBLISH_GITHUB_RELEASE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "! Unknown command: $APP_VARIANT"; usage; exit 1 ;;
 esac
-ZIP="$ROOT/build/AppOpt-增强版.zip"
+
+for ARG in "$@"; do
+    case "$ARG" in
+        --publish|publish) PUBLISH_GITHUB_RELEASE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "! Unknown option: $ARG"; usage; exit 1 ;;
+    esac
+done
+
+if [ "$PUBLISH_GITHUB_RELEASE" = "1" ] && [ "$APP_VARIANT" != "release" ]; then
+    echo "! GitHub Release 发布只支持 release 模块构建"
+    exit 1
+fi
+
+ZIP="$ROOT/build/AppOpt.zip"
 
 [ -d "$BASE_DIR" ] || { echo "! 找不到模块基底目录: $BASE_DIR"; exit 1; }
 [ -f "$SRC" ] || { echo "! 找不到主源码: $SRC"; exit 1; }
@@ -145,6 +169,81 @@ read_app_version_code() {
 
 read_app_version_name() {
     grep -E 'versionName[[:space:]]*=' "$ROOT/app/build.gradle.kts" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
+read_module_version_name() {
+    sed -n 's/^version=//p' "$BASE_DIR/module.prop" | head -n1 | tr -d '\r'
+}
+
+read_release_tag() {
+    local version
+    version="$(read_module_version_name)"
+    [ -n "$version" ] || version="$(read_app_version_name)"
+    [ -n "$version" ] || { echo "! Cannot read release version"; exit 1; }
+    case "$version" in
+        v*) printf '%s\n' "$version" ;;
+        *) printf 'v%s\n' "$version" ;;
+    esac
+}
+
+find_github_cli() {
+    if command -v gh >/dev/null 2>&1; then
+        command -v gh
+        return 0
+    fi
+    local candidate
+    if command -v cygpath >/dev/null 2>&1; then
+        candidate="$(cygpath -u 'C:\Program Files\GitHub CLI\gh.exe' 2>/dev/null || true)"
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+    for candidate in \
+        "/c/Program Files/GitHub CLI/gh.exe" \
+        "/mnt/c/Program Files/GitHub CLI/gh.exe"
+    do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+publish_github_release() {
+    local gh_bin tag title changelog
+    gh_bin="$(find_github_cli)" || {
+        echo "! 找不到 GitHub CLI: gh"
+        echo "! 请确认已安装 GitHub CLI 并加入 PATH"
+        exit 1
+    }
+
+    tag="$(read_release_tag)"
+    title="AppOpt $tag"
+    changelog="$ROOT/modules_update/changelog.md"
+
+    [ -s "$ZIP" ] || { echo "! 找不到模块 zip: $ZIP"; exit 1; }
+    [ -s "$changelog" ] || { echo "! 找不到更新日志: $changelog"; exit 1; }
+
+    "$gh_bin" auth status >/dev/null 2>&1 || {
+        echo "! GitHub CLI 尚未登录，请先执行: gh auth login"
+        exit 1
+    }
+
+    if "$gh_bin" release view "$tag" >/dev/null 2>&1; then
+        echo "- GitHub Release 已存在: $tag"
+        echo "- 更新 Release 说明并覆盖上传资产"
+        "$gh_bin" release edit "$tag" --title "$title" --notes-file "$changelog"
+        "$gh_bin" release upload "$tag" "$ZIP" "$changelog" --clobber
+    else
+        echo "- 创建 GitHub Release: $tag"
+        "$gh_bin" release create "$tag" "$ZIP" "$changelog" \
+            --title "$title" \
+            --notes-file "$changelog"
+    fi
+
+    echo "- 发布完成: $tag"
 }
 
 build_and_embed_app() {
@@ -286,3 +385,7 @@ fi
 rm -f "$ZIP"
 python "$ROOT/scripts/ziptool.py" pack "$WORK" "$ZIP"
 echo "- 完成: $ZIP"
+
+if [ "$PUBLISH_GITHUB_RELEASE" = "1" ]; then
+    publish_github_release
+fi

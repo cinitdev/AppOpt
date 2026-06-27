@@ -53,6 +53,7 @@ class UpdateInstallActivity : AppCompatActivity() {
         ModuleUpdater.installDownloadedModule(
             zipPath = zipPath,
             inAppUpdate = true,
+            context = this,
             callback = object : ModuleUpdater.InstallCallback {
                 override fun onProgress(message: String, percent: Int?) {
                     if (isFinishing || isDestroyed) return

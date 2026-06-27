@@ -1,6 +1,7 @@
 package top.suto.appopt
 
 import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
@@ -8,6 +9,7 @@ import android.net.Uri
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -208,7 +210,8 @@ object ModuleUpdater {
         zipPath: String,
         callback: InstallCallback,
         inAppUpdate: Boolean = true,
-        prepareDelayMs: Long = 0L
+        prepareDelayMs: Long = 0L,
+        context: Context? = null
     ) {
         val mainHandler = Handler(Looper.getMainLooper())
 
@@ -220,9 +223,18 @@ object ModuleUpdater {
             mainHandler.post { callback.onLog(text) }
         }
 
+        var installZip: File? = null
+        fun installFailureMessage(message: String): String {
+            val zip = installZip?.takeIf { it.exists() } ?: return message
+            if (!inAppUpdate) return message
+            val manualZip = retainOriginalZipForManualInstall(context, zip, true, ::log)
+            return "$message\n模块已保存到：$manualZip\n请在 Root 管理器中手动刷入"
+        }
+
         thread(name = "AppOptModuleInstaller") {
             try {
                 val zip = File(zipPath)
+                installZip = zip
                 if (!zip.exists()) {
                     mainHandler.post { callback.onFailure("模块 zip 不存在：$zipPath") }
                     return@thread
@@ -231,9 +243,10 @@ object ModuleUpdater {
                 progress("正在检测模块管理器", null)
                 val manager = detectRootManager()
                 if (manager == null) {
+                    val manualZip = retainOriginalZipForManualInstall(context, zip, inAppUpdate, ::log)
                     mainHandler.post {
                         callback.onFailure(
-                            "没有检测到可用的模块管理器\n模块 zip 已保留：$zipPath\n请手动刷入"
+                            "没有检测到可用的模块管理器\n模块已保存到：$manualZip\n请手动刷入"
                         )
                     }
                     return@thread
@@ -269,6 +282,7 @@ object ModuleUpdater {
                     }
                 }
                 if (result.success) {
+                    cleanupUpdateZips(zip, inAppUpdate, ::log)
                     val message = if (inAppUpdate) {
                         "模块已刷入，重启后生效；App 将在重启后自动更新"
                     } else {
@@ -276,16 +290,19 @@ object ModuleUpdater {
                     }
                     mainHandler.post { callback.onSuccess(message) }
                 } else {
+                    val manualZip = retainOriginalZipForManualInstall(context, zip, inAppUpdate, ::log)
                     mainHandler.post {
                         callback.onFailure(
-                            "刷入失败，已保留模块 zip：$zipPath\n请在 Root 管理器中手动刷入"
+                            "刷入失败，原始模块已保存到：$manualZip\n请在 Root 管理器中手动刷入"
                         )
                     }
                 }
             } catch (e: UpdateException) {
-                mainHandler.post { callback.onFailure(e.message ?: "刷入失败") }
+                val message = installFailureMessage(e.message ?: "刷入失败")
+                mainHandler.post { callback.onFailure(message) }
             } catch (_: Exception) {
-                mainHandler.post { callback.onFailure("刷入失败，请手动刷入模块 zip：$zipPath") }
+                val message = installFailureMessage("刷入失败")
+                mainHandler.post { callback.onFailure(message) }
             }
         }
     }
@@ -526,6 +543,123 @@ object ModuleUpdater {
 
         return marked.takeIf { it.exists() && it.length() > 0L }
             ?: throw UpdateException("写入 App 内更新标记失败，已取消刷入")
+    }
+
+    private fun cleanupUpdateZips(installZip: File, inAppUpdate: Boolean, log: (String) -> Unit) {
+        if (!inAppUpdate) return
+        var cleaned = false
+        originalZipForInAppZip(installZip)?.let { original ->
+            if (original.exists() && original.delete()) cleaned = true
+        }
+        if (installZip.exists() && installZip.delete()) cleaned = true
+        if (cleaned) {
+            log("\n- 已清理下载的模块临时文件\n")
+        }
+    }
+
+    private fun retainOriginalZipForManualInstall(
+        context: Context?,
+        installZip: File,
+        inAppUpdate: Boolean,
+        log: (String) -> Unit
+    ): String {
+        if (!inAppUpdate) return installZip.absolutePath
+
+        val original = originalZipForInAppZip(installZip)
+        if (original == null || !original.exists()) {
+            log("\n- 未找到原始模块，保留当前模块 zip：${installZip.absolutePath}\n")
+            return installZip.absolutePath
+        }
+
+        val publicPath = copyToPublicDownloads(context, original)
+        val manualPath = if (publicPath != null) {
+            if (original.delete()) {
+                log("\n- 原始模块已转移到：$publicPath\n")
+            } else {
+                log("\n- 原始模块已复制到：$publicPath\n")
+                log("- 私有目录原始模块删除失败：${original.absolutePath}\n")
+            }
+            publicPath
+        } else {
+            log("\n- 原始模块转移到系统 Download 失败，已保留在：${original.absolutePath}\n")
+            original.absolutePath
+        }
+
+        if (installZip.exists() && installZip.delete()) {
+            log("- 已删除 App 内临时模块：${installZip.name}\n")
+        }
+        return manualPath
+    }
+
+    private fun originalZipForInAppZip(installZip: File): File? {
+        val parent = installZip.parentFile ?: return null
+        val name = installZip.name
+        val suffix = "-inapp.zip"
+        if (!name.lowercase(Locale.US).endsWith(suffix)) return null
+        return File(parent, name.dropLast(suffix.length) + ".zip")
+    }
+
+    private fun copyToPublicDownloads(context: Context?, source: File): String? {
+        if (!source.exists()) return null
+        val appContext = context?.applicationContext ?: return copyToPublicDownloadsFile(source)
+        val resolver = appContext.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, source.name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = try {
+            resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        } catch (_: Exception) {
+            null
+        } ?: return copyToPublicDownloadsFile(source)
+
+        return try {
+            resolver.openOutputStream(uri, "w")?.use { output ->
+                source.inputStream().buffered().use { input ->
+                    input.copyTo(output)
+                }
+            } ?: throw UpdateException("无法写入系统 Download")
+
+            values.clear()
+            values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            "/storage/emulated/0/${Environment.DIRECTORY_DOWNLOADS}/${source.name}"
+        } catch (_: Exception) {
+            try {
+                resolver.delete(uri, null, null)
+            } catch (_: Exception) {
+            }
+            copyToPublicDownloadsFile(source)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun copyToPublicDownloadsFile(source: File): String? {
+        return try {
+            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (!dir.exists() && !dir.mkdirs()) return null
+            val target = uniqueFile(dir, source.name)
+            source.copyTo(target, overwrite = false)
+            target.absolutePath
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun uniqueFile(dir: File, name: String): File {
+        var target = File(dir, name)
+        if (!target.exists()) return target
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        var index = 1
+        while (target.exists()) {
+            target = File(dir, "$base-$index$ext")
+            index++
+        }
+        return target
     }
 
     private fun downloadReason(reason: Int): String {
