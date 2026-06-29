@@ -1,13 +1,28 @@
-# AppOpt v1.7.1
+# AppOpt v1.7.3
 
-## 主要更新
+## eBPF FPS 兼容性
 
-- 新增可视化自动校准策略, 支持在 App 内调整 AVG/MAX 阈值、最大规则数、通配线程组计算方式和连续核心范围。
-- 自动识别设备 CPU 频率拓扑, 默认生成适配当前设备的 `calib_policy.conf`。
-- 线程规则生成改为 AVG 与 MAX 同时达标, 降低低负载线程误升档概率。
-- 规则输出限制为连续核心范围, 避免生成 Android cpuset 不适合的非连续核心组合。
-- FPS 通道优先使用 App 本地 socket 推送, 文件写入仅作为兜底。
-- 守护进程状态检测改为 socket 反向验证, 避免仅靠进程名误判其他改版守护进程。
-- 优化历史记录导入、去重、排序和导出, 支持导出单次记录与原版 `.log` 数据。
-- 优化应用列表、待校准、已配置应用和设置页 UI, 降低大量应用/线程数据场景下的卡顿。
-- 文档和 SVG 已同步当前 eBPF、socket、历史导入和校准策略工作流。
+- eBPF FPS 新增 PerfEvent 备用事件通道，RingBuf 创建或映射失败时会自动切换到 PerfEvent。
+- 兼容 Android 17 上 RingBuf `mmap failed` 导致 FPS 无法采集的问题。
+- 启动日志会输出当前实际使用后端，例如 `RingBuf` 或 `PerfEvent`，并单独提示 RingBuf 不可用原因。
+- 优化目标应用长时间没有新帧时的日志语义，避免继续沿用旧 FPS。
+- 新增 `queuebuffer_probe_perf.bpf.c`，构建时同时打包 RingBuf 和 PerfEvent 两套 eBPF 对象。
+
+## Aya Lite 子模块
+
+- 将 `fps_monitor/aya` 从本地 vendored 目录改为 `AppOpt-aya-lite` 子模块。
+- `build_module.sh` 会自动初始化和更新 Aya Lite 子模块，减少首次构建漏拉依赖的问题。
+- 子模块本地拉取时排除 `.github` 和 `scripts` 目录，保留编译需要的 Aya 代码和文档。
+- 新增 GitHub Actions，用于定期检查 Aya Lite 更新、编译验证通过后自动提交子模块更新 PR。
+
+## 构建和发布
+
+- `build_module.sh` 新增 PerfEvent BPF 对象构建流程。
+- App 包名改为从 `app/build.gradle.kts` 的 `applicationId` 自动读取，不再在脚本中硬编码。
+- 更新 README 中的子模块拉取、BPF 构建和 release/publish 使用说明。
+- 更新 Cargo.lock 到 Aya 0.14.0 / aya-obj 0.3.0。
+
+## App 体验修复
+
+- App 回到前台时重新检测 Root 授权状态，避免授权或撤销后首页状态过期。
+- 调整运行环境卡片中未授权按钮的高度和内边距，减少未授权状态下的异常留白。
