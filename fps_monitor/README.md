@@ -8,8 +8,9 @@ AppOpt 的 FPS 监测模块。当前 eBPF 路径由 C shim + Rust/aya bridge 组
 ebpf_fps.h                    AppOpt.c 使用的 C API
 ebpf_fps.c                    C 适配层, 通过 FFI 调用 Rust/aya bridge
 fps_fallback.h/.c             SurfaceFlinger fallback
-bpf/queuebuffer_probe.bpf.c   内核侧 BPF 程序, 由 NDK clang 编译
-appopt_ebpf_bridge/           Rust staticlib, 负责加载 BPF、attach uprobe、读取 ringbuf
+bpf/queuebuffer_probe.bpf.c        RingBuf 内核侧 BPF 程序, 由 NDK clang 编译
+bpf/queuebuffer_probe_perf.bpf.c   PerfEvent 备用内核侧 BPF 程序, 由 NDK clang 编译
+appopt_ebpf_bridge/                Rust staticlib, 负责加载 BPF、attach uprobe、读取事件通道
 aya/                          精简后的本地 vendored aya, 只保留 aya/aya-obj 和许可证
 ```
 
@@ -27,6 +28,7 @@ aya/                          精简后的本地 vendored aya, 只保留 aya/aya
 脚本会构建:
 
 - `queuebuffer_probe.bpf.o`
+- `queuebuffer_probe_perf.bpf.o`
 - 每个 Android ABI 的 `appopt_ebpf_bridge`
 - `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` 的 AppOpt 二进制
 
@@ -34,10 +36,11 @@ aya/                          精简后的本地 vendored aya, 只保留 aya/aya
 
 1. `AppOpt.c` 调用 `ebpf_fps_*` C API。
 2. `ebpf_fps.c` 转发到 Rust FFI。
-3. Rust/aya 加载 `queuebuffer_probe.bpf.o`。
-4. Rust/aya attach 到 `libgui.so` 的 queueBuffer 候选符号。
-5. BPF 程序把帧事件写入 `events` ringbuf。
-6. Rust/aya 轮询 ringbuf, 计算 FPS 后返回给 C 层。
+3. Rust/aya 优先加载 `queuebuffer_probe.bpf.o` 并使用 RingBuf 事件通道。
+4. RingBuf 创建/映射失败时释放本次上下文，加载 `queuebuffer_probe_perf.bpf.o` 并切换到 PerfEvent。
+5. Rust/aya attach 到 `libgui.so` 的 queueBuffer 候选符号。
+6. BPF 程序把帧事件写入当前可用事件通道。
+7. Rust/aya 轮询事件通道, 计算 FPS 后返回给 C 层。
 
 如果 eBPF 启动失败，AppOpt 会降级到 SurfaceFlinger fallback。FPS 传给 App 的通道不在
 `fps_monitor` 内实现: C 守护进程优先推送到 App 创建的 Android 本地 socket，socket

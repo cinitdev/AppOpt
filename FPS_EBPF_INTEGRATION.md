@@ -11,8 +11,9 @@ AppOpt.c
 fps_monitor/
   ebpf_fps.h                    AppOpt.c 使用的 C API
   ebpf_fps.c                    C shim, 通过 FFI 调用 Rust/aya bridge
-  bpf/queuebuffer_probe.bpf.c   内核侧 BPF 程序
-  appopt_ebpf_bridge/           Rust staticlib, 负责 BPF 加载、uprobe attach、ringbuf 读取
+  bpf/queuebuffer_probe.bpf.c        RingBuf 内核侧 BPF 程序
+  bpf/queuebuffer_probe_perf.bpf.c   PerfEvent 备用内核侧 BPF 程序
+  appopt_ebpf_bridge/                Rust staticlib, 负责 BPF 加载、uprobe attach、事件通道读取
   aya/                          精简后的本地 vendored aya
   fps_fallback.h/.c             SurfaceFlinger fallback
 ```
@@ -26,10 +27,11 @@ fps_monitor/
 1. `AppOpt.c` 收到 FPS 监测命令后查找目标包名进程。
 2. 找到 PID 时调用 `ebpf_fps_start(bpf_obj, pid, pkg)`。
 3. 未及时找到 PID 时会用 `pid=-1` 启动全局 uprobe, Rust bridge 收到帧事件后按 `/proc/<pid>/cmdline` 过滤目标包名。
-4. Rust/aya 加载 `queuebuffer_probe.bpf.o`。
-5. Rust/aya 按优先级 attach `libgui.so` 的帧提交符号。
-6. BPF 程序把帧事件写入 ringbuf。
-7. Rust bridge 计算 FPS, C 层通过 `ebpf_fps_get()` 读取。
+4. Rust/aya 优先加载 `queuebuffer_probe.bpf.o` 并初始化 RingBuf 事件通道。
+5. 如果 RingBuf 创建/映射失败（例如 Android 17 上的 `mmap failed`），立即释放本次 eBPF 上下文，改为加载 `queuebuffer_probe_perf.bpf.o` 并使用 PerfEvent 备用通道。
+6. Rust/aya 按优先级 attach `libgui.so` 的帧提交符号。
+7. BPF 程序把帧事件写入当前可用事件通道。
+8. Rust bridge 计算 FPS, C 层通过 `ebpf_fps_get()` 读取。
 
 ## App 通信路径
 
@@ -165,9 +167,18 @@ eBPF 可用:
 ```text
 [FPS] 开始监测 com.tencent.tmgp.sgame, eBPF: 尝试启动
 [FPS] 目标进程 PID: 12345, 尝试 eBPF uprobe...
+[FPS] eBPF 使用后端: RingBuf
 [FPS] eBPF 已激活, 锁定符号: _ZN7android7Surface11queueBufferEP19ANativeWindowBufferi
 [FPS] eBPF 当前帧事件 PID: 12345
 [FPS] eBPF 首次捕获到帧率: 60.0 fps
+```
+
+RingBuf 不可用, 自动切换 PerfEvent:
+
+```text
+[FPS] eBPF RingBuf 不可用: `mmap` failed
+[FPS] eBPF 使用后端: PerfEvent
+[FPS] eBPF 已激活, 锁定符号: _ZN7android7Surface16hook_queueBufferEP13ANativeWindowP19ANativeWindowBufferi
 ```
 
 未及时找到 PID, 使用全局探测:
@@ -188,7 +199,7 @@ eBPF 可用:
 ## 权限和限制
 
 - 需要 root 权限。
-- 需要内核支持 BPF syscall、uprobes 和 ringbuf。
+- 需要内核支持 BPF syscall 和 uprobes；事件通道优先 RingBuf，RingBuf 不可用时尝试 PerfEvent。
 - 目标设备禁用 BPF 或限制 uprobe 时会自动 fallback。
 - `frame-analyzer-ebpf` 只支持 64 位设备和应用; AppOpt 当前构建包含 4 个 ABI,
   但具体设备上 32 位应用的 eBPF attach 仍取决于 libgui 路径、符号和内核能力。
@@ -200,6 +211,7 @@ eBPF 可用:
 
 ```text
 queuebuffer_probe.bpf.o
+queuebuffer_probe_perf.bpf.o
 appopt_ebpf_bridge staticlib
 AppOpt 主二进制
 Magisk 模块 zip
@@ -220,3 +232,4 @@ x86
 - `fps_monitor/ebpf_fps.c`
 - `fps_monitor/appopt_ebpf_bridge/src/lib.rs`
 - `fps_monitor/bpf/queuebuffer_probe.bpf.c`
+- `fps_monitor/bpf/queuebuffer_probe_perf.bpf.c`

@@ -6,12 +6,20 @@ use std::{
     num::NonZeroU32,
     os::raw::{c_char, c_double, c_int},
     panic::{catch_unwind, AssertUnwindSafe},
-    path::Path,
+    path::{Path, PathBuf},
     ptr,
     sync::Mutex,
 };
 
-use aya::{maps::RingBuf, programs::{uprobe::UProbeScope, UProbe}, Ebpf};
+use aya::{
+    maps::{
+        perf::{PerfEvent, PerfEventArrayBuffer},
+        MapData, PerfEventArray, RingBuf,
+    },
+    programs::{uprobe::UProbeScope, UProbe},
+    util::online_cpus,
+    Ebpf,
+};
 
 const FPS_WINDOW_NS: u64 = 1_000_000_000;
 const MIN_FRAME_NS: u64 = 1_000_000;
@@ -36,15 +44,38 @@ struct FrameEvent {
     surface_ptr: u64,
 }
 
+enum EventBackend {
+    RingBuf(RingBuf<MapData>),
+    PerfEvent(Vec<PerfEventArrayBuffer<MapData>>),
+}
+
+#[derive(Clone, Copy)]
+enum BackendKind {
+    RingBuf,
+    PerfEvent,
+}
+
+impl BackendKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RingBuf => "RingBuf",
+            Self::PerfEvent => "PerfEvent",
+        }
+    }
+}
+
 #[repr(C)]
 pub struct AppOptEbpfCtx {
     bpf: Ebpf,
+    backend: EventBackend,
     pid: i32,
     frame_times: VecDeque<u64>,
     frame_time_sum_ns: u64,
     last_ts: u64,
     cur_fps: f64,
     symbol: CString,
+    backend_label: CString,
+    startup_note: CString,
     last_error: CString,
     target_pkg: Option<String>,
 }
@@ -73,6 +104,22 @@ unsafe fn read_frame_event(buf: &[u8]) -> Option<FrameEvent> {
         return None;
     }
     Some(unsafe { ptr::read_unaligned(buf.as_ptr().cast::<FrameEvent>()) })
+}
+
+fn read_split_frame_event(head: &[u8], tail: &[u8]) -> Option<FrameEvent> {
+    let size = std::mem::size_of::<FrameEvent>();
+    if head.len().saturating_add(tail.len()) < size {
+        return None;
+    }
+    if head.len() >= size {
+        return unsafe { read_frame_event(head) };
+    }
+
+    let mut buf = [0u8; std::mem::size_of::<FrameEvent>()];
+    let head_len = head.len();
+    buf[..head_len].copy_from_slice(head);
+    buf[head_len..].copy_from_slice(&tail[..(size - head_len)]);
+    unsafe { read_frame_event(&buf) }
 }
 
 fn pid_matches_pkg(pid: u32, pkg: &str) -> bool {
@@ -138,17 +185,24 @@ fn on_frame(ctx: &mut AppOptEbpfCtx, event: FrameEvent) -> bool {
 
 fn poll_inner(ctx: &mut AppOptEbpfCtx) -> Result<i32, String> {
     let mut events = Vec::new();
-    {
-        let mut ring = RingBuf::try_from(
-            ctx.bpf
-                .map_mut("events")
-                .ok_or_else(|| "missing BPF map: events".to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
 
-        while let Some(item) = ring.next() {
-            if let Some(event) = unsafe { read_frame_event(&item) } {
-                events.push(event);
+    match &mut ctx.backend {
+        EventBackend::RingBuf(ring) => {
+            while let Some(item) = ring.next() {
+                if let Some(event) = unsafe { read_frame_event(&item) } {
+                    events.push(event);
+                }
+            }
+        }
+        EventBackend::PerfEvent(perf_buffers) => {
+            for perf_buf in perf_buffers {
+                perf_buf.for_each(|event| {
+                    if let PerfEvent::Sample { head, tail } = event {
+                        if let Some(frame) = read_split_frame_event(head, tail) {
+                            events.push(frame);
+                        }
+                    }
+                });
             }
         }
     }
@@ -195,6 +249,70 @@ fn attach_first_symbol(bpf: &mut Ebpf, pid: i32) -> Result<CString, String> {
     })
 }
 
+fn open_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<MapData>, String> {
+    RingBuf::try_from(
+        bpf.take_map("events")
+            .ok_or_else(|| "missing BPF map: events".to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn open_perf_buffers(bpf: &mut Ebpf) -> Result<Vec<PerfEventArrayBuffer<MapData>>, String> {
+    let mut perf_array = PerfEventArray::try_from(
+        bpf.take_map("events")
+            .ok_or_else(|| "missing BPF map: events".to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let cpus = online_cpus().map_err(|(_, err)| err.to_string())?;
+    let mut buffers = Vec::with_capacity(cpus.len());
+    for cpu in cpus {
+        let buffer = perf_array
+            .open(cpu, Some(2))
+            .map_err(|e| format!("open perf buffer cpu {cpu}: {e}"))?;
+        buffers.push(buffer);
+    }
+
+    if buffers.is_empty() {
+        return Err("no online CPUs for perf event array".to_string());
+    }
+    Ok(buffers)
+}
+
+fn perf_fallback_path(path: &Path) -> PathBuf {
+    path.with_file_name("queuebuffer_probe_perf.bpf.o")
+}
+
+fn start_backend(
+    path: &Path,
+    kind: BackendKind,
+    pid: c_int,
+    target_pkg: Option<String>,
+) -> Result<Box<AppOptEbpfCtx>, String> {
+    let mut bpf = Ebpf::load_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+
+    let backend = match kind {
+        BackendKind::RingBuf => EventBackend::RingBuf(open_ring_buffer(&mut bpf)?),
+        BackendKind::PerfEvent => EventBackend::PerfEvent(open_perf_buffers(&mut bpf)?),
+    };
+    let symbol = attach_first_symbol(&mut bpf, pid)?;
+
+    Ok(Box::new(AppOptEbpfCtx {
+        bpf,
+        backend,
+        pid,
+        frame_times: VecDeque::with_capacity(144),
+        frame_time_sum_ns: 0,
+        last_ts: 0,
+        cur_fps: 0.0,
+        symbol,
+        backend_label: cstring_lossy(kind.label()),
+        startup_note: cstring_lossy(""),
+        last_error: cstring_lossy(""),
+        target_pkg,
+    }))
+}
+
 fn start_impl(
     pid: c_int,
     bpf_obj_path: *const c_char,
@@ -218,20 +336,25 @@ fn start_impl(
             if pkg.is_empty() { None } else { Some(pkg) }
         };
 
-        let mut bpf = Ebpf::load_file(path).map_err(|e| e.to_string())?;
-        let symbol = attach_first_symbol(&mut bpf, pid)?;
-
-        let ctx = Box::new(AppOptEbpfCtx {
-            bpf,
-            pid,
-            frame_times: VecDeque::with_capacity(144),
-            frame_time_sum_ns: 0,
-            last_ts: 0,
-            cur_fps: 0.0,
-            symbol,
-            last_error: cstring_lossy(""),
-            target_pkg,
-        });
+        let ring_path = Path::new(path);
+        let ctx = match start_backend(ring_path, BackendKind::RingBuf, pid, target_pkg.clone()) {
+            Ok(ctx) => ctx,
+            Err(ring_err) => {
+                let perf_path = perf_fallback_path(ring_path);
+                match start_backend(&perf_path, BackendKind::PerfEvent, pid, target_pkg) {
+                    Ok(mut ctx) => {
+                        ctx.startup_note =
+                            cstring_lossy(format!("RingBuf 不可用: {ring_err}"));
+                        ctx
+                    }
+                    Err(perf_err) => {
+                        return Err(format!(
+                            "RingBuf failed: {ring_err}; PerfEvent failed: {perf_err}"
+                        ));
+                    }
+                }
+            }
+        };
 
         set_last_start_error("");
         Ok::<_, String>(ctx)
@@ -313,6 +436,24 @@ pub extern "C" fn appopt_ebpf_symbol(ctx: *const AppOptEbpfCtx) -> *const c_char
     }
     let ctx = unsafe { &*ctx };
     ctx.symbol.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn appopt_ebpf_backend(ctx: *const AppOptEbpfCtx) -> *const c_char {
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let ctx = unsafe { &*ctx };
+    ctx.backend_label.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn appopt_ebpf_startup_note(ctx: *const AppOptEbpfCtx) -> *const c_char {
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let ctx = unsafe { &*ctx };
+    ctx.startup_note.as_ptr()
 }
 
 #[unsafe(no_mangle)]

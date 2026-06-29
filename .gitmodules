@@ -1,0 +1,3 @@
+[submodule "fps_monitor/aya"]
+	path = fps_monitor/aya
+	url = https://github.com/cinitdev/AppOpt-aya-lite.git

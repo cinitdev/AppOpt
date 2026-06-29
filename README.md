@@ -67,6 +67,20 @@ AppOpt改版特色.md                 功能特色说明
 
 不需要 WSL。`build_module.sh` 会使用本机 Android SDK / NDK / Rust 工具链完成编译。
 
+### 拉取子模块
+
+项目使用 `fps_monitor/aya` 子模块保存精简版 Aya。首次克隆建议带上子模块：
+
+```bash
+git clone --recurse-submodules <repo-url>
+```
+
+如果已经克隆过项目，在项目根目录执行：
+
+```bash
+git submodule update --init --recursive
+```
+
 ### 安装 Android Studio / SDK / NDK
 
 1. 安装 Android Studio。
@@ -279,12 +293,13 @@ gh auth login
 ```
 
 Release tag 会自动读取当前模块版本，优先使用 `magisk_module/module.prop` 中的
-`version`，例如 `v1.7.2`；如果模块版本为空，则读取 App 的 `versionName`。
+`version`，例如 `v1.7.3`；如果模块版本为空，则读取 App 的 `versionName`。
 如果对应 Release 已存在，脚本会更新 Release 说明并覆盖上传资源。
 
 脚本会完成：
 
-- 编译 `fps_monitor/bpf/queuebuffer_probe.bpf.c` 为 BPF 对象。
+- 编译 `fps_monitor/bpf/queuebuffer_probe.bpf.c` 为 RingBuf BPF 对象。
+- 编译 `fps_monitor/bpf/queuebuffer_probe_perf.bpf.c` 为 PerfEvent 备用 BPF 对象。
 - 编译 Rust/aya bridge 静态库。
 - 按参数编译 release/debug APK，并复制到模块的 `config/app/`。
 - 编译 App 安装辅助工具，并打包到模块的 `config/app/tools/`。
@@ -302,6 +317,7 @@ Release tag 会自动读取当前模块版本，优先使用 `magisk_module/modu
 build/module/                         模块工作目录
 build/module/config/bin/<abi>/AppOpt   各 ABI native 二进制
 build/module/config/ebpf/queuebuffer_probe.bpf.o   eBPF 对象
+build/module/config/ebpf/queuebuffer_probe_perf.bpf.o   eBPF PerfEvent 备用对象
 build/AppOpt.zip                       可刷入模块包
 ```
 

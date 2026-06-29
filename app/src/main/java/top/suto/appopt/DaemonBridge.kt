@@ -45,8 +45,8 @@ object DaemonBridge {
     private const val FPS_CMD_FILE = "$CONFIG_DIR/fps.cmd"
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 172
-    const val REQUIRED_MODULE_VERSION_NAME = "1.7.2"
+    const val REQUIRED_MODULE_VERSION_CODE = 173
+    const val REQUIRED_MODULE_VERSION_NAME = "1.7.3"
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
     fun hasRoot(): Boolean = runAsRoot("id -u").trim() == "0"

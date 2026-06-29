@@ -201,18 +201,19 @@ class MainActivity : AppCompatActivity() {
         refresh()
         val shouldRefreshConfig = firstResume.not()
         firstResume = false
-        // 守护进程和配置可能在后台变化，回到前台时后台重查一次（有 root 才有意义）
-        if (hasRoot) refreshForegroundState(shouldRefreshConfig)
+        // 守护进程、Root 授权和配置可能在后台变化，回到前台时后台重查一次。
+        if (shouldRefreshConfig) refreshForegroundState(refreshConfig = true)
     }
 
     private fun refreshForegroundState(refreshConfig: Boolean) {
         val previousAddable = appLists.addable
         thread {
-            val pendingUpdate = DaemonBridge.hasPendingModuleUpdate()
-            val version = if (!pendingUpdate) DaemonBridge.readModuleVersion() else null
-            val compatible = isCompatibleModule(version)
-            val running = if (compatible && !pendingUpdate) DaemonBridge.isDaemonRunning() else false
-            val enabled = compatible && running
+            val root = DaemonBridge.hasRoot()
+            val pendingUpdate = if (root) DaemonBridge.hasPendingModuleUpdate() else false
+            val version = if (root && !pendingUpdate) DaemonBridge.readModuleVersion() else null
+            val compatible = root && isCompatibleModule(version)
+            val running = if (root && compatible && !pendingUpdate) DaemonBridge.isDaemonRunning() else false
+            val enabled = root && compatible && running
             val config = if (enabled && refreshConfig) ConfigReader.readPackages() else null
             val resolvedNames = config?.let { resolveProcessComponentNames(it, enabled) } ?: processNames
             val visibleLists = when {
@@ -221,6 +222,7 @@ class MainActivity : AppCompatActivity() {
                 else -> null
             }
             runOnUiThreadIfAlive {
+                hasRoot = root
                 pendingModuleUpdate = pendingUpdate
                 moduleVersion = version
                 moduleCompatible = compatible
@@ -234,6 +236,7 @@ class MainActivity : AppCompatActivity() {
                 refresh()
                 if (!enabled) buildAppList()
                 showModuleWarningIfNeeded()
+                maybeCheckStartupUpdate()
             }
         }
     }

@@ -10,7 +10,7 @@
  *     -> queuebuffer_probe.bpf.o
  *
  * Rust/aya 负责加载 BPF 字节码、attach 目标游戏进程 libgui.so 的
- * queueBuffer/hook_queueBuffer 符号，并从 ringbuf 读取帧提交事件。
+ * queueBuffer/hook_queueBuffer 符号，并从 RingBuf/PerfEvent 读取帧提交事件。
  * C 层只保留统一的启动、轮询、读取 FPS、停止接口，方便 AppOpt.c 使用。
  *
  * 如果 eBPF 初始化失败，上层会降级到 SurfaceFlinger fallback。
@@ -29,7 +29,7 @@ typedef struct ebpf_fps_ctx ebpf_fps_ctx;
 typedef enum {
     EBPF_CAP_OK = 0,            /* eBPF 路径可尝试启动 */
     EBPF_CAP_NO_BPF_SYSCALL,    /* bpf() 系统调用不可用或被禁用 */
-    EBPF_CAP_NO_RINGBUF,        /* 内核不支持 BPF_MAP_TYPE_RINGBUF */
+    EBPF_CAP_NO_RINGBUF,        /* RingBuf/PerfEvent 事件通道不可用 */
     EBPF_CAP_NO_UPROBE,         /* 当前环境不支持 uprobe attach */
     EBPF_CAP_LOAD_FAILED,       /* BPF 程序加载失败，例如 verifier 拒绝 */
     EBPF_CAP_OBJ_NOT_FOUND,     /* 找不到 queuebuffer_probe.bpf.o */
@@ -38,7 +38,7 @@ typedef enum {
 /* 探测当前 eBPF 路径是否可以尝试启动。
  *
  * 这里会先检查 BPF 对象是否存在、bpf() 系统调用是否可用、当前内核是否支持
- * RingBuf。真正的 uprobe attach 仍由 Rust/aya 在 ebpf_fps_start() 内完成，
+ * RingBuf 或 PerfEvent 通道。真正的 uprobe attach 仍由 Rust/aya 在 ebpf_fps_start() 内完成，
  * 因为 attach 需要具体目标 PID。
  */
 ebpf_cap_t ebpf_fps_probe_capability(const char *bpf_obj_path);
@@ -56,7 +56,7 @@ const char *ebpf_cap_str(ebpf_cap_t cap);
  */
 ebpf_fps_ctx *ebpf_fps_start(const char *bpf_obj_path, pid_t target_pid, const char *target_pkg);
 
-/* 非阻塞消费 ringbuf 中已积累的帧事件，并更新内部 FPS 统计。
+/* 非阻塞消费 eBPF 事件通道中已积累的帧事件，并更新内部 FPS 统计。
  * 建议上层周期性调用，例如每 100ms 一次。
  * 返回本次消费的事件数；失败返回 -1。
  */
@@ -77,6 +77,12 @@ pid_t ebpf_fps_pid(ebpf_fps_ctx *ctx);
  * 尚未锁定或 ctx 无效时返回 NULL。
  */
 const char *ebpf_fps_symbol(ebpf_fps_ctx *ctx);
+
+/* 获取当前事件通道后端: RingBuf 或 PerfEvent。 */
+const char *ebpf_fps_backend(ebpf_fps_ctx *ctx);
+
+/* 获取本次 eBPF 启动过程中的非致命提示，例如 RingBuf 降级到 PerfEvent。 */
+const char *ebpf_fps_startup_note(ebpf_fps_ctx *ctx);
 
 /* 获取最近一次 eBPF 启动或运行错误。
  * ctx 为 NULL 时返回最近一次启动失败原因。

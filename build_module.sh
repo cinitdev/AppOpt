@@ -8,9 +8,9 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 SRC="$ROOT/AppOpt.c"
 FPS_MON="$ROOT/fps_monitor"
 RUST_BRIDGE="$FPS_MON/appopt_ebpf_bridge"
+AYA_SUBMODULE="$FPS_MON/aya"
 BASE_DIR="$ROOT/magisk_module"
 WORK="$ROOT/build/module"
-APP_PACKAGE="top.suto.appopt"
 APP_NAME="AppOpt 线程优化"
 
 usage() {
@@ -62,6 +62,48 @@ ZIP="$ROOT/build/AppOpt.zip"
 [ -d "$FPS_MON" ] || { echo "! 找不到 fps_monitor 目录: $FPS_MON"; exit 1; }
 [ -d "$RUST_BRIDGE" ] || { echo "! 找不到 Rust bridge: $RUST_BRIDGE"; exit 1; }
 [ -f "$FPS_MON/ebpf_fps.c" ] || { echo "! 找不到 Rust C 适配层: $FPS_MON/ebpf_fps.c"; exit 1; }
+
+ensure_aya_submodule() {
+    [ -f "$ROOT/.gitmodules" ] || return 0
+    grep -q "path = fps_monitor/aya" "$ROOT/.gitmodules" || return 0
+
+    command -v git >/dev/null 2>&1 || {
+        echo "! 找不到 git，无法初始化子模块: fps_monitor/aya"
+        exit 1
+    }
+
+    echo "- 检查子模块: fps_monitor/aya"
+    if [ "${APPOPT_SKIP_SUBMODULE_UPDATE:-0}" = "1" ]; then
+        echo "- 跳过子模块指针重置，使用当前 fps_monitor/aya 工作区"
+    else
+        (
+            cd "$ROOT"
+            git submodule update --init --recursive fps_monitor/aya
+        )
+    fi
+
+    (
+        cd "$AYA_SUBMODULE"
+        git sparse-checkout init --no-cone >/dev/null
+        MSYS_NO_PATHCONV=1 git sparse-checkout set \
+            "/*" \
+            "!/.github/" \
+            "!/.github/**" \
+            "!/scripts/" \
+            "!/scripts/**" >/dev/null
+    )
+
+    [ -f "$AYA_SUBMODULE/aya/Cargo.toml" ] || {
+        echo "! 子模块不完整，缺少: $AYA_SUBMODULE/aya/Cargo.toml"
+        exit 1
+    }
+    [ -f "$AYA_SUBMODULE/aya-obj/Cargo.toml" ] || {
+        echo "! 子模块不完整，缺少: $AYA_SUBMODULE/aya-obj/Cargo.toml"
+        exit 1
+    }
+}
+
+ensure_aya_submodule
 
 resolve_sdk_dir() {
     python - "$ROOT/local.properties" <<'PY'
@@ -171,6 +213,10 @@ read_app_version_name() {
     grep -E 'versionName[[:space:]]*=' "$ROOT/app/build.gradle.kts" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
+read_app_package() {
+    grep -E 'applicationId[[:space:]]*=' "$ROOT/app/build.gradle.kts" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
 read_module_version_name() {
     sed -n 's/^version=//p' "$BASE_DIR/module.prop" | head -n1 | tr -d '\r'
 }
@@ -249,7 +295,7 @@ publish_github_release() {
 build_and_embed_app() {
     [ -n "$APP_VARIANT" ] || return 0
 
-    local task apk app_dir version_code version_name
+    local task apk app_dir app_package version_code version_name
     case "$APP_VARIANT" in
         debug) task="assembleDebug"; apk="$ROOT/app/build/outputs/apk/debug/app-debug.apk" ;;
         release) task="assembleRelease"; apk="$ROOT/app/build/outputs/apk/release/app-release.apk" ;;
@@ -263,20 +309,22 @@ build_and_embed_app() {
     mkdir -p "$app_dir"
     cp -f "$apk" "$app_dir/AppOpt.apk"
 
+    app_package="$(read_app_package)"
     version_code="$(read_app_version_code)"
     version_name="$(read_app_version_name)"
+    [ -n "$app_package" ] || { echo "! Cannot read App applicationId"; exit 1; }
     [ -n "$version_code" ] || { echo "! Cannot read App versionCode"; exit 1; }
     [ -n "$version_name" ] || { echo "! Cannot read App versionName"; exit 1; }
 
     cat > "$app_dir/app.prop" <<EOF
-package=$APP_PACKAGE
+package=$app_package
 name=$APP_NAME
 variant=$APP_VARIANT
 versionCode=$version_code
 versionName=$version_name
 apk=AppOpt.apk
 EOF
-    echo "- Embedded App: $APP_VARIANT v$version_name ($version_code)"
+    echo "- Embedded App: $APP_VARIANT $version_name ($version_code)"
 }
 
 build_rust_bridge() {
@@ -321,9 +369,12 @@ build_pkg_helper
 build_and_embed_app
 
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"
+BPF_PERF_SRC="$FPS_MON/bpf/queuebuffer_probe_perf.bpf.c"
 mkdir -p "$WORK/config/ebpf"
 BPF_OBJ="$WORK/config/ebpf/queuebuffer_probe.bpf.o"
+BPF_PERF_OBJ="$WORK/config/ebpf/queuebuffer_probe_perf.bpf.o"
 [ -f "$BPF_SRC" ] || { echo "! 找不到 BPF 源码: $BPF_SRC"; exit 1; }
+[ -f "$BPF_PERF_SRC" ] || { echo "! 找不到 PerfEvent BPF 源码: $BPF_PERF_SRC"; exit 1; }
 
 CLANG="$BIN/clang"
 [ ! -f "$CLANG" ] && CLANG="$BIN/clang.exe"
@@ -334,19 +385,26 @@ LLVM_STRIP="$BIN/llvm-strip"
 [ ! -f "$LLVM_STRIP" ] && LLVM_STRIP="$BIN/llvm-strip.exe"
 [ ! -f "$LLVM_STRIP" ] && LLVM_STRIP="$BIN/llvm-strip.cmd"
 
-echo "- 构建 BPF 对象: queuebuffer_probe.bpf.c"
 SYSROOT="$TC/$HOST/sysroot"
-(
-    cd "$(dirname "$BPF_SRC")"
-    "$CLANG" -target bpf -g -O2 -c "$(basename "$BPF_SRC")" -o "$BPF_OBJ" \
-        -fdebug-compilation-dir=. \
-        -ffile-prefix-map="$ROOT=." \
-        -I"$SYSROOT/usr/include" \
-        -I"$SYSROOT/usr/include/aarch64-linux-android" \
-        -D__TARGET_ARCH_arm64 \
-        -Wno-unused-value
-)
-[ -s "$BPF_OBJ" ] || { echo "! BPF 对象构建失败"; exit 1; }
+
+build_bpf_obj() {
+    local src="$1" obj="$2" label="$3"
+    echo "- 构建 BPF 对象: $label"
+    (
+        cd "$(dirname "$src")"
+        "$CLANG" -target bpf -g -O2 -c "$(basename "$src")" -o "$obj" \
+            -fdebug-compilation-dir=. \
+            -ffile-prefix-map="$ROOT=." \
+            -I"$SYSROOT/usr/include" \
+            -I"$SYSROOT/usr/include/aarch64-linux-android" \
+            -D__TARGET_ARCH_arm64 \
+            -Wno-unused-value
+    )
+    [ -s "$obj" ] || { echo "! BPF 对象构建失败: $label"; exit 1; }
+}
+
+build_bpf_obj "$BPF_SRC" "$BPF_OBJ" "queuebuffer_probe.bpf.c"
+build_bpf_obj "$BPF_PERF_SRC" "$BPF_PERF_OBJ" "queuebuffer_probe_perf.bpf.c"
 
 build_abi() {
     local triple="$1" abidir="$2" rust_target="$3"

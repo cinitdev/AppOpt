@@ -46,7 +46,7 @@
 #include "ebpf_fps.h"
 #include "fps_fallback.h"
 
-#define VERSION            "1.7.2"
+#define VERSION            "1.7.3"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -3597,6 +3597,13 @@ static void* fps_thread(void* arg) {
                         ebpf_ctx = fps_start_ebpf_ctx(pkg, target_pid);
 
                         if (ebpf_ctx) {
+                            const char *backend = ebpf_fps_backend(ebpf_ctx);
+                            const char *warn = ebpf_fps_startup_note(ebpf_ctx);
+                            if (warn && warn[0]) {
+                                printf("[FPS] eBPF %s\n", warn);
+                            }
+                            printf("[FPS] eBPF 使用后端: %s\n",
+                                   (backend && backend[0]) ? backend : "未知");
                             printf("[FPS] eBPF 已激活, 锁定符号: %s\n", ebpf_fps_symbol(ebpf_ctx));
                         } else {
                             const char *err = ebpf_fps_last_error(NULL);
@@ -3634,7 +3641,7 @@ static void* fps_thread(void* arg) {
             continue;
         }
 
-        /* === eBPF 模式: 高频轮询 RingBuf === */
+        /* === eBPF 模式: 高频轮询事件通道 === */
         if (ebpf_ctx) {
             int poll_rc = ebpf_fps_poll(ebpf_ctx);
             if (poll_rc < 0) {
@@ -3677,7 +3684,7 @@ static void* fps_thread(void* arg) {
                 now_ms - ebpf_last_frame_ms >= FPS_EBPF_STALE_MS;
             if (fps_is_stale) {
                 if (!ebpf_stale_zero_sent) {
-                    printf("[FPS] eBPF %.1f 秒未收到目标帧, 暂停沿用旧 FPS\n",
+                    printf("[FPS] eBPF 目标暂无新帧 %.1f 秒, 输出 0 FPS\n",
                            (double)(now_ms - ebpf_last_frame_ms) / 1000.0);
                     fps_write_out_windowed(0, &last_fps_output_ms, true);
                     ebpf_stale_zero_sent = true;
@@ -3703,6 +3710,13 @@ static void* fps_thread(void* arg) {
                         ebpf_last_frame_ms = now_ms;
                         ebpf_last_restart_ms = now_ms;
                         if (ebpf_ctx) {
+                            const char *backend = ebpf_fps_backend(ebpf_ctx);
+                            const char *warn = ebpf_fps_startup_note(ebpf_ctx);
+                            if (warn && warn[0]) {
+                                printf("[FPS] eBPF %s\n", warn);
+                            }
+                            printf("[FPS] eBPF 使用后端: %s\n",
+                                   (backend && backend[0]) ? backend : "未知");
                             printf("[FPS] eBPF 已重启, 锁定符号: %s\n", ebpf_fps_symbol(ebpf_ctx));
                         } else {
                             const char *err = ebpf_fps_last_error(NULL);

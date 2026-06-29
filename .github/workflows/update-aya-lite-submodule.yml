@@ -1,0 +1,128 @@
+name: Update Aya Lite Submodule
+
+on:
+  schedule:
+    - cron: "0 22 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    name: Update fps_monitor/aya
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Update aya-lite submodule
+        id: update
+        run: |
+          git submodule update --init --recursive fps_monitor/aya
+          git -C fps_monitor/aya fetch origin main
+          git -C fps_monitor/aya checkout --detach origin/main
+
+          if git diff --quiet -- fps_monitor/aya; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "aya-lite 子模块已经是最新"
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "aya_commit=$(git -C fps_monitor/aya rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "aya_full_commit=$(git -C fps_monitor/aya rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        if: steps.update.outputs.changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        if: steps.update.outputs.changed == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.1.13356709"
+
+      - name: Set up Rust Android targets
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            x86_64-linux-android \
+            i686-linux-android
+
+      - name: Build module
+        if: steps.update.outputs.changed == 'true'
+        env:
+          APPOPT_SKIP_SUBMODULE_UPDATE: "1"
+        run: |
+          if ! command -v python >/dev/null 2>&1; then
+            sudo ln -s "$(command -v python3)" /usr/local/bin/python
+          fi
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.1.13356709"
+          chmod +x ./gradlew ./build_module.sh
+          ./build_module.sh release
+
+      - name: Create update pull request
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AYA_COMMIT: ${{ steps.update.outputs.aya_commit }}
+          AYA_FULL_COMMIT: ${{ steps.update.outputs.aya_full_commit }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add fps_monitor/aya fps_monitor/appopt_ebpf_bridge/Cargo.lock
+          if git diff --cached --quiet; then
+            echo "构建后没有可提交变化"
+            exit 0
+          fi
+
+          BRANCH="bot/update-aya-lite"
+          git checkout -B "$BRANCH"
+          git commit -m "chore: update aya-lite submodule"
+          git push --force-with-lease origin "$BRANCH"
+
+          {
+            echo "自动更新 \`fps_monitor/aya\` 子模块。"
+            echo
+            echo "- aya-lite commit: \`$AYA_FULL_COMMIT\`"
+            echo "- 本次已执行: \`./build_module.sh release\`"
+            echo
+            echo "上游同步信息："
+            echo
+            cat fps_monitor/aya/UPSTREAM.md
+          } > /tmp/aya-lite-pr-body.md
+
+          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            gh pr edit "$BRANCH" \
+              --title "chore: update aya-lite submodule to ${AYA_COMMIT}" \
+              --body-file /tmp/aya-lite-pr-body.md
+          else
+            gh pr create \
+              --base "${GITHUB_REF_NAME:-main}" \
+              --head "$BRANCH" \
+              --title "chore: update aya-lite submodule to ${AYA_COMMIT}" \
+              --body-file /tmp/aya-lite-pr-body.md
+          fi
