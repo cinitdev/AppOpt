@@ -57,7 +57,9 @@
                 style="@style/AppCard"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginBottom="14dp">
+                android:layout_marginBottom="14dp"
+                app:contentPaddingBottom="12dp"
+                app:contentPaddingTop="12dp">
 
                 <LinearLayout
                     android:layout_width="match_parent"
@@ -73,141 +75,244 @@
                         android:textStyle="bold" />
 
                     <LinearLayout
-                        android:id="@+id/settingsHistoryRow"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_marginTop="14dp"
-                        android:background="@drawable/bg_action_row"
-                        android:clickable="true"
-                        android:focusable="true"
-                        android:foreground="?attr/selectableItemBackground"
-                        android:gravity="center_vertical"
-                        android:orientation="horizontal"
-                        android:padding="14dp">
-
-                        <ImageView
-                            android:layout_width="42dp"
-                            android:layout_height="42dp"
-                            android:background="@drawable/bg_icon_button_soft"
-                            android:contentDescription="@null"
-                            android:padding="10dp"
-                            android:src="@drawable/ic_history"
-                            app:tint="@color/brand_primary" />
+                        android:layout_marginTop="10dp"
+                        android:orientation="horizontal">
 
                         <LinearLayout
+                            android:id="@+id/settingsHistoryRow"
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
-                            android:layout_marginStart="12dp"
                             android:layout_weight="1"
-                            android:orientation="vertical">
+                            android:background="@drawable/bg_action_row"
+                            android:clickable="true"
+                            android:focusable="true"
+                            android:foreground="?attr/selectableItemBackground"
+                            android:gravity="center_vertical"
+                            android:minHeight="76dp"
+                            android:orientation="vertical"
+                            android:paddingStart="12dp"
+                            android:paddingTop="10dp"
+                            android:paddingEnd="12dp"
+                            android:paddingBottom="10dp">
+
+                            <LinearLayout
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:gravity="center_vertical"
+                                android:orientation="horizontal">
+
+                                <ImageView
+                                    android:layout_width="34dp"
+                                    android:layout_height="34dp"
+                                    android:background="@drawable/bg_icon_button_soft"
+                                    android:contentDescription="@null"
+                                    android:padding="8dp"
+                                    android:src="@drawable/ic_history"
+                                    app:tint="@color/brand_primary" />
+
+                                <TextView
+                                    android:layout_width="0dp"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginStart="10dp"
+                                    android:layout_weight="1"
+                                    android:ellipsize="end"
+                                    android:maxLines="1"
+                                    android:text="查看历史记录"
+                                    android:textColor="@color/text_primary"
+                                    android:textSize="14sp"
+                                    android:textStyle="bold" />
+                            </LinearLayout>
 
                             <TextView
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
-                                android:text="查看历史记录"
-                                android:textColor="@color/text_primary"
-                                android:textSize="15sp"
-                                android:textStyle="bold" />
-
-                            <TextView
-                                android:layout_width="match_parent"
-                                android:layout_height="wrap_content"
-                                android:layout_marginTop="3dp"
+                                android:layout_marginStart="0dp"
+                                android:layout_marginTop="4dp"
+                                android:ellipsize="end"
+                                android:maxLines="2"
                                 android:text="查看已导入的线程负载记录"
                                 android:textColor="@color/text_secondary"
                                 android:textSize="12sp" />
                         </LinearLayout>
-                    </LinearLayout>
-
-                    <LinearLayout
-                        android:id="@+id/settingsLogRow"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="10dp"
-                        android:background="@drawable/bg_action_row"
-                        android:clickable="true"
-                        android:focusable="true"
-                        android:foreground="?attr/selectableItemBackground"
-                        android:gravity="center_vertical"
-                        android:orientation="horizontal"
-                        android:padding="14dp">
-
-                        <ImageView
-                            android:layout_width="42dp"
-                            android:layout_height="42dp"
-                            android:background="@drawable/bg_icon_button_soft"
-                            android:contentDescription="@null"
-                            android:padding="10dp"
-                            android:src="@drawable/ic_log"
-                            app:tint="@color/brand_primary" />
 
                         <LinearLayout
+                            android:id="@+id/settingsLogRow"
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
-                            android:layout_marginStart="12dp"
+                            android:layout_marginStart="10dp"
                             android:layout_weight="1"
-                            android:orientation="vertical">
+                            android:background="@drawable/bg_action_row"
+                            android:clickable="true"
+                            android:focusable="true"
+                            android:foreground="?attr/selectableItemBackground"
+                            android:gravity="center_vertical"
+                            android:minHeight="76dp"
+                            android:orientation="vertical"
+                            android:paddingStart="12dp"
+                            android:paddingTop="10dp"
+                            android:paddingEnd="12dp"
+                            android:paddingBottom="10dp">
+
+                            <LinearLayout
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:gravity="center_vertical"
+                                android:orientation="horizontal">
+
+                                <ImageView
+                                    android:layout_width="34dp"
+                                    android:layout_height="34dp"
+                                    android:background="@drawable/bg_icon_button_soft"
+                                    android:contentDescription="@null"
+                                    android:padding="8dp"
+                                    android:src="@drawable/ic_log"
+                                    app:tint="@color/brand_primary" />
+
+                                <TextView
+                                    android:layout_width="0dp"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginStart="10dp"
+                                    android:layout_weight="1"
+                                    android:ellipsize="end"
+                                    android:maxLines="1"
+                                    android:text="C进程日志"
+                                    android:textColor="@color/text_primary"
+                                    android:textSize="14sp"
+                                    android:textStyle="bold" />
+                            </LinearLayout>
 
                             <TextView
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
-                                android:text="守护进程日志"
-                                android:textColor="@color/text_primary"
-                                android:textSize="15sp"
-                                android:textStyle="bold" />
-
-                            <TextView
-                                android:layout_width="match_parent"
-                                android:layout_height="wrap_content"
-                                android:layout_marginTop="3dp"
-                                android:text="查看本次开机以来的 AppOpt.log"
+                                android:layout_marginStart="0dp"
+                                android:layout_marginTop="4dp"
+                                android:ellipsize="end"
+                                android:maxLines="2"
+                                android:text="查看本次开机的 AppOpt.log"
                                 android:textColor="@color/text_secondary"
                                 android:textSize="12sp" />
                         </LinearLayout>
                     </LinearLayout>
 
                     <LinearLayout
-                        android:id="@+id/settingsHelpRow"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_marginTop="10dp"
-                        android:background="@drawable/bg_action_row"
-                        android:clickable="true"
-                        android:focusable="true"
-                        android:foreground="?attr/selectableItemBackground"
-                        android:gravity="center_vertical"
-                        android:orientation="horizontal"
-                        android:padding="14dp">
-
-                        <ImageView
-                            android:layout_width="42dp"
-                            android:layout_height="42dp"
-                            android:background="@drawable/bg_icon_button_soft"
-                            android:contentDescription="@null"
-                            android:padding="10dp"
-                            android:src="@drawable/ic_help"
-                            app:tint="@color/brand_primary" />
+                        android:layout_marginTop="8dp"
+                        android:orientation="horizontal">
 
                         <LinearLayout
+                            android:id="@+id/settingsHelpRow"
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
-                            android:layout_marginStart="12dp"
                             android:layout_weight="1"
-                            android:orientation="vertical">
+                            android:background="@drawable/bg_action_row"
+                            android:clickable="true"
+                            android:focusable="true"
+                            android:foreground="?attr/selectableItemBackground"
+                            android:gravity="center_vertical"
+                            android:minHeight="76dp"
+                            android:orientation="vertical"
+                            android:paddingStart="12dp"
+                            android:paddingTop="10dp"
+                            android:paddingEnd="12dp"
+                            android:paddingBottom="10dp">
+
+                            <LinearLayout
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:gravity="center_vertical"
+                                android:orientation="horizontal">
+
+                                <ImageView
+                                    android:layout_width="34dp"
+                                    android:layout_height="34dp"
+                                    android:background="@drawable/bg_icon_button_soft"
+                                    android:contentDescription="@null"
+                                    android:padding="8dp"
+                                    android:src="@drawable/ic_help"
+                                    app:tint="@color/brand_primary" />
+
+                                <TextView
+                                    android:layout_width="0dp"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginStart="10dp"
+                                    android:layout_weight="1"
+                                    android:ellipsize="end"
+                                    android:maxLines="1"
+                                    android:text="使用说明"
+                                    android:textColor="@color/text_primary"
+                                    android:textSize="14sp"
+                                    android:textStyle="bold" />
+                            </LinearLayout>
 
                             <TextView
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
-                                android:text="使用说明"
-                                android:textColor="@color/text_primary"
-                                android:textSize="15sp"
-                                android:textStyle="bold" />
+                                android:layout_marginStart="0dp"
+                                android:layout_marginTop="4dp"
+                                android:ellipsize="end"
+                                android:maxLines="2"
+                                android:text="查看校准与规则生成流程"
+                                android:textColor="@color/text_secondary"
+                                android:textSize="12sp" />
+                        </LinearLayout>
+
+                        <LinearLayout
+                            android:id="@+id/settingsDiagnosticRow"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="10dp"
+                            android:layout_weight="1"
+                            android:background="@drawable/bg_action_row"
+                            android:clickable="true"
+                            android:focusable="true"
+                            android:foreground="?attr/selectableItemBackground"
+                            android:gravity="center_vertical"
+                            android:minHeight="76dp"
+                            android:orientation="vertical"
+                            android:paddingStart="12dp"
+                            android:paddingTop="10dp"
+                            android:paddingEnd="12dp"
+                            android:paddingBottom="10dp">
+
+                            <LinearLayout
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:gravity="center_vertical"
+                                android:orientation="horizontal">
+
+                                <ImageView
+                                    android:layout_width="34dp"
+                                    android:layout_height="34dp"
+                                    android:background="@drawable/bg_icon_button_soft"
+                                    android:contentDescription="@null"
+                                    android:padding="8dp"
+                                    android:src="@drawable/ic_export"
+                                    app:tint="@color/brand_primary" />
+
+                                <TextView
+                                    android:layout_width="0dp"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginStart="10dp"
+                                    android:layout_weight="1"
+                                    android:ellipsize="end"
+                                    android:maxLines="1"
+                                    android:text="导出诊断包"
+                                    android:textColor="@color/text_primary"
+                                    android:textSize="14sp"
+                                    android:textStyle="bold" />
+                            </LinearLayout>
 
                             <TextView
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
-                                android:layout_marginTop="3dp"
-                                android:text="查看启动校准与规则生成流程"
+                                android:layout_marginStart="0dp"
+                                android:layout_marginTop="4dp"
+                                android:ellipsize="end"
+                                android:maxLines="2"
+                                android:text="导出日志、规则和系统状态"
                                 android:textColor="@color/text_secondary"
                                 android:textSize="12sp" />
                         </LinearLayout>

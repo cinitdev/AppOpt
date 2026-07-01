@@ -30,6 +30,7 @@ class SettingsActivity : AppCompatActivity() {
     private var moduleVersion: DaemonBridge.ModuleVersion? = null
     private var firstResume = true
     private var updateBusy = false
+    private var diagnosticBusy = false
     private var cachedUpdateInfo: ModuleUpdater.UpdateInfo? = null
     private var policyEditable = false
     private var suppressPolicyChange = false
@@ -61,6 +62,9 @@ class SettingsActivity : AppCompatActivity() {
         }
         binding.settingsLogRow.setOnClickListener {
             startActivity(Intent(this, LogActivity::class.java))
+        }
+        binding.settingsDiagnosticRow.setOnClickListener {
+            exportDiagnosticPackage()
         }
         binding.settingsUpdateButton.setOnClickListener {
             cachedUpdateInfo?.let { update ->
@@ -337,6 +341,30 @@ class SettingsActivity : AppCompatActivity() {
                 } else {
                     toast("自动保存失败，请检查 Root 或模块状态")
                 }
+            }
+        }
+    }
+
+    private fun exportDiagnosticPackage() {
+        if (diagnosticBusy) {
+            toast("正在导出诊断包")
+            return
+        }
+        diagnosticBusy = true
+        binding.settingsDiagnosticRow.isEnabled = false
+        binding.settingsDiagnosticRow.alpha = 0.55f
+        toast("正在导出诊断包")
+        thread {
+            val result = DiagnosticExporter.export(this)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                diagnosticBusy = false
+                binding.settingsDiagnosticRow.isEnabled = true
+                binding.settingsDiagnosticRow.alpha = 1f
+                result.fold(
+                    onSuccess = { toast("已导出到 $it") },
+                    onFailure = { toast("导出失败: ${it.message ?: "无法写入 Download"}") }
+                )
             }
         }
     }

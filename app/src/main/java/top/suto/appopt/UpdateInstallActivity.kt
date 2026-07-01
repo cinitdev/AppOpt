@@ -39,7 +39,6 @@ class UpdateInstallActivity : AppCompatActivity() {
 
         binding.updateInstallSubtitle.text =
             "当前 ${update.localVersion} (${update.localVersionCode}) -> ${update.remoteVersion} (${update.remoteVersionCode})"
-        binding.updateInstallReboot.setOnClickListener { rebootSystem() }
 
         appendLog("开始刷入 AppOpt 模块更新\n")
         appendLog("当前版本：${update.localVersion} (${update.localVersionCode})\n")
@@ -76,7 +75,7 @@ class UpdateInstallActivity : AppCompatActivity() {
                             "App 将在重启后自动更新"
                         )
                     )
-                    binding.updateInstallActions.visibility = View.VISIBLE
+                    showActionButton("重启系统") { rebootSystem() }
                 }
 
                 override fun onFailure(message: String) {
@@ -87,7 +86,7 @@ class UpdateInstallActivity : AppCompatActivity() {
                         success = false,
                         lines = listOf(message)
                     )
-                    binding.updateInstallActions.visibility = View.GONE
+                    showActionButton("返回") { finish() }
                 }
             }
         )
@@ -97,6 +96,13 @@ class UpdateInstallActivity : AppCompatActivity() {
         binding.updateInstallStatus.text = title
         binding.updateInstallDetail.text = detail
         binding.updateInstallDetail.visibility = if (detail.isBlank()) View.GONE else View.VISIBLE
+    }
+
+    private fun showActionButton(text: String, action: () -> Unit) {
+        binding.updateInstallReboot.text = text
+        binding.updateInstallReboot.isEnabled = true
+        binding.updateInstallReboot.setOnClickListener { action() }
+        binding.updateInstallActions.visibility = View.VISIBLE
     }
 
     private fun appendInstallResult(success: Boolean, lines: List<String>) {

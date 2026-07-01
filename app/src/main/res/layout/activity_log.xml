@@ -27,7 +27,7 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="守护进程日志"
+                android:text="C进程日志"
                 android:textColor="#FFFFFF"
                 android:textSize="22sp"
                 android:textStyle="bold" />

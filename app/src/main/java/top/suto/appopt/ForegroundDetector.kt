@@ -15,6 +15,18 @@ import android.os.Process
  */
 object ForegroundDetector {
 
+    data class State(
+        val foreground: Boolean,
+        val currentPackage: String?,
+        val lastEventPackage: String?,
+        val lastEventType: Int,
+        val eventCount: Int,
+        val resumedCount: Int,
+        val queryStart: Long,
+        val queryEnd: Long,
+        val error: String? = null
+    )
+
     /** 是否已被授予「使用情况访问」权限 */
     @Suppress("DEPRECATION")
     fun hasUsageAccess(context: Context): Boolean {
@@ -31,24 +43,22 @@ object ForegroundDetector {
         }
     }
 
-    private val sharedTracker = Tracker()
-
-    fun reset() {
-        sharedTracker.reset()
-    }
-
-    fun isAppForeground(context: Context, pkg: String, initialLookbackMs: Long = 60_000L): Boolean {
-        return sharedTracker.isAppForeground(context, pkg, initialLookbackMs)
-    }
-
     class Tracker {
         @Volatile private var lastQueryEnd = 0L
         @Volatile private var lastForegroundPkg: String? = null
+        @Volatile private var lastEventPkg: String? = null
+        @Volatile private var lastEventType: Int = -1
+
+        private companion object {
+            const val QUERY_OVERLAP_MS = 500L
+        }
 
         /** 重置增量跟踪状态。每次开始一轮前台监测前调用, 避免上一轮残留干扰判定。 */
         fun reset() {
             lastQueryEnd = 0L
             lastForegroundPkg = null
+            lastEventPkg = null
+            lastEventType = -1
         }
 
         /**
@@ -61,30 +71,57 @@ object ForegroundDetector {
          *
          * 未授权或查询失败返回 false(调用方据此走宽限/关闭逻辑)。
          */
-        fun isAppForeground(context: Context, pkg: String, initialLookbackMs: Long = 60_000L): Boolean {
-            if (pkg.isBlank()) return false
-            if (!ForegroundDetector.hasUsageAccess(context)) return false
+        fun queryState(context: Context, pkg: String, initialLookbackMs: Long = 60_000L): State {
+            if (pkg.isBlank()) {
+                return State(false, lastForegroundPkg, lastEventPkg, lastEventType, 0, 0, 0L, 0L, "empty_pkg")
+            }
+            if (!ForegroundDetector.hasUsageAccess(context)) {
+                return State(false, lastForegroundPkg, lastEventPkg, lastEventType, 0, 0, 0L, 0L, "usage_access_denied")
+            }
 
             return try {
                 val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
                 val now = System.currentTimeMillis()
-                // 首次回溯一段时间抓进入前台的事件做初值; 之后从上次查询点增量查, 不漏不重扫
-                val start = if (lastQueryEnd == 0L) now - initialLookbackMs else lastQueryEnd
+                // 首次回溯一段时间抓进入前台的事件做初值; 之后增量查。
+                // 这里保留 500ms 重叠, 避免部分 ROM 在时间边界上漏掉 UsageEvents。
+                val start = if (lastQueryEnd == 0L) {
+                    now - initialLookbackMs
+                } else {
+                    (lastQueryEnd - QUERY_OVERLAP_MS).coerceAtLeast(0L)
+                }
                 val events = usm.queryEvents(start, now)
                 val event = UsageEvents.Event()
+                var eventCount = 0
+                var resumedCount = 0
 
                 while (events.hasNextEvent()) {
                     events.getNextEvent(event)
+                    eventCount++
+                    lastEventPkg = event.packageName
+                    lastEventType = event.eventType
                     // ACTIVITY_RESUMED(=1, 旧名 MOVE_TO_FOREGROUND): 某 activity 进入前台
                     if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
-                        lastForegroundPkg = event.packageName
+                        resumedCount++
+                        val eventPkg = event.packageName
+                        if (!eventPkg.isNullOrBlank()) {
+                            lastForegroundPkg = eventPkg
+                        }
                     }
                 }
 
                 lastQueryEnd = now
-                lastForegroundPkg == pkg
-            } catch (_: Exception) {
-                false
+                State(
+                    foreground = lastForegroundPkg == pkg,
+                    currentPackage = lastForegroundPkg,
+                    lastEventPackage = lastEventPkg,
+                    lastEventType = lastEventType,
+                    eventCount = eventCount,
+                    resumedCount = resumedCount,
+                    queryStart = start,
+                    queryEnd = now
+                )
+            } catch (e: Exception) {
+                State(false, lastForegroundPkg, lastEventPkg, lastEventType, 0, 0, 0L, 0L, e.message)
             }
         }
     }

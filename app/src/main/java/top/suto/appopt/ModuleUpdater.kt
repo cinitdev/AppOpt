@@ -311,6 +311,16 @@ object ModuleUpdater {
         return detectRootManager()?.label
     }
 
+    fun retainDownloadedModuleForManualInstall(
+        context: Context?,
+        zipPath: String,
+        inAppUpdate: Boolean = true
+    ): String {
+        val zip = File(zipPath)
+        if (!zip.exists()) return zipPath
+        return retainOriginalZipForManualInstall(context, zip, inAppUpdate) {}
+    }
+
     fun renderMarkdown(markdown: String): Spanned {
         val builder = SpannableStringBuilder()
         var inCodeBlock = false

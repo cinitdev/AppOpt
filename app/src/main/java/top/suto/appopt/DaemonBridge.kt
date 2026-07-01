@@ -46,7 +46,7 @@ object DaemonBridge {
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
     const val REQUIRED_MODULE_VERSION_CODE = 173
-    const val REQUIRED_MODULE_VERSION_NAME = "1.7.3"
+    const val REQUIRED_MODULE_VERSION_NAME = "1.7.4"
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
     fun hasRoot(): Boolean = runAsRoot("id -u").trim() == "0"
@@ -68,14 +68,17 @@ object DaemonBridge {
         val success: Boolean
     )
 
+    data class TopAppState(
+        val targetTopApp: Boolean,
+        val pid: Int?,
+        val scanned: Int,
+        val packages: List<String>,
+        val backend: String = "cgroup-top"
+    )
+
     fun readRootFile(path: String): String? {
         val out = runAsRoot("cat ${shellQuote(path)} 2>/dev/null")
         return if (out.isNotErrored()) out else null
-    }
-
-    fun rootFileExists(path: String): Boolean {
-        return runAsRoot("[ -f ${shellQuote(path)} ] && printf 1 || printf 0")
-            .trim() == "1"
     }
 
     fun runRootCommand(cmd: String, timeoutSeconds: Long = 15L): RootCommandResult {
@@ -281,6 +284,54 @@ object DaemonBridge {
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .toSet()
+    }
+
+    fun readTopAppState(pkg: String): TopAppState {
+        val safePkg = cleanCommandArg(pkg.substringBefore(':'), allowColon = false)
+        if (safePkg.isBlank()) {
+            return TopAppState(false, null, 0, emptyList(), backend = "invalid")
+        }
+        val cmd = buildString {
+            append(shellQuote(BIN_FILE))
+            append(" --app-state ")
+            append(shellQuote(safePkg))
+        }
+        val out = runAsRoot(cmd, timeoutSeconds = 5L).substringBefore(ERR_MARK)
+        val values = out.lineSequence()
+            .mapNotNull { line ->
+                val index = line.indexOf('=')
+                if (index <= 0) null else line.substring(0, index).trim() to line.substring(index + 1).trim()
+            }
+            .toMap()
+        if (values.isEmpty()) return TopAppState(false, null, 0, emptyList(), backend = "empty")
+        val packages = values["packages"].orEmpty()
+            .split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        return TopAppState(
+            targetTopApp = values["target_top_app"] == "1" || values["top_app"] == "1",
+            pid = values["pid"]?.toIntOrNull()?.takeIf { it > 0 },
+            scanned = values["scanned"]?.toIntOrNull() ?: 0,
+            packages = packages,
+            backend = "cgroup-top"
+        )
+    }
+
+    fun readFocusedPackage(): String? {
+        val cmd = """
+            {
+                dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp|mFocusedWindow|FocusedWindow' | head -n 12
+                dumpsys activity activities 2>/dev/null | grep -E 'mResumedActivity|topResumedActivity|ResumedActivity|mFocusedApp' | head -n 12
+            } | sed -nE \
+                -e 's/.* u[0-9]+ ([A-Za-z0-9_][A-Za-z0-9_.]+)\/.*/\1/p' \
+                -e 's/.* ([A-Za-z0-9_][A-Za-z0-9_.]+)\/[A-Za-z0-9_.$]+.*/\1/p' \
+                | head -n 1
+        """.trimIndent()
+        return runAsRoot(cmd, timeoutSeconds = 3L)
+            .substringBefore(ERR_MARK)
+            .trim()
+            .takeIf { it.isNotBlank() }
     }
 
     /** 下发开始线程负载采样命令，并等待守护进程进入 sampling 状态。 */

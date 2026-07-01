@@ -954,8 +954,8 @@ class MainActivity : AppCompatActivity() {
             )
             !daemonRunning -> EmptyState(
                 R.drawable.ic_warning,
-                "守护进程未运行",
-                "请确认模块已启用并重启设备\n仍异常可在「设置」中查看守护进程日志"
+                "C进程未运行",
+                "请确认模块已启用并重启设备\n仍异常可在「设置」中查看C进程日志"
             )
             else -> null
         }
@@ -1178,17 +1178,21 @@ class MainActivity : AppCompatActivity() {
 
     /** 启动目标应用并显示悬浮球，把目标包名传给服务用于校准 */
     private fun startAppWithBall(pkg: String) {
+        android.util.Log.d("AppOpt", "startAppWithBall: pkg=$pkg")
         if (!canUseModuleFeatures()) {
+            android.util.Log.d("AppOpt", "startAppWithBall blocked: ${blockedState()?.title ?: "模块不可用"}")
             toast(blockedState()?.title ?: "模块不可用")
             buildAppList()
             return
         }
         if (!hasOverlay()) {
+            android.util.Log.d("AppOpt", "startAppWithBall blocked: overlay permission missing")
             toast("请先授予悬浮窗权限")
             refresh()
             return
         }
         if (!ForegroundDetector.hasUsageAccess(this)) {
+            android.util.Log.d("AppOpt", "startAppWithBall blocked: usage access missing")
             toast("请先授予使用情况访问权限")
             refresh()
             return
@@ -1199,31 +1203,22 @@ class MainActivity : AppCompatActivity() {
         if (launch != null) {
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             try {
-                ForegroundDetector.reset()
+                val svc = Intent(this, FloatingBallService::class.java)
+                    .putExtra(FloatingBallService.EXTRA_TARGET_PKG, pkg)
+                    .putExtra(FloatingBallService.EXTRA_LAUNCH_PKG, launchPkg)
+                android.util.Log.d("AppOpt", "startAppWithBall start floating service: pkg=$pkg")
+                startForegroundService(svc)
+                android.util.Log.d("AppOpt", "startAppWithBall launch: launchPkg=$launchPkg configPkg=$pkg")
                 startActivity(launch)
-                waitForLaunchThenShowBall(pkg, launchPkg)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                android.util.Log.e("AppOpt", "startAppWithBall launch failed: $launchPkg ${e.message}")
+                stopService(Intent(this, FloatingBallService::class.java))
                 toast("启动 $launchPkg 失败")
             }
         } else {
+            android.util.Log.d("AppOpt", "startAppWithBall blocked: no launcher for $launchPkg")
             toast("未找到 $launchPkg 的启动入口，请手动进入应用")
         }
-    }
-
-    private fun waitForLaunchThenShowBall(pkg: String, launchPkg: String, attempt: Int = 0) {
-        mainHandler.postDelayed({
-            if (activityDestroyed || isFinishing || isDestroyed) return@postDelayed
-            val foreground = ForegroundDetector.isAppForeground(this, launchPkg, initialLookbackMs = 8_000L)
-            if (foreground) {
-                val svc = Intent(this, FloatingBallService::class.java)
-                    .putExtra(FloatingBallService.EXTRA_TARGET_PKG, pkg)
-                startForegroundService(svc)
-            } else if (attempt < 15) {
-                waitForLaunchThenShowBall(pkg, launchPkg, attempt + 1)
-            } else {
-                toast("未检测到目标应用启动，已取消显示悬浮球")
-            }
-        }, 500L)
     }
 
     /** 把未配置应用写入 applist.conf，形式为 "包名=auto" */

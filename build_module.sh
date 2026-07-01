@@ -5,10 +5,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-SRC="$ROOT/AppOpt.c"
-FPS_MON="$ROOT/fps_monitor"
+NATIVE_DIR="$ROOT/native_daemon"
+SRC="$NATIVE_DIR/AppOpt.c"
+FOREGROUND_MONITOR_SRC="$NATIVE_DIR/foreground_monitor.c"
+FPS_MON="$NATIVE_DIR/fps_monitor"
 RUST_BRIDGE="$FPS_MON/appopt_ebpf_bridge"
 AYA_SUBMODULE="$FPS_MON/aya"
+AYA_SUBMODULE_REL="native_daemon/fps_monitor/aya"
 BASE_DIR="$ROOT/magisk_module"
 WORK="$ROOT/build/module"
 APP_NAME="AppOpt 线程优化"
@@ -58,27 +61,29 @@ fi
 ZIP="$ROOT/build/AppOpt.zip"
 
 [ -d "$BASE_DIR" ] || { echo "! 找不到模块基底目录: $BASE_DIR"; exit 1; }
+[ -d "$NATIVE_DIR" ] || { echo "! 找不到 native 源码目录: $NATIVE_DIR"; exit 1; }
 [ -f "$SRC" ] || { echo "! 找不到主源码: $SRC"; exit 1; }
+[ -f "$FOREGROUND_MONITOR_SRC" ] || { echo "! 找不到前台检测源码: $FOREGROUND_MONITOR_SRC"; exit 1; }
 [ -d "$FPS_MON" ] || { echo "! 找不到 fps_monitor 目录: $FPS_MON"; exit 1; }
 [ -d "$RUST_BRIDGE" ] || { echo "! 找不到 Rust bridge: $RUST_BRIDGE"; exit 1; }
 [ -f "$FPS_MON/ebpf_fps.c" ] || { echo "! 找不到 Rust C 适配层: $FPS_MON/ebpf_fps.c"; exit 1; }
 
 ensure_aya_submodule() {
     [ -f "$ROOT/.gitmodules" ] || return 0
-    grep -q "path = fps_monitor/aya" "$ROOT/.gitmodules" || return 0
+    grep -q "path = $AYA_SUBMODULE_REL" "$ROOT/.gitmodules" || return 0
 
     command -v git >/dev/null 2>&1 || {
-        echo "! 找不到 git，无法初始化子模块: fps_monitor/aya"
+        echo "! 找不到 git，无法初始化子模块: $AYA_SUBMODULE_REL"
         exit 1
     }
 
-    echo "- 检查子模块: fps_monitor/aya"
+    echo "- 检查子模块: $AYA_SUBMODULE_REL"
     if [ "${APPOPT_SKIP_SUBMODULE_UPDATE:-0}" = "1" ]; then
-        echo "- 跳过子模块指针重置，使用当前 fps_monitor/aya 工作区"
+        echo "- 跳过子模块指针重置，使用当前 $AYA_SUBMODULE_REL 工作区"
     else
         (
             cd "$ROOT"
-            git submodule update --init --recursive fps_monitor/aya
+            git submodule update --init --recursive "$AYA_SUBMODULE_REL"
         )
     fi
 
@@ -418,8 +423,10 @@ build_abi() {
 
     echo "- 构建 $abidir (AppOpt + Rust/aya eBPF bridge)"
     "$cc" -Wall -Wextra -O2 -pthread \
+        -I"$ROOT" \
         -I"$FPS_MON" \
         "$SRC" \
+        "$FOREGROUND_MONITOR_SRC" \
         "$FPS_MON/ebpf_fps.c" \
         "$FPS_MON/fps_fallback.c" \
         "$RUST_BRIDGE_LIB" \

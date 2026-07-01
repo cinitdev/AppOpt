@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.os.FileObserver
+import android.os.SystemClock
+import android.view.WindowManager
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -25,6 +27,8 @@ class FrameRateMonitor(
     private var observer: FileObserver? = null
     private var server: LocalServerSocket? = null
     private var activeSocket: LocalSocket? = null
+    private var refreshRateCap = 0f
+    private var refreshRateReadAt = 0L
     @Volatile private var running = false
 
     @Volatile var socketName: String? = null
@@ -115,7 +119,7 @@ class FrameRateMonitor(
             while (running) {
                 val line = reader.readLine() ?: break
                 val fps = line.trim().toFloatOrNull() ?: continue
-                if (fps >= 0f) onFps(fps)
+                emitFps(fps)
             }
         } catch (_: Exception) {
         } finally {
@@ -155,6 +159,37 @@ class FrameRateMonitor(
         } catch (_: Exception) {
             return
         }
-        if (fps >= 0f && running) onFps(fps)
+        emitFps(fps)
+    }
+
+    private fun emitFps(fps: Float) {
+        if (fps < 0f || !running) return
+        onFps(clampToRefreshRate(fps))
+    }
+
+    private fun clampToRefreshRate(fps: Float): Float {
+        if (fps <= 0f) return fps
+        val cap = currentRefreshRateCap()
+        if (cap <= 0f) return fps
+        return fps.coerceAtMost(cap)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentRefreshRateCap(): Float {
+        val now = SystemClock.elapsedRealtime()
+        if (refreshRateCap > 0f && now - refreshRateReadAt < 5_000L) {
+            return refreshRateCap
+        }
+
+        val rate = try {
+            val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+            windowManager?.defaultDisplay?.refreshRate ?: 0f
+        } catch (_: Exception) {
+            0f
+        }
+
+        refreshRateCap = if (rate in 30f..1000f) rate + 0.5f else 0f
+        refreshRateReadAt = now
+        return refreshRateCap
     }
 }

@@ -222,8 +222,8 @@ data class CalibPolicy(
             return sorted.last() - sorted.first() + 1 == sorted.size
         }
 
-        private fun formatContinuousRange(cpus: Set<Int>): String {
-            if (!isContinuous(cpus)) return ""
+        private fun formatContinuousRange(cpus: Set<Int>): String? {
+            if (!isContinuous(cpus)) return null
             val sorted = cpus.sorted()
             val start = sorted.first()
             val end = sorted.last()

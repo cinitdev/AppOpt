@@ -1,29 +1,31 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::TryInto,
     ffi::{CStr, CString},
     fs,
     num::NonZeroU32,
     os::raw::{c_char, c_double, c_int},
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     ptr,
     sync::Mutex,
 };
 
 use aya::{
-    maps::{
-        perf::{PerfEvent, PerfEventArrayBuffer},
-        MapData, PerfEventArray, RingBuf,
-    },
-    programs::{uprobe::UProbeScope, UProbe},
-    util::online_cpus,
     Ebpf,
+    maps::{
+        MapData, PerfEventArray, RingBuf,
+        perf::{PerfEvent, PerfEventArrayBuffer},
+    },
+    programs::{UProbe, uprobe::UProbeScope},
+    util::online_cpus,
 };
 
 const FPS_WINDOW_NS: u64 = 1_000_000_000;
 const MIN_FRAME_NS: u64 = 1_000_000;
 const MAX_FRAME_NS: u64 = 200_000_000;
+const STREAM_STALE_NS: u64 = 2_000_000_000;
+const MAX_STREAMS: usize = 32;
 
 static LAST_START_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 
@@ -49,6 +51,50 @@ enum EventBackend {
     PerfEvent(Vec<PerfEventArrayBuffer<MapData>>),
 }
 
+struct FpsStream {
+    frame_times: VecDeque<u64>,
+    frame_time_sum_ns: u64,
+    last_ts: u64,
+    last_seen_ns: u64,
+    cur_fps: f64,
+}
+
+impl FpsStream {
+    fn new(timestamp_ns: u64) -> Self {
+        Self {
+            frame_times: VecDeque::with_capacity(144),
+            frame_time_sum_ns: 0,
+            last_ts: 0,
+            last_seen_ns: timestamp_ns,
+            cur_fps: 0.0,
+        }
+    }
+
+    fn on_frame(&mut self, timestamp_ns: u64) {
+        if self.last_ts != 0 {
+            let delta = timestamp_ns.saturating_sub(self.last_ts);
+            if (MIN_FRAME_NS..=MAX_FRAME_NS).contains(&delta) {
+                self.frame_times.push_front(delta);
+                self.frame_time_sum_ns = self.frame_time_sum_ns.saturating_add(delta);
+
+                while self.frame_time_sum_ns > FPS_WINDOW_NS && self.frame_times.len() > 1 {
+                    if let Some(old) = self.frame_times.pop_back() {
+                        self.frame_time_sum_ns = self.frame_time_sum_ns.saturating_sub(old);
+                    }
+                }
+
+                if self.frame_time_sum_ns > 0 {
+                    self.cur_fps = (self.frame_times.len() as f64) * 1_000_000_000.0
+                        / (self.frame_time_sum_ns as f64);
+                }
+            }
+        }
+
+        self.last_ts = timestamp_ns;
+        self.last_seen_ns = timestamp_ns;
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BackendKind {
     RingBuf,
@@ -69,9 +115,7 @@ pub struct AppOptEbpfCtx {
     bpf: Ebpf,
     backend: EventBackend,
     pid: i32,
-    frame_times: VecDeque<u64>,
-    frame_time_sum_ns: u64,
-    last_ts: u64,
+    streams: HashMap<u64, FpsStream>,
     cur_fps: f64,
     symbol: CString,
     backend_label: CString,
@@ -131,10 +175,7 @@ fn pid_matches_pkg(pid: u32, pkg: &str) -> bool {
     let Ok(cmdline) = fs::read(path) else {
         return false;
     };
-    let name = cmdline
-        .split(|b| *b == 0)
-        .next()
-        .unwrap_or_default();
+    let name = cmdline.split(|b| *b == 0).next().unwrap_or_default();
     let name = match std::str::from_utf8(name) {
         Ok(s) => s.rsplit('/').next().unwrap_or(s),
         Err(_) => return false,
@@ -144,6 +185,38 @@ fn pid_matches_pkg(pid: u32, pkg: &str) -> bool {
         || name
             .strip_prefix(pkg)
             .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn stream_key(event: FrameEvent) -> u64 {
+    if event.surface_ptr != 0 {
+        event.surface_ptr
+    } else {
+        (1u64 << 63) | u64::from(event.tid)
+    }
+}
+
+fn refresh_current_fps(ctx: &mut AppOptEbpfCtx, now_ns: u64) {
+    ctx.streams
+        .retain(|_, stream| now_ns.saturating_sub(stream.last_seen_ns) <= STREAM_STALE_NS);
+
+    if ctx.streams.len() > MAX_STREAMS {
+        let mut streams = ctx
+            .streams
+            .iter()
+            .map(|(key, stream)| (*key, stream.last_seen_ns))
+            .collect::<Vec<_>>();
+        streams.sort_by_key(|(_, last_seen_ns)| *last_seen_ns);
+        for (key, _) in streams.into_iter().take(ctx.streams.len() - MAX_STREAMS) {
+            ctx.streams.remove(&key);
+        }
+    }
+
+    ctx.cur_fps = ctx
+        .streams
+        .values()
+        .filter(|stream| now_ns.saturating_sub(stream.last_seen_ns) <= STREAM_STALE_NS)
+        .map(|stream| stream.cur_fps)
+        .fold(0.0, f64::max);
 }
 
 fn on_frame(ctx: &mut AppOptEbpfCtx, event: FrameEvent) -> bool {
@@ -160,26 +233,12 @@ fn on_frame(ctx: &mut AppOptEbpfCtx, event: FrameEvent) -> bool {
         ctx.pid = event.pid as i32;
     }
 
-    if ctx.last_ts != 0 {
-        let delta = event.timestamp_ns.saturating_sub(ctx.last_ts);
-        if (MIN_FRAME_NS..=MAX_FRAME_NS).contains(&delta) {
-            ctx.frame_times.push_front(delta);
-            ctx.frame_time_sum_ns = ctx.frame_time_sum_ns.saturating_add(delta);
-
-            while ctx.frame_time_sum_ns > FPS_WINDOW_NS && ctx.frame_times.len() > 1 {
-                if let Some(old) = ctx.frame_times.pop_back() {
-                    ctx.frame_time_sum_ns = ctx.frame_time_sum_ns.saturating_sub(old);
-                }
-            }
-
-            if ctx.frame_time_sum_ns > 0 {
-                ctx.cur_fps =
-                    (ctx.frame_times.len() as f64) * 1_000_000_000.0 / (ctx.frame_time_sum_ns as f64);
-            }
-        }
-    }
-
-    ctx.last_ts = event.timestamp_ns;
+    let key = stream_key(event);
+    ctx.streams
+        .entry(key)
+        .or_insert_with(|| FpsStream::new(event.timestamp_ns))
+        .on_frame(event.timestamp_ns);
+    refresh_current_fps(ctx, event.timestamp_ns);
     true
 }
 
@@ -301,9 +360,7 @@ fn start_backend(
         bpf,
         backend,
         pid,
-        frame_times: VecDeque::with_capacity(144),
-        frame_time_sum_ns: 0,
-        last_ts: 0,
+        streams: HashMap::new(),
         cur_fps: 0.0,
         symbol,
         backend_label: cstring_lossy(kind.label()),
@@ -343,8 +400,7 @@ fn start_impl(
                 let perf_path = perf_fallback_path(ring_path);
                 match start_backend(&perf_path, BackendKind::PerfEvent, pid, target_pkg) {
                     Ok(mut ctx) => {
-                        ctx.startup_note =
-                            cstring_lossy(format!("RingBuf 不可用: {ring_err}"));
+                        ctx.startup_note = cstring_lossy(format!("RingBuf 不可用: {ring_err}"));
                         ctx
                     }
                     Err(perf_err) => {

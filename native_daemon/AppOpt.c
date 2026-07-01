@@ -45,8 +45,9 @@
 /* fps_monitor 模块: eBPF uprobe + timestats 回退 */
 #include "ebpf_fps.h"
 #include "fps_fallback.h"
+#include "foreground_monitor.h"
 
-#define VERSION            "1.7.3"
+#define VERSION            "1.7.4"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -3767,6 +3768,7 @@ static void print_help(const char* prog_name) {
     printf("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)\n");
     printf("  -v                 显示程序版本\n");
     printf("  -P, --ping-daemon <socket> <token>  请求守护进程反向验证 App\n");
+    printf("  --app-state <pkg>                   读取 top-app/foreground_window 并检查目标包是否前台\n");
     printf("  -h                 显示帮助信息\n");
     printf("\n示例:\n");
     printf("  %s -c /data/adb/modules/AppOpt/config/applist.conf -s 3\n", prog_name);
@@ -3791,6 +3793,13 @@ int main(int argc, char **argv) {
                 return 2;
             }
             return daemon_socket_ping_client(argv[i + 1], argv[i + 2]);
+        }
+        if (strcmp(argv[i], "--app-state") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--app-state 需要 <pkg>\n");
+                return 2;
+            }
+            return app_state_print_cli(argv[i + 1], NULL);
         }
     }
 

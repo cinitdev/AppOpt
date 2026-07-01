@@ -40,6 +40,7 @@ class FloatingBallService : Service() {
 
     private var calibrating = false
     private var targetPkg: String? = null
+    private var launchPkg: String? = null
     // FileObserver 回调线程写、主线程读, 需 @Volatile 保证可见性(否则主线程可能读到陈旧值)
     @Volatile private var currentFps = 0f
 
@@ -47,6 +48,7 @@ class FloatingBallService : Service() {
     private var hasAppearedForeground = false   // 目标应用是否已经在前台出现过(拉起成功)
     private var absentCount = 0                  // 连续检测到不在前台的次数
     private var foregroundClosing = false        // 是否已因离开前台进入关闭流程
+    private var launchProcessMissingCount = 0    // 启动阶段连续无法确认目标前台的次数
 
     private lateinit var fpsMonitor: FrameRateMonitor
 
@@ -59,6 +61,22 @@ class FloatingBallService : Service() {
     @Volatile private var serviceDestroyed = false
     private val foregroundTracker = ForegroundDetector.Tracker()
     private var usageAccessMissingCount = 0
+    @Volatile private var foregroundCheckRunning = false
+
+    private data class ForegroundCheckSnapshot(
+        val checkPkg: String,
+        val foreground: Boolean,
+        val processRunning: Boolean,
+        val usageForeground: Boolean,
+        val usagePackage: String?,
+        val usageLastEventPackage: String?,
+        val usageLastEventType: Int,
+        val usageEventCount: Int,
+        val usageResumedCount: Int,
+        val focusedPkg: String?,
+        val source: String,
+        val detail: String
+    )
 
     // 拖动状态
     private var initialX = 0
@@ -72,11 +90,13 @@ class FloatingBallService : Service() {
         private const val NOTIF_ID = 1001
         private const val DRAG_THRESHOLD_DP = 12f
         const val EXTRA_TARGET_PKG = "target_pkg"
+        const val EXTRA_LAUNCH_PKG = "launch_pkg"
 
         // 前台监测周期与离开阈值
         private const val FG_CHECK_INTERVAL = 3000L   // 每 3s 检查一次目标应用是否在前台
         private const val FG_ABSENT_LIMIT = 2         // 连续 2 次(约6s)不在前台才判定离开, 避免下拉通知栏等短暂切换误关
         private const val FG_APPEAR_GRACE = 15        // 启动后等待应用出现的宽限次数(约45s)
+        private const val FG_LAUNCH_PROCESS_MISS_LIMIT = 3
         private const val FG_USAGE_ACCESS_MISSING_LIMIT = 3
         private const val MANUAL_STOP_TIMEOUT_MS = 18_000L
         private const val MANUAL_STOP_CLOSE_DELAY_MS = 20_000L
@@ -85,6 +105,7 @@ class FloatingBallService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        android.util.Log.d("AppOpt", "FloatingBallService onCreate")
         serviceDestroyed = false
         startForeground(NOTIF_ID, buildNotification())
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -155,7 +176,9 @@ class FloatingBallService : Service() {
         try {
             windowManager.addView(capsule, layoutParams)
             capsuleAdded = true
+            android.util.Log.d("AppOpt", "FloatingBallService capsule added")
         } catch (e: Exception) {
+            android.util.Log.e("AppOpt", "FloatingBallService add capsule failed: ${e.message}")
             stopSelf()
         }
     }
@@ -215,15 +238,23 @@ class FloatingBallService : Service() {
             // 黄 -> 红: 开始校准。目标包名由启动 App 时通过 Intent 指定。
             val pkg = targetPkg
             if (pkg.isNullOrBlank()) {
+                android.util.Log.d("AppOpt", "calibration start ignored: target package empty")
                 toast("未指定目标应用, 请从优化 App 内启动")
                 return
             }
+            android.util.Log.d("AppOpt", "calibration start: pkg=$pkg")
             calibrating = true
+            // 用户能点击悬浮球开始校准, 说明目标 App 会话已经成立。
+            // 部分 ROM 的 UsageStats 会漏掉目标进入前台事件; 这里避免后续一直卡在"等待目标出现"阶段。
+            hasAppearedForeground = true
+            absentCount = 0
+            launchProcessMissingCount = 0
             capsule.setBackgroundResource(R.drawable.capsule_red)
             updateCapsuleText()
             showBanner("● 开始记录线程负载\n请正常操作游戏, 完成后再次点击胶囊结束", durationMs = 3500)
             thread {
                 val ok = DaemonBridge.startCalibration(pkg)
+                android.util.Log.d("AppOpt", "calibration start command result: pkg=$pkg ok=$ok")
                 if (!ok) postIfAlive {
                     showBanner("下发失败, 请确认已授予 root", durationMs = 3000)
                     revertToYellow()
@@ -232,6 +263,10 @@ class FloatingBallService : Service() {
         } else {
             // 红 -> 停止采样并生成规则; 移除胶囊, 弹出结果卡片
             val pkg = targetPkg ?: ""
+            android.util.Log.d(
+                "AppOpt",
+                "FloatingBallService manual stop: reason=manual_stop target=$pkg launch=${launchPkg.orEmpty()} appeared=$hasAppearedForeground calibrating=$calibrating absent=$absentCount"
+            )
             calibrating = false
             // 用户主动停止: 关闭前台监测, 避免查看结果卡片时被自动关闭打断
             foregroundClosing = true
@@ -426,7 +461,12 @@ class FloatingBallService : Service() {
             // 没有使用情况访问权限时无法判断前台。短暂不可用先重试, 连续不可用则收尾关闭,
             // 避免悬浮球在权限被系统回收或用户关闭后长期残留。
             if (!ForegroundDetector.hasUsageAccess(this@FloatingBallService)) {
-                if (++usageAccessMissingCount >= FG_USAGE_ACCESS_MISSING_LIMIT) {
+                usageAccessMissingCount++
+                android.util.Log.d(
+                    "AppOpt",
+                    "FloatingBallService foreground check: target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} check=${pkg} source=usage_access action=wait_permission foreground=false usage=false focused= appeared=$hasAppearedForeground calibrating=$calibrating absent=$absentCount confirmed=true notConfirmed=$launchProcessMissingCount graceLeft=$appearGraceLeft missing=$usageAccessMissingCount"
+                )
+                if (usageAccessMissingCount >= FG_USAGE_ACCESS_MISSING_LIMIT) {
                     closeByUsageAccessLost()
                 } else {
                     mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
@@ -434,35 +474,173 @@ class FloatingBallService : Service() {
                 return
             }
             usageAccessMissingCount = 0
+            val checkPkg = launchPkg ?: pkg
+            val needLaunchProcessCheck = !hasAppearedForeground
+            if (foregroundCheckRunning) {
+                android.util.Log.d(
+                    "AppOpt",
+                    "FloatingBallService foreground check: target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} check=$checkPkg source=previous_running action=skip foreground=false usage=false focused= appeared=$hasAppearedForeground calibrating=$calibrating absent=$absentCount confirmed=true notConfirmed=$launchProcessMissingCount graceLeft=$appearGraceLeft"
+                )
+                mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
+                return
+            }
+            foregroundCheckRunning = true
             thread {
-                val fg = foregroundTracker.isAppForeground(this@FloatingBallService, pkg)
-                postIfAlive { onForegroundChecked(fg) }
+                var foreground = false
+                var processRunning = true
+                var usageForeground = false
+                var usageState: ForegroundDetector.State? = null
+                var focusedPkg: String? = null
+                var checkKey = "unknown"
+                var checkDetail = ""
+                try {
+                    usageState = foregroundTracker.queryState(this@FloatingBallService, checkPkg)
+                    usageForeground = usageState.foreground
+                    val topState = DaemonBridge.readTopAppState(checkPkg)
+                    focusedPkg = DaemonBridge.readFocusedPackage()
+                    val focusMatchesTarget = focusedPkg == checkPkg
+                    val focusShowsOther = !focusedPkg.isNullOrBlank() && !focusMatchesTarget
+                    val topHasSignal = topState.targetTopApp || topState.scanned > 0 || topState.packages.isNotEmpty()
+                    val topShowsOther = topHasSignal && !topState.targetTopApp
+
+                    if (usageForeground && !focusShowsOther && !topShowsOther) {
+                        foreground = true
+                        processRunning = true
+                        checkKey = "usage"
+                        checkDetail = "UsageStats 命中; cgroup=${topState.targetTopApp} focused=${focusedPkg.orEmpty()} backend=${topState.backend} pid=${topState.pid ?: 0} scanned=${topState.scanned} packages=${topState.packages.joinToString("|")}"
+                    } else if (topState.targetTopApp) {
+                        foreground = true
+                        processRunning = true
+                        checkKey = "cgroup-top"
+                        checkDetail = "cgroup 前台组命中目标; usage=$usageForeground focused=${focusedPkg.orEmpty()} backend=${topState.backend} pid=${topState.pid ?: 0} scanned=${topState.scanned} packages=${topState.packages.joinToString("|")}"
+                    } else {
+                        foreground = focusMatchesTarget
+                        processRunning = if (needLaunchProcessCheck) focusMatchesTarget else true
+                        checkKey = when {
+                            focusMatchesTarget -> "dumpsys"
+                            focusShowsOther -> if (focusedPkg == packageName) "focus-self" else "focus-other"
+                            topShowsOther -> "cgroup-other"
+                            else -> "not-confirmed"
+                        }
+                        checkDetail = if (usageForeground && (focusShowsOther || topShowsOther)) {
+                            "UsageStats 命中但前台纠偏为离开目标; focused=${focusedPkg.orEmpty()} backend=${topState.backend} pid=${topState.pid ?: 0} scanned=${topState.scanned} packages=${topState.packages.joinToString("|")}"
+                        } else {
+                            "cgroup 前台组未命中目标, 回退 dumpsys; focused=${focusedPkg.orEmpty()} backend=${topState.backend} pid=${topState.pid ?: 0} scanned=${topState.scanned} packages=${topState.packages.joinToString("|")}"
+                        }
+                    }
+                } catch (e: Exception) {
+                    checkKey = "error"
+                    checkDetail = e.message.orEmpty()
+                } finally {
+                    postIfAlive {
+                        foregroundCheckRunning = false
+                        onForegroundChecked(
+                            ForegroundCheckSnapshot(
+                                checkPkg = checkPkg,
+                                foreground = foreground,
+                                processRunning = processRunning,
+                                usageForeground = usageForeground,
+                                usagePackage = usageState?.currentPackage,
+                                usageLastEventPackage = usageState?.lastEventPackage,
+                                usageLastEventType = usageState?.lastEventType ?: -1,
+                                usageEventCount = usageState?.eventCount ?: 0,
+                                usageResumedCount = usageState?.resumedCount ?: 0,
+                                focusedPkg = focusedPkg,
+                                source = checkKey,
+                                detail = checkDetail
+                            )
+                        )
+                    }
+                }
             }
             mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
         }
     }
 
-    private fun onForegroundChecked(foreground: Boolean) {
+    private fun onForegroundChecked(snapshot: ForegroundCheckSnapshot) {
         if (serviceDestroyed) return
         if (foregroundClosing) return
-        if (foreground) {
+        var action = "observe"
+        if (snapshot.foreground) {
             hasAppearedForeground = true
             absentCount = 0
+            launchProcessMissingCount = 0
+            logForegroundCheck(snapshot, action = "foreground")
             return
         }
         // 不在前台
         if (!hasAppearedForeground) {
-            // 应用还没拉起来, 给一段宽限期, 超时仍未出现也关闭(避免悬空)
-            if (--appearGraceLeft <= 0) closeByForeground(appeared = false)
+            // 目标 App 可能已经打开, 但部分 ROM/管控环境会漏掉 UsageStats 前台事件。
+            // 启动阶段若新 C/dumpsys 都无法确认目标前台, 说明目标 App 基本没有成功切到前台。
+            if (!snapshot.processRunning) {
+                launchProcessMissingCount++
+                action = "wait_process"
+            } else {
+                launchProcessMissingCount = 0
+                action = "wait_foreground"
+            }
+            if (!snapshot.processRunning && launchProcessMissingCount >= FG_LAUNCH_PROCESS_MISS_LIMIT) {
+                action = "close"
+                logForegroundCheck(snapshot, action = action)
+                closeByForeground(
+                    appeared = false,
+                    reason = "target_not_confirmed",
+                    focusedPkg = snapshot.focusedPkg,
+                    source = snapshot.source,
+                    detail = snapshot.detail
+                )
+                return
+            }
+            if (--appearGraceLeft <= 0) {
+                action = "grace_expired"
+                logForegroundCheck(snapshot, action = action)
+                if (!calibrating) {
+                    closeByForeground(
+                        appeared = false,
+                        reason = "target_not_confirmed",
+                        focusedPkg = snapshot.focusedPkg,
+                        source = snapshot.source,
+                        detail = snapshot.detail
+                    )
+                    return
+                }
+                appearGraceLeft = FG_APPEAR_GRACE
+            } else {
+                logForegroundCheck(snapshot, action = action)
+            }
             return
         }
         // 曾在前台, 现在离开: 累计到阈值即关闭
-        if (++absentCount >= FG_ABSENT_LIMIT) closeByForeground(appeared = true)
+        absentCount++
+        if (absentCount >= FG_ABSENT_LIMIT) {
+            logForegroundCheck(snapshot, action = "close")
+            closeByForeground(
+                appeared = true,
+                reason = "left_foreground",
+                focusedPkg = snapshot.focusedPkg,
+                source = snapshot.source,
+                detail = snapshot.detail
+            )
+        } else {
+            logForegroundCheck(snapshot, action = "absent_counting")
+        }
+    }
+
+    private fun logForegroundCheck(snapshot: ForegroundCheckSnapshot, action: String) {
+        val pkg = launchPkg ?: targetPkg ?: ""
+        android.util.Log.d(
+            "AppOpt",
+            "FloatingBallService foreground check: target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} check=${snapshot.checkPkg} pkg=$pkg source=${snapshot.source} action=$action foreground=${snapshot.foreground} usage=${snapshot.usageForeground} usagePkg=${snapshot.usagePackage.orEmpty()} usageEvents=${snapshot.usageEventCount} usageResumed=${snapshot.usageResumedCount} usageLast=${snapshot.usageLastEventPackage.orEmpty()} usageLastType=${snapshot.usageLastEventType} focused=${snapshot.focusedPkg.orEmpty()} appeared=$hasAppearedForeground calibrating=$calibrating absent=$absentCount confirmed=${snapshot.processRunning} notConfirmed=$launchProcessMissingCount graceLeft=$appearGraceLeft ${snapshot.detail}"
+        )
     }
 
     private fun closeByUsageAccessLost() {
         if (serviceDestroyed) return
         if (foregroundClosing) return
+        android.util.Log.d(
+            "AppOpt",
+            "FloatingBallService auto close: reason=usage_access_lost appeared=$hasAppearedForeground calibrating=$calibrating target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} focused= absent=$absentCount notConfirmed=$launchProcessMissingCount source=usage_access detail=UsageStats permission unavailable"
+        )
         foregroundClosing = true
         mainHandler.removeCallbacks(foregroundWatcher)
         removeCapsule()
@@ -489,9 +667,19 @@ class FloatingBallService : Service() {
      * 因目标应用离开前台(或始终未出现)而自动关闭。
      * 校准中则先停止采样; 关闭前显示明确横幅, 待横幅可见后再真正 stopSelf。
      */
-    private fun closeByForeground(appeared: Boolean) {
+    private fun closeByForeground(
+        appeared: Boolean,
+        reason: String = if (appeared) "left_foreground" else "target_not_confirmed",
+        focusedPkg: String? = null,
+        source: String? = null,
+        detail: String? = null
+    ) {
         if (serviceDestroyed) return
         if (foregroundClosing) return
+        android.util.Log.d(
+            "AppOpt",
+            "FloatingBallService auto close: reason=$reason appeared=$appeared calibrating=$calibrating target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} focused=${focusedPkg.orEmpty()} absent=$absentCount notConfirmed=$launchProcessMissingCount source=${source.orEmpty()} detail=${detail.orEmpty()}"
+        )
         foregroundClosing = true
         mainHandler.removeCallbacks(foregroundWatcher)
         removeCapsule()
@@ -531,6 +719,7 @@ class FloatingBallService : Service() {
     }
 
     override fun onDestroy() {
+        android.util.Log.d("AppOpt", "FloatingBallService onDestroy target=$targetPkg calibrating=$calibrating")
         val pkgToStop = targetPkg?.takeIf { it.isNotBlank() && calibrating }
         calibrating = false
         serviceDestroyed = true
@@ -555,7 +744,11 @@ class FloatingBallService : Service() {
         intent?.getStringExtra(EXTRA_TARGET_PKG)?.let {
             if (it.isNotBlank()) targetPkg = it
         }
+        intent?.getStringExtra(EXTRA_LAUNCH_PKG)?.let {
+            if (it.isNotBlank()) launchPkg = it
+        }
         if (targetPkg.isNullOrBlank()) {
+            android.util.Log.d("AppOpt", "FloatingBallService stop: missing target package")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -574,8 +767,14 @@ class FloatingBallService : Service() {
             val pkg = targetPkg!!
             val fpsSocketName = fpsMonitor.socketName
             val fpsSocketToken = fpsMonitor.socketToken
+            android.util.Log.d(
+                "AppOpt",
+                "FloatingBallService start fps monitor: pkg=$pkg socket=${!fpsSocketName.isNullOrBlank()}"
+            )
             thread {
-                if (!DaemonBridge.startFpsMonitor(pkg, fpsSocketName, fpsSocketToken)) {
+                val ok = DaemonBridge.startFpsMonitor(pkg, fpsSocketName, fpsSocketToken)
+                android.util.Log.d("AppOpt", "FloatingBallService fps command result: pkg=$pkg ok=$ok")
+                if (!ok) {
                     postIfAlive { toast("帧率监测下发失败, 请确认 root") }
                 }
             }
@@ -583,6 +782,8 @@ class FloatingBallService : Service() {
             hasAppearedForeground = false
             absentCount = 0
             usageAccessMissingCount = 0
+            launchProcessMissingCount = 0
+            foregroundCheckRunning = false
             appearGraceLeft = FG_APPEAR_GRACE
             foregroundTracker.reset()   // 清上一轮残留的前台跟踪状态
             mainHandler.removeCallbacks(foregroundWatcher)

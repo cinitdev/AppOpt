@@ -35,6 +35,25 @@ object ModuleUpdateDialog {
             return activity.isFinishing || activity.isDestroyed || !dialog.isShowing
         }
 
+        var downloading = false
+
+        fun retainForManualInstall(zipPath: String, message: String) {
+            view.updateInstallStatus.text = "正在保存模块 zip 到 Download"
+            thread {
+                val manualPath = ModuleUpdater.retainDownloadedModuleForManualInstall(activity, zipPath)
+                activity.runOnUiThread {
+                    if (inactive()) return@runOnUiThread
+                    downloading = false
+                    restoreDismissPolicy()
+                    view.updateLater.isEnabled = true
+                    view.updateInstall.isEnabled = true
+                    view.updateInstall.text = "重试"
+                    view.updateInstallStatus.text = "$message\n模块已保存到：$manualPath"
+                    AppToast.show(activity, message)
+                }
+            }
+        }
+
         view.updateVersionSummary.text = "模块更新需要下载并刷入，重启后生效"
         view.updateCurrentVersion.text = "${update.localVersion} (${update.localVersionCode})"
         view.updateLatestVersion.text = "${update.remoteVersion} (${update.remoteVersionCode})"
@@ -47,7 +66,6 @@ object ModuleUpdateDialog {
             linksClickable = true
         }
 
-        var downloading = false
         view.updateProgress.progress = 0
         view.updateLater.setOnClickListener { dialog.dismiss() }
         restoreDismissPolicy()
@@ -98,13 +116,10 @@ object ModuleUpdateDialog {
                                 handler.postDelayed({
                                     if (inactive()) return@postDelayed
                                     if (managerLabel == null) {
-                                        downloading = false
-                                        restoreDismissPolicy()
-                                        view.updateLater.isEnabled = true
-                                        view.updateInstall.isEnabled = false
-                                        view.updateInstallStatus.text =
-                                            "没有检测到可用的模块管理器，模块 zip 已保留：$zipPath"
-                                        AppToast.show(activity, "没有检测到可用的模块管理器，请手动刷入")
+                                        retainForManualInstall(
+                                            zipPath,
+                                            "没有检测到可用的模块管理器，请手动刷入"
+                                        )
                                         return@postDelayed
                                     }
                                     view.updateInstallStatus.text = "检测到 $managerLabel，准备刷入模块"
@@ -114,14 +129,10 @@ object ModuleUpdateDialog {
                                             activity.startActivity(UpdateInstallActivity.intent(activity, update, zipPath))
                                             dialog.dismiss()
                                         } catch (_: Exception) {
-                                            downloading = false
-                                            restoreDismissPolicy()
-                                            view.updateLater.isEnabled = true
-                                            view.updateInstall.isEnabled = true
-                                            view.updateInstall.text = "重试"
-                                            view.updateInstallStatus.text =
-                                                "打开刷入页面失败，模块 zip 已保留：$zipPath"
-                                            AppToast.show(activity, "打开刷入页面失败，请手动刷入")
+                                            retainForManualInstall(
+                                                zipPath,
+                                                "打开刷入页面失败，请手动刷入"
+                                            )
                                         }
                                     }, 1500L)
                                 }, detectRemain)
