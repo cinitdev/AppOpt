@@ -3488,27 +3488,66 @@ static bool fps_read_cmd(char* cmd_buf, size_t sz) {
     return read_stable_command_file(FPS_CMD_FILE, cmd_buf, sz, fps_cmd_valid);
 }
 
-static pid_t fps_wait_pkg_pid(const char* pkg, int attempts, useconds_t delay_us) {
-    for (int attempt = 0; attempt < attempts; attempt++) {
-        pid_t pids[64];
-        size_t np = collect_pkg_pids(pkg, pids, 64);
-        if (np > 0) return pids[0];
-        if (delay_us > 0) usleep(delay_us);
+static bool fps_pid_is_main_process(pid_t pid, const char* pkg) {
+    if (pid <= 0 || !pkg || !*pkg) return false;
+
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
+    int pfd = open(proc_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (pfd < 0) return false;
+
+    char cmd[MAX_PKG_LEN] = {0};
+    bool ok = read_file(pfd, "cmdline", cmd, sizeof(cmd));
+    close(pfd);
+    if (!ok) return false;
+
+    char* name = strrchr(cmd, '/');
+    name = name ? name + 1 : cmd;
+    return strcmp(name, pkg) == 0;
+}
+
+static pid_t fps_find_preferred_pkg_pid(const char* pkg, bool allow_child,
+                                        const char** source) {
+    if (source) *source = "未找到";
+
+    app_top_state_result top_state;
+    if (app_top_state_check(pkg, &top_state) &&
+        top_state.target_top_app && top_state.target_pid > 0) {
+        if (source) *source = "cgroup 前台组";
+        return top_state.target_pid;
+    }
+
+    pid_t pids[64];
+    size_t np = collect_pkg_pids(pkg, pids, 64);
+    for (size_t i = 0; i < np; i++) {
+        if (fps_pid_is_main_process(pids[i], pkg)) {
+            if (source) *source = "包名主进程";
+            return pids[i];
+        }
+    }
+
+    if (allow_child && np > 0) {
+        if (source) *source = "包名子进程回退";
+        return pids[0];
     }
     return (pid_t)-1;
 }
 
-static bool fps_pid_in_list(pid_t pid, const pid_t* pids, size_t count) {
-    if (pid <= 0) return false;
-    for (size_t i = 0; i < count; i++) {
-        if (pids[i] == pid) return true;
+static pid_t fps_wait_pkg_pid(const char* pkg, int attempts, useconds_t delay_us,
+                              const char** source) {
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        pid_t pid = fps_find_preferred_pkg_pid(pkg, false, source);
+        if (pid > 0) return pid;
+        if (delay_us > 0) usleep(delay_us);
     }
-    return false;
+    return fps_find_preferred_pkg_pid(pkg, true, source);
 }
 
-static ebpf_fps_ctx* fps_start_ebpf_ctx(const char* pkg, pid_t target_pid) {
+static ebpf_fps_ctx* fps_start_ebpf_ctx(const char* pkg, pid_t target_pid,
+                                        const char* pid_source) {
     if (target_pid > 0) {
-        printf("[FPS] 目标进程 PID: %d, 尝试 eBPF uprobe...\n", target_pid);
+        printf("[FPS] 目标进程 PID: %d (来源: %s), 尝试 eBPF uprobe...\n",
+               target_pid, pid_source ? pid_source : "未知");
         return ebpf_fps_start(FPS_BPF_OBJ, target_pid, pkg);
     }
 
@@ -3589,15 +3628,19 @@ static void* fps_thread(void* arg) {
 
                     if (cap == EBPF_CAP_OK) {
                         /* 2. 找目标进程 PID。游戏刚启动时 /proc/cmdline 可能短暂不可见, 等一小段时间。 */
-                        target_pid = fps_wait_pkg_pid(pkg, 30, 100 * 1000);
+                        const char* pid_source = "未找到";
+                        target_pid = fps_wait_pkg_pid(pkg, 30, 100 * 1000, &pid_source);
                         if (target_pid < 0) {
                             printf("[FPS] 等待约 3 秒仍未找到 %s 的进程, 尝试全局 eBPF 帧事件探测\n", pkg);
                         }
 
                         /* 3. 尝试 eBPF attach */
-                        ebpf_ctx = fps_start_ebpf_ctx(pkg, target_pid);
+                        ebpf_ctx = fps_start_ebpf_ctx(pkg, target_pid, pid_source);
 
                         if (ebpf_ctx) {
+                            long long started_ms = monotonic_ms();
+                            ebpf_last_frame_ms = started_ms;
+                            ebpf_last_restart_ms = started_ms;
                             const char *backend = ebpf_fps_backend(ebpf_ctx);
                             const char *warn = ebpf_fps_startup_note(ebpf_ctx);
                             if (warn && warn[0]) {
@@ -3683,6 +3726,8 @@ static void* fps_thread(void* arg) {
 
             bool fps_is_stale = ebpf_seen_frames && now_ms > 0 &&
                 now_ms - ebpf_last_frame_ms >= FPS_EBPF_STALE_MS;
+            bool fps_has_no_valid_value = ebpf_first_fps && now_ms > 0 &&
+                now_ms - ebpf_last_restart_ms >= FPS_EBPF_STALE_MS;
             if (fps_is_stale) {
                 if (!ebpf_stale_zero_sent) {
                     printf("[FPS] eBPF 目标暂无新帧 %.1f 秒, 输出 0 FPS\n",
@@ -3691,47 +3736,48 @@ static void* fps_thread(void* arg) {
                     ebpf_stale_zero_sent = true;
                 }
 
-                if (now_ms - ebpf_last_pid_check_ms >= 1000 &&
-                    now_ms - ebpf_last_restart_ms >= FPS_EBPF_RESTART_COOLDOWN_MS) {
-                    ebpf_last_pid_check_ms = now_ms;
-                    pid_t pids[64];
-                    size_t np = collect_pkg_pids(pkg, pids, 64);
-                    pid_t next_pid = np > 0 ? pids[0] : (pid_t)-1;
-                    if (next_pid > 0 && !fps_pid_in_list(active_pid, pids, np)) {
-                        printf("[FPS] 目标进程已切换: old=%d new=%d, 重启 eBPF 监测\n",
-                               active_pid, next_pid);
-                        ebpf_fps_stop(ebpf_ctx);
-                        ebpf_ctx = fps_start_ebpf_ctx(pkg, next_pid);
-                        target_pid = next_pid;
-                        ebpf_first_fps = true;
-                        ebpf_pid_reported = false;
-                        ebpf_poll_failures = 0;
-                        ebpf_seen_frames = false;
-                        ebpf_stale_zero_sent = false;
-                        ebpf_last_frame_ms = now_ms;
-                        ebpf_last_restart_ms = now_ms;
-                        if (ebpf_ctx) {
-                            const char *backend = ebpf_fps_backend(ebpf_ctx);
-                            const char *warn = ebpf_fps_startup_note(ebpf_ctx);
-                            if (warn && warn[0]) {
-                                printf("[FPS] eBPF %s\n", warn);
-                            }
-                            printf("[FPS] eBPF 使用后端: %s\n",
-                                   (backend && backend[0]) ? backend : "未知");
-                            printf("[FPS] eBPF 已重启, 锁定符号: %s\n", ebpf_fps_symbol(ebpf_ctx));
-                        } else {
-                            const char *err = ebpf_fps_last_error(NULL);
-                            printf("[FPS] eBPF 重启失败: %s, 切换到 SF fallback\n",
-                                   (err && err[0]) ? err : "未知错误");
-                            fallback_first_fps = true;
-                            fallback_ctx = fps_fallback_start(pkg);
-                            if (!fallback_ctx) {
-                                printf("[FPS] 警告: fallback 启动失败\n");
-                            }
+            }
+
+            if ((fps_is_stale || fps_has_no_valid_value) &&
+                now_ms - ebpf_last_pid_check_ms >= 1000 &&
+                now_ms - ebpf_last_restart_ms >= FPS_EBPF_RESTART_COOLDOWN_MS) {
+                ebpf_last_pid_check_ms = now_ms;
+                const char* next_pid_source = "未找到";
+                pid_t next_pid = fps_find_preferred_pkg_pid(pkg, true, &next_pid_source);
+                if (next_pid > 0 && next_pid != active_pid) {
+                    printf("[FPS] 目标进程已切换: old=%d new=%d (来源: %s), 重启 eBPF 监测\n",
+                           active_pid, next_pid, next_pid_source);
+                    ebpf_fps_stop(ebpf_ctx);
+                    ebpf_ctx = fps_start_ebpf_ctx(pkg, next_pid, next_pid_source);
+                    target_pid = next_pid;
+                    ebpf_first_fps = true;
+                    ebpf_pid_reported = false;
+                    ebpf_poll_failures = 0;
+                    ebpf_seen_frames = false;
+                    ebpf_stale_zero_sent = false;
+                    ebpf_last_frame_ms = now_ms;
+                    ebpf_last_restart_ms = now_ms;
+                    if (ebpf_ctx) {
+                        const char *backend = ebpf_fps_backend(ebpf_ctx);
+                        const char *warn = ebpf_fps_startup_note(ebpf_ctx);
+                        if (warn && warn[0]) {
+                            printf("[FPS] eBPF %s\n", warn);
                         }
-                        usleep(100 * 1000);
-                        continue;
+                        printf("[FPS] eBPF 使用后端: %s\n",
+                               (backend && backend[0]) ? backend : "未知");
+                        printf("[FPS] eBPF 已重启, 锁定符号: %s\n", ebpf_fps_symbol(ebpf_ctx));
+                    } else {
+                        const char *err = ebpf_fps_last_error(NULL);
+                        printf("[FPS] eBPF 重启失败: %s, 切换到 SF fallback\n",
+                               (err && err[0]) ? err : "未知错误");
+                        fallback_first_fps = true;
+                        fallback_ctx = fps_fallback_start(pkg);
+                        if (!fallback_ctx) {
+                            printf("[FPS] 警告: fallback 启动失败\n");
+                        }
                     }
+                    usleep(100 * 1000);
+                    continue;
                 }
             }
 
