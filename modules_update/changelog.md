@@ -1,28 +1,28 @@
-# AppOpt v1.7.3
 
-## eBPF FPS 兼容性
+## 悬浮球与前台检测
 
-- eBPF FPS 新增 PerfEvent 备用事件通道，RingBuf 创建或映射失败时会自动切换到 PerfEvent。
-- 兼容 Android 17 上 RingBuf `mmap failed` 导致 FPS 无法采集的问题。
-- 启动日志会输出当前实际使用后端，例如 `RingBuf` 或 `PerfEvent`，并单独提示 RingBuf 不可用原因。
+- 调整目标应用启动流程，先启动悬浮球服务再拉起应用，避免部分系统因 UsageStats 事件延迟而不显示悬浮球。
+- 前台状态改为 UsageStats、原生 cgroup 前台组和 dumpsys 三级检测，任一检测源不可用时会自动降级。
+- 目标应用离开前台后连续确认两次再关闭悬浮球，减少通知栏、输入法和系统短暂切换造成的误判。
+- 增加前台检测来源、UsageStats 事件、cgroup 包列表、焦点应用和自动关闭原因等详细日志，便于定位悬浮球问题。
+
+## FPS 兼容与准确性
+- eBPF FPS 新增 PerfEvent 备用事件通道，RingBuf 创建或映射失败时自动切换，兼容 Android 17 上的 `mmap failed`。
+- - 修复 QQ 等多进程应用可能锁定后台子进程而获取不到 FPS 的问题，优先选择目标应用的前台 PID，并在持续没有有效帧率时自动重新确认。
+- 启动日志会显示实际使用的 RingBuf 或 PerfEvent 后端，并分别记录降级原因和真实运行错误。
+- FPS 显示值按设备当前刷新率进行上限校正，避免短视频、QQ、微信等应用出现超过屏幕刷新率的异常数值。
 - 优化目标应用长时间没有新帧时的日志语义，避免继续沿用旧 FPS。
-- 新增 `queuebuffer_probe_perf.bpf.c`，构建时同时打包 RingBuf 和 PerfEvent 两套 eBPF 对象。
 
-## Aya Lite 子模块
+## 诊断与界面
 
-- 将 `fps_monitor/aya` 从本地 vendored 目录改为 `AppOpt-aya-lite` 子模块。
-- `build_module.sh` 会自动初始化和更新 Aya Lite 子模块，减少首次构建漏拉依赖的问题。
-- 子模块本地拉取时排除 `.github` 和 `scripts` 目录，保留编译需要的 Aya 代码和文档。
-- 新增 GitHub Actions，用于定期检查 Aya Lite 更新、编译验证通过后自动提交子模块更新 PR。
+- 设置页新增“一键导出诊断包”，可导出 App 日志、模块日志、版本、CPU 拓扑、cpuset、当前规则、Root 管理器和 FPS 后端状态。
+- 常用入口调整为两列布局，集中提供历史记录、C 进程日志、使用说明和诊断包导出。
+- App 回到前台时重新检测 Root 授权和守护进程状态，避免授权或撤销后状态显示过期。
+- 优化运行环境未授权状态和日志页文案显示。
 
-## 构建和发布
+## 更新与规则修复
 
-- `build_module.sh` 新增 PerfEvent BPF 对象构建流程。
-- App 包名改为从 `app/build.gradle.kts` 的 `applicationId` 自动读取，不再在脚本中硬编码。
-- 更新 README 中的子模块拉取、BPF 构建和 release/publish 使用说明。
-- 更新 Cargo.lock 到 Aya 0.14.0 / aya-obj 0.3.0。
+- 模块刷入失败、未检测到 Root 管理器或无法打开刷入页面时，将原始模块 zip 保存到 Download 并显示手动刷入路径。
+- 刷入成功时显示“重启系统”，刷入失败时显示“返回”，避免失败页面无法退出。
+- 修复非连续 CPU 集合被误当作空字符串处理的问题，保留正确的 CPU 范围回退逻辑。
 
-## App 体验修复
-
-- App 回到前台时重新检测 Root 授权状态，避免授权或撤销后首页状态过期。
-- 调整运行环境卡片中未授权按钮的高度和内边距，减少未授权状态下的异常留白。
