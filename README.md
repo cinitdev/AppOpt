@@ -262,7 +262,7 @@ cd /c/Users/你的用户名/AndroidStudioProjects/AppOpt
 脚本参数：
 
 ```text
-./build_module.sh [release|debug|no|publish] [--publish]
+./build_module.sh [release|debug|no|publish] [--publish] [--dry-run]
 ```
 
 常用命令：
@@ -278,11 +278,15 @@ cd /c/Users/你的用户名/AndroidStudioProjects/AppOpt
 # 只编译模块，不打包 App
 ./build_module.sh no
 
-# 编译 release 模块，并发布 AppOpt.zip 和 changelog.md 到 GitHub Release
+# 编译 release 模块，发布 AppOpt.zip 和 changelog.md 到 GitHub Release，
+# 然后基于远端最新提交更新 modules-update 分支的 AppOpt.json
 ./build_module.sh publish
 
 # 等价写法
 ./build_module.sh release --publish
+
+# 完整预演发布，不创建 Release、不提交、不推送
+./build_module.sh publish --dry-run
 ```
 
 发布功能会调用 GitHub CLI。首次使用前需要安装并登录：
@@ -290,6 +294,11 @@ cd /c/Users/你的用户名/AndroidStudioProjects/AppOpt
 ```bash
 gh auth login
 ```
+
+发布脚本会先抓取 `origin/modules-update`，在独立临时 worktree 中只更新
+`modules_update/AppOpt.json`。当前工作区和本地 `modules-update` 分支不会被切换或覆盖，
+远端分支中的 `changelog.md` 及其他网页修改会保持不变。脚本不会强制推送；如果发布期间
+远端分支再次产生新提交，会停止推送并要求重新执行。
 
 Release tag 会自动读取当前模块版本，优先使用 `magisk_module/module.prop` 中的
 `version`，例如 `v1.7.3`；如果模块版本为空，则读取 App 的 `versionName`。

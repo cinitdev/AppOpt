@@ -18,23 +18,27 @@ WORK="$ROOT/build/module"
 APP_NAME="AppOpt 线程优化"
 APP_GRADLE="$ROOT/app/build.gradle.kts"
 DAEMON_BRIDGE="$ROOT/app/src/main/java/top/suto/appopt/DaemonBridge.kt"
+UPDATE_JSON="$ROOT/modules_update/AppOpt.json"
+UPDATE_BRANCH="modules-update"
 
 usage() {
     cat <<EOF
-用法: ./build_module.sh [release|debug|no|publish] [--publish]
+用法: ./build_module.sh [release|debug|no|publish] [--publish] [--dry-run]
 
   release  编译 release APK 并打包进模块（默认）
   debug    编译 debug APK 并打包进模块
   no       只编译模块，不打包 App
-  publish  编译 release 模块，并发布 AppOpt.zip + changelog.md 到 GitHub Release
+  publish  编译 release 模块，发布 GitHub Release，并更新 modules-update 分支的 AppOpt.json
 
 选项:
-  --publish  构建完成后发布 release 产物
+  --publish  构建完成后发布 release 产物并更新 modules-update 分支
+  --dry-run  完整预演发布流程，不创建 Release、不提交、不推送
 EOF
 }
 
 APP_VARIANT="${1:-release}"
 PUBLISH_GITHUB_RELEASE=0
+PUBLISH_DRY_RUN=0
 if [ "$#" -gt 0 ]; then
     shift
 fi
@@ -43,7 +47,8 @@ case "$APP_VARIANT" in
     release) APP_VARIANT="release" ;;
     debug) APP_VARIANT="debug" ;;
     no|module) APP_VARIANT="" ;;
-    publish|release-publish) APP_VARIANT="release"; PUBLISH_GITHUB_RELEASE=1 ;;
+    publish|release-publish|--publish) APP_VARIANT="release"; PUBLISH_GITHUB_RELEASE=1 ;;
+    --dry-run) APP_VARIANT="release"; PUBLISH_GITHUB_RELEASE=1; PUBLISH_DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "! Unknown command: $APP_VARIANT"; usage; exit 1 ;;
 esac
@@ -51,6 +56,7 @@ esac
 for ARG in "$@"; do
     case "$ARG" in
         --publish|publish) PUBLISH_GITHUB_RELEASE=1 ;;
+        --dry-run) PUBLISH_GITHUB_RELEASE=1; PUBLISH_DRY_RUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "! Unknown option: $ARG"; usage; exit 1 ;;
     esac
@@ -332,6 +338,90 @@ find_github_cli() {
     return 1
 }
 
+validate_update_json() {
+    local tag="$1" version_code
+    version_code="$(read_app_version_code)"
+    [ -s "$UPDATE_JSON" ] || { echo "! 找不到远程更新配置: $UPDATE_JSON"; exit 1; }
+
+    python - "$UPDATE_JSON" "$tag" "$version_code" <<'PY'
+import json
+import sys
+
+path, expected_tag, expected_code = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+
+if data.get("version") != expected_tag:
+    raise SystemExit(f"! AppOpt.json version={data.get('version')!r}, 预期 {expected_tag!r}")
+if data.get("versionCode") != expected_code:
+    raise SystemExit(f"! AppOpt.json versionCode={data.get('versionCode')!r}, 预期 {expected_code}")
+
+release_path = f"/releases/download/{expected_tag}/"
+for key in ("zipUrl", "changelog"):
+    value = data.get(key)
+    if not isinstance(value, str) or release_path not in value:
+        raise SystemExit(f"! AppOpt.json {key} 未指向 {expected_tag} Release")
+PY
+}
+
+publish_update_json() (
+    set -e
+    local tag="$1" dry_run="$2" repo_root worktree remote_ref base_commit latest_commit
+    repo_root="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)" || {
+        echo "! 当前目录不是 Git 仓库: $ROOT"
+        exit 1
+    }
+    remote_ref="refs/remotes/origin/$UPDATE_BRANCH"
+
+    echo "- 同步远端更新分支: origin/$UPDATE_BRANCH"
+    git -C "$repo_root" fetch --no-tags origin "$UPDATE_BRANCH"
+    base_commit="$(git -C "$repo_root" rev-parse "$remote_ref^{commit}")" || {
+        echo "! 找不到远端分支: origin/$UPDATE_BRANCH"
+        exit 1
+    }
+
+    mkdir -p "$ROOT/build"
+    worktree="$(mktemp -d "$ROOT/build/modules-update-publish.XXXXXX")"
+    rmdir "$worktree"
+    cleanup_update_worktree() {
+        git -C "$repo_root" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+        git -C "$repo_root" worktree prune >/dev/null 2>&1 || true
+    }
+    trap cleanup_update_worktree EXIT INT TERM
+
+    git -C "$repo_root" worktree add --detach "$worktree" "$base_commit" >/dev/null
+    mkdir -p "$worktree/modules_update"
+    cp -f "$UPDATE_JSON" "$worktree/modules_update/AppOpt.json"
+    git -C "$worktree" add -- modules_update/AppOpt.json
+
+    if git -C "$worktree" diff --cached --quiet; then
+        echo "- origin/$UPDATE_BRANCH 的 AppOpt.json 已是 $tag"
+        exit 0
+    fi
+
+    if [ "$dry_run" = "1" ]; then
+        echo "- [预演] 将基于远端提交 $base_commit 更新 modules_update/AppOpt.json"
+        git -C "$worktree" diff --cached --stat
+        git -C "$worktree" diff --cached -- modules_update/AppOpt.json
+        echo "- [预演] 未提交、未推送 modules-update 分支"
+        exit 0
+    fi
+
+    git -C "$worktree" -c commit.gpgsign=false commit \
+        -m "发布：更新 $tag 远程更新信息" >/dev/null
+
+    # 推送前再次抓取。网页端若在发布过程中产生新提交，拒绝非快进推送。
+    git -C "$repo_root" fetch --no-tags origin "$UPDATE_BRANCH"
+    latest_commit="$(git -C "$repo_root" rev-parse "$remote_ref^{commit}")"
+    if [ "$latest_commit" != "$base_commit" ]; then
+        echo "! origin/$UPDATE_BRANCH 在发布期间发生变化，已停止推送，请重新执行发布"
+        exit 1
+    fi
+
+    git -C "$worktree" push origin "HEAD:refs/heads/$UPDATE_BRANCH"
+    echo "- 已更新 origin/$UPDATE_BRANCH: modules_update/AppOpt.json -> $tag"
+)
+
 publish_github_release() {
     local gh_bin tag title changelog
     gh_bin="$(find_github_cli)" || {
@@ -346,11 +436,24 @@ publish_github_release() {
 
     [ -s "$ZIP" ] || { echo "! 找不到模块 zip: $ZIP"; exit 1; }
     [ -s "$changelog" ] || { echo "! 找不到更新日志: $changelog"; exit 1; }
+    validate_update_json "$tag"
 
     "$gh_bin" auth status >/dev/null 2>&1 || {
         echo "! GitHub CLI 尚未登录，请先执行: gh auth login"
         exit 1
     }
+
+    if [ "$PUBLISH_DRY_RUN" = "1" ]; then
+        if "$gh_bin" release view "$tag" >/dev/null 2>&1; then
+            echo "- [预演] 将更新 GitHub Release: $tag"
+        else
+            echo "- [预演] 将创建 GitHub Release: $tag"
+        fi
+        echo "- [预演] 将上传: $ZIP 和 $changelog"
+        publish_update_json "$tag" 1
+        echo "- 发布预演完成: $tag（未写入 GitHub）"
+        return 0
+    fi
 
     if "$gh_bin" release view "$tag" >/dev/null 2>&1; then
         echo "- GitHub Release 已存在: $tag"
@@ -364,6 +467,7 @@ publish_github_release() {
             --notes-file "$changelog"
     fi
 
+    publish_update_json "$tag" 0
     echo "- 发布完成: $tag"
 }
 
