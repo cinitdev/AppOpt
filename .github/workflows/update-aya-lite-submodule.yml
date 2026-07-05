@@ -11,8 +11,11 @@ permissions:
 
 jobs:
   update:
-    name: Update fps_monitor/aya
+    name: Update native_daemon/fps_monitor/aya
     runs-on: ubuntu-latest
+    env:
+      AYA_SUBMODULE_PATH: native_daemon/fps_monitor/aya
+      AYA_BRIDGE_LOCK: native_daemon/fps_monitor/appopt_ebpf_bridge/Cargo.lock
 
     steps:
       - name: Checkout
@@ -24,19 +27,19 @@ jobs:
       - name: Update aya-lite submodule
         id: update
         run: |
-          git submodule update --init --recursive fps_monitor/aya
-          git -C fps_monitor/aya fetch origin main
-          git -C fps_monitor/aya checkout --detach origin/main
+          git submodule update --init --recursive "$AYA_SUBMODULE_PATH"
+          git -C "$AYA_SUBMODULE_PATH" fetch origin main
+          git -C "$AYA_SUBMODULE_PATH" checkout --detach origin/main
 
-          if git diff --quiet -- fps_monitor/aya; then
+          if git diff --quiet -- "$AYA_SUBMODULE_PATH"; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "aya-lite 子模块已经是最新"
             exit 0
           fi
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "aya_commit=$(git -C fps_monitor/aya rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "aya_full_commit=$(git -C fps_monitor/aya rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "aya_commit=$(git -C "$AYA_SUBMODULE_PATH" rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "aya_full_commit=$(git -C "$AYA_SUBMODULE_PATH" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK
         if: steps.update.outputs.changed == 'true'
@@ -93,7 +96,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add fps_monitor/aya fps_monitor/appopt_ebpf_bridge/Cargo.lock
+          git add "$AYA_SUBMODULE_PATH" "$AYA_BRIDGE_LOCK"
           if git diff --cached --quiet; then
             echo "构建后没有可提交变化"
             exit 0
@@ -105,14 +108,14 @@ jobs:
           git push --force-with-lease origin "$BRANCH"
 
           {
-            echo "自动更新 \`fps_monitor/aya\` 子模块。"
+            echo "自动更新 \`$AYA_SUBMODULE_PATH\` 子模块。"
             echo
             echo "- aya-lite commit: \`$AYA_FULL_COMMIT\`"
             echo "- 本次已执行: \`./build_module.sh release\`"
             echo
             echo "上游同步信息："
             echo
-            cat fps_monitor/aya/UPSTREAM.md
+            cat "$AYA_SUBMODULE_PATH/UPSTREAM.md"
           } > /tmp/aya-lite-pr-body.md
 
           if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
