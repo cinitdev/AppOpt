@@ -105,6 +105,7 @@ class FloatingBallService : Service() {
         private const val MANUAL_STOP_TIMEOUT_MS = 18_000L
         private const val MANUAL_STOP_CLOSE_DELAY_MS = 20_000L
         private const val MANUAL_WAIT_DONE_MS = 22_000L
+        private const val BACKGROUND_WAIT_DONE_MS = 5_000L
         private val FPS_COMMAND_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "AppOptFpsCommand").apply { isDaemon = true }
         }
@@ -123,6 +124,25 @@ class FloatingBallService : Service() {
         if (serviceDestroyed) return
         mainHandler.post {
             if (!serviceDestroyed) action()
+        }
+    }
+
+    private fun importCalibrationHistory(pkg: String, reason: String) {
+        try {
+            val result = DatabaseMigrator.migrateIfNeeded(applicationContext, pkg)
+            android.util.Log.d(
+                "AppOpt",
+                "FloatingBallService history import: target=$pkg reason=$reason " +
+                    "source=${result.sourceFound} imported=${result.importedSessions} " +
+                    "claims=${result.processedClaims} invalid=${result.invalidClaim} " +
+                    "cleanupFailed=${result.completionFailed}"
+            )
+        } catch (e: Exception) {
+            android.util.Log.e(
+                "AppOpt",
+                "FloatingBallService history import failed: target=$pkg reason=$reason",
+                e
+            )
         }
     }
 
@@ -319,6 +339,9 @@ class FloatingBallService : Service() {
             thread {
                 val ok = DaemonBridge.stopCalibration(pkg)
                 val status = if (ok) DaemonBridge.waitDone(pkg, timeoutMs = MANUAL_WAIT_DONE_MS) else null
+                if (status != null) {
+                    importCalibrationHistory(pkg, "manual_stop:$status")
+                }
                 val rules = if (status == "ok") DaemonBridge.readPkgRules(pkg) else emptyList()
                 android.util.Log.d("AppOpt", "校准完成: ok=$ok, status=$status, rules.size=${rules.size}")
                 postIfAlive {
@@ -689,7 +712,15 @@ class FloatingBallService : Service() {
 
         if (wasCalibrating && pkg.isNotBlank()) {
             thread {
-                DaemonBridge.stopCalibration(pkg)
+                val ok = DaemonBridge.stopCalibration(pkg)
+                val status = if (ok) {
+                    DaemonBridge.waitDone(pkg, timeoutMs = BACKGROUND_WAIT_DONE_MS)
+                } else {
+                    null
+                }
+                if (status != null) {
+                    importCalibrationHistory(pkg, "usage_access_lost:$status")
+                }
                 postIfAlive {
                     if (generation != monitorGeneration) return@postIfAlive
                     showBanner("使用情况访问权限不可用\n校准已停止，悬浮球已关闭", durationMs = 2800)
@@ -732,7 +763,14 @@ class FloatingBallService : Service() {
             // 校准中退出游戏: 快速等待 C 端返回状态并显示具体原因
             thread {
                 val ok = DaemonBridge.stopCalibration(pkg)
-                val status = if (ok) DaemonBridge.waitDone(pkg, timeoutMs = 2000) else null
+                val status = if (ok) {
+                    DaemonBridge.waitDone(pkg, timeoutMs = BACKGROUND_WAIT_DONE_MS)
+                } else {
+                    null
+                }
+                if (status != null) {
+                    importCalibrationHistory(pkg, "foreground_close:$status")
+                }
 
                 val msg = when (status) {
                     "ok" -> "校准完成，规则已生成"
@@ -772,7 +810,17 @@ class FloatingBallService : Service() {
         // 通知守护进程停止 FPS 监测(省电)。su 是独立进程,
         // 即使本进程随后退出, 已 fork 的命令仍会执行完。
         FPS_COMMAND_EXECUTOR.execute {
-            if (pkgToStop != null) DaemonBridge.stopCalibration(pkgToStop)
+            if (pkgToStop != null) {
+                val ok = DaemonBridge.stopCalibration(pkgToStop)
+                val status = if (ok) {
+                    DaemonBridge.waitDone(pkgToStop, timeoutMs = BACKGROUND_WAIT_DONE_MS)
+                } else {
+                    null
+                }
+                if (status != null) {
+                    importCalibrationHistory(pkgToStop, "service_destroy:$status")
+                }
+            }
             DaemonBridge.stopFpsMonitor()
         }
         removeCapsule()
@@ -797,7 +845,18 @@ class FloatingBallService : Service() {
         val targetChanged = !previousTarget.isNullOrBlank() && previousTarget != requestedTarget
         if (targetChanged && calibrating) {
             calibrating = false
-            FPS_COMMAND_EXECUTOR.execute { DaemonBridge.stopCalibration(previousTarget!!) }
+            FPS_COMMAND_EXECUTOR.execute {
+                val pkg = previousTarget!!
+                val ok = DaemonBridge.stopCalibration(pkg)
+                val status = if (ok) {
+                    DaemonBridge.waitDone(pkg, timeoutMs = BACKGROUND_WAIT_DONE_MS)
+                } else {
+                    null
+                }
+                if (status != null) {
+                    importCalibrationHistory(pkg, "target_changed:$status")
+                }
+            }
         }
 
         monitorGeneration++

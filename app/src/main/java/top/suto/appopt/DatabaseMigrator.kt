@@ -14,6 +14,14 @@ import top.suto.appopt.db.ThreadImport
  *  - 数据库主键 id 仅作为内部记录标识; 历史列表按记录生成时间倒序显示
  */
 object DatabaseMigrator {
+    data class MigrationResult(
+        val sourceFound: Boolean,
+        val importedSessions: Int,
+        val processedClaims: Int,
+        val invalidClaim: Boolean,
+        val completionFailed: Boolean
+    )
+
     // 按包名加锁,防止同一个包并发导入导致重复
     private val locks = mutableMapOf<String, Any>()
 
@@ -26,8 +34,8 @@ object DatabaseMigrator {
     /**
      * 把 .log 的新会话增量导入数据库，导入成功后删除 .log 文件
      */
-    fun migrateIfNeeded(context: Context, pkg: String) {
-        synchronized(getLock(pkg)) {  // 同一包名串行执行
+    fun migrateIfNeeded(context: Context, pkg: String): MigrationResult {
+        return synchronized(getLock(pkg)) {  // 同一包名串行执行
             val db = AppOptDbHelper.getInstance(context)
 
             // 已存在的 epoch 集合(去重用)
@@ -36,9 +44,13 @@ object DatabaseMigrator {
 
             var totalImported = 0
             var processedClaims = 0
+            var sourceFound = false
+            var invalidClaim = false
+            var completionFailed = false
             while (processedClaims < MAX_IMPORT_CLAIMS) {
                 val raw = DaemonBridge.claimHistoryImport(pkg)
                 if (raw.isBlank()) break
+                sourceFound = true
 
                 var imported = 0
                 var epoch = 0L
@@ -78,18 +90,34 @@ object DatabaseMigrator {
 
                 if (seenSessions <= 0) {
                     android.util.Log.w("AppOpt", "migrate: $pkg 认领文件不含有效会话，保留文件等待排查")
+                    invalidClaim = true
                     break
                 }
+                totalImported += imported
                 val completed = DaemonBridge.completeHistoryImport(pkg)
                 android.util.Log.d(
                     "AppOpt",
                     "migrate: $pkg 已处理认领文件,新导入 $imported 个会话,删除认领文件=$completed"
                 )
-                if (!completed) break
-                totalImported += imported
+                if (!completed) {
+                    completionFailed = true
+                    break
+                }
                 processedClaims++
             }
-            android.util.Log.d("AppOpt", "migrate: $pkg 完成,共新导入 $totalImported 个会话")
+            val result = MigrationResult(
+                sourceFound = sourceFound,
+                importedSessions = totalImported,
+                processedClaims = processedClaims,
+                invalidClaim = invalidClaim,
+                completionFailed = completionFailed
+            )
+            android.util.Log.d(
+                "AppOpt",
+                "migrate: $pkg 完成,找到文件=${result.sourceFound},新导入=${result.importedSessions}," +
+                    "已处理文件=${result.processedClaims},无效文件=${result.invalidClaim},清理失败=${result.completionFailed}"
+            )
+            result
         }  // synchronized 结束
     }
 

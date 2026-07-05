@@ -967,11 +967,15 @@ object DaemonBridge {
     fun listHistoryEntries(): List<HistoryEntry> {
         val out = runAsRoot(
             "for f in $HISTORY_DIR/*.log $HISTORY_DIR/*.log$HISTORY_IMPORT_SUFFIX; " +
-                "do [ -e \"\$f\" ] && stat -c '%Y %n' \"\$f\"; done 2>/dev/null"
+                "do [ -e \"\$f\" ] && stat -c '%Y %n' \"\$f\"; done 2>/dev/null; true"
         )
-        if (!out.isNotErrored()) return emptyList()
+        val clean = out.substringBefore(ERR_MARK)
+        if (!out.isNotErrored() && clean.isBlank()) {
+            android.util.Log.w("AppOpt", "history list: root 枚举失败")
+            return emptyList()
+        }
         val list = ArrayList<HistoryEntry>()
-        for (raw in out.lineSequence()) {
+        for (raw in clean.lineSequence()) {
             val line = raw.trim()
             if (line.isEmpty()) continue
             val sp = line.indexOf(' ')
@@ -984,9 +988,11 @@ object DaemonBridge {
             val pkg = normalizedName.removeSuffix(".log")
             if (pkg.isNotEmpty()) list.add(HistoryEntry(pkg, mtime))
         }
-        return list.groupBy { it.pkg }
+        val entries = list.groupBy { it.pkg }
             .map { (pkg, entries) -> HistoryEntry(pkg, entries.maxOf { it.mtime }) }
             .sortedByDescending { it.mtime }
+        android.util.Log.d("AppOpt", "history list: 枚举到 ${entries.size} 个应用历史文件")
+        return entries
     }
 
     private const val ERR_MARK = "__APPOPT_ERR__"
