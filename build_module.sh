@@ -13,8 +13,11 @@ RUST_BRIDGE="$FPS_MON/appopt_ebpf_bridge"
 AYA_SUBMODULE="$FPS_MON/aya"
 AYA_SUBMODULE_REL="native_daemon/fps_monitor/aya"
 BASE_DIR="$ROOT/magisk_module"
+MODULE_PROP="$BASE_DIR/module.prop"
 WORK="$ROOT/build/module"
 APP_NAME="AppOpt 线程优化"
+APP_GRADLE="$ROOT/app/build.gradle.kts"
+DAEMON_BRIDGE="$ROOT/app/src/main/java/top/suto/appopt/DaemonBridge.kt"
 
 usage() {
     cat <<EOF
@@ -61,6 +64,7 @@ fi
 ZIP="$ROOT/build/AppOpt.zip"
 
 [ -d "$BASE_DIR" ] || { echo "! 找不到模块基底目录: $BASE_DIR"; exit 1; }
+[ -f "$MODULE_PROP" ] || { echo "! 找不到模块属性文件: $MODULE_PROP"; exit 1; }
 [ -d "$NATIVE_DIR" ] || { echo "! 找不到 native 源码目录: $NATIVE_DIR"; exit 1; }
 [ -f "$SRC" ] || { echo "! 找不到主源码: $SRC"; exit 1; }
 [ -f "$FOREGROUND_MONITOR_SRC" ] || { echo "! 找不到前台检测源码: $FOREGROUND_MONITOR_SRC"; exit 1; }
@@ -211,19 +215,85 @@ build_pkg_helper() {
 }
 
 read_app_version_code() {
-    grep -E 'versionCode[[:space:]]*=' "$ROOT/app/build.gradle.kts" | head -n1 | sed -E 's/.*=[[:space:]]*([0-9]+).*/\1/'
+    grep -E 'versionCode[[:space:]]*=' "$APP_GRADLE" | head -n1 | sed -E 's/.*=[[:space:]]*([0-9]+).*/\1/'
 }
 
 read_app_version_name() {
-    grep -E 'versionName[[:space:]]*=' "$ROOT/app/build.gradle.kts" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+    grep -E 'versionName[[:space:]]*=' "$APP_GRADLE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
 read_app_package() {
-    grep -E 'applicationId[[:space:]]*=' "$ROOT/app/build.gradle.kts" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+    grep -E 'applicationId[[:space:]]*=' "$APP_GRADLE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
+sync_source_versions() {
+    local version_code version_name source_version_name current_code current_name current_c_version
+    local current_module_version current_module_code
+    local synced_code synced_name synced_c_version synced_module_version synced_module_code
+    version_code="$(read_app_version_code)"
+    version_name="$(read_app_version_name)"
+    [ -n "$version_code" ] || { echo "! 无法读取 App versionCode"; exit 1; }
+    [ -n "$version_name" ] || { echo "! 无法读取 App versionName"; exit 1; }
+
+    source_version_name="${version_name#v}"
+    source_version_name="${source_version_name#V}"
+    current_code="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
+    current_name="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
+    current_c_version="$(sed -n -E 's/^#define[[:space:]]+VERSION[[:space:]]+"([^"]*)".*/\1/p' "$SRC" | head -n1)"
+    current_module_version="$(sed -n 's/^version=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
+    current_module_code="$(sed -n 's/^versionCode=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
+
+    if [ "$current_code" != "$version_code" ]; then
+        echo "- 同步 REQUIRED_MODULE_VERSION_CODE: ${current_code:-缺失} -> $version_code"
+        sed -E -i "s/(REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*)[0-9]+/\1$version_code/" "$DAEMON_BRIDGE"
+    fi
+    if [ "$current_name" != "$source_version_name" ]; then
+        echo "- 同步 REQUIRED_MODULE_VERSION_NAME: ${current_name:-缺失} -> $source_version_name"
+        sed -E -i "s/(REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*)\"[^\"]*\"/\1\"$source_version_name\"/" "$DAEMON_BRIDGE"
+    fi
+    if [ "$current_c_version" != "$source_version_name" ]; then
+        echo "- 同步 AppOpt.c VERSION: ${current_c_version:-缺失} -> $source_version_name"
+        sed -E -i "s/(^#define[[:space:]]+VERSION[[:space:]]+)\"[^\"]*\"/\1\"$source_version_name\"/" "$SRC"
+    fi
+    if [ "$current_module_version" != "$version_name" ]; then
+        echo "- 同步 module.prop version: ${current_module_version:-缺失} -> $version_name"
+        sed -E -i "s/^version=.*/version=$version_name/" "$MODULE_PROP"
+    fi
+    if [ "$current_module_code" != "$version_code" ]; then
+        echo "- 同步 module.prop versionCode: ${current_module_code:-缺失} -> $version_code"
+        sed -E -i "s/^versionCode=.*/versionCode=$version_code/" "$MODULE_PROP"
+    fi
+
+    synced_code="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
+    synced_name="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
+    synced_c_version="$(sed -n -E 's/^#define[[:space:]]+VERSION[[:space:]]+"([^"]*)".*/\1/p' "$SRC" | head -n1)"
+    synced_module_version="$(sed -n 's/^version=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
+    synced_module_code="$(sed -n 's/^versionCode=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
+    [ "$synced_code" = "$version_code" ] || {
+        echo "! REQUIRED_MODULE_VERSION_CODE 同步失败"
+        exit 1
+    }
+    [ "$synced_name" = "$source_version_name" ] || {
+        echo "! REQUIRED_MODULE_VERSION_NAME 同步失败"
+        exit 1
+    }
+    [ "$synced_c_version" = "$source_version_name" ] || {
+        echo "! AppOpt.c VERSION 同步失败"
+        exit 1
+    }
+    [ "$synced_module_version" = "$version_name" ] || {
+        echo "! module.prop version 同步失败"
+        exit 1
+    }
+    [ "$synced_module_code" = "$version_code" ] || {
+        echo "! module.prop versionCode 同步失败"
+        exit 1
+    }
+    echo "- App、模块与守护进程版本已对齐: $version_name ($version_code)"
 }
 
 read_module_version_name() {
-    sed -n 's/^version=//p' "$BASE_DIR/module.prop" | head -n1 | tr -d '\r'
+    sed -n 's/^version=//p' "$MODULE_PROP" | head -n1 | tr -d '\r'
 }
 
 read_release_tag() {
@@ -365,6 +435,8 @@ build_rust_bridge() {
     [ -f "$lib" ] || { echo "! 找不到 Rust bridge 产物: $lib"; exit 1; }
     RUST_BRIDGE_LIB="$lib"
 }
+
+sync_source_versions
 
 echo "- 准备模块工作目录: $WORK"
 rm -rf "$WORK"

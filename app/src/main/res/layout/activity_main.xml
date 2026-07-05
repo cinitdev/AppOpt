@@ -53,7 +53,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="4dp"
-                    android:text="自动识别 CPU 拓扑 · 按线程负载分配大小核"
+                    android:text="自动识别 CPU 拓扑 · 主进程按线程、子进程按整体负载分配大小核"
                     android:textColor="#E8E8FF"
                     android:textSize="13sp" />
             </LinearLayout>

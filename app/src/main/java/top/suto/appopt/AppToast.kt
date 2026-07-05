@@ -20,9 +20,8 @@ import android.widget.Toast
 
 object AppToast {
     private var currentToast: Toast? = null
-    private var currentView: View? = null
-    private var hideRunnable: Runnable? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private const val ACTIVITY_TOAST_TAG = "appopt_activity_toast"
 
     @SuppressLint("ShowToast")
     @Suppress("DEPRECATION")
@@ -37,13 +36,6 @@ object AppToast {
             showInActivity(activity, message, duration)
             return
         }
-
-        hideRunnable?.let { mainHandler.removeCallbacks(it) }
-        hideRunnable = null
-        currentView?.let { old ->
-            (old.parent as? ViewGroup)?.removeView(old)
-        }
-        currentView = null
 
         val appContext = context.applicationContext
         val density = appContext.resources.displayMetrics.density
@@ -79,8 +71,7 @@ object AppToast {
         val density = activity.resources.displayMetrics.density
         fun dp(value: Float): Int = (value * density + 0.5f).toInt()
 
-        hideRunnable?.let { mainHandler.removeCallbacks(it) }
-        currentView?.let { old ->
+        root.findViewWithTag<View>(ACTIVITY_TOAST_TAG)?.let { old ->
             (old.parent as? ViewGroup)?.removeView(old)
         }
 
@@ -93,6 +84,7 @@ object AppToast {
             elevation = dp(12f).toFloat()
             alpha = 0f
             translationY = dp(10f).toFloat()
+            tag = ACTIVITY_TOAST_TAG
         }
 
         container.addView(View(activity).apply {
@@ -123,7 +115,6 @@ object AppToast {
             bottomMargin = dp(74f)
         }
         root.addView(container, params)
-        currentView = container
         container.animate()
             .alpha(1f)
             .translationY(0f)
@@ -138,12 +129,10 @@ object AppToast {
                 .setDuration(140L)
                 .withEndAction {
                     (container.parent as? ViewGroup)?.removeView(container)
-                    if (currentView === container) currentView = null
                 }
                 .start()
         }
-        hideRunnable = hide
-        mainHandler.postDelayed(hide, showMs)
+        container.postDelayed(hide, showMs)
     }
 
     private fun toastBackground(radius: Float): GradientDrawable {

@@ -40,7 +40,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="16dp"
-        android:background="@drawable/bg_action_row_danger"
+        android:background="@drawable/bg_history_action"
         android:clickable="true"
         android:focusable="true"
         android:foreground="?attr/selectableItemBackground"
@@ -75,7 +75,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="3dp"
-                android:text="保存线程负载、采样时间和曲线数据到 Download/AppOpt"
+                android:text="保存负载记录、采样时间和曲线数据到 Download/AppOpt"
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
         </LinearLayout>
@@ -86,7 +86,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="10dp"
-        android:background="@drawable/bg_action_row"
+        android:background="@drawable/bg_history_action_danger"
         android:clickable="true"
         android:focusable="true"
         android:foreground="?attr/selectableItemBackground"
@@ -131,8 +131,8 @@
         android:id="@+id/sessionManageCancel"
         style="@style/Widget.Material3.Button.OutlinedButton"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="50dp"
         android:layout_marginTop="14dp"
-        android:text="取消"
-        app:cornerRadius="12dp" />
+        android:text="关闭"
+        app:cornerRadius="10dp" />
 </LinearLayout>

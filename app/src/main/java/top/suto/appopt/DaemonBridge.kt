@@ -45,8 +45,8 @@ object DaemonBridge {
     private const val FPS_CMD_FILE = "$CONFIG_DIR/fps.cmd"
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 173
-    const val REQUIRED_MODULE_VERSION_NAME = "1.7.4"
+    const val REQUIRED_MODULE_VERSION_CODE = 175
+    const val REQUIRED_MODULE_VERSION_NAME = "1.7.5"
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
     fun hasRoot(): Boolean = runAsRoot("id -u").trim() == "0"
@@ -429,11 +429,26 @@ object DaemonBridge {
     }
 
     /**
-     * 读取某包名当前生效的规则行。
+     * 读取某应用当前生效的全部规则行, 包含主进程、线程和 :子进程规则。
      * 会过滤掉 pkg=auto 占位，只返回真正生成或手写的核心绑定规则。
      */
     fun readPkgRules(pkg: String): List<String> {
-        return readPkgRules(listOf(pkg))
+        val target = pkg.replace("'", "").trim()
+        if (target.isEmpty()) return emptyList()
+        val text = readConfigRaw()
+        if (text.isBlank()) return emptyList()
+
+        val result = ArrayList<String>()
+        for (raw in text.lineSequence()) {
+            val line = raw.trim()
+            val owner = configLineOwner(line) ?: continue
+            val value = line.substringAfter('=', "").trim()
+            val belongsToApp = owner == target || owner.startsWith("$target:")
+            if (belongsToApp && !value.equals("auto", ignoreCase = true)) {
+                result.add(line)
+            }
+        }
+        return sortConfigRuleLines(result)
     }
 
     fun readPkgRules(pkgs: Collection<String>): List<String> {
@@ -443,21 +458,19 @@ object DaemonBridge {
             .filter { it.isNotEmpty() }
             .distinct()
         if (targets.isEmpty()) return emptyList()
+        val targetSet = targets.toSet()
+        val targetGroups = targets.map { configGroupName(it) }.toSet()
         val result = ArrayList<String>()
         for (raw in text.lineSequence()) {
             val line = raw.trim()
-            if (line.isEmpty() || line.startsWith("#")) continue
-            val eq = line.indexOf('=')
-            if (eq <= 0) continue
-            var key = line.substring(0, eq).trim()
-            val brace = key.indexOf('{')
-            if (brace >= 0) key = key.substring(0, brace).trim()
-            val value = line.substring(eq + 1).trim()
-            if (key in targets && !value.equals("auto", ignoreCase = true)) {
+            val owner = configLineOwner(line) ?: continue
+            val value = line.substringAfter('=', "").trim()
+            if ((owner in targetSet || configGroupName(owner) in targetGroups) &&
+                !value.equals("auto", ignoreCase = true)) {
                 result.add(line)
             }
         }
-        return sortConfigRuleLines(result)
+        return result
     }
 
     /** 读取某包名的全部配置行，包括 pkg=auto 占位。 */
@@ -629,6 +642,92 @@ object DaemonBridge {
         val owners = newLines.mapNotNull { configLineOwner(it) }.toMutableSet()
         blocks.add(ConfigBlock(group, newLines.toMutableList(), owners))
         return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(blocks))
+    }
+
+    enum class ConfigReplaceResult {
+        SUCCESS,
+        SOURCE_CHANGED,
+        INVALID,
+        WRITE_FAILED
+    }
+
+    /**
+     * 按打开编辑器时的规则序号替换当前应用规则，保留原文件中的注释、空行和规则顺序。
+     * 写入前会核对原始规则快照，避免覆盖其他进程在编辑期间产生的修改。
+     */
+    fun replaceConfigRulesPreservingLayout(
+        pkgs: Collection<String>,
+        expectedOriginalLines: List<String>,
+        replacements: Map<Int, String>,
+        addedLines: List<String>,
+        allowedCpus: Set<Int>? = null
+    ): ConfigReplaceResult {
+        val targets = pkgs.map { it.replace("'", "").trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (targets.isEmpty() || replacements.keys.any { it !in expectedOriginalLines.indices }) {
+            return ConfigReplaceResult.INVALID
+        }
+
+        val finalLines = expectedOriginalLines.indices.mapNotNull(replacements::get) + addedLines
+        if (finalLines.isEmpty()) return ConfigReplaceResult.INVALID
+        val presentCpus = allowedCpus ?: readConfigAllowedCpus().takeIf { it.isNotEmpty() }
+        val check = validateConfigRulesForPackages(
+            targets,
+            finalLines.joinToString("\n"),
+            presentCpus
+        )
+        if (!check.ok) return ConfigReplaceResult.INVALID
+
+        val raw = readConfigRaw()
+        if (raw.isBlank()) return ConfigReplaceResult.SOURCE_CHANGED
+        val targetSet = targets.toSet()
+        val targetGroups = targets.map { configGroupName(it) }.toSet()
+
+        fun isEditableTargetRule(rawLine: String): Boolean {
+            val line = rawLine.trim()
+            val owner = configLineOwner(line) ?: return false
+            val value = line.substringAfter('=', "").trim()
+            return !value.equals("auto", ignoreCase = true) &&
+                (owner in targetSet || configGroupName(owner) in targetGroups)
+        }
+
+        val rawLines = raw.lineSequence().toList()
+        val currentOriginalLines = rawLines.asSequence()
+            .filter(::isEditableTargetRule)
+            .map(String::trim)
+            .toList()
+        if (currentOriginalLines != expectedOriginalLines.map(String::trim)) {
+            return ConfigReplaceResult.SOURCE_CHANGED
+        }
+
+        val output = ArrayList<String>(rawLines.size + addedLines.size)
+        var sourceIndex = 0
+        var additionsInserted = false
+        for (rawLine in rawLines) {
+            if (!isEditableTargetRule(rawLine)) {
+                output.add(rawLine)
+                continue
+            }
+
+            replacements[sourceIndex]?.let(output::add)
+            sourceIndex++
+            if (sourceIndex == expectedOriginalLines.size && !additionsInserted) {
+                output.addAll(addedLines)
+                additionsInserted = true
+            }
+        }
+        if (sourceIndex != expectedOriginalLines.size) {
+            return ConfigReplaceResult.SOURCE_CHANGED
+        }
+        if (!additionsInserted) output.addAll(addedLines)
+
+        val content = output.joinToString("\n").trimEnd() + "\n"
+        return if (writeFileAsRoot(CONFIG_FILE, content)) {
+            ConfigReplaceResult.SUCCESS
+        } else {
+            ConfigReplaceResult.WRITE_FAILED
+        }
     }
 
     private data class ConfigBlock(
@@ -813,18 +912,49 @@ object DaemonBridge {
         return key == pkg
     }
 
+    private const val HISTORY_IMPORT_SUFFIX = ".appopt-importing"
+
+    private fun safeHistoryPackage(pkg: String): String {
+        return pkg.map { ch ->
+            if (ch.isLetterOrDigit() || ch == '.' || ch == '_' || ch == ':' || ch == '-') ch else '_'
+        }.joinToString("")
+    }
+
     /** 读取某包名的原版历史 .log 内容；读不到时返回空字符串。 */
     fun readHistory(pkg: String): String {
-        val safe = pkg.replace("'", "")
-        val out = runAsRoot("cat '$HISTORY_DIR/$safe.log' 2>/dev/null")
+        val safe = safeHistoryPackage(pkg)
+        val out = runAsRoot("cat ${shellQuote("$HISTORY_DIR/$safe.log")} 2>/dev/null")
         return if (out.isNotErrored()) out else ""
+    }
+
+    /** 原子认领一份历史文件，避免导入完成时误删 C 刚写入的新会话。 */
+    fun claimHistoryImport(pkg: String): String {
+        val safe = safeHistoryPackage(pkg)
+        if (safe.isBlank()) return ""
+        val source = shellQuote("$HISTORY_DIR/$safe.log")
+        val claim = shellQuote("$HISTORY_DIR/$safe.log$HISTORY_IMPORT_SUFFIX")
+        val out = runAsRoot(
+            "if [ -f $claim ]; then cat $claim; " +
+                "elif [ -f $source ] && mv $source $claim; then cat $claim; fi; true"
+        )
+        return if (out.isNotErrored()) out.substringBefore(ERR_MARK) else ""
+    }
+
+    /** 仅删除已经成功入库的认领文件，不会触碰 C 后续生成的新 .log。 */
+    fun completeHistoryImport(pkg: String): Boolean {
+        val safe = safeHistoryPackage(pkg)
+        if (safe.isBlank()) return false
+        val claim = shellQuote("$HISTORY_DIR/$safe.log$HISTORY_IMPORT_SUFFIX")
+        return runAsRoot("rm -f $claim; true").isNotErrored()
     }
 
     /** 删除某包名的整份历史 .log 文件。 */
     fun deleteHistory(pkg: String): Boolean {
-        val safe = pkg.replace("'", "")
+        val safe = safeHistoryPackage(pkg)
         if (safe.isBlank()) return false
-        return runAsRoot("rm -f '$HISTORY_DIR/$safe.log'; rmdir '$HISTORY_DIR' 2>/dev/null; true").isNotErrored()
+        val source = shellQuote("$HISTORY_DIR/$safe.log")
+        val claim = shellQuote("$HISTORY_DIR/$safe.log$HISTORY_IMPORT_SUFFIX")
+        return runAsRoot("rm -f $source $claim; rmdir '$HISTORY_DIR' 2>/dev/null; true").isNotErrored()
     }
 
     /** history 目录下的一份历史记录文件概要。 */
@@ -836,7 +966,8 @@ object DaemonBridge {
      */
     fun listHistoryEntries(): List<HistoryEntry> {
         val out = runAsRoot(
-            "for f in $HISTORY_DIR/*.log; do [ -e \"\$f\" ] && stat -c '%Y %n' \"\$f\"; done 2>/dev/null"
+            "for f in $HISTORY_DIR/*.log $HISTORY_DIR/*.log$HISTORY_IMPORT_SUFFIX; " +
+                "do [ -e \"\$f\" ] && stat -c '%Y %n' \"\$f\"; done 2>/dev/null"
         )
         if (!out.isNotErrored()) return emptyList()
         val list = ArrayList<HistoryEntry>()
@@ -848,11 +979,14 @@ object DaemonBridge {
             val mtime = line.substring(0, sp).toLongOrNull() ?: continue
             val full = line.substring(sp + 1).trim()
             val name = full.substringAfterLast('/')
-            if (!name.endsWith(".log")) continue
-            val pkg = name.removeSuffix(".log")
+            val normalizedName = name.removeSuffix(HISTORY_IMPORT_SUFFIX)
+            if (!normalizedName.endsWith(".log")) continue
+            val pkg = normalizedName.removeSuffix(".log")
             if (pkg.isNotEmpty()) list.add(HistoryEntry(pkg, mtime))
         }
-        return list.sortedByDescending { it.mtime }
+        return list.groupBy { it.pkg }
+            .map { (pkg, entries) -> HistoryEntry(pkg, entries.maxOf { it.mtime }) }
+            .sortedByDescending { it.mtime }
     }
 
     private const val ERR_MARK = "__APPOPT_ERR__"

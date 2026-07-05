@@ -19,17 +19,11 @@ object ModuleUpdateDialog {
     fun show(
         activity: AppCompatActivity,
         update: ModuleUpdater.UpdateInfo,
-        requireExplicitDismiss: Boolean = false,
         onDismiss: (() -> Unit)? = null
     ) {
         val view = DialogModuleUpdateBinding.inflate(activity.layoutInflater)
         val dialog = BottomSheetDialog(activity)
         val handler = Handler(Looper.getMainLooper())
-
-        fun restoreDismissPolicy() {
-            dialog.setCancelable(!requireExplicitDismiss)
-            dialog.setCanceledOnTouchOutside(!requireExplicitDismiss)
-        }
 
         fun inactive(): Boolean {
             return activity.isFinishing || activity.isDestroyed || !dialog.isShowing
@@ -44,7 +38,6 @@ object ModuleUpdateDialog {
                 activity.runOnUiThread {
                     if (inactive()) return@runOnUiThread
                     downloading = false
-                    restoreDismissPolicy()
                     view.updateLater.isEnabled = true
                     view.updateInstall.isEnabled = true
                     view.updateInstall.text = "重试"
@@ -68,7 +61,8 @@ object ModuleUpdateDialog {
 
         view.updateProgress.progress = 0
         view.updateLater.setOnClickListener { dialog.dismiss() }
-        restoreDismissPolicy()
+        dialog.setCancelable(false)
+        dialog.setCanceledOnTouchOutside(false)
         view.updateInstall.setOnClickListener {
             if (downloading) return@setOnClickListener
             downloading = true
@@ -144,7 +138,6 @@ object ModuleUpdateDialog {
                 override fun onFailure(message: String) {
                     if (inactive()) return
                     downloading = false
-                    restoreDismissPolicy()
                     view.updateLater.isEnabled = true
                     view.updateInstall.isEnabled = true
                     view.updateInstall.text = "重试"
@@ -159,6 +152,10 @@ object ModuleUpdateDialog {
             onDismiss?.invoke()
         }
         dialog.setContentView(view.root)
+        dialog.setOnShowListener {
+            dialog.behavior.skipCollapsed = true
+            dialog.behavior.isHideable = false
+        }
         dialog.show()
     }
 

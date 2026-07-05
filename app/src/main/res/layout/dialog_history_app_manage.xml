@@ -40,7 +40,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="16dp"
-        android:background="@drawable/bg_action_row"
+        android:background="@drawable/bg_history_action"
         android:clickable="true"
         android:focusable="true"
         android:foreground="?attr/selectableItemBackground"
@@ -86,7 +86,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="10dp"
-        android:background="@drawable/bg_action_row_danger"
+        android:background="@drawable/bg_history_action_danger"
         android:clickable="true"
         android:focusable="true"
         android:foreground="?attr/selectableItemBackground"
@@ -131,8 +131,8 @@
         android:id="@+id/historyAppManageCancel"
         style="@style/Widget.Material3.Button.OutlinedButton"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="50dp"
         android:layout_marginTop="14dp"
-        android:text="取消"
-        app:cornerRadius="12dp" />
+        android:text="关闭"
+        app:cornerRadius="10dp" />
 </LinearLayout>

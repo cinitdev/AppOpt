@@ -36,6 +36,7 @@ class HistoryListActivity : AppCompatActivity() {
     private data class HistoryItem(
         val pkg: String,
         val mtime: Long,
+        val sessionCount: Int,
         val label: String,
         val icon: Drawable?
     )
@@ -44,6 +45,7 @@ class HistoryListActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityHistoryListBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        binding.historyListBack.setOnClickListener { finish() }
     }
 
     override fun onResume() {
@@ -67,6 +69,7 @@ class HistoryListActivity : AppCompatActivity() {
                 HistoryItem(
                     pkg = pkg,
                     mtime = it.lastTime,
+                    sessionCount = it.sessionCount,
                     label = appLabel(pkg),
                     icon = loadIcon(pkg)
                 )
@@ -93,6 +96,7 @@ class HistoryListActivity : AppCompatActivity() {
 
     private fun render(entries: List<HistoryItem>) {
         binding.listContainer.removeAllViews()
+        binding.historyListCount.text = if (entries.isEmpty()) "" else "${entries.size} 个应用"
         if (entries.isEmpty()) {
             binding.listEmpty.visibility = View.VISIBLE
             return
@@ -102,7 +106,9 @@ class HistoryListActivity : AppCompatActivity() {
         for (e in entries) {
             val item = ItemHistoryAppBinding.inflate(inflater, binding.listContainer, false)
             item.hisName.text = e.label
-            item.hisTime.text = "最近生成 ${formatHistoryTime(e.mtime)}"
+            item.hisPkg.text = e.pkg
+            item.hisTime.text = formatHistoryTime(e.mtime)
+            item.hisCount.text = "${e.sessionCount} 次"
             e.icon?.let { item.hisIcon.setImageDrawable(it) }
                 ?: item.hisIcon.setImageResource(R.drawable.ic_launcher_foreground)
             item.itemCard.setOnClickListener { openDetail(e.pkg, e.label) }
@@ -187,16 +193,10 @@ class HistoryListActivity : AppCompatActivity() {
                     .append(session.rounds)
                     .append('\n')
                 for (thread in session.threads) {
-                    append(
-                        String.format(
-                            Locale.US,
-                            "%.2f %.2f %s|%s\n",
-                            thread.avg,
-                            thread.max,
-                            thread.name,
-                            thread.series
-                        )
-                    )
+                    append(String.format(Locale.US, "%.2f %.2f %s|%s",
+                        thread.avg, thread.max, thread.name, thread.series))
+                    if (thread.details.isNotBlank()) append('|').append(thread.details)
+                    append('\n')
                 }
             }
         }

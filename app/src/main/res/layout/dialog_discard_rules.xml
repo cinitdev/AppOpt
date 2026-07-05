@@ -18,74 +18,46 @@
         android:background="@drawable/bg_banner" />
 
     <TextView
-        android:id="@+id/deleteTitle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:text="放弃未保存修改"
         android:textColor="@color/text_primary"
         android:textSize="18sp"
         android:textStyle="bold" />
 
     <TextView
-        android:id="@+id/deletePkg"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:ellipsize="middle"
-        android:maxLines="1"
+        android:layout_marginTop="6dp"
+        android:lineSpacingExtra="3dp"
+        android:text="规则已经发生变化，但尚未保存。放弃后，本次新增、编辑或删除的内容将丢失。"
         android:textColor="@color/text_secondary"
-        android:textSize="12sp" />
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="14dp"
-        android:text="将删除以下配置规则："
-        android:textColor="@color/text_primary"
-        android:textSize="14sp"
-        android:textStyle="bold" />
-
-    <ScrollView
-        android:layout_width="match_parent"
-        android:layout_height="220dp"
-        android:layout_marginTop="10dp"
-        android:background="@drawable/bg_code_block"
-        android:padding="12dp">
-
-        <TextView
-            android:id="@+id/deleteRules"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:fontFamily="monospace"
-            android:lineSpacingExtra="3dp"
-            android:textColor="@color/text_primary"
-            android:textIsSelectable="true"
-            android:textSize="12sp" />
-    </ScrollView>
+        android:textSize="13sp" />
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="14dp"
+        android:layout_marginTop="18dp"
         android:orientation="horizontal">
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/deleteCancel"
+            android:id="@+id/discardRulesContinue"
             style="@style/Widget.Material3.Button.OutlinedButton"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            android:layout_height="50dp"
             android:layout_weight="1"
-            android:text="取消"
-            app:cornerRadius="12dp" />
+            android:text="继续编辑"
+            app:cornerRadius="10dp" />
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/deleteConfirm"
+            android:id="@+id/discardRulesConfirm"
             style="@style/Widget.Material3.Button"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            android:layout_height="50dp"
             android:layout_marginStart="10dp"
             android:layout_weight="1"
             android:backgroundTint="#E74C3C"
-            android:text="确认删除"
-            app:cornerRadius="12dp" />
+            android:text="放弃修改"
+            app:cornerRadius="10dp" />
     </LinearLayout>
 </LinearLayout>

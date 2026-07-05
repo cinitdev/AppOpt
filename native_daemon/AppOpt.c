@@ -47,7 +47,7 @@
 #include "fps_fallback.h"
 #include "foreground_monitor.h"
 
-#define VERSION            "1.7.4"
+#define VERSION            "1.7.5"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -82,6 +82,10 @@
 #define DAEMON_SOCKET_PING_PREFIX "appopt.ping top.suto.appopt v1"
 #define DAEMON_SOCKET_CALLBACK "appopt.callback top.suto.appopt v1"
 #define CALIB_MIN_ROUNDS 60
+#define CALIB_MAX_SAMPLES 2048
+#define CALIB_MAX_TRACKED_TIDS 4096
+#define CALIB_MAX_CHILD_THREAD_SUMMARIES 1024
+#define CALIB_MAX_SERIES_POINTS 1200
 
 typedef struct {
     char pkg[MAX_PKG_LEN];
@@ -808,6 +812,10 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
     DIR* proc_dir = opendir("/proc");
     if (!proc_dir) return;
     int proc_fd = dirfd(proc_dir);
+    if (proc_fd < 0) {
+        closedir(proc_dir);
+        return;
+    }
     *count = 0;
 
     if (cache->procs == NULL) {
@@ -1241,18 +1249,24 @@ static void* config_loader_thread(void* arg) {
 
 /* ===================== 自动校准 (=auto) 模块 ===================== *
  * 用户在配置中写 "包名=auto" 后, App 启动游戏并下发 start 命令, 守护进程
- * 周期采样目标进程各线程的 CPU 占用; App 下发 stop 后, 按占用排序并依据
- * CPU 拓扑生成大/中/小核绑定规则(含通配符聚合), 回写 applist.conf。       */
+ * 周期采样主进程各线程与子进程整体 CPU 占用; App 下发 stop 后, 按占用
+ * 排序并依据 CPU 拓扑生成绑核规则, 回写 applist.conf。                    */
 
-/* 单个线程名的聚合采样数据 (同名线程跨多进程累加) */
+/* 单个进程内线程名的聚合采样数据 */
 typedef struct {
-    char name[MAX_THREAD_LEN];   /* 线程名 (comm) */
+    char owner[MAX_PKG_LEN];     /* 线程所属真实进程名, 包含可能的 :子进程后缀 */
+    char name[MAX_THREAD_LEN];   /* 主进程线程名; 子进程整体样本为空 */
+    bool is_process;             /* true 表示子进程整体负载, false 表示主进程线程 */
     unsigned long long busy;     /* 累计 (utime+stime) jiffies 增量 */
     bool alive;                  /* 本轮采样是否仍存在 */
     unsigned long long round_delta;  /* 本轮(一次 sample_once)累计的增量, 用于算瞬时占比 */
     float* series;               /* 每轮瞬时占比(%)序列, 用于历史折线图 */
     size_t series_len;
     size_t series_cap;
+    size_t series_start;         /* 达到上限后作为环形缓冲保留最近采样 */
+    double sum_pct;              /* 全会话统计不受可视曲线压缩影响 */
+    double max_pct;
+    size_t sample_count;
 } ThreadSample;
 
 /* per-(pid,tid) 的 CPU 跟踪, 用于在多进程下正确计算每个线程的增量,
@@ -1266,15 +1280,32 @@ typedef struct {
     char name[MAX_THREAD_LEN];
 } TidTrack;
 
+/* 子进程内部线程只保留 AVG/MAX 摘要, 用于历史记录按需展开。
+ * 不保存独立曲线, 也不参与规则生成。 */
+typedef struct {
+    char owner[MAX_PKG_LEN];
+    char name[MAX_THREAD_LEN];
+    unsigned long long busy;
+    unsigned long long round_delta;
+    double sum_pct;
+    double max_pct;
+    size_t sample_count;
+} ChildThreadSummary;
+
 typedef struct {
     char pkg[MAX_PKG_LEN];
-    ThreadSample* threads;       /* 按线程名聚合 */
+    ThreadSample* threads;       /* 主进程按线程、子进程按进程名聚合 */
     size_t count;
     size_t cap;
     TidTrack* tids;              /* 按 (pid,tid) 跟踪增量 */
     size_t tcount;
     size_t tcap;
+    ChildThreadSummary* child_threads;
+    size_t child_thread_count;
+    size_t child_thread_cap;
     size_t round_count;          /* 已完成的采样轮数, 即折线序列长度 */
+    long long last_sample_ms;    /* 上一轮采样完成时间, 用于计算真实 CPU 占用 */
+    long clock_ticks_per_second;
 } CalibData;
 
 /* 在 stat 文件中解析 utime(14) + stime(15)。stat 的 comm 字段可能含空格/括号,
@@ -1304,13 +1335,22 @@ static bool read_thread_cpu(int task_fd, const char* tid_name, unsigned long lon
     return true;
 }
 
-/* 收集属于该应用的所有进程 pid: 主进程 (cmdline==pkg) 与子进程 (cmdline 以 "pkg:" 开头)。
+typedef struct {
+    pid_t pid;
+    char owner[MAX_PKG_LEN];
+} CalibProcess;
+
+/* 收集属于该应用的所有进程: 主进程 (cmdline==pkg) 与子进程 (cmdline 以 "pkg:" 开头)。
  * 例如 com.tencent.tmgp.sgame 与 com.tencent.tmgp.sgame:GiftProcess 都计入。
- * 结果写入 out_pids (容量 max), 返回收集到的进程数。 */
-static size_t collect_pkg_pids(const char* pkg, pid_t* out_pids, size_t max) {
+ * 结果保留 pid 与真实进程名, 返回收集到的进程数。 */
+static size_t collect_pkg_processes(const char* pkg, CalibProcess* out, size_t max) {
     DIR* d = opendir("/proc");
     if (!d) return 0;
     int dfd = dirfd(d);
+    if (dfd < 0) {
+        closedir(d);
+        return 0;
+    }
     struct dirent* e;
     size_t n = 0;
     size_t plen = strlen(pkg);
@@ -1329,18 +1369,24 @@ static size_t collect_pkg_pids(const char* pkg, pid_t* out_pids, size_t max) {
         /* 主进程: 完全相等; 子进程: "pkg:子进程名" */
         if (strcmp(name, pkg) == 0 ||
             (strncmp(name, pkg, plen) == 0 && name[plen] == ':')) {
-            out_pids[n++] = (pid_t)pid;
+            out[n].pid = (pid_t)pid;
+            build_str(out[n].owner, sizeof(out[n].owner), name, NULL);
+            n++;
         }
     }
     closedir(d);
     return n;
 }
 
-/* 在 data 中按线程名查找, 不存在则追加, 返回索引; 失败返回 -1 */
-static long calib_find_or_add(CalibData* data, const char* name) {
+/* 在 data 中按样本类型、进程名和线程名查找, 不存在则追加, 返回索引。 */
+static long calib_find_or_add(CalibData* data, const char* owner, const char* name,
+                              bool is_process) {
     for (size_t i = 0; i < data->count; i++) {
-        if (strcmp(data->threads[i].name, name) == 0) return (long)i;
+        if (data->threads[i].is_process == is_process &&
+            strcmp(data->threads[i].owner, owner) == 0 &&
+            strcmp(data->threads[i].name, name) == 0) return (long)i;
     }
+    if (data->count >= CALIB_MAX_SAMPLES) return -1;
     if (data->count >= data->cap) {
         size_t nc = data->cap ? data->cap * 2 : 64;
         ThreadSample* t = realloc(data->threads, nc * sizeof(ThreadSample));
@@ -1350,7 +1396,19 @@ static long calib_find_or_add(CalibData* data, const char* name) {
     }
     ThreadSample* s = &data->threads[data->count];
     memset(s, 0, sizeof(*s));
+    build_str(s->owner, sizeof(s->owner), owner, NULL);
     build_str(s->name, sizeof(s->name), name, NULL);
+    s->is_process = is_process;
+    if (data->round_count > 0) {
+        size_t backfill = data->round_count < CALIB_MAX_SERIES_POINTS ?
+            data->round_count : CALIB_MAX_SERIES_POINTS;
+        s->series = calloc(backfill, sizeof(float));
+        if (s->series) {
+            s->series_len = backfill;
+            s->series_cap = backfill;
+        }
+        s->sample_count = data->round_count;
+    }
     return (long)data->count++;
 }
 
@@ -1361,6 +1419,7 @@ static TidTrack* calib_track_tid(CalibData* data, pid_t pid, pid_t tid,
         if (data->tids[i].pid == pid && data->tids[i].tid == tid)
             return &data->tids[i];
     }
+    if (data->tcount >= CALIB_MAX_TRACKED_TIDS) return NULL;
     if (data->tcount >= data->tcap) {
         size_t nc = data->tcap ? data->tcap * 2 : 128;
         TidTrack* t = realloc(data->tids, nc * sizeof(TidTrack));
@@ -1376,14 +1435,53 @@ static TidTrack* calib_track_tid(CalibData* data, pid_t pid, pid_t tid,
     return tk;
 }
 
-/* 对单个进程 task/ 做一遍扫描, 把每线程增量累加进按名聚合表。
- * 返回 false 表示该进程已不存在。 */
-static bool calib_sample_proc(CalibData* data, pid_t pid) {
+static ChildThreadSummary* calib_track_child_thread(CalibData* data,
+                                                    const char* owner,
+                                                    const char* name) {
+    for (size_t i = 0; i < data->child_thread_count; i++) {
+        ChildThreadSummary* s = &data->child_threads[i];
+        if (strcmp(s->owner, owner) == 0 && strcmp(s->name, name) == 0) return s;
+    }
+    if (data->child_thread_count >= CALIB_MAX_CHILD_THREAD_SUMMARIES) return NULL;
+    if (data->child_thread_count >= data->child_thread_cap) {
+        size_t nc = data->child_thread_cap ? data->child_thread_cap * 2 : 32;
+        ChildThreadSummary* p = realloc(data->child_threads,
+                                        nc * sizeof(ChildThreadSummary));
+        if (!p) return NULL;
+        data->child_threads = p;
+        data->child_thread_cap = nc;
+    }
+    ChildThreadSummary* s = &data->child_threads[data->child_thread_count++];
+    memset(s, 0, sizeof(*s));
+    build_str(s->owner, sizeof(s->owner), owner, NULL);
+    build_str(s->name, sizeof(s->name), name, NULL);
+    s->sample_count = data->round_count;
+    return s;
+}
+
+/* 对单个进程 task/ 做一遍扫描。主进程按线程累计, 子进程把所有线程增量
+ * 汇总为一个进程样本, 避免大量短时低负载线程稀释子进程实际负载。 */
+static bool calib_sample_proc(CalibData* data, pid_t pid, const char* owner) {
     char taskpath[64];
     snprintf(taskpath, sizeof(taskpath), "/proc/%d/task", pid);
     DIR* td = opendir(taskpath);
     if (!td) return false;
     int task_fd = dirfd(td);
+    if (task_fd < 0) {
+        closedir(td);
+        return false;
+    }
+    const bool is_main_process = strcmp(owner, data->pkg) == 0;
+    ThreadSample* process_sample = NULL;
+    if (!is_main_process) {
+        long idx = calib_find_or_add(data, owner, "", true);
+        if (idx < 0) {
+            closedir(td);
+            return false;
+        }
+        process_sample = &data->threads[idx];
+        process_sample->alive = true;
+    }
 
     struct dirent* te;
     while ((te = readdir(td))) {
@@ -1411,13 +1509,24 @@ static bool calib_sample_proc(CalibData* data, pid_t pid) {
         tk->last = cpu;
         tk->has_last = true;
 
-        /* 增量累加到按线程名聚合的统计 */
-        long idx = calib_find_or_add(data, tname);
-        if (idx < 0) continue;
-        ThreadSample* s = &data->threads[idx];
-        s->alive = true;
-        s->busy += delta;
-        s->round_delta += delta;   /* 本轮累计, sample_once 收尾时折算瞬时占比 */
+        if (is_main_process) {
+            long idx = calib_find_or_add(data, owner, tname, false);
+            if (idx < 0) continue;
+            ThreadSample* s = &data->threads[idx];
+            s->alive = true;
+            s->busy += delta;
+            s->round_delta += delta;
+        } else {
+            process_sample->busy += delta;
+            process_sample->round_delta += delta;
+            if (delta > 0) {
+                ChildThreadSummary* summary = calib_track_child_thread(data, owner, tname);
+                if (summary) {
+                    summary->busy += delta;
+                    summary->round_delta += delta;
+                }
+            }
+        }
     }
     closedir(td);
     return true;
@@ -1425,8 +1534,14 @@ static bool calib_sample_proc(CalibData* data, pid_t pid) {
 
 /* 给线程的瞬时占比序列追加一个采样点 */
 static void calib_series_push(ThreadSample* s, float pct) {
+    if (s->series_len >= CALIB_MAX_SERIES_POINTS) {
+        s->series[s->series_start] = pct;
+        s->series_start = (s->series_start + 1) % s->series_cap;
+        return;
+    }
     if (s->series_len >= s->series_cap) {
         size_t nc = s->series_cap ? s->series_cap * 2 : 32;
+        if (nc > CALIB_MAX_SERIES_POINTS) nc = CALIB_MAX_SERIES_POINTS;
         float* p = realloc(s->series, nc * sizeof(float));
         if (!p) return;
         s->series = p;
@@ -1435,42 +1550,88 @@ static void calib_series_push(ThreadSample* s, float pct) {
     s->series[s->series_len++] = pct;
 }
 
-/* 对目标应用做一次采样: 收集主进程与所有 :子进程, 逐一扫描线程。
+static double calib_cpu_percent(unsigned long long delta,
+                                long long elapsed_ms,
+                                long ticks_per_second) {
+    if (delta == 0 || elapsed_ms <= 0 || ticks_per_second <= 0) return 0.0;
+    double pct = (double)delta * 100000.0 /
+                 ((double)ticks_per_second * (double)elapsed_ms);
+    if (pct < 0.0) return 0.0;
+    return pct > 100.0 ? 100.0 : pct;
+}
+
+/* TID 基准只需保留本轮仍存活的线程，避免长时间校准时线性增长。 */
+static void calib_prune_dead_tids(CalibData* data) {
+    size_t kept = 0;
+    for (size_t i = 0; i < data->tcount; i++) {
+        if (!data->tids[i].alive) continue;
+        if (kept != i) data->tids[kept] = data->tids[i];
+        kept++;
+    }
+    data->tcount = kept;
+}
+
+/* 对目标应用做一次采样: 主进程保留线程维度, :子进程仅保留整体负载。
  * 返回 false 表示应用所有进程都已消失 (游戏退出)。 */
 static bool calib_sample_once(CalibData* data) {
-    pid_t pids[64];
-    size_t np = collect_pkg_pids(data->pkg, pids, 64);
+    CalibProcess procs[64];
+    size_t np = collect_pkg_processes(data->pkg, procs, 64);
     if (np == 0) return false;
 
     for (size_t i = 0; i < data->count; i++) {
         data->threads[i].alive = false;
         data->threads[i].round_delta = 0;
     }
+    for (size_t i = 0; i < data->child_thread_count; i++) {
+        data->child_threads[i].round_delta = 0;
+    }
     for (size_t i = 0; i < data->tcount; i++) data->tids[i].alive = false;
 
     bool any = false;
-    bool had_baseline = (data->round_count > 0) || (data->tcount > 0);
+    bool had_baseline = data->last_sample_ms > 0;
     for (size_t i = 0; i < np; i++) {
-        if (calib_sample_proc(data, pids[i])) any = true;
+        if (calib_sample_proc(data, procs[i].pid, procs[i].owner)) any = true;
     }
     if (!any) return false;
 
-    /* 收尾: 把本轮各线程增量折算成瞬时占比, 追加到折线序列。
-     * 第一轮没有基准(delta 全 0), 跳过记录以免折线全是 0。 */
-    if (had_baseline) {
-        unsigned long long round_total = 0;
-        for (size_t i = 0; i < data->count; i++)
-            round_total += data->threads[i].round_delta;
-        if (round_total > 0) {
-            for (size_t i = 0; i < data->count; i++) {
-                float pct = (float)((double)data->threads[i].round_delta * 100.0
-                                    / (double)round_total);
-                calib_series_push(&data->threads[i], pct);
-            }
-            data->round_count++;
-        }
+    long long now_ms = monotonic_ms();
+    if (data->clock_ticks_per_second <= 0) {
+        data->clock_ticks_per_second = sysconf(_SC_CLK_TCK);
+        if (data->clock_ticks_per_second <= 0) data->clock_ticks_per_second = 100;
     }
-    return any;
+    if (!had_baseline) {
+        data->last_sample_ms = now_ms;
+        calib_prune_dead_tids(data);
+        return true;
+    }
+
+    long long elapsed_ms = now_ms - data->last_sample_ms;
+    data->last_sample_ms = now_ms;
+    if (elapsed_ms <= 0) elapsed_ms = 500;
+
+    /* jiffies / 实际墙钟间隔才是真实单核 CPU 使用率。空闲轮次也写入 0，
+     * 防止只统计活跃轮次导致 AVG 被系统性抬高。 */
+    for (size_t i = 0; i < data->count; i++) {
+        double pct = calib_cpu_percent(data->threads[i].round_delta,
+                                       elapsed_ms,
+                                       data->clock_ticks_per_second);
+        data->threads[i].sum_pct += pct;
+        if (pct > data->threads[i].max_pct) data->threads[i].max_pct = pct;
+        data->threads[i].sample_count++;
+        calib_series_push(&data->threads[i], (float)pct);
+    }
+    for (size_t i = 0; i < data->child_thread_count; i++) {
+        ChildThreadSummary* s = &data->child_threads[i];
+        double pct = calib_cpu_percent(s->round_delta,
+                                       elapsed_ms,
+                                       data->clock_ticks_per_second);
+        s->sum_pct += pct;
+        if (pct > s->max_pct) s->max_pct = pct;
+        s->sample_count++;
+    }
+    data->round_count++;
+    calib_prune_dead_tids(data);
+    return true;
 }
 
 static bool calib_rule_name_syntax_ok(const char* name) {
@@ -1514,7 +1675,48 @@ static bool calib_wildcard_candidate(const char* name, char* out, size_t out_sz)
     for (size_t i = 0; i < prefix_len; i++) {
         if (isalpha((unsigned char)name[i])) alpha++;
     }
-    if (prefix_len < 4 || alpha < 2 || prefix_len + 2 > out_sz) return false;
+    if (prefix_len < 4 || alpha < 2) return false;
+
+    size_t first_digit_end = digit_pos;
+    while (isdigit((unsigned char)name[first_digit_end])) first_digit_end++;
+    bool has_stable_suffix = false;
+    for (size_t i = first_digit_end; name[i]; i++) {
+        if (isalpha((unsigned char)name[i])) {
+            has_stable_suffix = true;
+            break;
+        }
+    }
+
+    if (has_stable_suffix) {
+        static const char numeric_glob[] = "[0-9]*";
+        const size_t numeric_glob_len = sizeof(numeric_glob) - 1;
+        size_t src = 0;
+        size_t dst = 0;
+        bool overflow = false;
+        while (name[src]) {
+            if (isdigit((unsigned char)name[src])) {
+                if (dst + numeric_glob_len + 1 > out_sz) {
+                    overflow = true;
+                    break;
+                }
+                memcpy(out + dst, numeric_glob, numeric_glob_len);
+                dst += numeric_glob_len;
+                while (isdigit((unsigned char)name[src])) src++;
+            } else {
+                if (dst + 2 > out_sz) {
+                    overflow = true;
+                    break;
+                }
+                out[dst++] = name[src++];
+            }
+        }
+        if (!overflow) {
+            out[dst] = '\0';
+            if (calib_wildcard_name_syntax_ok(out)) return true;
+        }
+    }
+
+    if (prefix_len + 2 > out_sz) return false;
 
     memcpy(out, name, prefix_len);
     out[prefix_len] = '*';
@@ -1522,10 +1724,12 @@ static bool calib_wildcard_candidate(const char* name, char* out, size_t out_sz)
     return calib_wildcard_name_syntax_ok(out);
 }
 
-static int calib_wildcard_candidate_count(const CalibData* data, const char* candidate) {
-    if (!data || !candidate || !candidate[0]) return 0;
+static int calib_wildcard_candidate_count(const CalibData* data, const char* owner,
+                                          const char* candidate) {
+    if (!data || !owner || !candidate || !candidate[0]) return 0;
     int count = 0;
     for (size_t i = 0; i < data->count; i++) {
+        if (strcmp(data->threads[i].owner, owner) != 0) continue;
         char other[MAX_THREAD_LEN];
         if (calib_wildcard_candidate(data->threads[i].name, other, sizeof(other)) &&
             strcmp(other, candidate) == 0) {
@@ -1541,7 +1745,7 @@ static void calib_rule_base_for_thread(const CalibData* data, size_t idx, char* 
 
     char candidate[MAX_THREAD_LEN];
     if (calib_wildcard_candidate(data->threads[idx].name, candidate, sizeof(candidate)) &&
-        calib_wildcard_candidate_count(data, candidate) >= 2) {
+        calib_wildcard_candidate_count(data, data->threads[idx].owner, candidate) >= 2) {
         build_str(out, out_sz, candidate, NULL);
         return;
     }
@@ -1561,20 +1765,13 @@ static int calib_cmp_busy(const void* a, const void* b) {
 }
 
 static void calib_thread_pct_stats(const ThreadSample* s, double* avg, double* max) {
-    double sum = 0.0;
-    double mx = 0.0;
-    if (!s || s->series_len == 0) {
+    if (!s || s->sample_count == 0) {
         *avg = 0.0;
         *max = 0.0;
         return;
     }
-    for (size_t i = 0; i < s->series_len; i++) {
-        double v = s->series[i];
-        sum += v;
-        if (v > mx) mx = v;
-    }
-    *avg = sum / (double)s->series_len;
-    *max = mx;
+    *avg = s->sum_pct / (double)s->sample_count;
+    *max = s->max_pct;
 }
 
 static double calib_load_score(double avg_pct, double max_pct) {
@@ -1855,14 +2052,15 @@ static void calib_log_policy(const CalibPolicy* p, const CpuTopology* topo,
            topo->nonbig_str[0] ? topo->nonbig_str : "-",
            topo->all_str[0] ? topo->all_str : "-");
     calib_log_policy_rule(topo, "best_thread",
-                          "只挑负载最高且平均与峰值都达到阈值的 1 个线程生成第一条单独线程规则",
+                          "只挑主进程中负载最高且平均与峰值都达到阈值的 1 个线程生成第一条单独线程规则",
                           p->best_avg, p->best_max, p->best_tier, p->best_cores, true);
     calib_log_policy_rule(topo, "group_high",
-                          "较重线程或相似线程组平均与峰值都达到阈值后生成第二档线程规则",
+                          "主进程较重线程或相似线程组平均与峰值都达到阈值后生成第二档线程规则",
                           p->high_avg, p->high_max, p->high_tier, p->high_cores, true);
     calib_log_policy_rule(topo, "group_mid",
-                          "中等负载线程或相似线程组平均与峰值都达到阈值后生成第三档线程规则",
+                          "主进程中等负载线程或相似线程组平均与峰值都达到阈值后生成第三档线程规则",
                           p->mid_avg, p->mid_max, p->mid_tier, p->mid_cores, true);
+    printf("[校准策略] child_process: 汇总子进程全部线程负载, 使用 group_high/group_mid 阈值生成进程级规则, 不参与 best_thread\n");
     printf("[校准策略] wildcard_group: %s; %s\n",
            p->wildcard_mode == CALIB_WILDCARD_SUM ? "sum" : "max_member",
            p->wildcard_mode == CALIB_WILDCARD_SUM ?
@@ -2065,6 +2263,7 @@ static CalibPolicy calib_load_policy(const CpuTopology* topo) {
 
 /* 聚合后的通配组 */
 typedef struct {
+    char owner[MAX_PKG_LEN];     /* 规则所属真实进程名 */
     char base[MAX_THREAD_LEN];   /* 通配基名(可能含尾部 '*') */
     unsigned long long busy;     /* 组内线程 busy 之和 */
     double avg_pct;              /* 组内线程平均占比, 通配组按策略取最高成员或累加 */
@@ -2089,14 +2288,14 @@ static bool calib_append_rule(char** out, size_t* remain, int* lines,
                               const char* tier) {
     if (!out || !*out || !remain || !lines || !pkg || !tier || !tier[0]) return false;
 
-    char line[256];
+    char line[MAX_PKG_LEN + MAX_THREAD_LEN + 128];
     int need;
     if (thread && thread[0]) {
         need = snprintf(line, sizeof(line), "%s{%s}=%s\n", pkg, thread, tier);
     } else {
         need = snprintf(line, sizeof(line), "%s=%s\n", pkg, tier);
     }
-    if (need < 0 || (size_t)need > *remain) return false;
+    if (need < 0 || (size_t)need >= sizeof(line) || (size_t)need > *remain) return false;
 
     memcpy(*out, line, (size_t)need);
     *out += need;
@@ -2115,22 +2314,27 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     /* 1) 按 busy 降序排序 */
     qsort(data->threads, data->count, sizeof(ThreadSample), calib_cmp_busy);
 
-    /* 2) 聚合为通配组 */
+    /* 2) 主进程线程聚合为精确/通配组; 子进程整体样本稍后单独分级。 */
     CalibGroup* groups = calloc(data->count, sizeof(CalibGroup));
     if (!groups) return 0;
     size_t ng = 0;
     unsigned long long total = 0;
     for (size_t i = 0; i < data->count; i++) {
         total += data->threads[i].busy;
+        if (data->threads[i].is_process ||
+            strcmp(data->threads[i].owner, data->pkg) != 0) continue;
         char base[MAX_THREAD_LEN];
         calib_rule_base_for_thread(data, i, base, sizeof(base));
         if (!base[0]) continue;
         long gi = -1;
         for (size_t g = 0; g < ng; g++) {
-            if (strcmp(groups[g].base, base) == 0) { gi = (long)g; break; }
+            if (strcmp(groups[g].owner, data->threads[i].owner) == 0 &&
+                strcmp(groups[g].base, base) == 0) { gi = (long)g; break; }
         }
         if (gi < 0) {
             gi = (long)ng++;
+            build_str(groups[gi].owner, sizeof(groups[gi].owner),
+                      data->threads[i].owner, NULL);
             build_str(groups[gi].base, sizeof(groups[gi].base), base, NULL);
             groups[gi].is_wild = (strchr(base, '*') != NULL);
             groups[gi].busy = 0;
@@ -2166,16 +2370,20 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
      *    - 单个线程综合负载第一, 且 avg/max 都达到策略重载阈值: 独占最高性能簇, 并固定输出在第一行。
      *    - avg 与 max 同时达到 group_high 阈值: 高频中核。
      *    - avg 与 max 同时达到 group_mid 阈值: 中核。
+     *    - 子进程按整体负载进入中档/高档, 不参与最佳线程竞争。
      *    - 其余由进程级兜底覆盖。
      *    不按线程名白名单/黑名单猜职责, 避免不同游戏命名差异导致误判。
      *    同档位先输出精确线程, 再输出通配组; 只保留 Top N, 避免规则过多。 */
     char big_thread[MAX_THREAD_LEN] = {0};
     char big_rule[MAX_THREAD_LEN] = {0};
+    char big_owner[MAX_PKG_LEN] = {0};
     size_t best_idx = SIZE_MAX;
     double best_score = -1.0;
     double best_avg = 0.0;
     double best_max = 0.0;
     for (size_t i = 0; i < data->count; i++) {
+        if (data->threads[i].is_process ||
+            strcmp(data->threads[i].owner, data->pkg) != 0) continue;
         if (!calib_rule_name_syntax_ok(data->threads[i].name)) continue;
         double avg_pct, max_pct;
         calib_thread_pct_stats(&data->threads[i], &avg_pct, &max_pct);
@@ -2185,6 +2393,7 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
             best_avg = avg_pct;
             best_max = max_pct;
             best_idx = i;
+            build_str(big_owner, sizeof(big_owner), data->threads[i].owner, NULL);
             build_str(big_thread, sizeof(big_thread), data->threads[i].name, NULL);
         }
     }
@@ -2201,10 +2410,17 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     const bool has_big_thread = big_thread[0] && big_rule[0] && !big_rule_is_wild &&
         (best_avg >= policy.best_avg && best_max >= policy.best_max);
     const char* big_tier = calib_policy_core_range(topo, policy.best_tier, policy.best_cores);
+    const char* base_tier = calib_policy_core_range(topo, policy.fallback_tier, policy.fallback_cores);
+    size_t fallback_reserve = 0;
+    if (base_tier && base_tier[0]) {
+        fallback_reserve = strlen(data->pkg) + 1 + strlen(base_tier) + 1;
+        if (fallback_reserve > remain) fallback_reserve = remain;
+    }
+    size_t explicit_remain = remain - fallback_reserve;
 
     if (has_big_thread && big_tier && big_tier[0]) {
-        if (!calib_append_rule(&p, &remain, &lines, data->pkg, big_rule, big_tier))
-            goto finish;
+        if (!calib_append_rule(&p, &explicit_remain, &lines, big_owner, big_rule, big_tier))
+            goto append_fallback;
         thread_lines++;
     }
 
@@ -2213,7 +2429,7 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
             for (size_t g = 0; g < ng && thread_lines < max_thread_lines; g++) {
                 if ((groups[g].is_wild ? 1 : 0) != wild_pass) continue;
                 if (calib_group_tier(&groups[g], &policy) != tier_pass) continue;
-                if (has_big_thread) {
+                if (has_big_thread && strcmp(groups[g].owner, big_owner) == 0) {
                     if (strcmp(groups[g].base, big_rule) == 0) continue;
                     if (strchr(big_rule, '*') != NULL && !groups[g].is_wild) {
                         if (fnmatch(big_rule, groups[g].base, FNM_NOESCAPE) == 0) continue;
@@ -2228,30 +2444,103 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
                     calib_policy_core_range(topo, policy.high_tier, policy.high_cores) :
                     calib_policy_core_range(topo, policy.mid_tier, policy.mid_cores);
                 if (!tier || !tier[0]) continue;
-                if (!calib_append_rule(&p, &remain, &lines, data->pkg, groups[g].base, tier))
-                    goto finish;
+                if (!calib_append_rule(&p, &explicit_remain, &lines,
+                                       groups[g].owner, groups[g].base, tier))
+                    goto append_fallback;
                 thread_lines++;
             }
         }
     }
 
+    /* 子进程只生成进程级规则。未达到阈值的子进程不写独立规则,
+     * 运行时继续继承主进程兜底核心。 */
+    for (int tier_pass = 2; tier_pass >= 1; tier_pass--) {
+        for (size_t i = 0; i < data->count; i++) {
+            ThreadSample* s = &data->threads[i];
+            if (!s->is_process || strcmp(s->owner, data->pkg) == 0) continue;
+            double avg_pct, max_pct;
+            calib_thread_pct_stats(s, &avg_pct, &max_pct);
+            CalibGroup process_group = {
+                .avg_pct = avg_pct,
+                .max_pct = max_pct
+            };
+            if (calib_group_tier(&process_group, &policy) != tier_pass) continue;
+            const char* tier = (tier_pass == 2) ?
+                calib_policy_core_range(topo, policy.high_tier, policy.high_cores) :
+                calib_policy_core_range(topo, policy.mid_tier, policy.mid_cores);
+            if (!tier || !tier[0]) continue;
+            if (!calib_append_rule(&p, &explicit_remain, &lines, s->owner, NULL, tier))
+                goto append_fallback;
+        }
+    }
+
     /* 4) 进程级兜底规则: 默认使用小核+中核(e_core+p_core), 对齐常见 0-6。
      *    用户也可在策略中改为中核/中高性能核心/全部核心。 */
-    const char* base_tier = calib_policy_core_range(topo, policy.fallback_tier, policy.fallback_cores);
-    if (base_tier[0]) {
+append_fallback:
+    remain = explicit_remain + fallback_reserve;
+    if (base_tier && base_tier[0]) {
         calib_append_rule(&p, &remain, &lines, data->pkg, NULL, base_tier);
     }
-finish:
     *p = '\0';
     free(groups);
     return lines;
 }
 
-/* 把每线程负载历史写入 history/<pkg>.log (Scene 风格折线数据)。
+/* 把主进程线程和子进程整体负载写入 history/<pkg>.log。
  * 格式: 每段首行 "# <epoch> <采样轮数>", 随后每行:
- *   "<AVG%> <MAX%> <线程名>|<p1,p2,...,pN>"
+ *   "<AVG%> <MAX%> <名称>|<p1,p2,...,pN>[|v2:子线程名,AVG,MAX;...]"
  * 其中 p* 为每轮采样的瞬时占比(%)。每个包名最多保留最近 HISTORY_MAX_SESSIONS 段会话。 */
 #define HISTORY_MAX_SESSIONS 7
+
+static void calib_write_history_name(FILE* out, const char* name) {
+    if (!out || !name) return;
+    for (size_t i = 0; name[i]; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '|' || c == ',' || c == ';' || c == '\n' || c == '\r' || c < 0x20) {
+            fputc('_', out);
+        } else {
+            fputc(c, out);
+        }
+    }
+}
+
+static void calib_write_child_thread_summary(FILE* out, const CalibData* data,
+                                             const char* owner) {
+    size_t available = 0;
+    for (size_t i = 0; i < data->child_thread_count; i++) {
+        const ChildThreadSummary* s = &data->child_threads[i];
+        if (strcmp(s->owner, owner) != 0 || s->sample_count == 0) continue;
+        double avg = s->sum_pct / (double)s->sample_count;
+        if (s->max_pct >= 0.05 || avg >= 0.05) available++;
+    }
+    if (available == 0) return;
+
+    bool* written = calloc(data->child_thread_count, sizeof(bool));
+    if (!written) return;
+    fputs("|v2:", out);
+    for (size_t slot = 0; slot < available; slot++) {
+        size_t best = SIZE_MAX;
+        double best_avg = -1.0;
+        double best_max = -1.0;
+        for (size_t i = 0; i < data->child_thread_count; i++) {
+            const ChildThreadSummary* s = &data->child_threads[i];
+            if (written[i] || strcmp(s->owner, owner) != 0 || s->sample_count == 0) continue;
+            double avg = s->sum_pct / (double)s->sample_count;
+            if (s->max_pct < 0.05 && avg < 0.05) continue;
+            if (avg > best_avg || (avg == best_avg && s->max_pct > best_max)) {
+                best = i;
+                best_avg = avg;
+                best_max = s->max_pct;
+            }
+        }
+        if (best == SIZE_MAX) break;
+        written[best] = true;
+        if (slot > 0) fputc(';', out);
+        calib_write_history_name(out, data->child_threads[best].name);
+        fprintf(out, ",%.2f,%.2f", best_avg, best_max);
+    }
+    free(written);
+}
 
 static void calib_write_history(const char* pkg, CalibData* data) {
     if (data->count == 0) return;
@@ -2266,7 +2555,7 @@ static void calib_write_history(const char* pkg, CalibData* data) {
     safe_history_filename(pkg, safe, sizeof(safe));
     build_str(path, sizeof(path), HISTORY_DIR, "/", safe, ".log", NULL);
 
-    /* 1) 把本次会话格式化到内存缓冲: 段头 + 每线程(AVG MAX 名称|折线) */
+    /* 1) 把本次会话格式化到内存缓冲: 段头 + 每条负载记录(AVG MAX 名称|折线) */
     char* cur = NULL;
     size_t cur_len = 0;
     FILE* mem = open_memstream(&cur, &cur_len);
@@ -2275,17 +2564,23 @@ static void calib_write_history(const char* pkg, CalibData* data) {
         for (size_t i = 0; i < data->count; i++) {
             ThreadSample* s = &data->threads[i];
             if (s->series_len == 0) continue;
-            /* AVG / MAX 基于该线程实际采样点 */
-            double sum = 0.0; float mx = 0.0f;
-            for (size_t k = 0; k < s->series_len; k++) {
-                sum += s->series[k];
-                if (s->series[k] > mx) mx = s->series[k];
+            double avg = 0.0;
+            double mx = 0.0;
+            calib_thread_pct_stats(s, &avg, &mx);
+            if (mx < 0.05 && avg < 0.05) continue;   /* 整段几乎零负载的线程略过 */
+            if (s->is_process) {
+                fprintf(mem, "%.2f %.2f %s|", avg, mx, s->owner);
+            } else if (strcmp(s->owner, pkg) == 0) {
+                fprintf(mem, "%.2f %.2f %s|", avg, mx, s->name);
+            } else {
+                fprintf(mem, "%.2f %.2f %s{%s}|", avg, mx, s->owner, s->name);
             }
-            double avg = sum / (double)s->series_len;
-            if (mx < 0.05f && avg < 0.05) continue;   /* 整段几乎零负载的线程略过 */
-            fprintf(mem, "%.2f %.2f %s|", avg, mx, s->name);
             for (size_t k = 0; k < s->series_len; k++) {
-                fprintf(mem, k ? ",%.2f" : "%.2f", s->series[k]);
+                size_t index = (s->series_start + k) % s->series_cap;
+                fprintf(mem, k ? ",%.2f" : "%.2f", s->series[index]);
+            }
+            if (s->is_process) {
+                calib_write_child_thread_summary(mem, data, s->owner);
             }
             fputc('\n', mem);
         }
@@ -2604,11 +2899,16 @@ static void calib_free(CalibData* d) {
     }
     free(d->threads);
     free(d->tids);
+    free(d->child_threads);
     d->threads = NULL;
     d->tids = NULL;
+    d->child_threads = NULL;
     d->count = d->cap = 0;
     d->tcount = d->tcap = 0;
+    d->child_thread_count = d->child_thread_cap = 0;
     d->round_count = 0;
+    d->last_sample_ms = 0;
+    d->clock_ticks_per_second = 0;
 }
 
 /*
@@ -2630,8 +2930,8 @@ static void* calib_thread(void* arg) {
         if (calib_read_cmd(cmd, sizeof(cmd))) {
             if (is_start_command(cmd)) {
                 const char* pkg = strtrim(cmd + 6);
-                pid_t probe[8];
-                size_t np = collect_pkg_pids(pkg, probe, 8);
+                CalibProcess probe[8];
+                size_t np = collect_pkg_processes(pkg, probe, 8);
                 if (np > 0 && strlen(pkg) < MAX_PKG_LEN) {
                     calib_free(&data);
                     memset(&data, 0, sizeof(data));
@@ -2647,8 +2947,9 @@ static void* calib_thread(void* arg) {
             } else if (is_stop_command(cmd)) {
                 if (sampling) {
                     sampling = false;
-                    printf("[校准] 收到停止命令: %s 共采样 %zu 轮, 记录 %zu 个线程名(跟踪 %zu 个TID), 开始生成规则\n",
-                           data.pkg, data.round_count, data.count, data.tcount);
+                    printf("[校准] 收到停止命令: %s 共采样 %zu 轮, 记录 %zu 个负载项(跟踪 %zu 个TID, 子进程活跃线程摘要 %zu 个), 开始生成规则\n",
+                           data.pkg, data.round_count, data.count, data.tcount,
+                           data.child_thread_count);
 
                     /* 最低采样要求: 轮数不足时不生成规则, 否则数据不足以反映真实负载 */
                     if (data.round_count < CALIB_MIN_ROUNDS) {
@@ -2662,7 +2963,7 @@ static void* calib_thread(void* arg) {
                         continue;
                     }
 
-                    char rules[2048];
+                    char rules[4096];
                     int n = calib_generate_rules(&data, &g_topo, rules, sizeof(rules));
                     calib_write_history(data.pkg, &data);
                     char st[MAX_PKG_LEN + 64];
@@ -2679,7 +2980,7 @@ static void* calib_thread(void* arg) {
                         }
                         if (cfg) config_release(cfg);
                     } else {
-                        printf("[校准] 警告: %s 未能生成规则 (线程负载样本不足?)\n", data.pkg);
+                        printf("[校准] 警告: %s 未能生成规则 (负载样本不足?)\n", data.pkg);
                         snprintf(st, sizeof(st), "done %s;reason=no_load", data.pkg);
                     }
                     calib_set_state(st);
@@ -2693,8 +2994,9 @@ static void* calib_thread(void* arg) {
             if (!calib_sample_once(&data)) {
                 /* 进程消失, 用已采集数据直接出规则 */
                 sampling = false;
-                printf("[校准] %s 进程已退出, 用现有 %zu 轮/%zu 个线程名(跟踪 %zu 个TID)数据直接生成规则\n",
-                       data.pkg, data.round_count, data.count, data.tcount);
+                printf("[校准] %s 进程已退出, 用现有 %zu 轮/%zu 个负载项(跟踪 %zu 个TID, 子进程活跃线程摘要 %zu 个)数据直接生成规则\n",
+                       data.pkg, data.round_count, data.count, data.tcount,
+                       data.child_thread_count);
                 if (data.round_count < CALIB_MIN_ROUNDS) {
                     printf("[校准] 警告: %s 进程退出时采样不足 (仅 %zu 轮, 建议 >=%d 轮), 未生成规则\n",
                            data.pkg, data.round_count, CALIB_MIN_ROUNDS);
@@ -2704,7 +3006,7 @@ static void* calib_thread(void* arg) {
                     calib_free(&data);
                     continue;
                 }
-                char rules[2048];
+                char rules[4096];
                 int n = calib_generate_rules(&data, &g_topo, rules, sizeof(rules));
                 calib_write_history(data.pkg, &data);
                 char st[MAX_PKG_LEN + 64];
@@ -2721,15 +3023,16 @@ static void* calib_thread(void* arg) {
                     }
                     if (cfg) config_release(cfg);
                 } else {
-                    printf("[校准] 警告: %s 未能生成规则 (线程负载样本不足?)\n", data.pkg);
+                    printf("[校准] 警告: %s 未能生成规则 (负载样本不足?)\n", data.pkg);
                     snprintf(st, sizeof(st), "done %s;reason=no_load", data.pkg);
                 }
                 calib_set_state(st);
                 calib_free(&data);
             } else if (data.round_count != prev_rounds && data.round_count % 20 == 0) {
                 /* 每 20 轮(约 10s)报一次进度, 避免每 0.5s 刷屏 */
-                printf("[校准] %s 采样中... 已 %zu 轮, 当前记录 %zu 个线程名(跟踪 %zu 个TID)\n",
-                       data.pkg, data.round_count, data.count, data.tcount);
+                printf("[校准] %s 采样中... 已 %zu 轮, 当前记录 %zu 个负载项(跟踪 %zu 个TID, 子进程活跃线程摘要 %zu 个)\n",
+                       data.pkg, data.round_count, data.count, data.tcount,
+                       data.child_thread_count);
             }
         }
         usleep(500 * 1000);   /* 0.5s 采样周期 */
@@ -3517,18 +3820,18 @@ static pid_t fps_find_preferred_pkg_pid(const char* pkg, bool allow_child,
         return top_state.target_pid;
     }
 
-    pid_t pids[64];
-    size_t np = collect_pkg_pids(pkg, pids, 64);
+    CalibProcess procs[64];
+    size_t np = collect_pkg_processes(pkg, procs, 64);
     for (size_t i = 0; i < np; i++) {
-        if (fps_pid_is_main_process(pids[i], pkg)) {
+        if (fps_pid_is_main_process(procs[i].pid, pkg)) {
             if (source) *source = "包名主进程";
-            return pids[i];
+            return procs[i].pid;
         }
     }
 
     if (allow_child && np > 0) {
         if (source) *source = "包名子进程回退";
-        return pids[0];
+        return procs[0].pid;
     }
     return (pid_t)-1;
 }
@@ -3578,7 +3881,6 @@ static void* fps_thread(void* arg) {
 
     /* eBPF 状态 */
     ebpf_fps_ctx *ebpf_ctx = NULL;
-    pid_t target_pid = -1;
     bool ebpf_first_fps = true;
     bool ebpf_pid_reported = false;
     int ebpf_poll_failures = 0;
@@ -3629,13 +3931,13 @@ static void* fps_thread(void* arg) {
                     if (cap == EBPF_CAP_OK) {
                         /* 2. 找目标进程 PID。游戏刚启动时 /proc/cmdline 可能短暂不可见, 等一小段时间。 */
                         const char* pid_source = "未找到";
-                        target_pid = fps_wait_pkg_pid(pkg, 30, 100 * 1000, &pid_source);
-                        if (target_pid < 0) {
+                        pid_t start_pid = fps_wait_pkg_pid(pkg, 30, 100 * 1000, &pid_source);
+                        if (start_pid < 0) {
                             printf("[FPS] 等待约 3 秒仍未找到 %s 的进程, 尝试全局 eBPF 帧事件探测\n", pkg);
                         }
 
                         /* 3. 尝试 eBPF attach */
-                        ebpf_ctx = fps_start_ebpf_ctx(pkg, target_pid, pid_source);
+                        ebpf_ctx = fps_start_ebpf_ctx(pkg, start_pid, pid_source);
 
                         if (ebpf_ctx) {
                             long long started_ms = monotonic_ms();
@@ -3669,7 +3971,6 @@ static void* fps_thread(void* arg) {
                     monitoring = false;
                     if (ebpf_ctx) { ebpf_fps_stop(ebpf_ctx); ebpf_ctx = NULL; }
                     if (fallback_ctx) { fps_fallback_stop(fallback_ctx); fallback_ctx = NULL; }
-                    target_pid = -1;
                     ebpf_seen_frames = false;
                     ebpf_stale_zero_sent = false;
                     printf("[FPS] 停止监测 %s\n", pkg);
@@ -3749,7 +4050,6 @@ static void* fps_thread(void* arg) {
                            active_pid, next_pid, next_pid_source);
                     ebpf_fps_stop(ebpf_ctx);
                     ebpf_ctx = fps_start_ebpf_ctx(pkg, next_pid, next_pid_source);
-                    target_pid = next_pid;
                     ebpf_first_fps = true;
                     ebpf_pid_reported = false;
                     ebpf_poll_failures = 0;

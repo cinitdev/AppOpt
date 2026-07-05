@@ -22,7 +22,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
 ) {
     companion object {
         private const val DATABASE_NAME = "appopt.db"
-        private const val DATABASE_VERSION = 4
+        private const val DATABASE_VERSION = 5
 
         // 表名
         private const val TABLE_SESSIONS = "sessions"
@@ -42,6 +42,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
         private const val COL_AVG = "avg"
         private const val COL_MAX = "max"
         private const val COL_SERIES = "series"
+        private const val COL_DETAILS = "details"
 
         @Volatile
         private var instance: AppOptDbHelper? = null
@@ -144,6 +145,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
                 $COL_AVG REAL NOT NULL,
                 $COL_MAX REAL NOT NULL,
                 $COL_SERIES TEXT NOT NULL,
+                $COL_DETAILS TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY($COL_THREAD_SESSION_ID) REFERENCES $TABLE_SESSIONS($COL_SESSION_ID) ON DELETE CASCADE
             )
             """.trimIndent()
@@ -179,6 +181,12 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
             android.util.Log.d("AppOpt", "upgrade db v$oldVersion -> v$newVersion: add session de-duplication")
             removeDuplicateSessions(db)
             createIndexes(db)
+        }
+        if (oldVersion < 5) {
+            android.util.Log.d("AppOpt", "upgrade db v$oldVersion -> v$newVersion: add load details")
+            db.execSQL(
+                "ALTER TABLE $TABLE_THREADS ADD COLUMN $COL_DETAILS TEXT NOT NULL DEFAULT ''"
+            )
         }
     }
 
@@ -220,6 +228,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
                         put(COL_AVG, thread.avg)
                         put(COL_MAX, thread.max)
                         put(COL_SERIES, compressSeries(thread.series))
+                        put(COL_DETAILS, thread.details)
                     }
                     val threadId = db.insert(TABLE_THREADS, null, threadValues)
                     check(threadId != -1L) { "insert thread failed: ${thread.name}" }
@@ -325,12 +334,44 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
                         name = it.getString(it.getColumnIndexOrThrow(COL_NAME)),
                         avg = it.getFloat(it.getColumnIndexOrThrow(COL_AVG)),
                         max = it.getFloat(it.getColumnIndexOrThrow(COL_MAX)),
-                        series = decompressSeries(compressedSeries)
+                        series = decompressSeries(compressedSeries),
+                        details = it.getString(it.getColumnIndexOrThrow(COL_DETAILS))
                     )
                 )
             }
         }
         return threads
+    }
+
+    /**
+     * 读取规则编辑器需要的历史负载摘要，不读取和解压折线序列。
+     */
+    fun getRuleHistoryRecordsByPackage(pkg: String): List<RuleHistoryRecord> {
+        val records = mutableListOf<RuleHistoryRecord>()
+        val cursor = readableDatabase.rawQuery(
+            """
+            SELECT s.$COL_EPOCH, t.$COL_NAME, t.$COL_AVG, t.$COL_MAX, t.$COL_DETAILS
+            FROM $TABLE_SESSIONS s
+            INNER JOIN $TABLE_THREADS t ON t.$COL_THREAD_SESSION_ID = s.$COL_SESSION_ID
+            WHERE s.$COL_PKG = ?
+            ORDER BY s.$COL_EPOCH DESC, s.$COL_SESSION_ID DESC, t.$COL_AVG DESC
+            """.trimIndent(),
+            arrayOf(pkg)
+        )
+        cursor.use {
+            while (it.moveToNext()) {
+                records.add(
+                    RuleHistoryRecord(
+                        epoch = it.getLong(0),
+                        name = it.getString(1),
+                        avg = it.getFloat(2),
+                        max = it.getFloat(3),
+                        details = it.getString(4)
+                    )
+                )
+            }
+        }
+        return records
     }
 
     /**
@@ -375,7 +416,7 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
         val packages = mutableListOf<PackageInfo>()
         val cursor = db.rawQuery(
             """
-            SELECT $COL_PKG, MAX($COL_EPOCH) AS last_time
+            SELECT $COL_PKG, MAX($COL_EPOCH) AS last_time, COUNT(*) AS session_count
             FROM $TABLE_SESSIONS
             GROUP BY $COL_PKG
             ORDER BY last_time DESC
@@ -387,7 +428,8 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
                 packages.add(
                     PackageInfo(
                         pkg = it.getString(0),
-                        lastTime = it.getLong(1)
+                        lastTime = it.getLong(1),
+                        sessionCount = it.getInt(2)
                     )
                 )
             }
@@ -460,7 +502,8 @@ data class ThreadImport(
     val name: String,
     val avg: Float,
     val max: Float,
-    val series: String
+    val series: String,
+    val details: String = ""
 )
 
 /**
@@ -470,7 +513,19 @@ data class ThreadData(
     val name: String,
     val avg: Float,
     val max: Float,
-    val series: String
+    val series: String,
+    val details: String
+)
+
+/**
+ * 规则编辑器使用的轻量历史记录，不包含折线序列。
+ */
+data class RuleHistoryRecord(
+    val epoch: Long,
+    val name: String,
+    val avg: Float,
+    val max: Float,
+    val details: String
 )
 
 /**
@@ -478,5 +533,6 @@ data class ThreadData(
  */
 data class PackageInfo(
     val pkg: String,
-    val lastTime: Long
+    val lastTime: Long,
+    val sessionCount: Int
 )

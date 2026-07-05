@@ -13,7 +13,8 @@ object ConfigReader {
 
     data class ConfigPackages(
         val autoPackages: List<String>,
-        val configuredPackages: List<String>
+        val configuredPackages: List<String>,
+        val configuredRuleCounts: Map<String, Int> = emptyMap()
     )
 
     /**
@@ -25,13 +26,14 @@ object ConfigReader {
 
     /**
      * 返回配置中的待配置包名(auto)和已配置包名(非 auto)。
-     * 多条线程规则会合并为同一个包名, 保留配置文件中的首次出现顺序。
+     * 多条线程规则会合并为同一个包名, 同时保留每个进程的实际规则行数。
      */
     fun readPackages(): ConfigPackages {
         val text = DaemonBridge.readConfigRaw()
         if (text.isBlank()) return ConfigPackages(emptyList(), emptyList())
         val auto = LinkedHashSet<String>()
         val configured = LinkedHashSet<String>()
+        val configuredRuleCounts = LinkedHashMap<String, Int>()
         for (rawLine in text.lineSequence()) {
             val line = rawLine.trim()
             if (line.isEmpty() || line.startsWith("#")) continue
@@ -47,8 +49,9 @@ object ConfigReader {
                 auto.add(key)
             } else {
                 configured.add(key)
+                configuredRuleCounts[key] = (configuredRuleCounts[key] ?: 0) + 1
             }
         }
-        return ConfigPackages(auto.toList(), configured.toList())
+        return ConfigPackages(auto.toList(), configured.toList(), configuredRuleCounts)
     }
 }

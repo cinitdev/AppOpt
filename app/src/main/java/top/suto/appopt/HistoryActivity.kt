@@ -1,6 +1,8 @@
 package top.suto.appopt
 
 import android.content.ContentValues
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.graphics.Color
 import android.os.Bundle
 import android.os.Environment
@@ -8,12 +10,14 @@ import android.provider.MediaStore
 import android.view.LayoutInflater
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import kotlin.concurrent.thread
 import top.suto.appopt.databinding.ActivityHistoryBinding
 import top.suto.appopt.databinding.DialogSessionDeleteBinding
 import top.suto.appopt.databinding.DialogSessionManageBinding
 import top.suto.appopt.databinding.ItemCalibSessionBinding
+import top.suto.appopt.databinding.ItemChildThreadLoadBinding
 import top.suto.appopt.databinding.ItemThreadLoadBinding
 import top.suto.appopt.db.AppOptDbHelper
 import top.suto.appopt.db.ThreadData
@@ -22,12 +26,12 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 展示某应用的历史线程负载记录, 仿 Scene 风格: 每次校准一张卡片,
- * 卡片内每个线程一行: 线程名 + AVG/MAX 占比 + 折线图(瞬时占比随时间)。
+ * 展示某应用的历史负载记录: 每次校准一张卡片, 主进程按线程展示,
+ * 子进程按整体负载展示 AVG/MAX 占比和瞬时占比折线图。
  *
  * 数据来自守护进程写入的 history/<pkg>.log, 每段:
  *   # <epoch秒> <采样轮数>
- *   <AVG%> <MAX%> <线程名>|<p1,p2,...,pN>
+ *   <AVG%> <MAX%> <名称>|<p1,p2,...,pN>[|v2:子线程名,AVG,MAX;...]
  */
 class HistoryActivity : AppCompatActivity() {
 
@@ -44,7 +48,14 @@ class HistoryActivity : AppCompatActivity() {
         val name: String,
         val avg: Float,
         val max: Float,
-        val series: FloatArray
+        val series: FloatArray,
+        val details: String
+    )
+
+    private data class ChildThreadLoad(
+        val name: String,
+        val avg: Float?,
+        val max: Float?
     )
 
     /** 一次校准会话 */
@@ -64,6 +75,13 @@ class HistoryActivity : AppCompatActivity() {
         val label = intent.getStringExtra(EXTRA_LABEL).orEmpty().ifBlank { pkg }
         appLabel = label
         binding.historyTitle.text = label
+        binding.historyPkg.text = pkg
+        binding.historyBack.setOnClickListener { finish() }
+        try {
+            binding.historyIcon.setImageDrawable(packageManager.getApplicationIcon(pkg))
+        } catch (_: Exception) {
+            binding.historyIcon.setImageResource(R.drawable.ic_launcher_foreground)
+        }
 
         if (pkg.isBlank()) {
             showEmpty("无效的包名")
@@ -117,6 +135,7 @@ class HistoryActivity : AppCompatActivity() {
         binding.historyEmpty.text = msg
         binding.historyEmpty.visibility = View.VISIBLE
         binding.sessionContainer.visibility = View.GONE
+        binding.historyCount.text = ""
     }
 
     /** 当前展开的卡片绑定; 每次只展开一张, 点新的先折叠旧的。 */
@@ -136,17 +155,20 @@ class HistoryActivity : AppCompatActivity() {
         }
         binding.historyEmpty.visibility = View.GONE
         binding.sessionContainer.visibility = View.VISIBLE
+        binding.historyCount.text = "${sessions.size} 次校准"
         binding.sessionContainer.removeAllViews()
         expandedCard = null
         val inflater = LayoutInflater.from(this)
 
         for (s in sessions) {
             val card = ItemCalibSessionBinding.inflate(inflater, binding.sessionContainer, false)
-            card.sessionTime.text = formatHistoryTime(s.epoch)
+            card.sessionDate.text = formatHistoryDate(s.epoch)
+            card.sessionTime.text = formatHistoryClock(s.epoch)
             // round_count = 采样轮数, 每轮间隔 0.5 秒; 显示成采样时长
             val durationSec = s.rounds / 2
             val durationStr = formatDuration(durationSec)
-            card.sessionMeta.text = "${s.threadCount} 线程 · $durationStr"
+            card.sessionThreads.text = "${s.threadCount} 条记录"
+            card.sessionDuration.text = durationStr
             // 默认全部折叠; 点击头部展开本卡, 同时折叠上一张展开的卡(单展开互斥)
             setCardExpanded(card, false)
             card.sessionHeader.setOnClickListener {
@@ -173,7 +195,7 @@ class HistoryActivity : AppCompatActivity() {
         val durationSec = session.rounds / 2
         view.sessionManageTitle.text = "校准记录"
         view.sessionManageMeta.text =
-            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 线程 · ${formatDuration(durationSec)}"
+            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 条记录 · ${formatDuration(durationSec)}"
 
         view.sessionManageCancel.setOnClickListener { dialog.dismiss() }
         view.sessionManageExport.setOnClickListener {
@@ -194,7 +216,7 @@ class HistoryActivity : AppCompatActivity() {
 
         view.sessionDeleteTitle.text = "删除校准记录"
         view.sessionDeleteMeta.text =
-            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 线程"
+            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 条记录"
         view.sessionDeleteCancel.setOnClickListener { dialog.dismiss() }
         view.sessionDeleteConfirm.setOnClickListener {
             dialog.dismiss()
@@ -238,17 +260,46 @@ class HistoryActivity : AppCompatActivity() {
             appendLine("时间: ${formatHistoryTime(session.epoch)}")
             appendLine("采样轮数: ${session.rounds}")
             appendLine("采样时长: ${formatDuration(durationSec)}")
-            appendLine("线程数: ${threads.size}")
+            appendLine("负载记录数: ${threads.size}")
             appendLine()
-            appendLine("线程负载:")
-            appendLine("AVG%  MAX%  线程名")
+            appendLine("负载记录:")
+            appendLine("AVG%  MAX%  类型    名称")
             for (t in threads) {
-                appendLine(String.format(Locale.US, "%.1f  %.1f  %s", t.avg, t.max, t.name))
+                val childProcess = isChildProcessLoad(t.name)
+                appendLine(
+                    String.format(
+                        Locale.US,
+                        "%.1f  %.1f  %-6s  %s",
+                        t.avg,
+                        t.max,
+                        if (childProcess) "子进程" else "线程",
+                        displayLoadName(t.name)
+                    )
+                )
+                val childThreads = parseChildThreadLoads(t.details)
+                if (childProcess && childThreads.isNotEmpty()) {
+                    appendLine("             线程明细:")
+                    for (childThread in childThreads) {
+                        val stats = if (childThread.avg != null && childThread.max != null) {
+                            String.format(
+                                Locale.US,
+                                "AVG %.1f%%  MAX %.1f%%",
+                                childThread.avg,
+                                childThread.max
+                            )
+                        } else {
+                            "AVG --  MAX --"
+                        }
+                        appendLine("               ${childThread.name}  $stats")
+                    }
+                }
             }
             appendLine()
             appendLine("曲线数据:")
             for (t in threads) {
-                appendLine("${t.name}|${t.series}")
+                append(t.name).append('|').append(t.series)
+                if (t.details.isNotBlank()) append('|').append(t.details)
+                appendLine()
             }
         }
     }
@@ -304,6 +355,16 @@ class HistoryActivity : AppCompatActivity() {
             .format(Date(epochSeconds * 1000))
     }
 
+    private fun formatHistoryDate(epochSeconds: Long): String {
+        return SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            .format(Date(epochSeconds * 1000))
+    }
+
+    private fun formatHistoryClock(epochSeconds: Long): String {
+        return SimpleDateFormat("HH:mm:ss", Locale.US)
+            .format(Date(epochSeconds * 1000))
+    }
+
     private fun ensureThreadsLoaded(card: ItemCalibSessionBinding, sessionId: Long, durationSec: Int) {
         if (card.threadRows.childCount > 0) return
         val generation = reloadGeneration
@@ -355,9 +416,34 @@ class HistoryActivity : AppCompatActivity() {
         for (i in startIndex until nextIndex) {
             val tl = loads[i]
             val row = ItemThreadLoadBinding.inflate(inflater, card.threadRows, false)
-            row.threadName.text = tl.name
-            row.threadStats.text =
-                String.format(Locale.US, "AVG %.1f%%  MAX %.1f%%", tl.avg, tl.max)
+            val isChildProcess = isChildProcessLoad(tl.name)
+            row.loadType.text = if (isChildProcess) "子进程" else "线程"
+            row.loadType.setBackgroundResource(
+                if (isChildProcess) R.drawable.bg_rule_type_main else R.drawable.bg_rule_type_thread
+            )
+            row.loadType.setTextColor(
+                ContextCompat.getColor(
+                    this,
+                    if (isChildProcess) R.color.brand_secondary else R.color.brand_primary_dark
+                )
+            )
+            row.threadName.text = displayLoadName(tl.name)
+            row.threadName.setOnLongClickListener {
+                copyLoadName(tl.name)
+                true
+            }
+            val childThreads = parseChildThreadLoads(tl.details)
+            bindChildThreadDetails(row, inflater, isChildProcess, childThreads)
+            row.threadAvg.text = String.format(
+                Locale.US,
+                if (isChildProcess) "整体 AVG %.1f%%" else "AVG %.1f%%",
+                tl.avg
+            )
+            row.threadMax.text = String.format(
+                Locale.US,
+                if (isChildProcess) "整体 MAX %.1f%%" else "MAX %.1f%%",
+                tl.max
+            )
             row.threadSpark.setData(tl.series, colorFor(tl.avg, tl.max), durationSec)
             card.threadRows.addView(row.root)
         }
@@ -394,8 +480,92 @@ class HistoryActivity : AppCompatActivity() {
             name = name,
             avg = avg,
             max = max,
-            series = series.split(',').mapNotNull { it.toFloatOrNull() }.toFloatArray()
+            series = series.split(',').mapNotNull { it.toFloatOrNull() }.toFloatArray(),
+            details = details
         )
+    }
+
+    private fun parseChildThreadLoads(details: String): List<ChildThreadLoad> {
+        if (details.isBlank()) return emptyList()
+        if (!details.startsWith("v2:")) {
+            return details.split(',')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .map { ChildThreadLoad(it, null, null) }
+        }
+        return details.removePrefix("v2:")
+            .split(';')
+            .mapNotNull { record ->
+                val parts = record.split(',', limit = 3)
+                val name = parts.getOrNull(0)?.trim().orEmpty()
+                val avg = parts.getOrNull(1)?.toFloatOrNull()
+                val max = parts.getOrNull(2)?.toFloatOrNull()
+                if (name.isEmpty() || avg == null || max == null) null
+                else ChildThreadLoad(name, avg, max)
+            }
+    }
+
+    private fun bindChildThreadDetails(
+        row: ItemThreadLoadBinding,
+        inflater: LayoutInflater,
+        isChildProcess: Boolean,
+        loads: List<ChildThreadLoad>
+    ) {
+        val available = isChildProcess && loads.isNotEmpty()
+        row.childThreadsToggle.visibility = if (available) View.VISIBLE else View.GONE
+        row.childThreadsContainer.visibility = View.GONE
+        row.childThreadsArrow.rotation = 0f
+        if (!available) return
+
+        row.childThreadCount.text = "${loads.size} 个活跃"
+        var rendered = false
+        var expanded = false
+        row.childThreadsToggle.setOnClickListener {
+            if (!rendered) {
+                for (load in loads) {
+                    val item = ItemChildThreadLoadBinding.inflate(
+                        inflater,
+                        row.childThreadsRows,
+                        false
+                    )
+                    item.childThreadName.text = load.name
+                    item.childThreadName.setOnLongClickListener {
+                        copyLoadName(load.name)
+                        true
+                    }
+                    item.childThreadAvg.text = load.avg?.let {
+                        String.format(Locale.US, "%.1f%%", it)
+                    } ?: "--"
+                    item.childThreadMax.text = load.max?.let {
+                        String.format(Locale.US, "%.1f%%", it)
+                    } ?: "--"
+                    row.childThreadsRows.addView(item.root)
+                }
+                rendered = true
+            }
+            expanded = !expanded
+            row.childThreadsContainer.visibility = if (expanded) View.VISIBLE else View.GONE
+            row.childThreadsArrow.rotation = if (expanded) 180f else 0f
+        }
+    }
+
+    private fun displayLoadName(name: String): String {
+        return if (isChildProcessLoad(name)) {
+            name.removePrefix(pkg)
+        } else {
+            name
+        }
+    }
+
+    private fun isChildProcessLoad(name: String): Boolean {
+        return name.startsWith("$pkg:") && !name.contains('{')
+    }
+
+    private fun copyLoadName(name: String) {
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        clipboard.setPrimaryClip(ClipData.newPlainText("AppOpt 负载名称", name))
+        val isChildProcess = isChildProcessLoad(name)
+        toast(if (isChildProcess) "已复制子进程名" else "已复制线程名")
     }
 
     private fun toast(msg: String) {
@@ -410,5 +580,5 @@ class HistoryActivity : AppCompatActivity() {
         else -> Color.parseColor("#2ECC71")
     }
 
-    /** 解析日志文本为会话列表, 最新一次排在前面; 会话内线程按 AVG 降序。 */
+    /** 会话内主进程线程与子进程整体负载统一按 AVG 降序。 */
 }

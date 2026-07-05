@@ -18,6 +18,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.TextView
 import java.util.Locale
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 import kotlin.math.abs
 import top.suto.appopt.databinding.OverlayResultBinding
@@ -59,11 +60,14 @@ class FloatingBallService : Service() {
     private var resultView: View? = null
     private var capsuleAdded = false
     @Volatile private var serviceDestroyed = false
-    private val foregroundTracker = ForegroundDetector.Tracker()
+    private var foregroundTracker = ForegroundDetector.Tracker()
     private var usageAccessMissingCount = 0
-    @Volatile private var foregroundCheckRunning = false
+    private var foregroundCheckGeneration = -1L
+    private var monitorGeneration = 0L
+    private var pendingStopRunnable: Runnable? = null
 
     private data class ForegroundCheckSnapshot(
+        val generation: Long,
         val checkPkg: String,
         val foreground: Boolean,
         val processRunning: Boolean,
@@ -101,6 +105,9 @@ class FloatingBallService : Service() {
         private const val MANUAL_STOP_TIMEOUT_MS = 18_000L
         private const val MANUAL_STOP_CLOSE_DELAY_MS = 20_000L
         private const val MANUAL_WAIT_DONE_MS = 22_000L
+        private val FPS_COMMAND_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "AppOptFpsCommand").apply { isDaemon = true }
+        }
     }
 
     override fun onCreate() {
@@ -117,6 +124,21 @@ class FloatingBallService : Service() {
         mainHandler.post {
             if (!serviceDestroyed) action()
         }
+    }
+
+    private fun cancelPendingStop() {
+        pendingStopRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingStopRunnable = null
+    }
+
+    private fun scheduleStopSelf(delayMs: Long, generation: Long = monitorGeneration) {
+        cancelPendingStop()
+        val stop = Runnable {
+            pendingStopRunnable = null
+            if (!serviceDestroyed && generation == monitorGeneration) stopSelf()
+        }
+        pendingStopRunnable = stop
+        mainHandler.postDelayed(stop, delayMs)
     }
 
     private fun buildNotification(): Notification {
@@ -251,7 +273,7 @@ class FloatingBallService : Service() {
             launchProcessMissingCount = 0
             capsule.setBackgroundResource(R.drawable.capsule_red)
             updateCapsuleText()
-            showBanner("● 开始记录线程负载\n请正常操作游戏, 完成后再次点击胶囊结束", durationMs = 3500)
+            showBanner("● 开始记录应用负载\n请正常操作游戏, 完成后再次点击胶囊结束", durationMs = 3500)
             thread {
                 val ok = DaemonBridge.startCalibration(pkg)
                 android.util.Log.d("AppOpt", "calibration start command result: pkg=$pkg ok=$ok")
@@ -262,6 +284,7 @@ class FloatingBallService : Service() {
             }
         } else {
             // 红 -> 停止采样并生成规则; 移除胶囊, 弹出结果卡片
+            val generation = monitorGeneration
             val pkg = targetPkg ?: ""
             android.util.Log.d(
                 "AppOpt",
@@ -272,16 +295,20 @@ class FloatingBallService : Service() {
             foregroundClosing = true
             mainHandler.removeCallbacks(foregroundWatcher)
             removeCapsule()
-            showBanner("正在分析线程负载并生成规则…", durationMs = 3500)
+            showBanner("正在分析负载并生成规则…", durationMs = 3500)
             var stopTimedOut = false
             var timeoutClose: Runnable? = null
             var timeoutStopSelf: Runnable? = null
             val stopTimeout = Runnable {
+                if (generation != monitorGeneration) return@Runnable
                 stopTimedOut = true
                 showBanner("已请求停止，守护进程仍在生成规则\n完成后会自动显示结果", durationMs = 4200)
                 val close = Runnable {
+                    if (generation != monitorGeneration) return@Runnable
                     showBanner("校准收尾时间过长\n可稍后在历史记录或日志里查看结果", durationMs = 3200)
-                    val stop = Runnable { stopSelf() }
+                    val stop = Runnable {
+                        if (generation == monitorGeneration) stopSelf()
+                    }
                     timeoutStopSelf = stop
                     mainHandler.postDelayed(stop, 3200)
                 }
@@ -295,12 +322,13 @@ class FloatingBallService : Service() {
                 val rules = if (status == "ok") DaemonBridge.readPkgRules(pkg) else emptyList()
                 android.util.Log.d("AppOpt", "校准完成: ok=$ok, status=$status, rules.size=${rules.size}")
                 postIfAlive {
+                    if (generation != monitorGeneration) return@postIfAlive
                     mainHandler.removeCallbacks(stopTimeout)
                     timeoutClose?.let { mainHandler.removeCallbacks(it) }
                     timeoutStopSelf?.let { mainHandler.removeCallbacks(it) }
                     if (ok && status == null && !stopTimedOut) {
                         showBanner("等待守护进程响应超时\n规则可能未生成，请重试或检查日志", durationMs = 3200)
-                        mainHandler.postDelayed({ stopSelf() }, 3000)
+                        scheduleStopSelf(3000, generation)
                     } else {
                         showResult(pkg, ok, status, rules)
                     }
@@ -312,6 +340,7 @@ class FloatingBallService : Service() {
     /** 校准结束后, 在悬浮窗里展示生成的规则结果; 3 秒后自动关闭, 用户也可点「完成」提前关闭。 */
     private fun showResult(pkg: String, ok: Boolean, status: String?, rules: List<String>) {
         if (serviceDestroyed) return
+        val generation = monitorGeneration
         // Service 的 Context 没有 Theme, 需要包装一个带主题的 ContextThemeWrapper
         val themedContext = android.view.ContextThemeWrapper(this, R.style.Theme_AppOpt)
         val view = OverlayResultBinding.inflate(LayoutInflater.from(themedContext))
@@ -329,7 +358,7 @@ class FloatingBallService : Service() {
         } else if (status == "no_load") {
             view.resultIcon.setImageResource(R.drawable.ic_info)
             view.resultTitle.text = "负载过低"
-            view.resultSummary.text = "未检测到明显的线程负载变化\n建议在游戏内正常游玩时采样"
+            view.resultSummary.text = "未检测到明显的负载变化\n建议在游戏内正常游玩时采样"
             view.rulesContainer.visibility = android.view.View.GONE
         } else if (status == "write_fail") {
             view.resultIcon.setImageResource(R.drawable.ic_error)
@@ -372,7 +401,7 @@ class FloatingBallService : Service() {
                 mainHandler.removeCallbacks(this)  // 取消未触发的自动关闭
                 try { windowManager.removeView(view.root) } catch (_: Exception) {}
                 if (resultView === view.root) resultView = null
-                stopSelf()
+                if (generation == monitorGeneration) stopSelf()
             }
         }
         view.resultOk.setOnClickListener { close.run() }
@@ -385,7 +414,7 @@ class FloatingBallService : Service() {
         } catch (e: Exception) {
             if (resultView === view.root) resultView = null
             // addView 失败(权限撤销/窗口异常), 停止服务避免空跑
-            stopSelf()
+            if (generation == monitorGeneration) stopSelf()
         }
     }
 
@@ -456,6 +485,7 @@ class FloatingBallService : Service() {
     private val foregroundWatcher = object : Runnable {
         override fun run() {
             if (serviceDestroyed) return
+            val generation = monitorGeneration
             val pkg = targetPkg
             if (pkg.isNullOrBlank() || foregroundClosing) return
             // 没有使用情况访问权限时无法判断前台。短暂不可用先重试, 连续不可用则收尾关闭,
@@ -476,7 +506,7 @@ class FloatingBallService : Service() {
             usageAccessMissingCount = 0
             val checkPkg = launchPkg ?: pkg
             val needLaunchProcessCheck = !hasAppearedForeground
-            if (foregroundCheckRunning) {
+            if (foregroundCheckGeneration == generation) {
                 android.util.Log.d(
                     "AppOpt",
                     "FloatingBallService foreground check: target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} check=$checkPkg source=previous_running action=skip foreground=false usage=false focused= appeared=$hasAppearedForeground calibrating=$calibrating absent=$absentCount confirmed=true notConfirmed=$launchProcessMissingCount graceLeft=$appearGraceLeft"
@@ -484,7 +514,8 @@ class FloatingBallService : Service() {
                 mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
                 return
             }
-            foregroundCheckRunning = true
+            foregroundCheckGeneration = generation
+            val tracker = foregroundTracker
             thread {
                 var foreground = false
                 var processRunning = true
@@ -494,7 +525,7 @@ class FloatingBallService : Service() {
                 var checkKey = "unknown"
                 var checkDetail = ""
                 try {
-                    usageState = foregroundTracker.queryState(this@FloatingBallService, checkPkg)
+                    usageState = tracker.queryState(this@FloatingBallService, checkPkg)
                     usageForeground = usageState.foreground
                     val topState = DaemonBridge.readTopAppState(checkPkg)
                     focusedPkg = DaemonBridge.readFocusedPackage()
@@ -533,9 +564,13 @@ class FloatingBallService : Service() {
                     checkDetail = e.message.orEmpty()
                 } finally {
                     postIfAlive {
-                        foregroundCheckRunning = false
+                        if (generation != monitorGeneration) return@postIfAlive
+                        if (foregroundCheckGeneration == generation) {
+                            foregroundCheckGeneration = -1L
+                        }
                         onForegroundChecked(
                             ForegroundCheckSnapshot(
+                                generation = generation,
                                 checkPkg = checkPkg,
                                 foreground = foreground,
                                 processRunning = processRunning,
@@ -559,6 +594,8 @@ class FloatingBallService : Service() {
 
     private fun onForegroundChecked(snapshot: ForegroundCheckSnapshot) {
         if (serviceDestroyed) return
+        if (snapshot.generation != monitorGeneration) return
+        if (snapshot.checkPkg != (launchPkg ?: targetPkg)) return
         if (foregroundClosing) return
         var action = "observe"
         if (snapshot.foreground) {
@@ -642,6 +679,7 @@ class FloatingBallService : Service() {
             "FloatingBallService auto close: reason=usage_access_lost appeared=$hasAppearedForeground calibrating=$calibrating target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} focused= absent=$absentCount notConfirmed=$launchProcessMissingCount source=usage_access detail=UsageStats permission unavailable"
         )
         foregroundClosing = true
+        val generation = monitorGeneration
         mainHandler.removeCallbacks(foregroundWatcher)
         removeCapsule()
 
@@ -653,13 +691,14 @@ class FloatingBallService : Service() {
             thread {
                 DaemonBridge.stopCalibration(pkg)
                 postIfAlive {
+                    if (generation != monitorGeneration) return@postIfAlive
                     showBanner("使用情况访问权限不可用\n校准已停止，悬浮球已关闭", durationMs = 2800)
-                    mainHandler.postDelayed({ stopSelf() }, 2600)
+                    scheduleStopSelf(2600, generation)
                 }
             }
         } else {
             showBanner("使用情况访问权限不可用\n悬浮球已关闭", durationMs = 2800)
-            mainHandler.postDelayed({ stopSelf() }, 2600)
+            scheduleStopSelf(2600, generation)
         }
     }
 
@@ -681,6 +720,7 @@ class FloatingBallService : Service() {
             "FloatingBallService auto close: reason=$reason appeared=$appeared calibrating=$calibrating target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} focused=${focusedPkg.orEmpty()} absent=$absentCount notConfirmed=$launchProcessMissingCount source=${source.orEmpty()} detail=${detail.orEmpty()}"
         )
         foregroundClosing = true
+        val generation = monitorGeneration
         mainHandler.removeCallbacks(foregroundWatcher)
         removeCapsule()
         val pkg = targetPkg ?: ""
@@ -697,14 +737,15 @@ class FloatingBallService : Service() {
                 val msg = when (status) {
                     "ok" -> "校准完成，规则已生成"
                     "short" -> "采样时长不足 (需要 ≥30 秒)\n建议重新进入游戏多玩一会"
-                    "no_load" -> "未检测到明显线程负载\n建议在游戏内正常游玩时采样"
+                    "no_load" -> "未检测到明显负载\n建议在游戏内正常游玩时采样"
                     "write_fail" -> "规则写回配置文件失败\n请检查模块权限"
                     else -> "已退出游戏，校准已停止\n(数据已保存到历史记录)"
                 }
 
                 postIfAlive {
+                    if (generation != monitorGeneration) return@postIfAlive
                     showBanner(msg, durationMs = 2600)
-                    mainHandler.postDelayed({ stopSelf() }, 2600)
+                    scheduleStopSelf(2600, generation)
                 }
             }
         } else {
@@ -714,7 +755,7 @@ class FloatingBallService : Service() {
                 else     -> "未检测到目标应用启动\n悬浮球已自动关闭"
             }
             showBanner(msg, durationMs = 2600)
-            mainHandler.postDelayed({ stopSelf() }, 2200)
+            scheduleStopSelf(2200, generation)
         }
     }
 
@@ -723,12 +764,14 @@ class FloatingBallService : Service() {
         val pkgToStop = targetPkg?.takeIf { it.isNotBlank() && calibrating }
         calibrating = false
         serviceDestroyed = true
+        monitorGeneration++
+        cancelPendingStop()
         mainHandler.removeCallbacksAndMessages(null)
         // fpsMonitor 在 onStartCommand 才初始化; 服务若在那之前被回收, 直接访问会崩
         if (::fpsMonitor.isInitialized) fpsMonitor.stop()
         // 通知守护进程停止 FPS 监测(省电)。su 是独立进程,
         // 即使本进程随后退出, 已 fork 的命令仍会执行完。
-        thread {
+        FPS_COMMAND_EXECUTOR.execute {
             if (pkgToStop != null) DaemonBridge.stopCalibration(pkgToStop)
             DaemonBridge.stopFpsMonitor()
         }
@@ -741,17 +784,46 @@ class FloatingBallService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        intent?.getStringExtra(EXTRA_TARGET_PKG)?.let {
-            if (it.isNotBlank()) targetPkg = it
-        }
-        intent?.getStringExtra(EXTRA_LAUNCH_PKG)?.let {
-            if (it.isNotBlank()) launchPkg = it
-        }
-        if (targetPkg.isNullOrBlank()) {
+        val requestedTarget = intent?.getStringExtra(EXTRA_TARGET_PKG)
+            ?.takeIf { it.isNotBlank() } ?: targetPkg
+        if (requestedTarget.isNullOrBlank()) {
             android.util.Log.d("AppOpt", "FloatingBallService stop: missing target package")
             stopSelf()
             return START_NOT_STICKY
         }
+        val requestedLaunch = intent?.getStringExtra(EXTRA_LAUNCH_PKG)
+            ?.takeIf { it.isNotBlank() } ?: requestedTarget
+        val previousTarget = targetPkg
+        val targetChanged = !previousTarget.isNullOrBlank() && previousTarget != requestedTarget
+        if (targetChanged && calibrating) {
+            calibrating = false
+            FPS_COMMAND_EXECUTOR.execute { DaemonBridge.stopCalibration(previousTarget!!) }
+        }
+
+        monitorGeneration++
+        val generation = monitorGeneration
+        cancelPendingStop()
+        mainHandler.removeCallbacks(foregroundWatcher)
+        bannerView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
+        bannerView = null
+        resultView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
+        resultView = null
+        foregroundClosing = false
+        targetPkg = requestedTarget
+        launchPkg = requestedLaunch
+        hasAppearedForeground = false
+        absentCount = 0
+        usageAccessMissingCount = 0
+        launchProcessMissingCount = 0
+        foregroundCheckGeneration = -1L
+        appearGraceLeft = FG_APPEAR_GRACE
+        foregroundTracker = ForegroundDetector.Tracker()
+        currentFps = 0f
+        if (capsuleAdded && ::capsule.isInitialized) {
+            capsule.setBackgroundResource(R.drawable.capsule_yellow)
+            updateCapsuleText()
+        }
+
         addCapsule()
         // 初始化真实帧率接收器: 优先本地 socket, 文件监听仅作兜底
         if (!::fpsMonitor.isInitialized) {
@@ -771,22 +843,17 @@ class FloatingBallService : Service() {
                 "AppOpt",
                 "FloatingBallService start fps monitor: pkg=$pkg socket=${!fpsSocketName.isNullOrBlank()}"
             )
-            thread {
+            FPS_COMMAND_EXECUTOR.execute {
                 val ok = DaemonBridge.startFpsMonitor(pkg, fpsSocketName, fpsSocketToken)
                 android.util.Log.d("AppOpt", "FloatingBallService fps command result: pkg=$pkg ok=$ok")
                 if (!ok) {
-                    postIfAlive { toast("帧率监测下发失败, 请确认 root") }
+                    postIfAlive {
+                        if (generation == monitorGeneration) {
+                            toast("帧率监测下发失败, 请确认 root")
+                        }
+                    }
                 }
             }
-            // 重置前台检测状态(避免保留上次启动的残留值)
-            hasAppearedForeground = false
-            absentCount = 0
-            usageAccessMissingCount = 0
-            launchProcessMissingCount = 0
-            foregroundCheckRunning = false
-            appearGraceLeft = FG_APPEAR_GRACE
-            foregroundTracker.reset()   // 清上一轮残留的前台跟踪状态
-            mainHandler.removeCallbacks(foregroundWatcher)
             mainHandler.postDelayed(foregroundWatcher, FG_CHECK_INTERVAL)
         }
         return START_NOT_STICKY

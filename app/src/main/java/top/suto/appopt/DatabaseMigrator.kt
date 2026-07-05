@@ -30,73 +30,84 @@ object DatabaseMigrator {
         synchronized(getLock(pkg)) {  // 同一包名串行执行
             val db = AppOptDbHelper.getInstance(context)
 
-            // 读取 .log 文件
-            val raw = DaemonBridge.readHistory(pkg)
-            if (raw.isBlank()) {
-                return  // 无数据
-            }
-
             // 已存在的 epoch 集合(去重用)
             val existingEpochs = db.getEpochsByPackage(pkg).toHashSet()
-
             android.util.Log.d("AppOpt", "migrate: $pkg 开始,已有 ${existingEpochs.size} 个 epoch")
 
-            var imported = 0
-            var epoch = 0L
-            var rounds = 0
-            val threadLines = mutableListOf<String>()
-            var inSession = false
-            var seenSessions = 0
+            var totalImported = 0
+            var processedClaims = 0
+            while (processedClaims < MAX_IMPORT_CLAIMS) {
+                val raw = DaemonBridge.claimHistoryImport(pkg)
+                if (raw.isBlank()) break
 
-            fun flush() {
-                if (inSession && epoch > 0) {
-                    seenSessions++
-                }
-                if (inSession && epoch > 0 && epoch !in existingEpochs) {
-                    val threads = threadLines.mapNotNull { parseThreadLine(it) }
-                    val inserted = db.insertSessionWithThreadsIfAbsent(pkg, epoch, rounds, threads)
-                    if (inserted) {
-                        imported++
+                var imported = 0
+                var epoch = 0L
+                var rounds = 0
+                val threadLines = mutableListOf<String>()
+                var inSession = false
+                var seenSessions = 0
+
+                fun flush() {
+                    if (inSession && epoch > 0) {
+                        seenSessions++
                     }
-                    existingEpochs.add(epoch)  // 防止同一文件内重复或并发重复
+                    if (inSession && epoch > 0 && epoch !in existingEpochs) {
+                        val threads = threadLines.mapNotNull { parseThreadLine(it) }
+                        if (db.insertSessionWithThreadsIfAbsent(pkg, epoch, rounds, threads)) {
+                            imported++
+                        }
+                        existingEpochs.add(epoch)
+                    }
+                    threadLines.clear()
                 }
-                threadLines.clear()
-            }
 
-            for (line in raw.lineSequence()) {
-                val t = line.trim()
-                if (t.isEmpty()) continue
-                if (t.startsWith("#")) {
-                    flush()
-                    val parts = t.removePrefix("#").trim().split(Regex("\\s+"))
-                    epoch = parts.getOrNull(0)?.toLongOrNull() ?: 0L
-                    rounds = parts.getOrNull(1)?.toIntOrNull() ?: 0
-                    inSession = true
-                } else {
-                    threadLines.add(t)
+                for (line in raw.lineSequence()) {
+                    val t = line.trim()
+                    if (t.isEmpty()) continue
+                    if (t.startsWith("#")) {
+                        flush()
+                        val parts = t.removePrefix("#").trim().split(Regex("\\s+"))
+                        epoch = parts.getOrNull(0)?.toLongOrNull() ?: 0L
+                        rounds = parts.getOrNull(1)?.toIntOrNull() ?: 0
+                        inSession = true
+                    } else {
+                        threadLines.add(t)
+                    }
                 }
-            }
-            flush()
+                flush()
 
-            // 导入完成后删除 .log 文件，数据库成为唯一数据源
-            if (seenSessions > 0) {
-                val deleted = DaemonBridge.deleteHistory(pkg)
-                android.util.Log.d("AppOpt", "migrate: $pkg 完成,新导入 $imported 个会话, .log 已删除=$deleted")
-            } else {
-                android.util.Log.d("AppOpt", "migrate: $pkg 完成,无新会话")
+                if (seenSessions <= 0) {
+                    android.util.Log.w("AppOpt", "migrate: $pkg 认领文件不含有效会话，保留文件等待排查")
+                    break
+                }
+                val completed = DaemonBridge.completeHistoryImport(pkg)
+                android.util.Log.d(
+                    "AppOpt",
+                    "migrate: $pkg 已处理认领文件,新导入 $imported 个会话,删除认领文件=$completed"
+                )
+                if (!completed) break
+                totalImported += imported
+                processedClaims++
             }
+            android.util.Log.d("AppOpt", "migrate: $pkg 完成,共新导入 $totalImported 个会话")
         }  // synchronized 结束
     }
 
     /**
-     * 解析线程行: "<AVG> <MAX> <名称>|<p1,p2,...>"
-     * @return (name, avg, max, series)
+     * 解析负载记录行: "<AVG> <MAX> <名称>|<p1,p2,...>[|摘要]"
+     * 旧日志没有摘要字段时保持兼容。
      */
     private fun parseThreadLine(line: String): ThreadImport? {
         val bar = line.indexOf('|')
         if (bar < 0) return null
         val head = line.substring(0, bar)
-        val seriesStr = line.substring(bar + 1)
+        val detailsBar = line.indexOf('|', bar + 1)
+        val seriesStr = if (detailsBar >= 0) {
+            line.substring(bar + 1, detailsBar)
+        } else {
+            line.substring(bar + 1)
+        }
+        val details = if (detailsBar >= 0) line.substring(detailsBar + 1).trim() else ""
         val sp1 = head.indexOf(' ')
         if (sp1 <= 0) return null
         val sp2 = head.indexOf(' ', sp1 + 1)
@@ -105,6 +116,8 @@ object DatabaseMigrator {
         val max = head.substring(sp1 + 1, sp2).toFloatOrNull() ?: return null
         val name = head.substring(sp2 + 1).trim()
         if (name.isEmpty()) return null
-        return ThreadImport(name, avg, max, seriesStr)
+        return ThreadImport(name, avg, max, seriesStr, details)
     }
+
+    private const val MAX_IMPORT_CLAIMS = 8
 }

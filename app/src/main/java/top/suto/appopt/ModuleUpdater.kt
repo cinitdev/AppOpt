@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.text.SpannableStringBuilder
 import android.text.Spanned
@@ -34,6 +35,8 @@ object ModuleUpdater {
     private const val CONNECT_TIMEOUT_MS = 10000
     private const val READ_TIMEOUT_MS = 15000
     private const val INSTALL_TIMEOUT_SECONDS = 180L
+    private const val DOWNLOAD_TIMEOUT_MS = 30L * 60L * 1000L
+    private const val DOWNLOAD_MISSING_LIMIT = 6
     private const val IN_APP_UPDATE_ENV = "APPOPT_IN_APP_UPDATE"
     private const val IN_APP_UPDATE_MARKER_ENTRY = "config/app/.appopt_in_app_update"
     private const val IN_APP_UPDATE_FLAG_PATH = "/data/adb/appopt_in_app_update"
@@ -456,35 +459,55 @@ object ModuleUpdater {
 
         val id = manager.enqueue(request)
         val query = DownloadManager.Query().setFilterById(id)
-        while (true) {
-            manager.query(query)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    when (cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))) {
-                        DownloadManager.STATUS_SUCCESSFUL -> {
-                            onProgress("下载完成，准备刷入", 100)
-                            return target.takeIf { it.exists() } ?: downloadedFile(cursor) ?: target
-                        }
-                        DownloadManager.STATUS_FAILED -> {
-                            val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
-                            throw UpdateException("下载失败：${downloadReason(reason)}")
-                        }
-                        DownloadManager.STATUS_PAUSED -> {
-                            val percent = downloadPercent(cursor)
-                            onProgress("下载暂停，等待系统继续", percent)
-                        }
-                        DownloadManager.STATUS_PENDING -> onProgress("等待开始下载", 0)
-                        DownloadManager.STATUS_RUNNING -> {
-                            val percent = downloadPercent(cursor)
-                            onProgress(if (percent != null) "下载中 $percent%" else "下载中", percent)
+        val startedAt = SystemClock.elapsedRealtime()
+        var missingCount = 0
+        try {
+            while (true) {
+                if (SystemClock.elapsedRealtime() - startedAt > DOWNLOAD_TIMEOUT_MS) {
+                    throw UpdateException("下载超时，请检查网络后重试")
+                }
+                var found = false
+                manager.query(query)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        found = true
+                        when (cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))) {
+                            DownloadManager.STATUS_SUCCESSFUL -> {
+                                onProgress("下载完成，准备刷入", 100)
+                                return target.takeIf { it.exists() }
+                                    ?: downloadedFile(cursor)
+                                    ?: throw UpdateException("下载完成，但未找到模块文件")
+                            }
+                            DownloadManager.STATUS_FAILED -> {
+                                val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+                                throw UpdateException("下载失败：${downloadReason(reason)}")
+                            }
+                            DownloadManager.STATUS_PAUSED -> {
+                                val percent = downloadPercent(cursor)
+                                onProgress("下载暂停，等待系统继续", percent)
+                            }
+                            DownloadManager.STATUS_PENDING -> onProgress("等待开始下载", 0)
+                            DownloadManager.STATUS_RUNNING -> {
+                                val percent = downloadPercent(cursor)
+                                onProgress(if (percent != null) "下载中 $percent%" else "下载中", percent)
+                            }
                         }
                     }
                 }
+                missingCount = if (found) 0 else missingCount + 1
+                if (missingCount >= DOWNLOAD_MISSING_LIMIT) {
+                    throw UpdateException("系统下载任务已被移除，请重新下载")
+                }
+                try {
+                    Thread.sleep(500L)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw UpdateException("下载已中断")
+                }
             }
-            try {
-                Thread.sleep(500L)
-            } catch (_: InterruptedException) {
-                throw UpdateException("下载已中断")
-            }
+        } catch (e: Exception) {
+            manager.remove(id)
+            target.delete()
+            throw e
         }
     }
 

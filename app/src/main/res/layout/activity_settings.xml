@@ -132,7 +132,7 @@
                                 android:layout_marginTop="4dp"
                                 android:ellipsize="end"
                                 android:maxLines="2"
-                                android:text="查看已导入的线程负载记录"
+                                android:text="查看已导入的负载校准记录"
                                 android:textColor="@color/text_secondary"
                                 android:textSize="12sp" />
                         </LinearLayout>
