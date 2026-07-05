@@ -5,6 +5,8 @@ import android.os.Looper
 import android.text.method.LinkMovementMethod
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
@@ -30,8 +32,27 @@ object ModuleUpdateDialog {
         }
 
         var downloading = false
+        var downloadHandle: ModuleUpdater.DownloadHandle? = null
+        var downloadedZipPath: String? = null
+        var artifactHandedOff = false
+
+        fun cancelUnhandedDownload() {
+            if (!downloading || artifactHandedOff) return
+            downloadHandle?.cancel()
+            downloadedZipPath?.let(ModuleUpdater::discardDownloadedModule)
+            downloading = false
+        }
+
+        val lifecycleObserver = object : DefaultLifecycleObserver {
+            override fun onDestroy(owner: LifecycleOwner) {
+                handler.removeCallbacksAndMessages(null)
+                cancelUnhandedDownload()
+            }
+        }
+        activity.lifecycle.addObserver(lifecycleObserver)
 
         fun retainForManualInstall(zipPath: String, message: String) {
+            artifactHandedOff = true
             view.updateInstallStatus.text = "正在保存模块 zip 到 Download"
             thread {
                 val manualPath = ModuleUpdater.retainDownloadedModuleForManualInstall(activity, zipPath)
@@ -77,7 +98,10 @@ object ModuleUpdateDialog {
             view.updateProgress.isIndeterminate = false
             view.updateProgress.progress = 0
 
-            ModuleUpdater.downloadModule(activity, update, object : ModuleUpdater.DownloadCallback {
+            downloadHandle = ModuleUpdater.downloadModule(
+                activity,
+                update,
+                object : ModuleUpdater.DownloadCallback {
                 override fun onProgress(message: String, percent: Int?) {
                     if (inactive()) return
                     view.updateInstallStatus.text = if (percent != null) {
@@ -93,6 +117,7 @@ object ModuleUpdateDialog {
 
                 override fun onSuccess(zipPath: String) {
                     if (inactive()) return
+                    downloadedZipPath = zipPath
                     view.updateInstallStatus.text = "下载完成，准备刷入模块"
                     view.updateProgress.isIndeterminate = false
                     view.updateProgress.progress = 100
@@ -120,9 +145,11 @@ object ModuleUpdateDialog {
                                     handler.postDelayed({
                                         if (inactive()) return@postDelayed
                                         try {
+                                            artifactHandedOff = true
                                             activity.startActivity(UpdateInstallActivity.intent(activity, update, zipPath))
                                             dialog.dismiss()
                                         } catch (_: Exception) {
+                                            artifactHandedOff = false
                                             retainForManualInstall(
                                                 zipPath,
                                                 "打开刷入页面失败，请手动刷入"
@@ -135,9 +162,15 @@ object ModuleUpdateDialog {
                     }, 1500L)
                 }
 
-                override fun onFailure(message: String) {
+                override fun onFailure(message: String, recoverableZipPath: String?) {
                     if (inactive()) return
+                    if (recoverableZipPath != null) {
+                        downloadedZipPath = recoverableZipPath
+                        retainForManualInstall(recoverableZipPath, message)
+                        return
+                    }
                     downloading = false
+                    downloadHandle = null
                     view.updateLater.isEnabled = true
                     view.updateInstall.isEnabled = true
                     view.updateInstall.text = "重试"
@@ -146,9 +179,13 @@ object ModuleUpdateDialog {
                     view.updateInstallStatus.text = message
                     AppToast.show(activity, message)
                 }
-            })
+                }
+            )
         }
         dialog.setOnDismissListener {
+            handler.removeCallbacksAndMessages(null)
+            cancelUnhandedDownload()
+            activity.lifecycle.removeObserver(lifecycleObserver)
             onDismiss?.invoke()
         }
         dialog.setContentView(view.root)

@@ -37,6 +37,7 @@ object DaemonBridge {
     private const val CMD_FILE = "$CONFIG_DIR/calibrate.cmd"
     private const val STATE_FILE = "$CONFIG_DIR/calibrate.state"
     private const val CONFIG_FILE = "$CONFIG_DIR/applist.conf"
+    private const val CONFIG_LOCK_DIR = "$CONFIG_DIR/applist.conf.lock"
     private const val POLICY_FILE = "$CONFIG_DIR/calib_policy.conf"
     private const val POLICY_LOCK_DIR = "$CONFIG_DIR/calib_policy.conf.lock"
     private const val POLICY_UPDATE_FILE = "$UPDATE_CONFIG_DIR/calib_policy.conf"
@@ -47,6 +48,7 @@ object DaemonBridge {
     private const val ROOT_TIMEOUT_SECONDS = 15L
     const val REQUIRED_MODULE_VERSION_CODE = 175
     const val REQUIRED_MODULE_VERSION_NAME = "1.7.5"
+    private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
     fun hasRoot(): Boolean = runAsRoot("id -u").trim() == "0"
@@ -531,13 +533,16 @@ object DaemonBridge {
     fun addAutoPackage(pkg: String): Boolean {
         val safe = pkg.replace("'", "")
         if (safe.isBlank()) return false
-        val blocks = parseConfigBlocks(readConfigRaw())
-        val group = configGroupName(safe)
-        if (blocks.any { safe in it.owners || it.group == group }) {
-            return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(blocks))
+        return withConfigMutation(false) { token ->
+            val raw = readConfigRawForMutation() ?: return@withConfigMutation false
+            val blocks = parseConfigBlocks(raw)
+            val group = configGroupName(safe)
+            if (blocks.any { safe in it.owners || it.group == group }) {
+                return@withConfigMutation true
+            }
+            blocks.add(ConfigBlock(group, mutableListOf("$safe=auto"), mutableSetOf(safe)))
+            writeConfigFileLocked(formatConfigBlocks(blocks), token)
         }
-        blocks.add(ConfigBlock(group, mutableListOf("$safe=auto"), mutableSetOf(safe)))
-        return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(blocks))
     }
 
     /** 批量删除 applist.conf 中多个包名或进程名的全部配置行。 */
@@ -546,13 +551,15 @@ object DaemonBridge {
             .filter { it.isNotEmpty() }
             .distinct()
         if (targets.isEmpty()) return false
-        val raw = readConfigRaw()
-        if (raw.isBlank()) return true
-        val targetSet = targets.toSet()
-        val targetGroups = targets.map { configGroupName(it) }.toSet()
-        val kept = parseConfigBlocks(raw)
-            .filterNot { block -> block.group in targetGroups || block.owners.any { it in targetSet } }
-        return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(kept))
+        return withConfigMutation(false) { token ->
+            val raw = readConfigRawForMutation() ?: return@withConfigMutation false
+            if (raw.isBlank()) return@withConfigMutation true
+            val targetSet = targets.toSet()
+            val targetGroups = targets.map { configGroupName(it) }.toSet()
+            val kept = parseConfigBlocks(raw)
+                .filterNot { block -> block.group in targetGroups || block.owners.any { it in targetSet } }
+            writeConfigFileLocked(formatConfigBlocks(kept), token)
+        }
     }
 
     data class ConfigRuleValidation(
@@ -616,34 +623,6 @@ object DaemonBridge {
         )
     }
 
-    /** 替换指定应用/子进程的配置规则; 只接受属于 targets 的规则行, 避免误改其他应用。 */
-    fun replaceConfigRules(
-        pkgs: Collection<String>,
-        editedText: String,
-        allowedCpus: Set<Int>? = null
-    ): Boolean {
-        val targets = pkgs.map { it.replace("'", "").trim() }
-            .filter { it.isNotEmpty() }
-            .distinct()
-        if (targets.isEmpty()) return false
-
-        val presentCpus = allowedCpus ?: readConfigAllowedCpus().takeIf { it.isNotEmpty() }
-        val check = validateConfigRulesForPackages(targets, editedText, presentCpus)
-        if (!check.ok) return false
-        val newLines = sortConfigRuleLines(check.validLines)
-        if (newLines.isEmpty()) return false
-
-        val targetSet = targets.toSet()
-        val targetGroups = targets.map { configGroupName(it) }.toSet()
-        val blocks = parseConfigBlocks(readConfigRaw())
-            .filterNot { block -> block.group in targetGroups || block.owners.any { it in targetSet } }
-            .toMutableList()
-        val group = configGroupName(targets.first())
-        val owners = newLines.mapNotNull { configLineOwner(it) }.toMutableSet()
-        blocks.add(ConfigBlock(group, newLines.toMutableList(), owners))
-        return writeFileAsRoot(CONFIG_FILE, formatConfigBlocks(blocks))
-    }
-
     enum class ConfigReplaceResult {
         SUCCESS,
         SOURCE_CHANGED,
@@ -679,54 +658,57 @@ object DaemonBridge {
         )
         if (!check.ok) return ConfigReplaceResult.INVALID
 
-        val raw = readConfigRaw()
-        if (raw.isBlank()) return ConfigReplaceResult.SOURCE_CHANGED
-        val targetSet = targets.toSet()
-        val targetGroups = targets.map { configGroupName(it) }.toSet()
+        return withConfigMutation(ConfigReplaceResult.WRITE_FAILED) { token ->
+            val raw = readConfigRawForMutation()
+                ?: return@withConfigMutation ConfigReplaceResult.WRITE_FAILED
+            if (raw.isBlank()) return@withConfigMutation ConfigReplaceResult.SOURCE_CHANGED
+            val targetSet = targets.toSet()
+            val targetGroups = targets.map { configGroupName(it) }.toSet()
 
-        fun isEditableTargetRule(rawLine: String): Boolean {
-            val line = rawLine.trim()
-            val owner = configLineOwner(line) ?: return false
-            val value = line.substringAfter('=', "").trim()
-            return !value.equals("auto", ignoreCase = true) &&
-                (owner in targetSet || configGroupName(owner) in targetGroups)
-        }
-
-        val rawLines = raw.lineSequence().toList()
-        val currentOriginalLines = rawLines.asSequence()
-            .filter(::isEditableTargetRule)
-            .map(String::trim)
-            .toList()
-        if (currentOriginalLines != expectedOriginalLines.map(String::trim)) {
-            return ConfigReplaceResult.SOURCE_CHANGED
-        }
-
-        val output = ArrayList<String>(rawLines.size + addedLines.size)
-        var sourceIndex = 0
-        var additionsInserted = false
-        for (rawLine in rawLines) {
-            if (!isEditableTargetRule(rawLine)) {
-                output.add(rawLine)
-                continue
+            fun isEditableTargetRule(rawLine: String): Boolean {
+                val line = rawLine.trim()
+                val owner = configLineOwner(line) ?: return false
+                val value = line.substringAfter('=', "").trim()
+                return !value.equals("auto", ignoreCase = true) &&
+                    (owner in targetSet || configGroupName(owner) in targetGroups)
             }
 
-            replacements[sourceIndex]?.let(output::add)
-            sourceIndex++
-            if (sourceIndex == expectedOriginalLines.size && !additionsInserted) {
-                output.addAll(addedLines)
-                additionsInserted = true
+            val rawLines = raw.lineSequence().toList()
+            val currentOriginalLines = rawLines.asSequence()
+                .filter(::isEditableTargetRule)
+                .map(String::trim)
+                .toList()
+            if (currentOriginalLines != expectedOriginalLines.map(String::trim)) {
+                return@withConfigMutation ConfigReplaceResult.SOURCE_CHANGED
             }
-        }
-        if (sourceIndex != expectedOriginalLines.size) {
-            return ConfigReplaceResult.SOURCE_CHANGED
-        }
-        if (!additionsInserted) output.addAll(addedLines)
 
-        val content = output.joinToString("\n").trimEnd() + "\n"
-        return if (writeFileAsRoot(CONFIG_FILE, content)) {
-            ConfigReplaceResult.SUCCESS
-        } else {
-            ConfigReplaceResult.WRITE_FAILED
+            val output = ArrayList<String>(rawLines.size + addedLines.size)
+            var sourceIndex = 0
+            var additionsInserted = false
+            for (rawLine in rawLines) {
+                if (!isEditableTargetRule(rawLine)) {
+                    output.add(rawLine)
+                    continue
+                }
+
+                replacements[sourceIndex]?.let(output::add)
+                sourceIndex++
+                if (sourceIndex == expectedOriginalLines.size && !additionsInserted) {
+                    output.addAll(addedLines)
+                    additionsInserted = true
+                }
+            }
+            if (sourceIndex != expectedOriginalLines.size) {
+                return@withConfigMutation ConfigReplaceResult.SOURCE_CHANGED
+            }
+            if (!additionsInserted) output.addAll(addedLines)
+
+            val content = output.joinToString("\n").trimEnd() + "\n"
+            if (writeConfigFileLocked(content, token)) {
+                ConfigReplaceResult.SUCCESS
+            } else {
+                ConfigReplaceResult.WRITE_FAILED
+            }
         }
     }
 
@@ -920,13 +902,6 @@ object DaemonBridge {
         }.joinToString("")
     }
 
-    /** 读取某包名的原版历史 .log 内容；读不到时返回空字符串。 */
-    fun readHistory(pkg: String): String {
-        val safe = safeHistoryPackage(pkg)
-        val out = runAsRoot("cat ${shellQuote("$HISTORY_DIR/$safe.log")} 2>/dev/null")
-        return if (out.isNotErrored()) out else ""
-    }
-
     /** 原子认领一份历史文件，避免导入完成时误删 C 刚写入的新会话。 */
     fun claimHistoryImport(pkg: String): String {
         val safe = safeHistoryPackage(pkg)
@@ -940,12 +915,17 @@ object DaemonBridge {
         return if (out.isNotErrored()) out.substringBefore(ERR_MARK) else ""
     }
 
-    /** 仅删除已经成功入库的认领文件，不会触碰 C 后续生成的新 .log。 */
+    /** 删除已经成功入库的认领文件；history 为空时一并清理目录。 */
     fun completeHistoryImport(pkg: String): Boolean {
         val safe = safeHistoryPackage(pkg)
         if (safe.isBlank()) return false
         val claim = shellQuote("$HISTORY_DIR/$safe.log$HISTORY_IMPORT_SUFFIX")
-        return runAsRoot("rm -f $claim; true").isNotErrored()
+        val out = runAsRoot(
+            "if rm -f $claim; then " +
+                "rmdir '$HISTORY_DIR' 2>/dev/null || true; printf 1; " +
+                "else printf 0; fi"
+        )
+        return out.isNotErrored() && out.substringBefore(ERR_MARK).trim() == "1"
     }
 
     /** 删除某包名的整份历史 .log 文件。 */
@@ -1020,17 +1000,89 @@ object DaemonBridge {
         return "'" + value.replace("'", "'\"'\"'") + "'"
     }
 
-    /**
-     * 以 root 写入文件。
-     * 内容先 base64，再通过 heredoc 在设备端还原，避免 shell 转义和长文本换行问题。
-     */
-    private fun writeFileAsRoot(path: String, content: String): Boolean {
+    /** 同一 App 进程内串行修改，并与守护进程共享设备端锁。 */
+    private fun <T> withConfigMutation(lockFailure: T, action: (String) -> T): T {
+        return synchronized(configMutationLock) {
+            val token = acquireConfigLock() ?: return@synchronized lockFailure
+            try {
+                action(token)
+            } finally {
+                releaseConfigLock(token)
+            }
+        }
+    }
+
+    private fun acquireConfigLock(): String? {
+        val token = UUID.randomUUID().toString()
+        val cmd = """
+            lock='$CONFIG_LOCK_DIR'
+            token='$token'
+            mkdir -p '$CONFIG_DIR'
+            waited=0
+            while ! mkdir "${'$'}lock" 2>/dev/null; do
+                now=${'$'}(date +%s)
+                mtime=${'$'}(stat -c %Y "${'$'}lock" 2>/dev/null || printf 0)
+                if [ "${'$'}mtime" -gt 0 ] && [ "${'$'}now" -gt "${'$'}((mtime + 30))" ]; then
+                    rm -f "${'$'}lock/owner"
+                    rmdir "${'$'}lock" 2>/dev/null || true
+                    continue
+                fi
+                waited=${'$'}((waited + 1))
+                [ "${'$'}waited" -ge 5 ] && exit 1
+                sleep 1
+            done
+            if ! printf '%s' "${'$'}token" > "${'$'}lock/owner"; then
+                rmdir "${'$'}lock" 2>/dev/null || true
+                exit 1
+            fi
+            printf '%s' "${'$'}token"
+        """.trimIndent()
+        val out = runAsRoot(cmd)
+        return token.takeIf { out.isNotErrored() && out.substringBefore(ERR_MARK).trim() == token }
+    }
+
+    private fun releaseConfigLock(token: String) {
+        val cmd = """
+            lock='$CONFIG_LOCK_DIR'
+            if [ "${'$'}(cat "${'$'}lock/owner" 2>/dev/null)" = '$token' ]; then
+                rm -f "${'$'}lock/owner"
+                rmdir "${'$'}lock" 2>/dev/null || true
+            fi
+        """.trimIndent()
+        runAsRoot(cmd)
+    }
+
+    /** 锁内读取时区分“文件不存在”和“Root 读取失败”，避免把读取失败误当成空配置。 */
+    private fun readConfigRawForMutation(): String? {
+        val missingMarker = "__APPOPT_CONFIG_MISSING__"
+        val out = runAsRoot(
+            "if [ -f '$CONFIG_FILE' ]; then cat '$CONFIG_FILE' || exit 1; " +
+                "else printf '$missingMarker'; fi"
+        )
+        if (!out.isNotErrored()) return null
+        val content = out.substringBefore(ERR_MARK)
+        return if (content == missingMarker) "" else content
+    }
+
+    /** 锁内原子写入 applist.conf，避免 App 与守护进程相互覆盖或留下半文件。 */
+    private fun writeConfigFileLocked(content: String, token: String): Boolean {
         val b64 = android.util.Base64.encodeToString(
             content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
         )
-        val parent = path.substringBeforeLast("/", "")
-        val mkdir = if (parent.isNotBlank()) "mkdir -p '$parent'; " else ""
-        val cmd = "${mkdir}base64 -d > '$path' << 'EOF_BASE64'\n$b64\nEOF_BASE64"
+        val tmp = "$CONFIG_FILE.app-$token.tmp"
+        val cmd = """
+            lock='$CONFIG_LOCK_DIR'
+            target='$CONFIG_FILE'
+            tmp='$tmp'
+            [ "${'$'}(cat "${'$'}lock/owner" 2>/dev/null)" = '$token' ] || exit 1
+            trap 'rm -f "${'$'}tmp"' EXIT
+            base64 -d > "${'$'}tmp" << 'EOF_BASE64'
+            $b64
+            EOF_BASE64
+            chmod 0644 "${'$'}tmp" 2>/dev/null || true
+            chown 0:0 "${'$'}tmp" 2>/dev/null || true
+            mv -f "${'$'}tmp" "${'$'}target"
+        """.trimIndent()
         return runAsRoot(cmd).isNotErrored()
     }
 
@@ -1046,6 +1098,12 @@ object DaemonBridge {
             mkdir -p '$CONFIG_DIR'
             waited=0
             while ! mkdir "${'$'}lock" 2>/dev/null; do
+                now=${'$'}(date +%s)
+                mtime=${'$'}(stat -c %Y "${'$'}lock" 2>/dev/null || printf 0)
+                if [ "${'$'}mtime" -gt 0 ] && [ "${'$'}now" -gt "${'$'}((mtime + 30))" ]; then
+                    rmdir "${'$'}lock" 2>/dev/null || true
+                    continue
+                fi
                 waited=${'$'}((waited + 1))
                 [ "${'$'}waited" -ge 5 ] && exit 1
                 sleep 1

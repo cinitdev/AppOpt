@@ -86,6 +86,7 @@ class MainActivity : AppCompatActivity() {
     private val pendingIconLoads = Collections.synchronizedSet(mutableSetOf<String>())
     private val mainHandler = Handler(Looper.getMainLooper())
     private val iconExecutor = Executors.newSingleThreadExecutor()
+    private val rulesLoadingPackages = mutableSetOf<String>()
     @Volatile private var activityDestroyed = false
     private var firstResume = true
     private lateinit var appAdapter: AppAdapter
@@ -472,6 +473,10 @@ class MainActivity : AppCompatActivity() {
     private fun setupAppRecycler() {
         appAdapter = AppAdapter()
         binding.appSection.appRecycler.apply {
+            layoutParams = layoutParams.apply {
+                height = (resources.displayMetrics.heightPixels * 0.55f).toInt()
+                    .coerceIn(dp(360f), dp(620f))
+            }
             layoutManager = LinearLayoutManager(this@MainActivity)
             adapter = appAdapter
             setHasFixedSize(true)
@@ -1340,6 +1345,8 @@ class MainActivity : AppCompatActivity() {
         view.deleteTitle.text = "删除 ${appLabel(displayPkg)}"
         view.deletePkg.text = targets.joinToString("\n")
         view.deleteRules.text = "正在读取当前规则..."
+        view.deleteConfirm.isEnabled = false
+        view.deleteConfirm.text = "读取中"
         view.deleteCancel.setOnClickListener { dialog.dismiss() }
         view.deleteConfirm.setOnClickListener {
             dialog.dismiss()
@@ -1349,13 +1356,25 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
 
         thread {
-            val rules = targets.flatMap { DaemonBridge.readPkgConfigLines(it) }
+            val result = runCatching {
+                targets.flatMap { DaemonBridge.readPkgConfigLines(it) }
+            }
             runOnUiThreadIfAlive {
-                view.deleteRules.text = if (rules.isEmpty()) {
-                    "未读取到当前规则；确认后仍会删除这些配置项在 applist.conf 中的所有配置行。"
-                } else {
-                    rules.joinToString("\n")
-                }
+                view.deleteRules.text = result.fold(
+                    onSuccess = { rules ->
+                        if (rules.isEmpty()) {
+                            "未读取到当前规则；确认后仍会删除这些配置项在 applist.conf 中的所有配置行。"
+                        } else {
+                            rules.joinToString("\n")
+                        }
+                    },
+                    onFailure = { error ->
+                        android.util.Log.e("AppOpt", "read rules before delete failed", error)
+                        "读取当前规则失败。仍可确认删除，删除操作会重新读取并修改 applist.conf。"
+                    }
+                )
+                view.deleteConfirm.isEnabled = true
+                view.deleteConfirm.text = "确认删除"
             }
         }
     }
@@ -1439,26 +1458,52 @@ class MainActivity : AppCompatActivity() {
             toast("请先授予 Root 权限")
             return
         }
+        if (!rulesLoadingPackages.add(entry.pkg)) {
+            toast("正在读取规则")
+            return
+        }
+        toast("正在读取规则")
         val targets = entry.configPkgs.distinct()
         thread {
-            val lines = DaemonBridge.readPkgRules(targets)
-            val allowedCpus = DaemonBridge.readConfigAllowedCpus()
-            val historyCandidates = try {
-                RuleHistoryCandidates.build(
-                    entry.pkg,
-                    AppOptDbHelper.getInstance(this).getRuleHistoryRecordsByPackage(entry.pkg)
-                )
+            try {
+                val lines = DaemonBridge.readPkgRules(targets)
+                val allowedCpus = DaemonBridge.readConfigAllowedCpus()
+                val historyCandidates = try {
+                    RuleHistoryCandidates.build(
+                        entry.pkg,
+                        AppOptDbHelper.getInstance(this).getRuleHistoryRecordsByPackage(entry.pkg)
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.w("AppOpt", "read rule history candidates failed: ${e.message}")
+                    emptyList()
+                }
+                runOnUiThreadIfAlive {
+                    rulesLoadingPackages.remove(entry.pkg)
+                    showConfiguredRulesDialog(entry, targets, lines, allowedCpus, historyCandidates)
+                }
             } catch (e: Exception) {
-                android.util.Log.w("AppOpt", "read rule history candidates failed: ${e.message}")
-                emptyList()
+                android.util.Log.e("AppOpt", "read configured rules failed: ${entry.pkg}", e)
+                runOnUiThreadIfAlive {
+                    rulesLoadingPackages.remove(entry.pkg)
+                    toast("读取规则失败，请重试")
+                }
             }
-            runOnUiThreadIfAlive {
+        }
+    }
+
+    private fun showConfiguredRulesDialog(
+        entry: AppEntry,
+        targets: List<String>,
+        lines: List<String>,
+        allowedCpus: Set<Int>,
+        historyCandidates: List<RuleHistoryCandidate>
+    ) {
                 val rules = lines.mapIndexedNotNull { index, line ->
                     parseEditableConfigRule(line, index)
                 }.toMutableList()
                 if (rules.size != lines.size) {
                     toast("部分规则格式无法解析，请检查 applist.conf")
-                    return@runOnUiThreadIfAlive
+                    return
                 }
                 val initialRuleSnapshot = rules.map { it.asLine() }.sorted()
                 var ruleSearchQuery = ""
@@ -1607,8 +1652,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 renderRules()
                 dialog.show()
-            }
-        }
     }
 
     private fun parseEditableConfigRule(line: String, sourceIndex: Int?): EditableConfigRule? {

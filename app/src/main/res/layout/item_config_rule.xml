@@ -54,7 +54,7 @@
                 android:ellipsize="middle"
                 android:maxLines="1"
                 android:textColor="@color/text_secondary"
-                android:textSize="10sp" />
+                android:textSize="11sp" />
         </LinearLayout>
 
         <TextView

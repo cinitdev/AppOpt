@@ -9,20 +9,11 @@ package top.suto.appopt
  */
 object ConfigReader {
 
-    private const val CONFIG_FILE = "/data/adb/modules/AppOpt/config/applist.conf"
-
     data class ConfigPackages(
         val autoPackages: List<String>,
         val configuredPackages: List<String>,
         val configuredRuleCounts: Map<String, Int> = emptyMap()
     )
-
-    /**
-     * 返回配置中所有 "=auto" 的包名 (去重, 保序)。
-     * 解析规则: 去掉 '#' 注释行, 行内允许 "pkg=auto" 或 "pkg{Thread}=auto",
-     * 只要等号右侧 (大小写不敏感) 为 auto 即收录其包名部分。
-     */
-    fun readAutoPackages(): List<String> = readPackages().autoPackages
 
     /**
      * 返回配置中的待配置包名(auto)和已配置包名(非 auto)。

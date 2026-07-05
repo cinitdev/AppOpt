@@ -1,5 +1,6 @@
 package top.suto.appopt
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -16,6 +17,7 @@ import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.FrameLayout
 import android.widget.TextView
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -35,6 +37,7 @@ import top.suto.appopt.databinding.OverlayResultBinding
 class FloatingBallService : Service() {
 
     private lateinit var windowManager: WindowManager
+    private lateinit var capsuleContainer: FrameLayout
     private lateinit var capsule: TextView
     private lateinit var layoutParams: WindowManager.LayoutParams
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -180,6 +183,7 @@ class FloatingBallService : Service() {
             TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics
         ).toInt()
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun addCapsule() {
         if (capsuleAdded) return
         capsule = TextView(this).apply {
@@ -196,13 +200,27 @@ class FloatingBallService : Service() {
             // 整体再叠一层轻微透明, 让悬浮球在游戏画面上不喧宾夺主
             alpha = 0.92f
         }
+        capsuleContainer = object : FrameLayout(this) {
+            override fun performClick(): Boolean {
+                super.performClick()
+                return true
+            }
+        }.apply {
+            isClickable = true
+            contentDescription = "AppOpt 悬浮球，点击开始校准，拖动可移动"
+            setOnClickListener { onCapsuleClick() }
+            addView(
+                capsule,
+                FrameLayout.LayoutParams(dp(45f), dp(30f), Gravity.CENTER)
+            )
+        }
 
         val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
 
         // 固定尺寸: 扁胶囊, 按最宽内容("● 120.0")预留, 避免帧率变化导致忽大忽小
         layoutParams = WindowManager.LayoutParams(
-            dp(45f),
-            dp(30f),
+            dp(48f),
+            dp(48f),
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
@@ -212,11 +230,11 @@ class FloatingBallService : Service() {
             y = dp(120f)
         }
 
-        capsule.setOnTouchListener { _, event -> handleTouch(event) }
+        capsuleContainer.setOnTouchListener { view, event -> handleTouch(view, event) }
         // 服务被系统重建或悬浮窗权限被撤销时, addView 会抛 BadTokenException。
         // 包裹后失败则直接 stopSelf, 避免崩溃 + 避免空跑一个看不见的服务。
         try {
-            windowManager.addView(capsule, layoutParams)
+            windowManager.addView(capsuleContainer, layoutParams)
             capsuleAdded = true
             android.util.Log.d("AppOpt", "FloatingBallService capsule added")
         } catch (e: Exception) {
@@ -233,7 +251,7 @@ class FloatingBallService : Service() {
         val label = if (currentFps > 0f) String.format(Locale.US, "%.1f", currentFps) else "0.0"
         capsule.text = if (calibrating) label else label
     }
-    private fun handleTouch(event: MotionEvent): Boolean {
+    private fun handleTouch(clickView: View, event: MotionEvent): Boolean {
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 initialX = layoutParams.x
@@ -253,7 +271,7 @@ class FloatingBallService : Service() {
                     layoutParams.x = initialX + dx.toInt()
                     layoutParams.y = initialY + dy.toInt()
                     try {
-                        windowManager.updateViewLayout(capsule, layoutParams)
+                        windowManager.updateViewLayout(capsuleContainer, layoutParams)
                     } catch (_: Exception) {
                         stopSelf()
                     }
@@ -265,7 +283,7 @@ class FloatingBallService : Service() {
                 val dy = event.rawY - touchY
                 val stopClickThreshold = dp(DRAG_THRESHOLD_DP).toFloat() * 2.5f
                 val isStopTap = calibrating && abs(dx) <= stopClickThreshold && abs(dy) <= stopClickThreshold
-                if (!dragged || isStopTap) onCapsuleClick()
+                if (!dragged || isStopTap) clickView.performClick()
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
@@ -286,6 +304,7 @@ class FloatingBallService : Service() {
             }
             android.util.Log.d("AppOpt", "calibration start: pkg=$pkg")
             calibrating = true
+            capsuleContainer.contentDescription = "AppOpt 正在校准，点击停止校准，拖动可移动"
             // 用户能点击悬浮球开始校准, 说明目标 App 会话已经成立。
             // 部分 ROM 的 UsageStats 会漏掉目标进入前台事件; 这里避免后续一直卡在"等待目标出现"阶段。
             hasAppearedForeground = true
@@ -444,6 +463,7 @@ class FloatingBallService : Service() {
     private fun revertToYellow() {
         if (serviceDestroyed) return
         calibrating = false
+        capsuleContainer.contentDescription = "AppOpt 悬浮球，点击开始校准，拖动可移动"
         capsule.setBackgroundResource(R.drawable.capsule_yellow)
         updateCapsuleText()
     }
@@ -451,7 +471,7 @@ class FloatingBallService : Service() {
     private fun removeCapsule() {
         if (!capsuleAdded) return
         try {
-            windowManager.removeView(capsule)
+            windowManager.removeView(capsuleContainer)
         } catch (_: Exception) {
         } finally {
             capsuleAdded = false
@@ -879,6 +899,7 @@ class FloatingBallService : Service() {
         foregroundTracker = ForegroundDetector.Tracker()
         currentFps = 0f
         if (capsuleAdded && ::capsule.isInitialized) {
+            capsuleContainer.contentDescription = "AppOpt 悬浮球，点击开始校准，拖动可移动"
             capsule.setBackgroundResource(R.drawable.capsule_yellow)
             updateCapsuleText()
         }

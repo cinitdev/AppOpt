@@ -378,11 +378,37 @@ class HistoryActivity : AppCompatActivity() {
         card.threadRows.addView(loading)
 
         thread {
-            val db = AppOptDbHelper.getInstance(this)
-            val loads = db.getThreadsBySessionId(sessionId).map { it.toThreadLoad() }
+            val result = runCatching {
+                val db = AppOptDbHelper.getInstance(this)
+                db.getThreadsBySessionId(sessionId).map { it.toThreadLoad() }
+            }
             runOnUiThreadIfAlive {
                 if (isThreadRenderStale(card, generation)) return@runOnUiThreadIfAlive
                 card.threadRows.removeAllViews()
+                val loads = result.getOrElse { error ->
+                    android.util.Log.e("AppOpt", "history thread load failed: session=$sessionId", error)
+                    val retry = android.widget.TextView(this).apply {
+                        text = "加载失败，点击重试"
+                        setTextColor(resources.getColor(R.color.brand_primary, theme))
+                        textSize = 13f
+                        setPadding(0, 12, 0, 12)
+                        setOnClickListener {
+                            card.threadRows.removeAllViews()
+                            ensureThreadsLoaded(card, sessionId, durationSec)
+                        }
+                    }
+                    card.threadRows.addView(retry)
+                    return@runOnUiThreadIfAlive
+                }
+                if (loads.isEmpty()) {
+                    card.threadRows.addView(android.widget.TextView(this).apply {
+                        text = "暂无负载明细"
+                        setTextColor(resources.getColor(R.color.text_secondary, theme))
+                        textSize = 13f
+                        setPadding(0, 12, 0, 12)
+                    })
+                    return@runOnUiThreadIfAlive
+                }
                 val inflater = LayoutInflater.from(this)
                 renderThreadPage(card, inflater, loads, durationSec, 0, generation)
             }
@@ -472,7 +498,7 @@ class HistoryActivity : AppCompatActivity() {
     }
 
     private fun isThreadRenderStale(card: ItemCalibSessionBinding, generation: Int): Boolean {
-        return isThreadRenderStale(generation) || card.threadRows.visibility != View.VISIBLE
+        return isThreadRenderStale(generation) || card.root.parent == null
     }
 
     private fun ThreadData.toThreadLoad(): ThreadLoad {

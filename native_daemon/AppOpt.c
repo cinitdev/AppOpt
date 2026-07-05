@@ -60,6 +60,7 @@
 #define CALIB_STATE_FILE   CONFIG_DIR "/calibrate.state"
 #define CALIB_POLICY_FILE  CONFIG_DIR "/calib_policy.conf"
 #define CALIB_POLICY_LOCK  CONFIG_DIR "/calib_policy.conf.lock"
+#define CALIB_CONFIG_LOCK  CONFIG_DIR "/applist.conf.lock"
 #define HISTORY_DIR        MODULE_DIR "/history"
 
 /* ---- 真实帧率(FPS)监测 ----
@@ -2109,6 +2110,43 @@ static void calib_policy_lock_release(void) {
     }
 }
 
+static bool calib_config_lock_acquire(void) {
+    const int timeout_ms = 5000;
+    const int step_us = 50000;
+    int waited_us = 0;
+    while (!shutdown_requested && waited_us <= timeout_ms * 1000) {
+        if (mkdir(CALIB_CONFIG_LOCK, 0777) == 0) return true;
+        if (errno != EEXIST) {
+            printf("[校准] 获取规则配置锁失败: %s err=%s\n",
+                   CALIB_CONFIG_LOCK, strerror(errno));
+            return false;
+        }
+
+        struct stat st;
+        time_t now = time(NULL);
+        if (stat(CALIB_CONFIG_LOCK, &st) == 0 && now > st.st_mtime + 30) {
+            char owner_path[512];
+            build_str(owner_path, sizeof(owner_path), CALIB_CONFIG_LOCK, "/owner", NULL);
+            unlink(owner_path);
+            if (rmdir(CALIB_CONFIG_LOCK) == 0) {
+                printf("[校准] 已清理过期规则配置锁: %s\n", CALIB_CONFIG_LOCK);
+                continue;
+            }
+        }
+        usleep(step_us);
+        waited_us += step_us;
+    }
+    printf("[校准] 等待规则配置锁超时: %s\n", CALIB_CONFIG_LOCK);
+    return false;
+}
+
+static void calib_config_lock_release(void) {
+    if (rmdir(CALIB_CONFIG_LOCK) != 0 && errno != ENOENT) {
+        printf("[校准] 释放规则配置锁失败: %s err=%s\n",
+               CALIB_CONFIG_LOCK, strerror(errno));
+    }
+}
+
 static void calib_sync_policy_topology(const CpuTopology* topo) {
     if (!topo) return;
     if (!calib_policy_lock_acquire()) return;
@@ -2542,13 +2580,13 @@ static void calib_write_child_thread_summary(FILE* out, const CalibData* data,
     free(written);
 }
 
-static void calib_write_history(const char* pkg, CalibData* data) {
-    if (data->count == 0) return;
-    mkdir(HISTORY_DIR, 0755);
+static bool calib_write_history(const char* pkg, CalibData* data) {
+    if (data->count == 0) return false;
+    if (mkdir(HISTORY_DIR, 0755) != 0 && errno != EEXIST) return false;
 
     unsigned long long total = 0;
     for (size_t i = 0; i < data->count; i++) total += data->threads[i].busy;
-    if (total == 0) return;
+    if (total == 0) return false;
 
     char path[512];
     char safe[MAX_PKG_LEN];
@@ -2558,35 +2596,38 @@ static void calib_write_history(const char* pkg, CalibData* data) {
     /* 1) 把本次会话格式化到内存缓冲: 段头 + 每条负载记录(AVG MAX 名称|折线) */
     char* cur = NULL;
     size_t cur_len = 0;
+    size_t written_rows = 0;
     FILE* mem = open_memstream(&cur, &cur_len);
-    if (mem) {
-        fprintf(mem, "# %ld %zu\n", (long)time(NULL), data->round_count);
-        for (size_t i = 0; i < data->count; i++) {
-            ThreadSample* s = &data->threads[i];
-            if (s->series_len == 0) continue;
-            double avg = 0.0;
-            double mx = 0.0;
-            calib_thread_pct_stats(s, &avg, &mx);
-            if (mx < 0.05 && avg < 0.05) continue;   /* 整段几乎零负载的线程略过 */
-            if (s->is_process) {
-                fprintf(mem, "%.2f %.2f %s|", avg, mx, s->owner);
-            } else if (strcmp(s->owner, pkg) == 0) {
-                fprintf(mem, "%.2f %.2f %s|", avg, mx, s->name);
-            } else {
-                fprintf(mem, "%.2f %.2f %s{%s}|", avg, mx, s->owner, s->name);
-            }
-            for (size_t k = 0; k < s->series_len; k++) {
-                size_t index = (s->series_start + k) % s->series_cap;
-                fprintf(mem, k ? ",%.2f" : "%.2f", s->series[index]);
-            }
-            if (s->is_process) {
-                calib_write_child_thread_summary(mem, data, s->owner);
-            }
-            fputc('\n', mem);
+    if (!mem) return false;
+    fprintf(mem, "# %ld %zu\n", (long)time(NULL), data->round_count);
+    for (size_t i = 0; i < data->count; i++) {
+        ThreadSample* s = &data->threads[i];
+        if (s->series_len == 0) continue;
+        double avg = 0.0;
+        double mx = 0.0;
+        calib_thread_pct_stats(s, &avg, &mx);
+        if (mx < 0.05 && avg < 0.05) continue;   /* 整段几乎零负载的线程略过 */
+        if (s->is_process) {
+            fprintf(mem, "%.2f %.2f %s|", avg, mx, s->owner);
+        } else if (strcmp(s->owner, pkg) == 0) {
+            fprintf(mem, "%.2f %.2f %s|", avg, mx, s->name);
+        } else {
+            fprintf(mem, "%.2f %.2f %s{%s}|", avg, mx, s->owner, s->name);
         }
-        fclose(mem);
+        for (size_t k = 0; k < s->series_len; k++) {
+            size_t index = (s->series_start + k) % s->series_cap;
+            fprintf(mem, k ? ",%.2f" : "%.2f", s->series[index]);
+        }
+        if (s->is_process) {
+            calib_write_child_thread_summary(mem, data, s->owner);
+        }
+        fputc('\n', mem);
+        written_rows++;
     }
-    if (!cur) return;
+    if (fclose(mem) != 0 || !cur || written_rows == 0) {
+        free(cur);
+        return false;
+    }
 
     /* 2) 读入已有内容, 找到各段(以 '#' 开头的行)的起始偏移 */
     char* old = NULL;
@@ -2633,27 +2674,27 @@ static void calib_write_history(const char* pkg, CalibData* data) {
     char tmp_path[520];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
     FILE* wf = fopen(tmp_path, "w");
-    if (wf) {
-        bool write_ok = true;
-        if (keep_from && *keep_from) {
-            if (fputs(keep_from, wf) == EOF) write_ok = false;
-            size_t kl = strlen(keep_from);
-            if (write_ok && kl > 0 && keep_from[kl - 1] != '\n') {
-                if (fputc('\n', wf) == EOF) write_ok = false;
-            }
-        }
-        if (write_ok && fputs(cur, wf) == EOF) write_ok = false;
-        if (fclose(wf) != 0) write_ok = false;
-
-        if (write_ok) {
-            rename(tmp_path, path);  // 原子覆盖
-        } else {
-            unlink(tmp_path);        // 写入失败, 删除临时文件, 保留原文件
+    if (!wf) {
+        free(old);
+        free(cur);
+        return false;
+    }
+    bool write_ok = true;
+    if (keep_from && *keep_from) {
+        if (fputs(keep_from, wf) == EOF) write_ok = false;
+        size_t kl = strlen(keep_from);
+        if (write_ok && kl > 0 && keep_from[kl - 1] != '\n') {
+            if (fputc('\n', wf) == EOF) write_ok = false;
         }
     }
+    if (write_ok && fputs(cur, wf) == EOF) write_ok = false;
+    if (fclose(wf) != 0) write_ok = false;
+    if (write_ok && rename(tmp_path, path) != 0) write_ok = false;
+    if (!write_ok) unlink(tmp_path);
 
     free(old);
     free(cur);
+    return write_ok;
 }
 
 static bool calib_write_line_normalized(FILE* out, const char* text) {
@@ -2807,12 +2848,20 @@ static bool calib_flush_config_block(FILE* out, CalibConfigBlock* block,
  * 这样可以清理重复 auto/旧规则, 并把应用块之间规整为一空行。成功返回 true。 */
 static bool calib_write_back(const char* config_file, const char* pkg,
                              const char* rules_text) {
+    if (!calib_config_lock_acquire()) return false;
     FILE* in = fopen(config_file, "r");
-    if (!in) return false;
+    if (!in) {
+        calib_config_lock_release();
+        return false;
+    }
     char tmp_path[4096 + 8];
     build_str(tmp_path, sizeof(tmp_path), config_file, ".tmp", NULL);
     FILE* out = fopen(tmp_path, "w");
-    if (!out) { fclose(in); return false; }
+    if (!out) {
+        fclose(in);
+        calib_config_lock_release();
+        return false;
+    }
 
     char target_group[MAX_PKG_LEN];
     calib_config_group_name(pkg, target_group, sizeof(target_group));
@@ -2862,12 +2911,15 @@ static bool calib_write_back(const char* config_file, const char* pkg,
     if (fclose(out) != 0) write_ok = false;
     if (!write_ok) {
         unlink(tmp_path);
+        calib_config_lock_release();
         return false;
     }
     if (rename(tmp_path, config_file) != 0) {
         unlink(tmp_path);
+        calib_config_lock_release();
         return false;
     }
+    calib_config_lock_release();
     return true;
 }
 
@@ -2965,7 +3017,9 @@ static void* calib_thread(void* arg) {
 
                     char rules[4096];
                     int n = calib_generate_rules(&data, &g_topo, rules, sizeof(rules));
-                    calib_write_history(data.pkg, &data);
+                    if (!calib_write_history(data.pkg, &data)) {
+                        printf("[校准] 警告: %s 历史记录写入失败，规则生成继续执行\n", data.pkg);
+                    }
                     char st[MAX_PKG_LEN + 64];
                     if (n > 0) {
                         AppConfig* cfg = get_config();
@@ -3008,7 +3062,9 @@ static void* calib_thread(void* arg) {
                 }
                 char rules[4096];
                 int n = calib_generate_rules(&data, &g_topo, rules, sizeof(rules));
-                calib_write_history(data.pkg, &data);
+                if (!calib_write_history(data.pkg, &data)) {
+                    printf("[校准] 警告: %s 历史记录写入失败，规则生成继续执行\n", data.pkg);
+                }
                 char st[MAX_PKG_LEN + 64];
                 if (n > 0) {
                     AppConfig* cfg = get_config();

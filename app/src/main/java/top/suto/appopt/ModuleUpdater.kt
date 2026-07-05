@@ -3,27 +3,18 @@ package top.suto.appopt
 import android.app.DownloadManager
 import android.content.ContentValues
 import android.content.Context
-import android.graphics.Color
-import android.graphics.Typeface
 import android.net.Uri
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
-import android.text.SpannableStringBuilder
-import android.text.Spanned
-import android.text.style.ForegroundColorSpan
-import android.text.style.LeadingMarginSpan
-import android.text.style.RelativeSizeSpan
-import android.text.style.StyleSpan
-import android.text.style.TypefaceSpan
-import android.text.style.URLSpan
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -86,7 +77,28 @@ object ModuleUpdater {
     interface DownloadCallback {
         fun onProgress(message: String, percent: Int?)
         fun onSuccess(zipPath: String)
-        fun onFailure(message: String)
+        fun onFailure(message: String, recoverableZipPath: String?)
+    }
+
+    class DownloadHandle internal constructor() {
+        private val cancelled = AtomicBoolean(false)
+        @Volatile private var artifact: File? = null
+
+        val isCancelled: Boolean
+            get() = cancelled.get()
+
+        internal val artifactPath: String?
+            get() = artifact?.takeIf(File::exists)?.absolutePath
+
+        internal fun track(file: File) {
+            artifact = file
+            if (isCancelled) discardDownloadedModule(file.absolutePath)
+        }
+
+        fun cancel() {
+            cancelled.set(true)
+            artifact?.let { discardDownloadedModule(it.absolutePath) }
+        }
     }
 
     interface InstallCallback {
@@ -184,29 +196,60 @@ object ModuleUpdater {
         )
     }
 
-    fun downloadModule(context: Context, update: UpdateInfo, callback: DownloadCallback) {
+    fun downloadModule(
+        context: Context,
+        update: UpdateInfo,
+        callback: DownloadCallback
+    ): DownloadHandle {
         val appContext = context.applicationContext
         val mainHandler = Handler(Looper.getMainLooper())
+        val handle = DownloadHandle()
 
         fun progress(message: String, percent: Int? = null) {
-            mainHandler.post { callback.onProgress(message, percent) }
+            if (!handle.isCancelled) {
+                mainHandler.post {
+                    if (!handle.isCancelled) callback.onProgress(message, percent)
+                }
+            }
         }
 
         thread(name = "AppOptModuleUpdater") {
             try {
+                if (handle.isCancelled) throw DownloadCancelledException()
                 progress("准备下载模块", 0)
-                val zip = downloadWithManager(appContext, update) { message, percent ->
+                val zip = downloadWithManager(appContext, update, handle) { message, percent ->
                     progress(message, percent)
                 }
+                handle.track(zip)
+                if (handle.isCancelled) throw DownloadCancelledException()
                 val markedZip = markZipForInAppUpdate(zip)
+                handle.track(markedZip)
+                if (handle.isCancelled) throw DownloadCancelledException()
                 progress("下载完成，准备刷入", 100)
-                mainHandler.post { callback.onSuccess(markedZip.absolutePath) }
+                mainHandler.post {
+                    if (!handle.isCancelled) callback.onSuccess(markedZip.absolutePath)
+                }
+            } catch (_: DownloadCancelledException) {
+                handle.cancel()
             } catch (e: UpdateException) {
-                mainHandler.post { callback.onFailure(e.message ?: "更新失败") }
+                if (!handle.isCancelled) {
+                    mainHandler.post {
+                        if (!handle.isCancelled) {
+                            callback.onFailure(e.message ?: "更新失败", handle.artifactPath)
+                        }
+                    }
+                }
             } catch (_: Exception) {
-                mainHandler.post { callback.onFailure("更新失败，请稍后重试") }
+                if (!handle.isCancelled) {
+                    mainHandler.post {
+                        if (!handle.isCancelled) {
+                            callback.onFailure("更新失败，请稍后重试", handle.artifactPath)
+                        }
+                    }
+                }
             }
         }
+        return handle
     }
 
     fun installDownloadedModule(
@@ -321,120 +364,24 @@ object ModuleUpdater {
     ): String {
         val zip = File(zipPath)
         if (!zip.exists()) return zipPath
+        if (inAppUpdate && originalZipForInAppZip(zip) == null) {
+            val publicPath = copyToPublicDownloads(context, zip) ?: return zip.absolutePath
+            zip.delete()
+            return publicPath
+        }
         return retainOriginalZipForManualInstall(context, zip, inAppUpdate) {}
     }
 
-    fun renderMarkdown(markdown: String): Spanned {
-        val builder = SpannableStringBuilder()
-        var inCodeBlock = false
-
-        for (raw in markdown.replace("\r\n", "\n").lines()) {
-            val line = raw.trimEnd()
-            if (line.trim().startsWith("```")) {
-                inCodeBlock = !inCodeBlock
-                continue
-            }
-
-            val start = builder.length
-            when {
-                inCodeBlock -> {
-                    builder.append(line.ifBlank { " " }).append('\n')
-                    builder.setSpan(TypefaceSpan("monospace"), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    builder.setSpan(ForegroundColorSpan(Color.parseColor("#1A1A2E")), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-                line.startsWith("# ") -> {
-                    appendInlineMarkdown(builder, line.removePrefix("# ").trim())
-                    builder.append('\n')
-                    setHeadingSpan(builder, start, 1.22f)
-                }
-                line.startsWith("## ") -> {
-                    appendInlineMarkdown(builder, line.removePrefix("## ").trim())
-                    builder.append('\n')
-                    setHeadingSpan(builder, start, 1.14f)
-                }
-                line.startsWith("### ") -> {
-                    appendInlineMarkdown(builder, line.removePrefix("### ").trim())
-                    builder.append('\n')
-                    setHeadingSpan(builder, start, 1.08f)
-                }
-                line.trimStart().startsWith("- ") || line.trimStart().startsWith("* ") -> {
-                    val item = line.trimStart().drop(2).trim()
-                    builder.append("• ")
-                    appendInlineMarkdown(builder, item)
-                    builder.append('\n')
-                    builder.setSpan(LeadingMarginSpan.Standard(0, 28), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-                line.isBlank() -> builder.append('\n')
-                else -> {
-                    appendInlineMarkdown(builder, line)
-                    builder.append('\n')
-                }
-            }
-        }
-        return builder
-    }
-
-    private fun setHeadingSpan(builder: SpannableStringBuilder, start: Int, size: Float) {
-        builder.setSpan(StyleSpan(Typeface.BOLD), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        builder.setSpan(RelativeSizeSpan(size), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-    }
-
-    private fun appendInlineMarkdown(builder: SpannableStringBuilder, text: String) {
-        var index = 0
-        while (index < text.length) {
-            when {
-                text.startsWith("**", index) -> {
-                    val end = text.indexOf("**", index + 2)
-                    if (end > index + 2) {
-                        val start = builder.length
-                        builder.append(text.substring(index + 2, end))
-                        builder.setSpan(StyleSpan(Typeface.BOLD), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                        index = end + 2
-                    } else {
-                        builder.append(text[index])
-                        index++
-                    }
-                }
-                text[index] == '`' -> {
-                    val end = text.indexOf('`', index + 1)
-                    if (end > index + 1) {
-                        val start = builder.length
-                        builder.append(text.substring(index + 1, end))
-                        builder.setSpan(TypefaceSpan("monospace"), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                        builder.setSpan(ForegroundColorSpan(Color.parseColor("#1A1A2E")), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                        index = end + 1
-                    } else {
-                        builder.append(text[index])
-                        index++
-                    }
-                }
-                text[index] == '[' -> {
-                    val labelEnd = text.indexOf("](", index)
-                    val urlEnd = if (labelEnd > index) text.indexOf(')', labelEnd + 2) else -1
-                    if (labelEnd > index && urlEnd > labelEnd + 2) {
-                        val label = text.substring(index + 1, labelEnd)
-                        val url = text.substring(labelEnd + 2, urlEnd)
-                        val start = builder.length
-                        builder.append(label)
-                        builder.setSpan(URLSpan(url), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                        builder.setSpan(ForegroundColorSpan(Color.parseColor("#5B5BD6")), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                        index = urlEnd + 1
-                    } else {
-                        builder.append(text[index])
-                        index++
-                    }
-                }
-                else -> {
-                    builder.append(text[index])
-                    index++
-                }
-            }
-        }
+    fun discardDownloadedModule(zipPath: String) {
+        val zip = File(zipPath)
+        originalZipForInAppZip(zip)?.delete()
+        zip.delete()
     }
 
     private fun downloadWithManager(
         context: Context,
         update: UpdateInfo,
+        handle: DownloadHandle,
         onProgress: (String, Int?) -> Unit
     ): File {
         val manager = context.getSystemService(DownloadManager::class.java)
@@ -463,6 +410,7 @@ object ModuleUpdater {
         var missingCount = 0
         try {
             while (true) {
+                if (handle.isCancelled) throw DownloadCancelledException()
                 if (SystemClock.elapsedRealtime() - startedAt > DOWNLOAD_TIMEOUT_MS) {
                     throw UpdateException("下载超时，请检查网络后重试")
                 }
@@ -848,4 +796,5 @@ object ModuleUpdater {
     }
 
     private class UpdateException(message: String) : Exception(message)
+    private class DownloadCancelledException : Exception()
 }

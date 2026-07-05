@@ -18,6 +18,7 @@ import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.checkbox.MaterialCheckBox
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputLayout
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 import top.suto.appopt.databinding.ActivitySettingsBinding
 import top.suto.appopt.databinding.DialogPolicyModeBinding
@@ -50,6 +51,7 @@ class SettingsActivity : AppCompatActivity() {
     private companion object {
         const val MIN_MODULE_VERSION_CODE = DaemonBridge.REQUIRED_MODULE_VERSION_CODE
         const val MIN_MODULE_VERSION_NAME = DaemonBridge.REQUIRED_MODULE_VERSION_NAME
+        val POLICY_IO_EXECUTOR = Executors.newSingleThreadExecutor()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -106,7 +108,7 @@ class SettingsActivity : AppCompatActivity() {
         policyEditable = false
         setPolicyStatus("正在读取策略")
         setPolicyInputsEnabled(false)
-        thread {
+        POLICY_IO_EXECUTOR.execute {
             val root = DaemonBridge.hasRoot()
             val version = if (root) DaemonBridge.readModuleVersion() else null
             val file = if (root) DaemonBridge.readCalibPolicyRaw() else null
@@ -270,10 +272,10 @@ class SettingsActivity : AppCompatActivity() {
     private fun schedulePolicySave(delayMs: Long = 650L) {
         if (!policyEditable || suppressPolicyChange) return
         autoSaveRunnable?.let { mainHandler.removeCallbacks(it) }
-        val seq = ++saveSeq
         val runnable = Runnable {
+            autoSaveRunnable = null
             val policy = readPolicyFromInputs() ?: return@Runnable
-            savePolicy(policy, seq)
+            savePolicy(policy, ++saveSeq)
         }
         autoSaveRunnable = runnable
         mainHandler.postDelayed(runnable, delayMs)
@@ -282,6 +284,15 @@ class SettingsActivity : AppCompatActivity() {
     private fun cancelAutoSave() {
         autoSaveRunnable?.let { mainHandler.removeCallbacks(it) }
         autoSaveRunnable = null
+    }
+
+    private fun flushAutoSave() {
+        val pending = autoSaveRunnable ?: return
+        mainHandler.removeCallbacks(pending)
+        autoSaveRunnable = null
+        if (!policyEditable || suppressPolicyChange) return
+        val policy = readPolicyFromInputs() ?: return
+        savePolicy(policy, ++saveSeq)
     }
 
     private fun showResetPolicyConfirm() {
@@ -297,6 +308,7 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun restoreModuleDefaultPolicy() {
+        cancelAutoSave()
         val policy = moduleDefaultPolicy()
         setPolicyStatus("默认策略已生成，正在保存")
         setPolicyInputsEnabled(false)
@@ -328,7 +340,7 @@ class SettingsActivity : AppCompatActivity() {
             toast("模块更新待重启，当前不能修改策略")
             return
         }
-        thread {
+        POLICY_IO_EXECUTOR.execute {
             val ok = DaemonBridge.writeCalibPolicyRaw(policy.toConfigText())
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
@@ -790,6 +802,11 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun toast(msg: String) {
         AppToast.show(this, msg)
+    }
+
+    override fun onStop() {
+        flushAutoSave()
+        super.onStop()
     }
 
     override fun onDestroy() {

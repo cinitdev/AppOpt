@@ -1,7 +1,6 @@
 <resources>
     <!-- 悬浮球胶囊配色 (沿用) -->
     <color name="yellow_capsule">#F1C40F</color>
-    <color name="red_capsule">#E74C3C</color>
     <color name="capsule_text">#FFFFFF</color>
 
     <!-- 品牌主色: 性能/科技感的蓝紫 -->

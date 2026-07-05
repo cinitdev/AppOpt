@@ -32,7 +32,7 @@
             android:paddingStart="5dp"
             android:paddingEnd="5dp"
             android:textColor="@color/brand_primary_dark"
-            android:textSize="10sp"
+            android:textSize="11sp"
             android:textStyle="bold" />
 
         <LinearLayout
@@ -60,7 +60,7 @@
                 android:ellipsize="middle"
                 android:maxLines="1"
                 android:textColor="@color/text_secondary"
-                android:textSize="10sp" />
+                android:textSize="11sp" />
         </LinearLayout>
 
         <LinearLayout
@@ -77,7 +77,7 @@
                 android:fontFamily="monospace"
                 android:gravity="center"
                 android:textColor="@color/brand_primary_dark"
-                android:textSize="9sp"
+                android:textSize="11sp"
                 android:textStyle="bold" />
 
             <TextView
@@ -89,7 +89,7 @@
                 android:fontFamily="monospace"
                 android:gravity="center"
                 android:textColor="@color/text_secondary"
-                android:textSize="9sp"
+                android:textSize="11sp"
                 android:textStyle="bold" />
         </LinearLayout>
     </LinearLayout>
