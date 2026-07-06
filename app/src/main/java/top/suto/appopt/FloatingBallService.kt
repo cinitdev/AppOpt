@@ -332,7 +332,7 @@ class FloatingBallService : Service() {
             foregroundClosing = true
             mainHandler.removeCallbacks(foregroundWatcher)
             removeCapsule()
-            showBanner("正在分析负载并生成规则…", durationMs = 3500)
+            showBanner("正在结束校准…", durationMs = 3500)
             var stopTimedOut = false
             var timeoutClose: Runnable? = null
             var timeoutStopSelf: Runnable? = null
@@ -772,30 +772,26 @@ class FloatingBallService : Service() {
         calibrating = false
 
         if (wasCalibrating && appeared && pkg.isNotBlank()) {
-            // 校准中退出游戏: 快速等待 C 端返回状态并显示具体原因
+            showBanner("正在结束校准…", durationMs = 3500)
             thread {
                 val ok = DaemonBridge.stopCalibration(pkg)
                 val status = if (ok) {
-                    DaemonBridge.waitDone(pkg, timeoutMs = BACKGROUND_WAIT_DONE_MS)
+                    DaemonBridge.waitDone(pkg, timeoutMs = MANUAL_WAIT_DONE_MS)
                 } else {
                     null
                 }
                 if (status != null) {
                     importCalibrationHistory(pkg, "foreground_close:$status")
                 }
-
-                val msg = when (status) {
-                    "ok" -> "校准完成，规则已生成"
-                    "short" -> "采样时长不足 (需要 ≥30 秒)\n建议重新进入游戏多玩一会"
-                    "no_load" -> "未检测到明显负载\n建议在游戏内正常游玩时采样"
-                    "write_fail" -> "规则写回配置文件失败\n请检查模块权限"
-                    else -> "已退出游戏，校准已停止\n(数据已保存到历史记录)"
-                }
+                val rules = if (status == "ok") DaemonBridge.readPkgRules(pkg) else emptyList()
+                android.util.Log.d(
+                    "AppOpt",
+                    "FloatingBallService foreground stop calibration result: pkg=$pkg ok=$ok status=$status rules=${rules.size}"
+                )
 
                 postIfAlive {
                     if (generation != monitorGeneration) return@postIfAlive
-                    showBanner(msg, durationMs = 2600)
-                    scheduleStopSelf(2600, generation)
+                    showResult(pkg, ok, status, rules)
                 }
             }
         } else {
