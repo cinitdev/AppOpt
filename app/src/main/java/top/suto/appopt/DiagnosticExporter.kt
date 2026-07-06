@@ -43,10 +43,13 @@ object DiagnosticExporter {
 
                     if (root) {
                         zip.addRootFile("module/AppOpt.log", "/data/adb/modules/AppOpt/logs/AppOpt.log")
+                        zip.addRootFile("module/ForegroundHelper.log", "/data/adb/modules/AppOpt/logs/ForegroundHelper.log")
                         zip.addRootFile("module/module.prop", "/data/adb/modules/AppOpt/module.prop")
                         zip.addRootFile("module/pending_module.prop", "/data/adb/modules_update/AppOpt/module.prop")
                         zip.addRootFile("config/applist.conf", "/data/adb/modules/AppOpt/config/applist.conf")
                         zip.addRootFile("config/calib_policy.conf", "/data/adb/modules/AppOpt/config/calib_policy.conf")
+                        zip.addRootFile("config/foreground_task.state", "/data/adb/modules/AppOpt/config/foreground_task.state")
+                        zip.addRootFile("config/foreground_helper.pid", "/data/adb/modules/AppOpt/config/foreground_helper.pid")
                         zip.addText("system/cpu_topology.txt", runRoot(CPU_TOPOLOGY_CMD, timeoutSeconds = 10L))
                         zip.addText("system/cpuset.txt", runRoot(CPUSET_CMD, timeoutSeconds = 10L))
                         zip.addText("system/processes.txt", runRoot(PROCESS_CMD, timeoutSeconds = 10L))
@@ -217,7 +220,7 @@ object DiagnosticExporter {
 
     private val PROCESS_CMD = """
         echo '# appopt processes'
-        ps -A 2>/dev/null | grep -i -E 'AppOpt|top.suto.appopt' || true
+        ps -A 2>/dev/null | grep -i -E 'AppOpt|top.suto.appopt|appopt_foreground_helper' || true
         echo
         echo '# module daemon pid'
         pidof AppOpt 2>/dev/null || true

@@ -64,7 +64,6 @@ class FloatingBallService : Service() {
     private var capsuleAdded = false
     @Volatile private var serviceDestroyed = false
     private var foregroundTracker = ForegroundDetector.Tracker()
-    private var usageAccessMissingCount = 0
     private var foregroundCheckGeneration = -1L
     private var monitorGeneration = 0L
     private var pendingStopRunnable: Runnable? = null
@@ -104,7 +103,6 @@ class FloatingBallService : Service() {
         private const val FG_ABSENT_LIMIT = 2         // 连续 2 次(约6s)不在前台才判定离开, 避免下拉通知栏等短暂切换误关
         private const val FG_APPEAR_GRACE = 15        // 启动后等待应用出现的宽限次数(约45s)
         private const val FG_LAUNCH_PROCESS_MISS_LIMIT = 3
-        private const val FG_USAGE_ACCESS_MISSING_LIMIT = 3
         private const val MANUAL_STOP_TIMEOUT_MS = 18_000L
         private const val MANUAL_STOP_CLOSE_DELAY_MS = 20_000L
         private const val MANUAL_WAIT_DONE_MS = 22_000L
@@ -531,22 +529,6 @@ class FloatingBallService : Service() {
             val generation = monitorGeneration
             val pkg = targetPkg
             if (pkg.isNullOrBlank() || foregroundClosing) return
-            // 没有使用情况访问权限时无法判断前台。短暂不可用先重试, 连续不可用则收尾关闭,
-            // 避免悬浮球在权限被系统回收或用户关闭后长期残留。
-            if (!ForegroundDetector.hasUsageAccess(this@FloatingBallService)) {
-                usageAccessMissingCount++
-                android.util.Log.d(
-                    "AppOpt",
-                    "FloatingBallService foreground check: target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} check=${pkg} source=usage_access action=wait_permission foreground=false usage=false focused= appeared=$hasAppearedForeground calibrating=$calibrating absent=$absentCount confirmed=true notConfirmed=$launchProcessMissingCount graceLeft=$appearGraceLeft missing=$usageAccessMissingCount"
-                )
-                if (usageAccessMissingCount >= FG_USAGE_ACCESS_MISSING_LIMIT) {
-                    closeByUsageAccessLost()
-                } else {
-                    mainHandler.postDelayed(this, FG_CHECK_INTERVAL)
-                }
-                return
-            }
-            usageAccessMissingCount = 0
             val checkPkg = launchPkg ?: pkg
             val needLaunchProcessCheck = !hasAppearedForeground
             if (foregroundCheckGeneration == generation) {
@@ -568,39 +550,88 @@ class FloatingBallService : Service() {
                 var checkKey = "unknown"
                 var checkDetail = ""
                 try {
-                    usageState = tracker.queryState(this@FloatingBallService, checkPkg)
-                    usageForeground = usageState.foreground
-                    val topState = DaemonBridge.readTopAppState(checkPkg)
-                    focusedPkg = DaemonBridge.readFocusedPackage()
-                    val focusMatchesTarget = focusedPkg == checkPkg
-                    val focusShowsOther = !focusedPkg.isNullOrBlank() && !focusMatchesTarget
-                    val topHasSignal = topState.targetTopApp || topState.scanned > 0 || topState.packages.isNotEmpty()
-                    val topShowsOther = topHasSignal && !topState.targetTopApp
-
-                    if (usageForeground && !focusShowsOther && !topShowsOther) {
-                        foreground = true
-                        processRunning = true
-                        checkKey = "usage"
-                        checkDetail = "UsageStats 命中; cgroup=${topState.targetTopApp} focused=${focusedPkg.orEmpty()} backend=${topState.backend} pid=${topState.pid ?: 0} scanned=${topState.scanned} packages=${topState.packages.joinToString("|")}"
-                    } else if (topState.targetTopApp) {
-                        foreground = true
-                        processRunning = true
-                        checkKey = "cgroup-top"
-                        checkDetail = "cgroup 前台组命中目标; usage=$usageForeground focused=${focusedPkg.orEmpty()} backend=${topState.backend} pid=${topState.pid ?: 0} scanned=${topState.scanned} packages=${topState.packages.joinToString("|")}"
-                    } else {
-                        foreground = focusMatchesTarget
-                        processRunning = if (needLaunchProcessCheck) focusMatchesTarget else true
+                    val usageAccess = ForegroundDetector.hasUsageAccess(this@FloatingBallService)
+                    if (usageAccess) {
+                        usageState = tracker.queryState(this@FloatingBallService, checkPkg)
+                        usageForeground = usageState.foreground
+                    }
+                    val taskState = DaemonBridge.readTaskForegroundState()
+                    if (taskState.available) {
+                        focusedPkg = taskState.packageName
+                        foreground = focusedPkg == checkPkg
+                        processRunning = if (needLaunchProcessCheck) foreground else true
                         checkKey = when {
-                            focusMatchesTarget -> "dumpsys"
-                            focusShowsOther -> if (focusedPkg == packageName) "focus-self" else "focus-other"
-                            topShowsOther -> "cgroup-other"
+                            foreground -> "activity-task"
+                            focusedPkg == packageName -> "activity-task-self"
+                            else -> "activity-task-other"
+                        }
+                        checkDetail = "ActivityTaskManager mode=${taskState.mode} age=${taskState.ageMs ?: -1}ms " +
+                            "generation=${taskState.generation ?: 0} reason=${taskState.reason} " +
+                            "selection=${taskState.selection} task=${taskState.taskId ?: 0} " +
+                            "display=${taskState.displayId ?: -1} visible=${taskState.visiblePackages.joinToString("|")} " +
+                            "usageAccess=$usageAccess"
+                    } else {
+                        val topState = DaemonBridge.readTopAppState(checkPkg)
+                        focusedPkg = DaemonBridge.readFocusedPackage()
+                        val focusMatchesTarget = focusedPkg == checkPkg
+                        val focusShowsOther = !focusedPkg.isNullOrBlank() && !focusMatchesTarget
+                        val topHasSignal = topState.targetTopApp || topState.scanned > 0 || topState.packages.isNotEmpty()
+                        val taskFallback = "atm=${taskState.status}/${taskState.mode} " +
+                            "age=${taskState.ageMs ?: -1}ms error=${taskState.error.ifBlank { "none" }}"
+
+                        val usageSignal = when {
+                            !usageAccess -> "none"
+                            usageState?.error?.isNotBlank() == true -> "none"
+                            usageForeground -> "target"
+                            usageState?.currentPackage?.isNotBlank() == true -> "other"
+                            else -> "none"
+                        }
+                        val cgroupSignal = when {
+                            topState.targetTopApp -> "target"
+                            topHasSignal -> "other"
+                            else -> "none"
+                        }
+                        val focusSignal = when {
+                            focusMatchesTarget -> "target"
+                            focusShowsOther -> "other"
+                            else -> "none"
+                        }
+                        val targetVotes = listOf(usageSignal, cgroupSignal, focusSignal).count { it == "target" }
+                        val otherVotes = listOf(usageSignal, cgroupSignal, focusSignal).count { it == "other" }
+                        val signalCount = targetVotes + otherVotes
+                        val noSignal = signalCount == 0
+
+                        foreground = when {
+                            otherVotes >= 2 -> false
+                            targetVotes >= 2 -> true
+                            targetVotes == 1 && otherVotes == 0 -> true
+                            otherVotes == 1 && targetVotes == 0 -> false
+                            focusSignal == "target" -> true
+                            focusSignal == "other" -> false
+                            else -> false
+                        }
+                        processRunning = when {
+                            foreground -> true
+                            needLaunchProcessCheck && signalCount == 0 -> true
+                            needLaunchProcessCheck -> false
+                            else -> true
+                        }
+                        checkKey = when {
+                            targetVotes >= 2 || otherVotes >= 2 -> "fallback-vote"
+                            focusSignal == "target" -> "dumpsys"
+                            focusSignal == "other" -> if (focusedPkg == packageName) "focus-self" else "focus-other"
+                            cgroupSignal == "target" -> "cgroup-top"
+                            cgroupSignal == "other" -> "cgroup-other"
+                            usageSignal == "target" -> "usage"
+                            usageSignal == "other" -> "usage-other"
+                            noSignal && hasAppearedForeground -> "no-signal"
                             else -> "not-confirmed"
                         }
-                        checkDetail = if (usageForeground && (focusShowsOther || topShowsOther)) {
-                            "UsageStats 命中但前台纠偏为离开目标; focused=${focusedPkg.orEmpty()} backend=${topState.backend} pid=${topState.pid ?: 0} scanned=${topState.scanned} packages=${topState.packages.joinToString("|")}"
-                        } else {
-                            "cgroup 前台组未命中目标, 回退 dumpsys; focused=${focusedPkg.orEmpty()} backend=${topState.backend} pid=${topState.pid ?: 0} scanned=${topState.scanned} packages=${topState.packages.joinToString("|")}"
-                        }
+                        checkDetail = "fallback vote targetVotes=$targetVotes otherVotes=$otherVotes " +
+                            "usage=$usageSignal usagePkg=${usageState?.currentPackage.orEmpty()} " +
+                            "cgroup=$cgroupSignal focused=${focusedPkg.orEmpty()} " +
+                            "backend=${topState.backend} pid=${topState.pid ?: 0} scanned=${topState.scanned} " +
+                            "packages=${topState.packages.joinToString("|")}; $taskFallback"
                     }
                 } catch (e: Exception) {
                     checkKey = "error"
@@ -712,45 +743,6 @@ class FloatingBallService : Service() {
             "AppOpt",
             "FloatingBallService foreground check: target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} check=${snapshot.checkPkg} pkg=$pkg source=${snapshot.source} action=$action foreground=${snapshot.foreground} usage=${snapshot.usageForeground} usagePkg=${snapshot.usagePackage.orEmpty()} usageEvents=${snapshot.usageEventCount} usageResumed=${snapshot.usageResumedCount} usageLast=${snapshot.usageLastEventPackage.orEmpty()} usageLastType=${snapshot.usageLastEventType} focused=${snapshot.focusedPkg.orEmpty()} appeared=$hasAppearedForeground calibrating=$calibrating absent=$absentCount confirmed=${snapshot.processRunning} notConfirmed=$launchProcessMissingCount graceLeft=$appearGraceLeft ${snapshot.detail}"
         )
-    }
-
-    private fun closeByUsageAccessLost() {
-        if (serviceDestroyed) return
-        if (foregroundClosing) return
-        android.util.Log.d(
-            "AppOpt",
-            "FloatingBallService auto close: reason=usage_access_lost appeared=$hasAppearedForeground calibrating=$calibrating target=${targetPkg.orEmpty()} launch=${launchPkg.orEmpty()} focused= absent=$absentCount notConfirmed=$launchProcessMissingCount source=usage_access detail=UsageStats permission unavailable"
-        )
-        foregroundClosing = true
-        val generation = monitorGeneration
-        mainHandler.removeCallbacks(foregroundWatcher)
-        removeCapsule()
-
-        val pkg = targetPkg ?: ""
-        val wasCalibrating = calibrating
-        calibrating = false
-
-        if (wasCalibrating && pkg.isNotBlank()) {
-            thread {
-                val ok = DaemonBridge.stopCalibration(pkg)
-                val status = if (ok) {
-                    DaemonBridge.waitDone(pkg, timeoutMs = BACKGROUND_WAIT_DONE_MS)
-                } else {
-                    null
-                }
-                if (status != null) {
-                    importCalibrationHistory(pkg, "usage_access_lost:$status")
-                }
-                postIfAlive {
-                    if (generation != monitorGeneration) return@postIfAlive
-                    showBanner("使用情况访问权限不可用\n校准已停止，悬浮球已关闭", durationMs = 2800)
-                    scheduleStopSelf(2600, generation)
-                }
-            }
-        } else {
-            showBanner("使用情况访问权限不可用\n悬浮球已关闭", durationMs = 2800)
-            scheduleStopSelf(2600, generation)
-        }
     }
 
     /**
@@ -892,7 +884,6 @@ class FloatingBallService : Service() {
         launchPkg = requestedLaunch
         hasAppearedForeground = false
         absentCount = 0
-        usageAccessMissingCount = 0
         launchProcessMissingCount = 0
         foregroundCheckGeneration = -1L
         appearGraceLeft = FG_APPEAR_GRACE
@@ -924,6 +915,8 @@ class FloatingBallService : Service() {
                 "FloatingBallService start fps monitor: pkg=$pkg socket=${!fpsSocketName.isNullOrBlank()}"
             )
             FPS_COMMAND_EXECUTOR.execute {
+                val helperOk = DaemonBridge.ensureTaskForegroundHelper()
+                android.util.Log.d("AppOpt", "FloatingBallService foreground helper ensure: ok=$helperOk")
                 val ok = DaemonBridge.startFpsMonitor(pkg, fpsSocketName, fpsSocketToken)
                 android.util.Log.d("AppOpt", "FloatingBallService fps command result: pkg=$pkg ok=$ok")
                 if (!ok) {

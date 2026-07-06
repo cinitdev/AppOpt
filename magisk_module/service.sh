@@ -19,6 +19,8 @@ cd "$MODDIR"
 BIN="$MODDIR/config/bin/AppOpt"
 CONF="$MODDIR/config/applist.conf"
 LOG="$MODDIR/logs/AppOpt.log"
+FOREGROUND_HELPER="$MODDIR/config/tools/appopt_foreground_helper.sh"
+FOREGROUND_HELPER_LOG="$MODDIR/logs/ForegroundHelper.log"
 APPOPT_IN_APP_UPDATE_FLAG="/data/adb/appopt_in_app_update"
 
 mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" "$MODDIR/logs"
@@ -29,6 +31,7 @@ chmod 0755 "$BIN"
 
 # 本次开机先清空日志一次 (只保留本次开机以来的输出)
 : > "$LOG"
+[ -f "$FOREGROUND_HELPER_LOG" ] && : > "$FOREGROUND_HELPER_LOG"
 
 read_app_prop() {
 	local key="$1"
@@ -112,6 +115,13 @@ install_deferred_app_update
 rm -f "$MODDIR/logs/AppOpt_app_info.prop" "$MODDIR/logs/AppOpt_app_install.prop" 2>/dev/null || true
 rm -f "$APPOPT_IN_APP_UPDATE_FLAG" 2>/dev/null || true
 
+start_foreground_helper() {
+	[ -f "$FOREGROUND_HELPER" ] || return 1
+	sh "$FOREGROUND_HELPER" start
+}
+
+start_foreground_helper || echo "- ActivityTaskManager 前台助手启动失败，将由 App 使用兼容检测" >> "$LOG"
+
 # 判断是否已经有"本模块自己的" AppOpt 守护进程在运行。
 # 不能只用 pgrep -x AppOpt: 项目开源后, 其他二改版本也可能使用同名进程。
 # 这里用 /proc/<pid>/exe 反查可执行文件路径, 只有路径等于本模块 BIN 才算命中。
@@ -127,6 +137,7 @@ is_our_daemon_running() {
 # 看门狗: 守护进程退出后自动重启, 只按本模块 BIN 做单实例判断。
 (
 	while true; do
+		start_foreground_helper >/dev/null 2>&1 || true
 		if ! is_our_daemon_running; then
 			# 追加写: 崩溃重启不丢上一轮日志, 便于排查异常退出原因
 			"$BIN" -c "$CONF" -s 2 >>"$LOG" 2>&1

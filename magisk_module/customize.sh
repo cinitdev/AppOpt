@@ -477,5 +477,6 @@ prepare_calib_policy
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOpt" 0 2000 0755 0755 u:object_r:magisk_file:s0
 [ -d "$MODPATH/config/app/tools" ] && chmod 0755 "$MODPATH/config/app/tools" "$MODPATH/config/app/tools"/*.sh 2>/dev/null
+[ -d "$MODPATH/config/tools" ] && chmod 0755 "$MODPATH/config/tools" "$MODPATH/config/tools"/*.sh 2>/dev/null
 install_or_update_app
 cleanup_embedded_app

@@ -1,6 +1,7 @@
 package top.suto.appopt
 
 import android.net.LocalServerSocket
+import android.os.SystemClock
 import java.io.BufferedReader
 import java.io.DataOutputStream
 import java.io.InputStreamReader
@@ -44,6 +45,9 @@ object DaemonBridge {
     private const val HISTORY_DIR = "$MODULE_DIR/history"
     private const val LOG_FILE = "$LOG_DIR/AppOpt.log"
     private const val FPS_CMD_FILE = "$CONFIG_DIR/fps.cmd"
+    private const val FOREGROUND_TASK_STATE_FILE = "$CONFIG_DIR/foreground_task.state"
+    private const val FOREGROUND_HELPER_SCRIPT = "$CONFIG_DIR/tools/appopt_foreground_helper.sh"
+    private const val FOREGROUND_TASK_MAX_AGE_MS = 12_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
     const val REQUIRED_MODULE_VERSION_CODE = 175
@@ -76,6 +80,23 @@ object DaemonBridge {
         val scanned: Int,
         val packages: List<String>,
         val backend: String = "cgroup-top"
+    )
+
+    data class TaskForegroundState(
+        val available: Boolean,
+        val status: String,
+        val mode: String,
+        val packageName: String?,
+        val activityName: String?,
+        val taskId: Int?,
+        val displayId: Int?,
+        val visiblePackages: List<String>,
+        val ageMs: Long?,
+        val generation: Long?,
+        val reason: String,
+        val selection: String,
+        val error: String,
+        val raw: String
     )
 
     fun readRootFile(path: String): String? {
@@ -317,6 +338,57 @@ object DaemonBridge {
             scanned = values["scanned"]?.toIntOrNull() ?: 0,
             packages = packages,
             backend = "cgroup-top"
+        )
+    }
+
+    fun ensureTaskForegroundHelper(): Boolean {
+        return runAsRoot(
+            "[ -f ${shellQuote(FOREGROUND_HELPER_SCRIPT)} ] && " +
+                "sh ${shellQuote(FOREGROUND_HELPER_SCRIPT)} start >/dev/null 2>&1"
+        ).isNotErrored()
+    }
+
+    fun readTaskForegroundState(): TaskForegroundState {
+        val raw = runAsRoot("cat ${shellQuote(FOREGROUND_TASK_STATE_FILE)} 2>/dev/null")
+            .substringBefore(ERR_MARK)
+        return parseTaskForegroundState(raw, SystemClock.elapsedRealtime())
+    }
+
+    internal fun parseTaskForegroundState(raw: String, elapsedNowMs: Long): TaskForegroundState {
+        val values = raw.lineSequence()
+            .mapNotNull { line ->
+                val index = line.indexOf('=')
+                if (index <= 0) null else line.substring(0, index).trim() to
+                    line.substring(index + 1).trim()
+            }
+            .toMap()
+        val updatedElapsed = values["updated_elapsed_ms"]?.toLongOrNull()
+        val age = updatedElapsed?.let {
+            if (it <= 0L || elapsedNowMs < it) null else elapsedNowMs - it
+        }
+        val status = values["status"].orEmpty()
+        val packageName = values["focused_package"].orEmpty().ifBlank { null }
+        val available = status == "ok" && packageName != null &&
+            age != null && age <= FOREGROUND_TASK_MAX_AGE_MS
+        return TaskForegroundState(
+            available = available,
+            status = status.ifBlank { "missing" },
+            mode = values["mode"].orEmpty(),
+            packageName = packageName,
+            activityName = values["focused_activity"].orEmpty().ifBlank { null },
+            taskId = values["focused_task_id"]?.toIntOrNull()?.takeIf { it > 0 },
+            displayId = values["focused_display_id"]?.toIntOrNull()?.takeIf { it >= 0 },
+            visiblePackages = values["visible_packages"].orEmpty()
+                .split(',')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct(),
+            ageMs = age,
+            generation = values["generation"]?.toLongOrNull(),
+            reason = values["reason"].orEmpty(),
+            selection = values["selection"].orEmpty(),
+            error = values["error"].orEmpty(),
+            raw = raw
         )
     }
 

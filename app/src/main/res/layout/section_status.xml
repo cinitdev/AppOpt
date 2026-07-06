@@ -201,5 +201,37 @@
                 android:textColor="@color/text_secondary"
                 android:textSize="13sp" />
         </LinearLayout>
+
+        <!-- 前台监听行(ActivityTaskManager helper) -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginTop="6dp">
+
+            <View
+                android:id="@+id/dotForegroundHelper"
+                android:layout_width="10dp"
+                android:layout_height="10dp"
+                android:background="@drawable/dot_status" />
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="10dp"
+                android:text="前台监听"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/foregroundHelperState"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="检查中"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp" />
+        </LinearLayout>
     </LinearLayout>
 </com.google.android.material.card.MaterialCardView>

@@ -10,6 +10,7 @@ SRC="$NATIVE_DIR/AppOpt.c"
 FOREGROUND_MONITOR_SRC="$NATIVE_DIR/foreground_monitor.c"
 FPS_MON="$NATIVE_DIR/fps_monitor"
 RUST_BRIDGE="$FPS_MON/appopt_ebpf_bridge"
+FOREGROUND_HELPER="$ROOT/tools/appopt_foreground_helper"
 AYA_SUBMODULE="$FPS_MON/aya"
 AYA_SUBMODULE_REL="native_daemon/fps_monitor/aya"
 BASE_DIR="$ROOT/magisk_module"
@@ -218,6 +219,50 @@ build_pkg_helper() {
 
     (cd "$helper_dex" && jar cf "$tools_dir/appopt_pkg_helper.jar" classes.dex)
     [ -s "$tools_dir/appopt_pkg_helper.jar" ] || { echo "! package helper jar build failed"; exit 1; }
+}
+
+build_foreground_helper() {
+    local android_platform android_jar build_tools d8_jar helper_src stub_src helper_build
+    local helper_classes helper_dex stub_jar tools_dir
+    android_platform="$(latest_dir "$SDK_DIR/platforms")"
+    android_jar="$android_platform/android.jar"
+    build_tools="$(latest_dir "$SDK_DIR/build-tools")"
+    d8_jar="$build_tools/lib/d8.jar"
+    helper_src="$FOREGROUND_HELPER/src"
+    stub_src="$FOREGROUND_HELPER/stubs"
+    helper_build="$ROOT/build/foreground-helper"
+    helper_classes="$helper_build/classes"
+    helper_dex="$helper_build/dex"
+    stub_jar="$helper_build/framework-stubs.jar"
+    tools_dir="$WORK/config/tools"
+
+    [ -f "$android_jar" ] || { echo "! android.jar not found: $android_jar"; exit 1; }
+    [ -f "$d8_jar" ] || { echo "! d8.jar not found: $d8_jar"; exit 1; }
+    [ -d "$helper_src" ] || { echo "! foreground helper source not found: $helper_src"; exit 1; }
+    [ -d "$stub_src" ] || { echo "! foreground helper stubs not found: $stub_src"; exit 1; }
+
+    rm -rf "$helper_build"
+    mkdir -p "$helper_classes" "$helper_dex" "$tools_dir"
+
+    echo "- Build ActivityTaskManager foreground helper dex jar"
+    javac -encoding UTF-8 --release 11 \
+        -classpath "$android_jar" \
+        -d "$helper_classes" \
+        $(find "$stub_src" "$helper_src" -name '*.java' | sort)
+
+    (cd "$helper_classes" && jar cf "$stub_jar" android/app/TaskStackListener.class)
+    java -cp "$d8_jar" com.android.tools.r8.D8 \
+        --release --min-api 31 \
+        --lib "$android_jar" \
+        --lib "$stub_jar" \
+        --output "$helper_dex" \
+        $(find "$helper_classes/appopt" -name '*.class' | sort)
+
+    (cd "$helper_dex" && jar cf "$tools_dir/appopt_foreground_helper.jar" classes.dex)
+    [ -s "$tools_dir/appopt_foreground_helper.jar" ] || {
+        echo "! foreground helper jar build failed"
+        exit 1
+    }
 }
 
 read_app_version_code() {
@@ -547,6 +592,7 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 cp -r "$BASE_DIR/." "$WORK/"
 build_pkg_helper
+build_foreground_helper
 build_and_embed_app
 
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"

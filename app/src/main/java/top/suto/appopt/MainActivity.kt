@@ -65,6 +65,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var hasRoot = false
     private var daemonRunning = false
+    private var foregroundHelperStatus = ForegroundHelperStatus()
     private var moduleVersion: DaemonBridge.ModuleVersion? = null
     private var moduleCompatible = false
     private var pendingModuleUpdate = false
@@ -90,6 +91,11 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var activityDestroyed = false
     private var firstResume = true
     private lateinit var appAdapter: AppAdapter
+
+    private data class ForegroundHelperStatus(
+        val state: DaemonBridge.TaskForegroundState? = null,
+        val startRequested: Boolean = false
+    )
 
     private companion object {
         const val PREFS_NAME = "appopt_prefs"
@@ -180,6 +186,7 @@ class MainActivity : AppCompatActivity() {
             val version = if (r && !pendingUpdate) DaemonBridge.readModuleVersion() else null
             val compatible = isCompatibleModule(version)
             val running = if (r && compatible && !pendingUpdate) DaemonBridge.isDaemonRunning() else false
+            val helperStatus = if (r && compatible && !pendingUpdate) queryForegroundHelperStatus() else ForegroundHelperStatus()
             val enabled = r && compatible && running
             val config = if (enabled) ConfigReader.readPackages() else ConfigReader.ConfigPackages(emptyList(), emptyList())
             val resolvedNames = resolveProcessComponentNames(config, enabled)
@@ -192,6 +199,7 @@ class MainActivity : AppCompatActivity() {
                     moduleVersion = version
                     moduleCompatible = compatible
                     daemonRunning = running
+                    foregroundHelperStatus = helperStatus
                     environmentLoading = false
                     appListsLoading = false
                     processNames = resolvedNames
@@ -252,6 +260,7 @@ class MainActivity : AppCompatActivity() {
             val version = if (root && !pendingUpdate) DaemonBridge.readModuleVersion() else null
             val compatible = root && isCompatibleModule(version)
             val running = if (root && compatible && !pendingUpdate) DaemonBridge.isDaemonRunning() else false
+            val helperStatus = if (root && compatible && !pendingUpdate) queryForegroundHelperStatus() else ForegroundHelperStatus()
             val enabled = root && compatible && running
             val config = if (enabled && refreshConfig) ConfigReader.readPackages() else null
             val resolvedNames = config?.let { resolveProcessComponentNames(it, enabled) } ?: processNames
@@ -266,6 +275,7 @@ class MainActivity : AppCompatActivity() {
                 moduleVersion = version
                 moduleCompatible = compatible
                 daemonRunning = running
+                foregroundHelperStatus = helperStatus
                 if (visibleLists != null) {
                     appListsLoading = false
                     processNames = resolvedNames
@@ -310,6 +320,26 @@ class MainActivity : AppCompatActivity() {
     private fun moduleVersionLabel(): String {
         val version = moduleVersion ?: return "未检测到"
         return "${version.versionName} (${version.versionCode})"
+    }
+
+    private fun queryForegroundHelperStatus(): ForegroundHelperStatus {
+        var state = DaemonBridge.readTaskForegroundState()
+        if (state.available) return ForegroundHelperStatus(state = state)
+
+        val started = DaemonBridge.ensureTaskForegroundHelper()
+        if (started) {
+            for (_i in 0 until 3) {
+                if (state.available) break
+                try {
+                    Thread.sleep(160L)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+                state = DaemonBridge.readTaskForegroundState()
+            }
+        }
+        return ForegroundHelperStatus(state = state, startRequested = started)
     }
 
     private fun showModuleWarningIfNeeded() {
@@ -371,6 +401,8 @@ class MainActivity : AppCompatActivity() {
             setDot(s.dotRoot, R.color.status_warn)
             s.daemonState.text = "检查中"
             setDot(s.dotDaemon, R.color.status_warn)
+            s.foregroundHelperState.text = "检查中"
+            setDot(s.dotForegroundHelper, R.color.status_warn)
             return
         }
 
@@ -398,6 +430,50 @@ class MainActivity : AppCompatActivity() {
             else -> {
                 s.daemonState.text = "未运行"
                 setDot(s.dotDaemon, R.color.status_warn)
+            }
+        }
+
+        val helper = foregroundHelperStatus.state
+        when {
+            !hasRoot -> {
+                s.foregroundHelperState.text = "未知"
+                setDot(s.dotForegroundHelper, R.color.status_off)
+            }
+            pendingModuleUpdate -> {
+                s.foregroundHelperState.text = "待重启"
+                setDot(s.dotForegroundHelper, R.color.status_warn)
+            }
+            !moduleCompatible -> {
+                s.foregroundHelperState.text = "模块需更新"
+                setDot(s.dotForegroundHelper, R.color.status_warn)
+            }
+            helper?.available == true && helper.mode == "poll" -> {
+                s.foregroundHelperState.text = "轮询中"
+                setDot(s.dotForegroundHelper, R.color.status_warn)
+            }
+            helper?.available == true -> {
+                s.foregroundHelperState.text = "运行中"
+                setDot(s.dotForegroundHelper, R.color.status_ok)
+            }
+            helper?.status == "error" -> {
+                s.foregroundHelperState.text = "错误"
+                setDot(s.dotForegroundHelper, R.color.status_warn)
+            }
+            helper?.status == "empty" -> {
+                s.foregroundHelperState.text = "无任务"
+                setDot(s.dotForegroundHelper, R.color.status_warn)
+            }
+            helper?.ageMs != null -> {
+                s.foregroundHelperState.text = "状态过期"
+                setDot(s.dotForegroundHelper, R.color.status_warn)
+            }
+            foregroundHelperStatus.startRequested -> {
+                s.foregroundHelperState.text = "启动中"
+                setDot(s.dotForegroundHelper, R.color.status_warn)
+            }
+            else -> {
+                s.foregroundHelperState.text = "不可用"
+                setDot(s.dotForegroundHelper, R.color.status_off)
             }
         }
     }

@@ -21,10 +21,6 @@ static const char *TOP_APP_GROUP_PATHS[] = {
     "/dev/cpuset/foreground_window/tasks",
     "/dev/cpuctl/foreground_window/cgroup.procs",
     "/dev/cpuctl/foreground_window/tasks",
-    "/dev/stune/top-app/cgroup.procs",
-    "/dev/stune/top-app/tasks",
-    "/dev/stune/foreground_window/cgroup.procs",
-    "/dev/stune/foreground_window/tasks",
 };
 
 static bool is_number_text(const char *text) {
