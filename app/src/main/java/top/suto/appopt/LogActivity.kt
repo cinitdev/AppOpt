@@ -21,6 +21,7 @@ class LogActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityLogBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBars.applyEdgeToEdge(this, binding.root, binding.logHeader)
 
         binding.btnRefreshLog.setOnClickListener { loadLog() }
         loadLog()

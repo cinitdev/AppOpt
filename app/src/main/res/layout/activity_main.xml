@@ -23,6 +23,7 @@
 
             <!-- 渐变品牌头部 -->
             <LinearLayout
+                android:id="@+id/mainHeader"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical"

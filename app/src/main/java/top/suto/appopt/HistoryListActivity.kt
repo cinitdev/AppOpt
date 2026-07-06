@@ -45,6 +45,7 @@ class HistoryListActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityHistoryListBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBars.applyEdgeToEdge(this, binding.root, binding.historyListHeader)
         binding.historyListBack.setOnClickListener { finish() }
     }
 

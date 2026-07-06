@@ -58,6 +58,7 @@ class SettingsActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivitySettingsBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBars.applyEdgeToEdge(this, binding.root, binding.settingsHeader)
 
         binding.settingsHistoryRow.setOnClickListener {
             startActivity(Intent(this, HistoryListActivity::class.java))

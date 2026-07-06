@@ -20,6 +20,7 @@ class UpdateInstallActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityUpdateInstallBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBars.applyEdgeToEdge(this, binding.root, binding.updateInstallHeader)
         viewModel = ViewModelProvider(this)[UpdateInstallViewModel::class.java]
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {

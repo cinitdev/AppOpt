@@ -70,6 +70,7 @@ class HistoryActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityHistoryBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBars.applyEdgeToEdge(this, binding.root, binding.historyHeader)
 
         val pkg = intent.getStringExtra(EXTRA_PKG).orEmpty()
         val label = intent.getStringExtra(EXTRA_LABEL).orEmpty().ifBlank { pkg }

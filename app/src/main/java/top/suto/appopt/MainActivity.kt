@@ -160,6 +160,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBars.applyEdgeToEdge(this, binding.root, binding.mainHeader)
         environmentLoadingShownAt = SystemClock.uptimeMillis()
         hideMissingConfigured = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getBoolean(PREF_HIDE_MISSING_CONFIGURED, false)

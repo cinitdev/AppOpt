@@ -5,7 +5,11 @@
         <item name="colorOnPrimary">@color/brand_on_primary</item>
         <item name="colorSecondary">@color/brand_secondary</item>
         <item name="android:windowBackground">@color/surface_app</item>
-        <item name="android:statusBarColor">@color/brand_primary</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:navigationBarColor">@color/surface_app</item>
+        <item name="android:windowLightNavigationBar">true</item>
     </style>
 
     <style name="Theme.AppOpt.Starting" parent="Theme.AppOpt">
