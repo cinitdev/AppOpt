@@ -229,6 +229,15 @@
                             self.pkg, active_pid
                         );
                     }
+                    if self.ebpf_seen_frames && active_pid > 0 && process_exists(active_pid) {
+                        println!(
+                            "[FPS] eBPF 已捕获过目标帧但暂时停帧, 目标进程仍存在, 继续保持 eBPF 等待: pkg={} pid={}",
+                            self.pkg, active_pid
+                        );
+                        self.ebpf_stale_checks = 0;
+                        thread::sleep(Duration::from_millis(300));
+                        return;
+                    }
                     println!(
                         "[FPS] eBPF 连续无目标新帧且 PID 未切换, 切换到 SurfaceFlinger fallback: pkg={} pid={}",
                         self.pkg, active_pid
@@ -314,6 +323,10 @@
             }
             write_fps_file(fps);
         }
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        pid > 0 && fs::metadata(format!("/proc/{pid}")).is_ok()
     }
 
     fn start_ebpf_for_pkg(pkg: &str, pid: i32, source: &str) -> *mut AppOptEbpfCtx {
