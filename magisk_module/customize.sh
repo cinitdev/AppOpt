@@ -35,20 +35,41 @@ extract_bin() {
 	ui_print "********************************************"
 	mkdir -p $MODPATH/config/bin
 	if [ "$ARCH" == "arm" ]; then
-		cp $MODPATH/config/bin/armeabi-v7a/AppOpt $MODPATH/config/bin/AppOpt
+		BIN_ABI_DIR="armeabi-v7a"
 	elif [ "$ARCH" == "arm64" ]; then
-		cp $MODPATH/config/bin/arm64-v8a/AppOpt $MODPATH/config/bin/AppOpt
+		BIN_ABI_DIR="arm64-v8a"
 	elif [ "$ARCH" == "x86" ]; then
-		cp $MODPATH/config/bin/x86/AppOpt $MODPATH/config/bin/AppOpt
+		BIN_ABI_DIR="x86"
 	elif [ "$ARCH" == "x64" ]; then
-		cp $MODPATH/config/bin/x86_64/AppOpt $MODPATH/config/bin/AppOpt
+		BIN_ABI_DIR="x86_64"
 	else
 		abort "! Unsupported platform: $ARCH"
 	fi
+	cp $MODPATH/config/bin/$BIN_ABI_DIR/AppOpt $MODPATH/config/bin/AppOpt
+	[ -f $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs ] && cp $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs $MODPATH/config/bin/AppOptRs
+	if [ -d "$MODPATH/config/ebpf/$BIN_ABI_DIR" ]; then
+		cp "$MODPATH/config/ebpf/$BIN_ABI_DIR/queuebuffer_probe.bpf.o" "$MODPATH/config/ebpf/queuebuffer_probe.bpf.o" 2>/dev/null || true
+		cp "$MODPATH/config/ebpf/$BIN_ABI_DIR/queuebuffer_probe_perf.bpf.o" "$MODPATH/config/ebpf/queuebuffer_probe_perf.bpf.o" 2>/dev/null || true
+	fi
 	ui_print "- Device platform: $ARCH"
 	rm -rf $MODPATH/config/bin/armeabi-v7a $MODPATH/config/bin/arm64-v8a $MODPATH/config/bin/x86 $MODPATH/config/bin/x86_64
+	rm -rf $MODPATH/config/ebpf/armeabi-v7a $MODPATH/config/ebpf/arm64-v8a $MODPATH/config/ebpf/x86 $MODPATH/config/ebpf/x86_64
 	[ -f $MODPATH/config/bin/AppOpt ] && chmod a+x $MODPATH/config/bin/AppOpt
-	if ! $MODPATH/config/bin/AppOpt -v; then
+	[ -f $MODPATH/config/bin/AppOptRs ] && chmod a+x $MODPATH/config/bin/AppOptRs
+	if [ -f $MODPATH/config/bin/AppOptRs ]; then
+		if $MODPATH/config/bin/AppOptRs -v; then
+			ui_print "- Rust 守护验证通过，将优先使用 AppOptRs"
+			if [ -f $MODPATH/config/bin/AppOpt ]; then
+				$MODPATH/config/bin/AppOpt -v >/dev/null 2>&1 || ui_print "- C 守护验证失败，仅保留 Rust 守护"
+			fi
+			return
+		fi
+		ui_print "- Rust 守护验证失败，删除 AppOptRs 并使用 C 守护"
+		rm -f $MODPATH/config/bin/AppOptRs
+	else
+		ui_print "- Rust 守护不可用，将使用 C 守护"
+	fi
+	if ! $MODPATH/config/bin/AppOpt -v >/dev/null 2>&1; then
 		abort "! 主程序验证失败，请检查模块zip文件是否损坏"
 	fi
 }
@@ -475,7 +496,7 @@ module_instructions
 add_default_rules
 prepare_calib_policy
 set_perm_recursive "$MODPATH" 0 0 0755 0644
-set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOpt" 0 2000 0755 0755 u:object_r:magisk_file:s0
+set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOpt $MODPATH/config/bin/AppOptRs" 0 2000 0755 0755 u:object_r:magisk_file:s0
 [ -d "$MODPATH/config/app/tools" ] && chmod 0755 "$MODPATH/config/app/tools" "$MODPATH/config/app/tools"/*.sh 2>/dev/null
 [ -d "$MODPATH/config/tools" ] && chmod 0755 "$MODPATH/config/tools" "$MODPATH/config/tools"/*.sh 2>/dev/null
 install_or_update_app

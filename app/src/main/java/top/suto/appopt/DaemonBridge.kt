@@ -33,6 +33,8 @@ object DaemonBridge {
     private const val MODULE_UPDATE_DIR = "/data/adb/modules_update/AppOpt"
     private const val CONFIG_DIR = "$MODULE_DIR/config"
     private const val BIN_FILE = "$CONFIG_DIR/bin/AppOpt"
+    private const val BIN_RS_FILE = "$CONFIG_DIR/bin/AppOptRs"
+    private const val RS_FALLBACK_FILE = "$CONFIG_DIR/.appopt_use_c_daemon"
     private const val LOG_DIR = "$MODULE_DIR/logs"
     private const val UPDATE_CONFIG_DIR = "$MODULE_UPDATE_DIR/config"
     private const val CMD_FILE = "$CONFIG_DIR/calibrate.cmd"
@@ -50,8 +52,8 @@ object DaemonBridge {
     private const val FOREGROUND_TASK_MAX_AGE_MS = 12_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 175
-    const val REQUIRED_MODULE_VERSION_NAME = "1.7.5"
+    const val REQUIRED_MODULE_VERSION_CODE = 176
+    const val REQUIRED_MODULE_VERSION_NAME = "1.7.6"
     private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
@@ -125,6 +127,7 @@ object DaemonBridge {
      * C 二进制 `AppOpt -v` 仅作为辅助显示信息, 不决定模块版本是否合格。
      */
     fun readModuleVersion(): ModuleVersion? {
+        val binSelect = daemonBinarySelectShell()
         val cmd = """
             prop="$MODULE_DIR/module.prop"
             prop_code=
@@ -132,8 +135,9 @@ object DaemonBridge {
             bin_version=
             [ -f "${'$'}prop" ] && prop_code=${'$'}(sed -n 's/^versionCode=//p' "${'$'}prop" 2>/dev/null | head -n 1)
             [ -f "${'$'}prop" ] && prop_version=${'$'}(sed -n 's/^version=//p' "${'$'}prop" 2>/dev/null | head -n 1)
-            if [ -x '$BIN_FILE' ]; then
-                bin_out=$('$BIN_FILE' -v 2>/dev/null)
+            daemon_bin=${'$'}($binSelect)
+            if [ -x "${'$'}daemon_bin" ]; then
+                bin_out=$("${'$'}daemon_bin" -v 2>/dev/null)
                 bin_version=${'$'}(printf '%s\n' "${'$'}bin_out" | sed -n 's/.*AppOpt 版本[[:space:]]*//p' | tail -n 1)
             fi
             printf 'propCode=%s\npropVersion=%s\nbinVersion=%s\n' "${'$'}prop_code" "${'$'}prop_version" "${'$'}bin_version"
@@ -196,7 +200,8 @@ object DaemonBridge {
             }
 
             val rootThread = Thread({
-                runAsRoot("'$BIN_FILE' --ping-daemon '$socketName' '$token' 2>/dev/null")
+                val binSelect = daemonBinarySelectShell()
+                runAsRoot("daemon_bin=\$($binSelect); \"\$daemon_bin\" --ping-daemon '$socketName' '$token' 2>/dev/null")
             }, "AppOptDaemonPing").apply {
                 isDaemon = true
                 start()
@@ -314,8 +319,11 @@ object DaemonBridge {
         if (safePkg.isBlank()) {
             return TopAppState(false, null, 0, emptyList(), backend = "invalid")
         }
+        val binSelect = daemonBinarySelectShell()
         val cmd = buildString {
-            append(shellQuote(BIN_FILE))
+            append("daemon_bin=$(")
+            append(binSelect)
+            append("); \"\$daemon_bin\"")
             append(" --app-state ")
             append(shellQuote(safePkg))
         }
@@ -1066,6 +1074,13 @@ object DaemonBridge {
     private fun cleanCommandArg(value: String, allowColon: Boolean): String {
         val allowed = if (allowColon) Regex("[^A-Za-z0-9._:-]") else Regex("[^A-Za-z0-9._-]")
         return value.trim().replace("'", "").replace(allowed, "")
+    }
+
+    private fun daemonBinarySelectShell(): String {
+        val rs = shellQuote(BIN_RS_FILE)
+        val c = shellQuote(BIN_FILE)
+        val fallback = shellQuote(RS_FALLBACK_FILE)
+        return "[ -x $rs ] && [ ! -f $fallback ] && printf '%s' $rs || printf '%s' $c"
     }
 
     private fun shellQuote(value: String): String {

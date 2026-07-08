@@ -2,19 +2,27 @@
 
 > 基于原版 **AppOpt v1.6.3**(作者 suto)深度扩展。原版是一个专注、可靠的 CPU 线程绑核守护进程;本增强版在其内核之上，新增了**自动校准、真实帧率监测、历史负载记录**三大守护进程能力，并从零做了一个**配套图形 App**，把命令行工具变成人人可用的一键工具。
 >
+> 当前版本默认优先运行 Rust 守护进程 `AppOptRs`，C 版 `AppOpt` 作为兼容兜底；前台识别由 root `app_process` 启动的 `appopt_foreground_helper.jar` 辅助。
+>
 > 兼容 Magisk / KernelSU / APatch，规则即时生效、无需重启。
 
 ---
 
-## 一、守护进程（C）新增能力
+## 一、守护进程（Rust 优先 / C 兜底）新增能力
 
-原版只做"按配置文件静态绑核"。增强版让守护进程**会观察、会学习、会测帧**：
+原版只做"按配置文件静态绑核"。增强版让守护进程**会观察、会学习、会测帧**，并把长期运行主路径迁移到 Rust，C 版保留为稳定兜底：
+
+- **Rust 守护进程优先**
+  `service.sh` 默认优先启动 `AppOptRs`。Rust 版读取 `applist.conf` 与 `package_uid.map`，先用 UID 缩小候选进程，再缓存已命中的 PID/TID，减少长期运行时对 `/proc` 的全量遍历。Rust 版连续快速异常退出时，会在本次开机内回退到 C 版 `AppOpt`。
+
+- **ActivityTaskManager 前台助手**
+  `appopt_foreground_helper.jar` 通过 root `app_process` 常驻，监听前台任务并写入 `foreground_task.state`；同时生成 `package_uid.map`，让 Rust 守护进程不依赖 `cmd` / `pm` / `dumpsys` 获取包名 UID。App 前台判断优先使用 helper，不可用时再回退到 UsageStats、cgroup 前台组和 dumpsys。
 
 - **自动校准生成规则**
   进游戏点一下悬浮球，守护进程开始采样各线程的 CPU 负载；结束时读取 `calib_policy.conf`，按用户设置的 AVG/MAX 阈值、最大规则数、通配线程组策略和核心范围生成绑核规则 —— 不用再手写 `package{thread}=cpus`。
 
 - **可视化校准策略**
-  App 设置页可直接调整重载 / 较重 / 中等负载阈值、分配核心、最大线程规则数和相似线程计算方式。核心选择会限制为连续 CPU 范围，C 端也会校验 present CPU，非法配置自动回退到设备拓扑默认值。
+  App 设置页可直接调整重载 / 较重 / 中等负载阈值、分配核心、最大线程规则数和相似线程计算方式。核心选择会限制为连续 CPU 范围，守护进程端也会校验 present CPU，非法配置自动回退到设备拓扑默认值。
 
 - **CPU 拓扑自动识别**
   守护进程按 cpufreq policy 识别低性能、主性能、高性能、最高性能、非最高性能核心，并写入 `calib_policy.conf` 的 detected 信息。模块更新时会保留用户已有策略；存在 `/data/adb/modules_update/AppOpt/calib_policy.conf` 时，App 会读取待生效配置并锁定编辑，避免重启后配置被覆盖。
@@ -23,7 +31,7 @@
   优先使用 **eBPF uprobe** 在内核态逐帧捕获 `libgui::queueBuffer`，精度最高；不可用时自动降级到 **SurfaceFlinger --latency** binder 直连（差分读、不清缓冲，与 Scene FAS 共存），再按运行时探测结果降级到 **--timestats**（Android 16 等兼容）。FPS 数据优先通过 App 创建的本地 socket 推送，socket 不可用时回退到 app 私有目录 `fps` 文件。
 
 - **守护进程反向验证**
-  App 不再只靠进程名判断守护进程是否运行，而是创建一次性本地 socket，通过 root helper 触发 C 守护进程反连并回传随机 token、版本和 PID，避免社区二改同名二进制造成误判。
+  App 不再只靠进程名判断守护进程是否运行，而是创建一次性本地 socket，通过 root helper 触发当前守护进程反连并回传随机 token、版本和 PID，避免社区二改同名二进制造成误判。
 
 - **历史线程负载记录（数据库存储）**
   SQLite 数据库保存历史，`.log` 导入后按 `pkg + epoch` 去重并删除源文件；列表按记录生成时间倒序显示，新的在上面。series 字段使用 Deflate 压缩，节省 60-80% 存储空间。历史会话支持导出，应用维度支持导出原版 `.log`。
@@ -49,15 +57,18 @@
 
 ## 三、原版 vs 增强版
 
-| 能力 | 原版 v1.6.3 | 增强版 v1.7.1 |
+| 能力 | 原版 v1.6.3 | 增强版 v1.7.5 |
 |---|:---:|:---:|
 | 线程绑核（cpuset + 亲和） | ✓ | ✓ |
 | 配置热重载（inotify） | ✓ | ✓ |
+| Rust 守护进程优先 / C 兜底 | ✗ | **✓ 新增** |
+| UID 预过滤 / PID-TID 缓存 | ✗ | **✓ 新增** |
 | 自动校准生成规则 | ✗ | **✓ 新增** |
 | 真实帧率监测 | ✗ | **✓ 新增** |
 | 历史负载记录 | ✗ | **✓ 新增** |
 | 图形 App / 悬浮球 | ✗ | **✓ 新增** |
 | 可视化校准策略 | ✗ | **✓ 新增** |
+| ActivityTaskManager 前台助手 | ✗ | **✓ 新增** |
 | 守护进程 socket 反向验证 | ✗ | **✓ 新增** |
 | 历史导出 / 原版 .log 导出 | ✗ | **✓ 新增** |
 | 看门狗自动拉起守护进程 | ✗ | **✓ 新增** |

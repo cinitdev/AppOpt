@@ -10,6 +10,9 @@ SRC="$NATIVE_DIR/AppOpt.c"
 FOREGROUND_MONITOR_SRC="$NATIVE_DIR/foreground_monitor.c"
 FPS_MON="$NATIVE_DIR/fps_monitor"
 RUST_BRIDGE="$FPS_MON/appopt_ebpf_bridge"
+RUST_DAEMON="$NATIVE_DIR/daemon_rs"
+RUST_DAEMON_MAIN="$RUST_DAEMON/src/main.rs"
+RUST_DAEMON_VERSION_SRC="$RUST_DAEMON/src/daemon_core/preamble.rs"
 FOREGROUND_HELPER="$ROOT/tools/appopt_foreground_helper"
 AYA_SUBMODULE="$FPS_MON/aya"
 AYA_SUBMODULE_REL="native_daemon/fps_monitor/aya"
@@ -77,6 +80,9 @@ ZIP="$ROOT/build/AppOpt.zip"
 [ -f "$FOREGROUND_MONITOR_SRC" ] || { echo "! 找不到前台检测源码: $FOREGROUND_MONITOR_SRC"; exit 1; }
 [ -d "$FPS_MON" ] || { echo "! 找不到 fps_monitor 目录: $FPS_MON"; exit 1; }
 [ -d "$RUST_BRIDGE" ] || { echo "! 找不到 Rust bridge: $RUST_BRIDGE"; exit 1; }
+[ -f "$RUST_DAEMON/Cargo.toml" ] || { echo "! 找不到 Rust daemon: $RUST_DAEMON"; exit 1; }
+[ -f "$RUST_DAEMON_MAIN" ] || { echo "! 找不到 Rust daemon 入口: $RUST_DAEMON_MAIN"; exit 1; }
+[ -f "$RUST_DAEMON_VERSION_SRC" ] || { echo "! 找不到 Rust daemon 版本文件: $RUST_DAEMON_VERSION_SRC"; exit 1; }
 [ -f "$FPS_MON/ebpf_fps.c" ] || { echo "! 找不到 Rust C 适配层: $FPS_MON/ebpf_fps.c"; exit 1; }
 
 ensure_aya_submodule() {
@@ -278,9 +284,9 @@ read_app_package() {
 }
 
 sync_source_versions() {
-    local version_code version_name source_version_name current_code current_name current_c_version
+    local version_code version_name source_version_name current_code current_name current_c_version current_rs_version
     local current_module_version current_module_code
-    local synced_code synced_name synced_c_version synced_module_version synced_module_code
+    local synced_code synced_name synced_c_version synced_rs_version synced_module_version synced_module_code
     version_code="$(read_app_version_code)"
     version_name="$(read_app_version_name)"
     [ -n "$version_code" ] || { echo "! 无法读取 App versionCode"; exit 1; }
@@ -291,6 +297,7 @@ sync_source_versions() {
     current_code="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
     current_name="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
     current_c_version="$(sed -n -E 's/^#define[[:space:]]+VERSION[[:space:]]+"([^"]*)".*/\1/p' "$SRC" | head -n1)"
+    current_rs_version="$(sed -n -E 's/^const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)"
     current_module_version="$(sed -n 's/^version=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
     current_module_code="$(sed -n 's/^versionCode=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
 
@@ -306,6 +313,10 @@ sync_source_versions() {
         echo "- 同步 AppOpt.c VERSION: ${current_c_version:-缺失} -> $source_version_name"
         sed -E -i "s/(^#define[[:space:]]+VERSION[[:space:]]+)\"[^\"]*\"/\1\"$source_version_name\"/" "$SRC"
     fi
+    if [ "$current_rs_version" != "$source_version_name" ]; then
+        echo "- 同步 AppOptRs VERSION: ${current_rs_version:-缺失} -> $source_version_name"
+        sed -E -i "s/(^const[[:space:]]+VERSION:[[:space:]]*\&str[[:space:]]*=[[:space:]]*)\"[^\"]*\"/\1\"$source_version_name\"/" "$RUST_DAEMON_VERSION_SRC"
+    fi
     if [ "$current_module_version" != "$version_name" ]; then
         echo "- 同步 module.prop version: ${current_module_version:-缺失} -> $version_name"
         sed -E -i "s/^version=.*/version=$version_name/" "$MODULE_PROP"
@@ -318,6 +329,7 @@ sync_source_versions() {
     synced_code="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
     synced_name="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
     synced_c_version="$(sed -n -E 's/^#define[[:space:]]+VERSION[[:space:]]+"([^"]*)".*/\1/p' "$SRC" | head -n1)"
+    synced_rs_version="$(sed -n -E 's/^const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)"
     synced_module_version="$(sed -n 's/^version=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
     synced_module_code="$(sed -n 's/^versionCode=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
     [ "$synced_code" = "$version_code" ] || {
@@ -330,6 +342,10 @@ sync_source_versions() {
     }
     [ "$synced_c_version" = "$source_version_name" ] || {
         echo "! AppOpt.c VERSION 同步失败"
+        exit 1
+    }
+    [ "$synced_rs_version" = "$source_version_name" ] || {
+        echo "! AppOptRs VERSION 同步失败"
         exit 1
     }
     [ "$synced_module_version" = "$version_name" ] || {
@@ -585,6 +601,41 @@ build_rust_bridge() {
     RUST_BRIDGE_LIB="$lib"
 }
 
+build_rust_daemon() {
+    local rust_target="$1" cc="$2" abidir="$3"
+
+    command -v cargo >/dev/null 2>&1 || { echo "! 找不到 cargo"; exit 1; }
+    rustup target list --installed 2>/dev/null | grep -qx "$rust_target" || {
+        echo "! 未安装 Rust target: $rust_target"
+        exit 1
+    }
+
+    local ar="$BIN/llvm-ar${EXT}"
+    [ -f "$cc" ] || { echo "! 找不到 NDK clang: $cc"; exit 1; }
+    [ -f "$ar" ] || ar=""
+
+    echo "- 构建 Rust daemon: $rust_target"
+    local target_dir="$ROOT/build/rust-daemon-target"
+    local target_env cargo_cc cargo_ar
+    target_env="$(printf '%s' "$rust_target" | tr '[:lower:]-' '[:upper:]_')"
+    cargo_cc="$(path_for_cargo "$cc")"
+    [ -n "$ar" ] && cargo_ar="$(path_for_cargo "$ar")" || cargo_ar=""
+
+    env \
+        "CARGO_TARGET_${target_env}_LINKER=$cargo_cc" \
+        "CARGO_TARGET_${target_env}_AR=$cargo_ar" \
+        "RUSTC_BOOTSTRAP=1" \
+        "RUSTFLAGS=${RUSTFLAGS:-} $RUST_NO_LOCATION_FLAGS" \
+        cargo build --manifest-path "$RUST_DAEMON/Cargo.toml" \
+            --release --target "$rust_target" --target-dir "$target_dir"
+
+    local bin="$target_dir/$rust_target/release/appopt_daemon_rs"
+    local dst="$WORK/config/bin/$abidir/AppOptRs"
+    [ -f "$bin" ] || { echo "! 找不到 Rust daemon 产物: $bin"; exit 1; }
+    cp "$bin" "$dst"
+    [ -f "$LLVM_STRIP" ] && "$LLVM_STRIP" --strip-all "$dst" || true
+}
+
 sync_source_versions
 
 echo "- 准备模块工作目录: $WORK"
@@ -615,7 +666,7 @@ LLVM_STRIP="$BIN/llvm-strip"
 SYSROOT="$TC/$HOST/sysroot"
 
 build_bpf_obj() {
-    local src="$1" obj="$2" label="$3"
+    local src="$1" obj="$2" label="$3" target_arch="$4" include_arch="$5" abi_define="$6"
     echo "- 构建 BPF 对象: $label"
     (
         cd "$(dirname "$src")"
@@ -623,15 +674,30 @@ build_bpf_obj() {
             -fdebug-compilation-dir=. \
             -ffile-prefix-map="$ROOT=." \
             -I"$SYSROOT/usr/include" \
-            -I"$SYSROOT/usr/include/aarch64-linux-android" \
-            -D__TARGET_ARCH_arm64 \
+            -I"$SYSROOT/usr/include/$include_arch" \
+            -D"$target_arch" \
+            -D"$abi_define" \
             -Wno-unused-value
     )
     [ -s "$obj" ] || { echo "! BPF 对象构建失败: $label"; exit 1; }
 }
 
-build_bpf_obj "$BPF_SRC" "$BPF_OBJ" "queuebuffer_probe.bpf.c"
-build_bpf_obj "$BPF_PERF_SRC" "$BPF_PERF_OBJ" "queuebuffer_probe_perf.bpf.c"
+build_bpf_pair_for_abi() {
+    local abidir="$1" target_arch="$2" include_arch="$3" abi_define="$4"
+    local ebpf_dir="$WORK/config/ebpf/$abidir"
+    mkdir -p "$ebpf_dir"
+    build_bpf_obj "$BPF_SRC" "$ebpf_dir/queuebuffer_probe.bpf.o" "queuebuffer_probe.bpf.c ($abidir)" "$target_arch" "$include_arch" "$abi_define"
+    build_bpf_obj "$BPF_PERF_SRC" "$ebpf_dir/queuebuffer_probe_perf.bpf.o" "queuebuffer_probe_perf.bpf.c ($abidir)" "$target_arch" "$include_arch" "$abi_define"
+}
+
+build_bpf_pair_for_abi arm64-v8a   __TARGET_ARCH_arm64 aarch64-linux-android  APPOPT_BPF_ARM64
+build_bpf_pair_for_abi armeabi-v7a __TARGET_ARCH_arm   arm-linux-androideabi  APPOPT_BPF_ARM
+build_bpf_pair_for_abi x86_64      __TARGET_ARCH_x86   x86_64-linux-android   APPOPT_BPF_X86_64
+build_bpf_pair_for_abi x86         __TARGET_ARCH_x86   i686-linux-android      APPOPT_BPF_I386
+
+# 保留根目录默认对象，兼容手动解包测试；正式刷入时 customize.sh 会按设备 ABI 覆盖。
+cp "$WORK/config/ebpf/arm64-v8a/queuebuffer_probe.bpf.o" "$BPF_OBJ"
+cp "$WORK/config/ebpf/arm64-v8a/queuebuffer_probe_perf.bpf.o" "$BPF_PERF_OBJ"
 
 build_abi() {
     local triple="$1" abidir="$2" rust_target="$3"
@@ -656,6 +722,7 @@ build_abi() {
         -o "$dst"
 
     [ -f "$LLVM_STRIP" ] && "$LLVM_STRIP" --strip-all "$dst" || true
+    build_rust_daemon "$rust_target" "$cc" "$abidir"
 }
 
 build_abi aarch64-linux-android    arm64-v8a     aarch64-linux-android

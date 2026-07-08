@@ -223,6 +223,7 @@ object DiagnosticExporter {
         ps -A 2>/dev/null | grep -i -E 'AppOpt|top.suto.appopt|appopt_foreground_helper' || true
         echo
         echo '# module daemon pid'
+        pidof AppOptRs 2>/dev/null || true
         pidof AppOpt 2>/dev/null || true
         echo
         echo '# app pid'

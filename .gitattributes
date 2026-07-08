@@ -1,0 +1,4 @@
+*.sh text eol=lf
+build_module.sh text eol=lf
+magisk_module/service.sh text eol=lf
+magisk_module/customize.sh text eol=lf

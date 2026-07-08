@@ -16,7 +16,9 @@ wait_sys_boot_completed
 
 MODDIR=${0%/*}
 cd "$MODDIR"
-BIN="$MODDIR/config/bin/AppOpt"
+BIN_C="$MODDIR/config/bin/AppOpt"
+BIN_RS="$MODDIR/config/bin/AppOptRs"
+RS_FALLBACK_FLAG="$MODDIR/config/.appopt_use_c_daemon"
 CONF="$MODDIR/config/applist.conf"
 LOG="$MODDIR/logs/AppOpt.log"
 FOREGROUND_HELPER="$MODDIR/config/tools/appopt_foreground_helper.sh"
@@ -24,6 +26,19 @@ FOREGROUND_HELPER_LOG="$MODDIR/logs/ForegroundHelper.log"
 APPOPT_IN_APP_UPDATE_FLAG="/data/adb/appopt_in_app_update"
 
 mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" "$MODDIR/logs"
+rm -f "$RS_FALLBACK_FLAG" 2>/dev/null || true
+
+select_daemon_binary() {
+	if [ -x "$BIN_RS" ] && [ ! -f "$RS_FALLBACK_FLAG" ]; then
+		BIN="$BIN_RS"
+		DAEMON_PROC_NAME="AppOptRs"
+	else
+		BIN="$BIN_C"
+		DAEMON_PROC_NAME="AppOpt"
+	fi
+}
+
+select_daemon_binary
 
 # 二进制不存在直接退出
 [ -f "$BIN" ] || exit 0
@@ -120,30 +135,48 @@ start_foreground_helper() {
 	sh "$FOREGROUND_HELPER" start
 }
 
-start_foreground_helper || echo "- ActivityTaskManager 前台助手启动失败，将由 App 使用兼容检测" >> "$LOG"
+start_foreground_helper || echo "- ActivityTaskManager helper start failed, App fallback will be used" >> "$LOG"
 
-# 判断是否已经有"本模块自己的" AppOpt 守护进程在运行。
-# 不能只用 pgrep -x AppOpt: 项目开源后, 其他二改版本也可能使用同名进程。
-# 这里用 /proc/<pid>/exe 反查可执行文件路径, 只有路径等于本模块 BIN 才算命中。
+# Check only the daemon started from this module path.
 is_our_daemon_running() {
-	for PID in $(pidof AppOpt 2>/dev/null) $(pgrep -x AppOpt 2>/dev/null); do
-		[ -n "$PID" ] || continue
-		EXE="$(readlink "/proc/$PID/exe" 2>/dev/null)"
-		[ "$EXE" = "$BIN" ] && return 0
-	done
-	return 1
+    for PID in $(pidof "$DAEMON_PROC_NAME" 2>/dev/null) $(pgrep -x "$DAEMON_PROC_NAME" 2>/dev/null); do
+        [ -n "$PID" ] || continue
+        EXE="$(readlink "/proc/$PID/exe" 2>/dev/null)"
+        [ "$EXE" = "$BIN" ] && return 0
+    done
+    return 1
 }
 
-# 看门狗: 守护进程退出后自动重启, 只按本模块 BIN 做单实例判断。
+# Watchdog: prefer Rust daemon, but fall back to C for this boot if Rust crashes quickly.
 (
-	while true; do
-		start_foreground_helper >/dev/null 2>&1 || true
-		if ! is_our_daemon_running; then
-			# 追加写: 崩溃重启不丢上一轮日志, 便于排查异常退出原因
-			"$BIN" -c "$CONF" -s 2 >>"$LOG" 2>&1
-		fi
-		sleep 5
-	done
+    RS_CRASH_COUNT=0
+    while true; do
+        start_foreground_helper >/dev/null 2>&1 || true
+        select_daemon_binary
+        if ! is_our_daemon_running; then
+            echo "- 启动守护进程: $BIN" >>"$LOG"
+            START_TS="$(date +%s 2>/dev/null || echo 0)"
+            "$BIN" -c "$CONF" -s 2 >>"$LOG" 2>&1
+            EXIT_CODE=$?
+            END_TS="$(date +%s 2>/dev/null || echo 0)"
+            RUNTIME=$((END_TS - START_TS))
+            [ "$RUNTIME" -lt 0 ] && RUNTIME=0
+            if [ "$BIN" = "$BIN_RS" ]; then
+                if [ "$RUNTIME" -lt 20 ]; then
+                    RS_CRASH_COUNT=$((RS_CRASH_COUNT + 1))
+                else
+                    RS_CRASH_COUNT=0
+                fi
+                echo "- Rust daemon exited: code=$EXIT_CODE runtime=${RUNTIME}s count=$RS_CRASH_COUNT" >>"$LOG"
+                if [ "$RS_CRASH_COUNT" -ge 3 ] && [ -x "$BIN_C" ]; then
+                    echo "- Rust daemon crashed repeatedly, fallback to C daemon until next boot" >>"$LOG"
+                    : > "$RS_FALLBACK_FLAG"
+                    RS_CRASH_COUNT=0
+                fi
+            fi
+        fi
+        sleep 5
+    done
 ) &
 
 # --- 以下为原版行为: 把可在线核数锁定到最大, 避免核心被离线 ---

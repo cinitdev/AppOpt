@@ -3,6 +3,8 @@ package appopt.foreground;
 import android.app.ActivityManager;
 import android.app.TaskStackListener;
 import android.content.ComponentName;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageInfo;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -12,6 +14,7 @@ import android.os.SystemClock;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.lang.reflect.Field;
@@ -21,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * 常驻 root app_process 前台任务监听器。
@@ -32,13 +36,20 @@ import java.util.Set;
 public final class ForegroundHelper {
     private static final long LISTENER_RECONCILE_MS = 5000L;
     private static final long POLL_RETRY_MS = 1200L;
+    private static final long UID_MAP_INITIAL_DELAY_MS = 1500L;
+    private static final long UID_MAP_RECONCILE_MS = 30000L;
+    private static final long UID_MAP_FORCE_REFRESH_MS = 300000L;
     private static final long EVENT_DEBOUNCE_MS = 80L;
     private static final int MAX_TASKS = 24;
 
     private static final Object SCHEDULE_LOCK = new Object();
     private static Handler handler;
     private static File stateFile;
+    private static File configDir;
+    private static File appListFile;
+    private static File uidMapFile;
     private static Object activityTaskManager;
+    private static Object packageManager;
     private static Method getTasksMethod;
     private static Method registerMethod;
     private static Method unregisterMethod;
@@ -46,6 +57,10 @@ public final class ForegroundHelper {
     private static boolean listenerRegistered;
     private static boolean refreshScheduled;
     private static long generation;
+    private static long lastUidMapConfigMtime = -1L;
+    private static long lastUidMapConfigLength = -1L;
+    private static long lastUidMapSyncElapsed = 0L;
+    private static int lastUidMapCount = -1;
     private static String startupError = "";
 
     private ForegroundHelper() {
@@ -63,6 +78,9 @@ public final class ForegroundHelper {
             System.err.println("无法创建状态目录: " + parent);
             System.exit(1);
         }
+        configDir = parent == null ? new File("/data/adb/modules/AppOpt/config") : parent;
+        appListFile = new File(configDir, "applist.conf");
+        uidMapFile = new File(configDir, "package_uid.map");
 
         Looper.prepare();
         handler = new Handler(Looper.myLooper());
@@ -72,6 +90,7 @@ public final class ForegroundHelper {
             "AppOptForegroundShutdown"
         ));
         requestRefresh("start", 0L);
+        handler.postDelayed(ForegroundHelper::uidMapLoop, UID_MAP_INITIAL_DELAY_MS);
         handler.postDelayed(ForegroundHelper::reconcile, listenerRegistered
             ? LISTENER_RECONCILE_MS : POLL_RETRY_MS);
         Looper.loop();
@@ -277,6 +296,214 @@ public final class ForegroundHelper {
             }
         }
         stateFile.setReadable(true, false);
+    }
+
+    private static void uidMapLoop() {
+        syncPackageUidMap("loop");
+        handler.postDelayed(ForegroundHelper::uidMapLoop, UID_MAP_RECONCILE_MS);
+    }
+
+    private static void syncPackageUidMap(String reason) {
+        if (appListFile == null || uidMapFile == null || !appListFile.isFile()) {
+            return;
+        }
+
+        long mtime = appListFile.lastModified();
+        long length = appListFile.length();
+        long nowElapsed = SystemClock.elapsedRealtime();
+        boolean uidMapMissing = !uidMapFile.isFile() || uidMapFile.length() == 0;
+        boolean forceRefresh = nowElapsed - lastUidMapSyncElapsed >= UID_MAP_FORCE_REFRESH_MS;
+        if (!uidMapMissing
+                && !forceRefresh
+                && mtime == lastUidMapConfigMtime
+                && length == lastUidMapConfigLength
+                && lastUidMapCount >= 0) {
+            return;
+        }
+
+        Set<String> packages;
+        try {
+            packages = readRulePackages(appListFile);
+        } catch (Throwable error) {
+            System.err.println("[前台助手] 读取 applist.conf 失败: " + errorText(error));
+            return;
+        }
+
+        TreeMap<String, Integer> uidMap = new TreeMap<>();
+        if (!packages.isEmpty()) {
+            try {
+                ensurePackageManager();
+                for (String pkg : packages) {
+                    int uid = packageUid(pkg);
+                    if (uid >= 0) {
+                        uidMap.put(pkg, uid);
+                    }
+                }
+            } catch (Throwable error) {
+                packageManager = null;
+                System.err.println("[前台助手] 生成 package_uid.map 失败: " + errorText(error));
+                return;
+            }
+        }
+
+        if (!packages.isEmpty() && uidMap.isEmpty()) {
+            System.err.println("[前台助手] package_uid.map 未更新: 未解析到任何已安装应用 UID");
+            return;
+        }
+
+        if (!writeUidMap(uidMap)) {
+            return;
+        }
+
+        lastUidMapConfigMtime = mtime;
+        lastUidMapConfigLength = length;
+        lastUidMapSyncElapsed = nowElapsed;
+        lastUidMapCount = uidMap.size();
+        System.out.println("[前台助手] package_uid.map 已更新: rules="
+            + packages.size() + " uid=" + uidMap.size() + " reason=" + reason);
+    }
+
+    private static Set<String> readRulePackages(File file) throws IOException {
+        String text = new String(java.nio.file.Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+        Set<String> out = new LinkedHashSet<>();
+        String[] lines = text.split("\\r?\\n");
+        for (String raw : lines) {
+            String line = raw == null ? "" : raw.trim();
+            if (line.isEmpty() || line.startsWith("#")) {
+                continue;
+            }
+            int eq = line.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            String base = extractBasePackage(line.substring(0, eq).trim());
+            if (base.length() > 0) {
+                out.add(base);
+            }
+        }
+        return out;
+    }
+
+    private static String extractBasePackage(String left) {
+        int brace = left.indexOf('{');
+        if (brace >= 0) {
+            left = left.substring(0, brace).trim();
+        }
+        int colon = left.indexOf(':');
+        if (colon >= 0) {
+            left = left.substring(0, colon).trim();
+        }
+        if (left.indexOf('.') < 0) {
+            return "";
+        }
+        for (int i = 0; i < left.length(); i++) {
+            char ch = left.charAt(i);
+            boolean ok = (ch >= 'a' && ch <= 'z')
+                || (ch >= 'A' && ch <= 'Z')
+                || (ch >= '0' && ch <= '9')
+                || ch == '_' || ch == '.';
+            if (!ok) {
+                return "";
+            }
+        }
+        return left;
+    }
+
+    private static void ensurePackageManager() throws Exception {
+        if (packageManager != null) {
+            return;
+        }
+        Class<?> appGlobals = Class.forName("android.app.AppGlobals");
+        Object service = appGlobals.getMethod("getPackageManager").invoke(null);
+        if (service == null) {
+            throw new IllegalStateException("package manager service is null");
+        }
+        packageManager = service;
+    }
+
+    private static int packageUid(String packageName) throws Exception {
+        PackageInfo info = getPackageInfo(packageName);
+        if (info == null) {
+            return -1;
+        }
+        ApplicationInfo appInfo = info.applicationInfo;
+        return appInfo == null ? -1 : appInfo.uid;
+    }
+
+    private static PackageInfo getPackageInfo(String packageName) throws Exception {
+        ensurePackageManager();
+        for (Method method : packageManager.getClass().getMethods()) {
+            if (!"getPackageInfo".equals(method.getName())) {
+                continue;
+            }
+            Class<?>[] types = method.getParameterTypes();
+            if (types.length != 3 || types[0] != String.class || types[2] != int.class) {
+                continue;
+            }
+            Object flags;
+            if (types[1] == long.class || types[1] == Long.TYPE) {
+                flags = 0L;
+            } else if (types[1] == int.class || types[1] == Integer.TYPE) {
+                flags = 0;
+            } else {
+                continue;
+            }
+            Object result = invoke(method, packageManager, packageName, flags, 0);
+            return result instanceof PackageInfo ? (PackageInfo) result : null;
+        }
+        throw new NoSuchMethodException("IPackageManager.getPackageInfo");
+    }
+
+    private static boolean writeUidMap(TreeMap<String, Integer> uidMap) {
+        File parent = uidMapFile.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+            System.err.println("[前台助手] 无法创建 UID 映射目录: " + parent);
+            return false;
+        }
+        String content = uidMapContent(uidMap);
+        try {
+            if (uidMapFile.isFile()) {
+                String old = new String(java.nio.file.Files.readAllBytes(uidMapFile.toPath()), StandardCharsets.UTF_8);
+                if (old.equals(content)) {
+                    uidMapFile.setReadable(true, false);
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        File temp = new File(parent, uidMapFile.getName() + ".tmp." + Process.myPid());
+        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(
+            new FileOutputStream(temp, false), StandardCharsets.UTF_8))) {
+            out.print(content);
+            out.flush();
+            if (out.checkError()) {
+                throw new IllegalStateException("uid map write failed");
+            }
+        } catch (Throwable error) {
+            System.err.println("[前台助手] 写入 package_uid.map 失败: " + errorText(error));
+            temp.delete();
+            return false;
+        }
+
+        if (!temp.renameTo(uidMapFile)) {
+            uidMapFile.delete();
+            if (!temp.renameTo(uidMapFile)) {
+                System.err.println("[前台助手] 原子替换 package_uid.map 失败: " + uidMapFile);
+                temp.delete();
+                return false;
+            }
+        }
+        uidMapFile.setReadable(true, false);
+        return true;
+    }
+
+    private static String uidMapContent(TreeMap<String, Integer> uidMap) {
+        StringBuilder out = new StringBuilder();
+        for (java.util.Map.Entry<String, Integer> entry : uidMap.entrySet()) {
+            out.append(entry.getKey()).append('=').append(entry.getValue()).append('\n');
+        }
+        return out.toString();
     }
 
     private static void unregisterListener() {

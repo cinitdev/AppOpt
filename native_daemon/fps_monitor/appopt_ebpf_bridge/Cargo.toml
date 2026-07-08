@@ -5,7 +5,7 @@ edition = "2024"
 license = "GPL-3.0"
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 aya = { path = "../aya/aya" }

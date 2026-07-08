@@ -2,11 +2,17 @@
 
 ## 当前架构
 
-AppOpt 的 FPS 监测现在由 C 接口层、Rust/aya bridge 和 SurfaceFlinger fallback 组成。
+AppOpt 的 FPS 监测现在由 Rust 守护进程、C 兼容接口层、Rust/aya bridge 和
+SurfaceFlinger fallback 组成。默认运行的 `AppOptRs` 会直接通过 FFI 调用
+Rust/aya bridge；C 版 `AppOpt` 作为 fallback 时，则通过 `ebpf_fps.c` 这层 C shim
+调用同一套 Rust/aya bridge。
 
 ```text
 native_daemon/AppOpt.c
-  调用 native_daemon/fps_monitor/ebpf_fps.h 暴露的 C API
+  C fallback daemon, 调用 native_daemon/fps_monitor/ebpf_fps.h 暴露的 C API
+
+native_daemon/daemon_rs/
+  Rust daemon, 直接调用 appopt_ebpf_bridge FFI
 
 native_daemon/fps_monitor/
   ebpf_fps.h                    native_daemon/AppOpt.c 使用的 C API
@@ -24,14 +30,18 @@ native_daemon/fps_monitor/
 
 ## eBPF 路径
 
-1. `native_daemon/AppOpt.c` 收到 FPS 监测命令后查找目标包名进程。
-2. 找到 PID 时调用 `ebpf_fps_start(bpf_obj, pid, pkg)`。
-3. 未及时找到 PID 时会用 `pid=-1` 启动全局 uprobe, Rust bridge 收到帧事件后按 `/proc/<pid>/cmdline` 过滤目标包名。
-4. Rust/aya 优先加载 `queuebuffer_probe.bpf.o` 并初始化 RingBuf 事件通道。
-5. 如果 RingBuf 创建/映射失败（例如 Android 17 上的 `mmap failed`），立即释放本次 eBPF 上下文，改为加载 `queuebuffer_probe_perf.bpf.o` 并使用 PerfEvent 备用通道。
-6. Rust/aya 按优先级 attach `libgui.so` 的帧提交符号。
-7. BPF 程序把帧事件写入当前可用事件通道。
-8. Rust bridge 计算 FPS, C 层通过 `ebpf_fps_get()` 读取。
+1. App 写入 `fps.cmd` 请求开始监测某个包名。
+2. 当前守护进程优先通过 ActivityTaskManager helper / cgroup 前台组 / 包名进程查找目标 PID。
+3. 找到具体 PID 后，Rust daemon 调用 `appopt_ebpf_start_for_package(pid, bpf_obj, pkg)`；
+   C fallback daemon 调用 `ebpf_fps_start(bpf_obj, pid, pkg)`。
+4. 如果暂时找不到 PID，不再启动全局 uprobe；守护进程会等待后续拿到真实 PID 后再尝试 eBPF，
+   期间可由 SurfaceFlinger fallback 兜底输出。
+5. Rust/aya 优先加载 `queuebuffer_probe.bpf.o` 并初始化 RingBuf 事件通道。
+6. 如果 RingBuf 创建/映射失败（例如 Android 17 上的 `mmap failed`），立即释放本次 eBPF 上下文，改为加载 `queuebuffer_probe_perf.bpf.o` 并使用 PerfEvent 备用通道。
+7. Rust/aya 按优先级 attach `libgui.so` 的帧提交符号，attach 范围限制为目标 PID。
+8. BPF 程序把帧事件写入当前可用事件通道，并同步维护 `frame_stats` 计数 map。
+9. RingBuf 后端直接按事件滑动窗口计算 FPS；PerfEvent 后端优先使用 `frame_stats`
+   计数差计算 FPS，避免 per-CPU PerfEvent 乱序或丢样本导致帧率偏低。
 
 ## App 通信路径
 
@@ -49,12 +59,12 @@ FPS 传给 App:
 ```
 
 App 启动悬浮胶囊时会先创建一次性本地 socket, 并把 socket 名和随机 token 写入
-`fps.cmd`。C 守护进程收到 `start <pkg> <socket> <token>` 后优先反连该 socket,
-握手成功后按行推送 FPS。socket 被 SELinux/ROM 行为拦住时, C 端才覆盖写
+`fps.cmd`。当前守护进程收到 `start <pkg> <socket> <token>` 后优先反连该 socket,
+握手成功后按行推送 FPS。socket 被 SELinux/ROM 行为拦住时, 守护进程才覆盖写
 `/data/data/top.suto.appopt/files/fps`, App 侧用 FileObserver 兜底读取。
 
 守护进程存活检测也走反向验证: App 创建一次性 socket, 通过 root helper 下发
-`--ping-daemon <socket> <token>`, C 守护进程连接回 App 并回传 token/版本/PID。
+`--ping-daemon <socket> <token>`, 当前守护进程连接回 App 并回传 token/版本/PID。
 这样 App 不再只靠进程名判断, 可以区分同名或二改版本。
 
 ## uprobe 符号策略
@@ -93,8 +103,8 @@ eBPF uprobe
 
 ## 与 auto 规则生成的关系
 
-本文件描述 FPS/eBPF 监测链路。CPU 亲和性 `auto` 规则生成在 `native_daemon/AppOpt.c` 中完成,
-不在 `native_daemon/fps_monitor` 或 Rust/aya bridge 中完成。
+本文件描述 FPS/eBPF 监测链路。CPU 亲和性 `auto` 规则生成在 Rust daemon 和 C fallback
+daemon 中实现，不在 `native_daemon/fps_monitor` 或 Rust/aya bridge 中完成。
 
 当前 `auto` 规则不依赖线程名白名单/黑名单, 也不特殊识别 `UnityMain`、`MainThread`、
 `RenderThread`、`worker`、`Audio` 等名字。算法只看采样负载:
@@ -181,12 +191,11 @@ RingBuf 不可用, 自动切换 PerfEvent:
 [FPS] eBPF 已激活, 锁定符号: _ZN7android7Surface16hook_queueBufferEP13ANativeWindowP19ANativeWindowBufferi
 ```
 
-未及时找到 PID, 使用全局探测:
+未及时找到 PID:
 
 ```text
-[FPS] 等待约 3 秒仍未找到 com.xxx 的进程, 尝试全局 eBPF 帧事件探测
-[FPS] 未锁定包名 PID, 尝试 eBPF 全局 uprobe 探测屏幕帧事件...
-[FPS] eBPF 当前帧事件 PID: 12345
+[FPS] 等待约 3 秒仍未找到 com.xxx 的进程, 暂不启动全局 eBPF 探测, 后续拿到真实 PID 再重试
+[FPS] 启用 SurfaceFlinger FPS 源: com.xxx
 ```
 
 降级到 fallback:
@@ -201,8 +210,9 @@ RingBuf 不可用, 自动切换 PerfEvent:
 - 需要 root 权限。
 - 需要内核支持 BPF syscall 和 uprobes；事件通道优先 RingBuf，RingBuf 不可用时尝试 PerfEvent。
 - 目标设备禁用 BPF 或限制 uprobe 时会自动 fallback。
-- `frame-analyzer-ebpf` 只支持 64 位设备和应用; AppOpt 当前构建包含 4 个 ABI,
-  但具体设备上 32 位应用的 eBPF attach 仍取决于 libgui 路径、符号和内核能力。
+- AppOpt 当前构建包含 `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` 四个 ABI；
+  BPF 程序也针对 arm64/arm/x86_64/x86 读取 queueBuffer 第一个参数。
+  具体设备上能否 attach 仍取决于 libgui 路径、符号和内核能力。
 - Android 12-16 不靠版本号判断, 以实际 attach 成功与否为准。
 
 ## 构建
@@ -213,7 +223,8 @@ RingBuf 不可用, 自动切换 PerfEvent:
 queuebuffer_probe.bpf.o
 queuebuffer_probe_perf.bpf.o
 appopt_ebpf_bridge staticlib
-AppOpt 主二进制
+AppOpt C fallback 二进制
+AppOptRs Rust 守护进程
 Magisk 模块 zip
 ```
 

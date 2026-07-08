@@ -49,8 +49,8 @@ const char *ebpf_cap_str(ebpf_cap_t cap);
 /* 启动目标进程的 eBPF FPS 采集。
  *
  * bpf_obj_path: 编译好的 BPF 字节码文件，例如 queuebuffer_probe.bpf.o
- * target_pid:   目标游戏进程 PID；传 -1 表示全局探测后按 target_pkg 锁定
- * target_pkg:   目标包名，用于全局探测模式下过滤帧事件 PID
+ * target_pid:   目标游戏进程 PID；必须大于 0，Android 侧不再启用全局 uprobe
+ * target_pkg:   目标包名，用于校验/日志，避免同包多进程切换时误记其它应用
  *
  * 成功返回 ctx；失败返回 NULL，上层应降级到 fallback。
  */
@@ -68,7 +68,7 @@ int ebpf_fps_poll(ebpf_fps_ctx *ctx);
 double ebpf_fps_get(ebpf_fps_ctx *ctx);
 
 /* 获取当前 eBPF 实际锁定的 PID。
- * 指定 PID 启动时返回该 PID；全局探测模式下，收到第一条帧事件后返回事件 PID。
+ * 指定 PID 启动时返回该 PID。
  * 未锁定或 ctx 无效时返回 -1。
  */
 pid_t ebpf_fps_pid(ebpf_fps_ctx *ctx);
