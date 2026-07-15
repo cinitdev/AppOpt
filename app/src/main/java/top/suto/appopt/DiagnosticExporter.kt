@@ -47,6 +47,7 @@ object DiagnosticExporter {
                         zip.addRootFile("module/module.prop", "/data/adb/modules/AppOpt/module.prop")
                         zip.addRootFile("module/pending_module.prop", "/data/adb/modules_update/AppOpt/module.prop")
                         zip.addRootFile("config/applist.conf", "/data/adb/modules/AppOpt/config/applist.conf")
+                        zip.addRootFile("config/rule_health.tsv", "/data/adb/modules/AppOpt/config/rule_health.tsv")
                         zip.addRootFile("config/calib_policy.conf", "/data/adb/modules/AppOpt/config/calib_policy.conf")
                         zip.addRootFile("config/foreground_task.state", "/data/adb/modules/AppOpt/config/foreground_task.state")
                         zip.addRootFile("config/foreground_helper.pid", "/data/adb/modules/AppOpt/config/foreground_helper.pid")

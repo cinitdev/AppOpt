@@ -72,6 +72,11 @@ fn daemon_socket_thread() -> io::Result<()> {
             thread::sleep(Duration::from_millis(200));
             continue;
         }
+        if let Err(err) = socket_set_recv_timeout(client_fd, Duration::from_secs(2)) {
+            eprintln!("[CTRL] 守护验证 socket 设置接收超时失败: {err}");
+            close_fd(client_fd);
+            continue;
+        }
         daemon_socket_handle_client(client_fd);
         close_fd(client_fd);
     }
@@ -87,16 +92,17 @@ fn daemon_socket_thread() -> io::Result<()> {
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn daemon_socket_handle_client(client_fd: i32) {
-    let mut buf = [0u8; 160];
-    let n = unsafe { recv(client_fd, buf.as_mut_ptr().cast(), buf.len() - 1, 0) };
-    if n <= 0 {
-        eprintln!("[CTRL] 守护验证 socket 收包失败");
-        return;
-    }
-    let req = String::from_utf8_lossy(&buf[..n as usize])
-        .trim()
-        .to_string();
-    if !req.starts_with(DAEMON_SOCKET_PING_PREFIX) {
+    let req = match socket_recv_line(client_fd, 1024) {
+        Ok(req) => req,
+        Err(err) => {
+            eprintln!("[CTRL] 守护验证 socket 收包失败: {err}");
+            return;
+        }
+    };
+    let valid_prefix = req
+        .strip_prefix(DAEMON_SOCKET_PING_PREFIX)
+        .is_some_and(|rest| rest.is_empty() || rest.as_bytes()[0].is_ascii_whitespace());
+    if !valid_prefix {
         eprintln!("[CTRL] 守护验证 socket 收到未知请求: {req}");
         return;
     }
@@ -122,6 +128,63 @@ fn daemon_socket_handle_client(client_fd: i32) {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+fn socket_set_recv_timeout(fd: i32, timeout: Duration) -> io::Result<()> {
+    let value = libc::timeval {
+        tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
+        tv_usec: i64::from(timeout.subsec_micros()) as libc::suseconds_t,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&value as *const libc::timeval).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn socket_recv_line(fd: i32, max_len: usize) -> io::Result<String> {
+    let mut request = Vec::with_capacity(160);
+    let mut buf = [0u8; 256];
+    loop {
+        let n = unsafe { recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n > 0 {
+            let chunk = &buf[..n as usize];
+            if let Some(newline) = chunk.iter().position(|byte| *byte == b'\n') {
+                if request.len().saturating_add(newline) > max_len {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "请求行过长"));
+                }
+                request.extend_from_slice(&chunk[..newline]);
+                return Ok(String::from_utf8_lossy(&request).trim().to_string());
+            }
+            if request.len().saturating_add(chunk.len()) > max_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "请求行过长"));
+            }
+            request.extend_from_slice(chunk);
+            continue;
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "请求未以换行结束",
+            ));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn request_field(req: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     req.split_whitespace()
@@ -133,7 +196,7 @@ fn request_field(req: &str, key: &str) -> Option<String> {
 fn daemon_socket_send_callback(callback_name: &str, callback_token: &str) -> io::Result<()> {
     let fd = unix_connect_abstract(callback_name)?;
     let resp = format!(
-        "{DAEMON_SOCKET_CALLBACK} token={callback_token} version={VERSION} pid={}\n",
+        "{DAEMON_SOCKET_CALLBACK} token={callback_token} version={VERSION} kind=rust pid={}\n",
         std::process::id()
     );
     let result = socket_send_all(fd, resp.as_bytes());

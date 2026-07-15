@@ -58,8 +58,10 @@ int main(int argc, char **argv) {
             case 's':
             {
                 char *endptr;
+                errno = 0;
                 long val = strtol(optarg, &endptr, 10);
-                if (endptr == optarg || *endptr != '\0' || val < 1) {
+                if (errno == ERANGE || endptr == optarg || *endptr != '\0' ||
+                    val < 1 || val > INT_MAX) {
                     fprintf(stderr, "无效的时间间隔: %s\n", optarg);
                     fprintf(stderr, "间隔必须是 >=1 的整数\n");
                     exit(EXIT_FAILURE);
@@ -244,11 +246,19 @@ int main(int argc, char **argv) {
         if (atomic_exchange(&config_updated, 0)) {
             cache.scan_all_proc = true;
             cache.last_proc_count = 0;
+            affinity_counter = 0;
         }
 
         AppConfig* cfg = get_config();
         if (cfg) {
-            update_cache(&cache, cfg, &affinity_counter);
+            bool health_ready = rule_health_sync_config(cfg, NULL);
+            bool health_full_scan = health_ready && rule_health_full_scan_due(&cache);
+            bool foreground_discovery_scan =
+                rule_health_foreground_discovery_scan_due(cfg, &cache);
+            update_cache(
+                &cache, cfg, &affinity_counter,
+                health_full_scan || foreground_discovery_scan);
+            if (health_ready) rule_health_update(cfg, &cache);
             affinity_counter--;
             if (affinity_counter < 1) {
                 apply_affinity(&cache, &cfg->topo);

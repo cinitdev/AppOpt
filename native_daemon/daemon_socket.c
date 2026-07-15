@@ -52,22 +52,22 @@ static bool daemon_req_field(const char* req, const char* key, char* out, size_t
     int pn = snprintf(pattern, sizeof(pattern), "%s=", key);
     if (pn < 0 || (size_t)pn >= sizeof(pattern)) return false;
 
-    const char* p = strstr(req, pattern);
-    if (!p) return false;
-    p += (size_t)pn;
-    if (*p == '\0') return false;
-
-    size_t n = 0;
-    while (p[n] && !isspace((unsigned char)p[n])) {
-        if (n + 1 >= out_sz) {
-            out[0] = '\0';
-            return false;
+    const char* cursor = req;
+    while (*cursor) {
+        while (isspace((unsigned char)*cursor)) cursor++;
+        const char* end = cursor;
+        while (*end && !isspace((unsigned char)*end)) end++;
+        size_t token_len = (size_t)(end - cursor);
+        if (token_len > (size_t)pn && strncmp(cursor, pattern, (size_t)pn) == 0) {
+            size_t value_len = token_len - (size_t)pn;
+            if (value_len >= out_sz) return false;
+            memcpy(out, cursor + pn, value_len);
+            out[value_len] = '\0';
+            return true;
         }
-        out[n] = p[n];
-        n++;
+        cursor = end;
     }
-    out[n] = '\0';
-    return n > 0;
+    return false;
 }
 
 static bool daemon_socket_send_callback(const char* name, const char* token) {
@@ -84,7 +84,7 @@ static bool daemon_socket_send_callback(const char* name, const char* token) {
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     char resp[256];
-    int rn = snprintf(resp, sizeof(resp), "%s token=%s version=%s pid=%ld\n",
+    int rn = snprintf(resp, sizeof(resp), "%s token=%s version=%s kind=c pid=%ld\n",
                       DAEMON_SOCKET_CALLBACK, token, VERSION, (long)getpid());
     if (rn < 0) {
         close(fd);
@@ -108,17 +108,36 @@ static void daemon_socket_handle_client(int client_fd) {
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    char req_buf[160];
-    ssize_t n = recv(client_fd, req_buf, sizeof(req_buf) - 1, 0);
-    if (n <= 0) {
+    enum { REQUEST_MAX = 1024 };
+    char req_buf[REQUEST_MAX + 1];
+    size_t used = 0;
+    bool got_line = false;
+    while (!got_line) {
+        char chunk[256];
+        ssize_t n = recv(client_fd, chunk, sizeof(chunk), 0);
+        if (n > 0) {
+            char* newline = memchr(chunk, '\n', (size_t)n);
+            size_t take = newline ? (size_t)(newline - chunk) : (size_t)n;
+            if (take > REQUEST_MAX - used) {
+                printf("[CTRL] daemon 验证 socket 请求过长: fd=%d\n", client_fd);
+                return;
+            }
+            memcpy(req_buf + used, chunk, take);
+            used += take;
+            got_line = newline != NULL;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
         printf("[CTRL] daemon 验证 socket 收包失败: fd=%d err=%s\n",
-               client_fd, n < 0 ? strerror(errno) : "EOF");
+               client_fd, n < 0 ? strerror(errno) : "请求未以换行结束");
         return;
     }
-    req_buf[n] = '\0';
+    req_buf[used] = '\0';
     char* req = strtrim(req_buf);
 
-    if (strncmp(req, DAEMON_SOCKET_PING_PREFIX, strlen(DAEMON_SOCKET_PING_PREFIX)) != 0) {
+    size_t prefix_len = strlen(DAEMON_SOCKET_PING_PREFIX);
+    if (strncmp(req, DAEMON_SOCKET_PING_PREFIX, prefix_len) != 0 ||
+        (req[prefix_len] != '\0' && !isspace((unsigned char)req[prefix_len]))) {
         printf("[CTRL] daemon 验证 socket 收到未知请求: fd=%d req=%s\n", client_fd, req);
         return;
     }

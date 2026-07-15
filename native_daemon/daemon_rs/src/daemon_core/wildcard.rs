@@ -8,7 +8,24 @@
 // 这里不引入 regex，原因有两个：
 // 1. Android 守护进程不需要完整正则，旧规则也不是正则语法。
 // 2. 线程扫描会频繁调用匹配函数，轻量 glob 更容易控制性能和行为。
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn glob_match(pattern: &str, text: &str) -> bool {
+    let Ok(pattern) = CString::new(pattern) else {
+        return false;
+    };
+    let Ok(text) = CString::new(text) else {
+        return false;
+    };
+    unsafe { libc::fnmatch(pattern.as_ptr(), text.as_ptr(), libc::FNM_NOESCAPE) == 0 }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_portable(pattern, text)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn glob_match_portable(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -43,6 +60,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 fn pattern_atom_matches(pattern: &[char], index: usize, ch: char) -> Option<usize> {
     match pattern[index] {
         '?' => Some(index + 1),
@@ -52,13 +70,18 @@ fn pattern_atom_matches(pattern: &[char], index: usize, ch: char) -> Option<usiz
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 fn match_class(pattern: &[char], index: usize, ch: char) -> Option<usize> {
     let mut i = index + 1;
+    let negated = i < pattern.len() && matches!(pattern[i], '!' | '^');
+    if negated {
+        i += 1;
+    }
     let mut matched = false;
 
     while i < pattern.len() {
         if pattern[i] == ']' {
-            return if matched { Some(i + 1) } else { None };
+            return if matched != negated { Some(i + 1) } else { None };
         }
 
         if i + 2 < pattern.len() && pattern[i + 1] == '-' && pattern[i + 2] != ']' {

@@ -40,15 +40,19 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
             char* eb = strchr(br, '}');
             if (!eb) continue;
             *eb = 0;
+            if (strchr(br, '{') || strtrim(eb + 1)[0]) continue;
             thread = strtrim(br);
+            if (!thread[0]) continue;
+        } else if (strchr(p, '}')) {
+            continue;
         }
 
         char* pkg = strtrim(p);
         char* cpus = strtrim(eq);
-        if (strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) continue;
+        if (!pkg[0] || strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) continue;
 
         /* 包名=auto: 标记为待校准, 不生成绑核规则, 但仍需被进程扫描发现 */
-        if (!thread[0] && strcmp(cpus, "auto") == 0) {
+        if (!thread[0] && strcasecmp(cpus, "auto") == 0) {
             bool aexists = false;
             for (size_t i = 0; i < auto_cnt; i++) {
                 if (strcmp(new_auto[i], pkg) == 0) { aexists = true; break; }
@@ -78,23 +82,28 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
 
         cpu_set_t set;
         CPU_ZERO(&set);
-        parse_cpu_ranges(cpus, &set, &cfg->topo.present_cpus);
-        if (CPU_COUNT(&set) == 0) continue;
+        if (!parse_cpu_ranges_strict(cpus, &set, NULL)) continue;
 
-        char* dir_name = cpu_set_to_str(&set);
-        if (!dir_name) continue;
-
-        char path[256];
-        build_str(path, sizeof(path), BASE_CPUSET, "/", dir_name, NULL);
-        if (!create_cpuset_dir(path, dir_name, cfg->topo.mems_str)) {
-            free(dir_name);
-            continue;
-        }
+        cpu_set_t effective_set;
+        CPU_AND(&effective_set, &set, &cfg->topo.present_cpus);
+        char* dir_name = CPU_COUNT(&effective_set) > 0 ?
+            cpu_set_to_str(&effective_set) : NULL;
+        if (CPU_COUNT(&effective_set) > 0 && !dir_name) continue;
 
         AffinityRule rule = {0};
         build_str(rule.pkg, sizeof(rule.pkg), pkg, NULL);
         build_str(rule.thread, sizeof(rule.thread), thread, NULL);
-        build_str(rule.cpuset_dir, sizeof(rule.cpuset_dir), dir_name, NULL);
+        if (cfg->topo.cpuset_enabled && dir_name) {
+            char path[256];
+            build_str(path, sizeof(path), BASE_CPUSET, "/", dir_name, NULL);
+            if (create_cpuset_dir(path, dir_name, cfg->topo.mems_str)) {
+                build_str(rule.cpuset_dir, sizeof(rule.cpuset_dir), dir_name, NULL);
+            } else {
+                printf("cpuset 创建失败，规则降级为仅 sched_setaffinity: %s{%s}=%s\n",
+                       pkg, thread, dir_name);
+                cfg->topo.cpuset_enabled = false;
+            }
+        }
         rule.cpus = set;
         free(dir_name);
 
@@ -159,42 +168,715 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
     return NULL;
 }
 
-static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) {
-    DIR* proc_dir = opendir("/proc");
-    if (!proc_dir) return;
-    int proc_fd = dirfd(proc_dir);
-    if (proc_fd < 0) {
-        closedir(proc_dir);
-        return;
-    }
-    *count = 0;
+typedef enum {
+    PROC_FILE_OK = 0,
+    PROC_FILE_EMPTY,
+    PROC_FILE_ERROR,
+} ProcFileResult;
 
-    if (cache->procs == NULL) {
-        cache->procs_cap = 2048;
-        cache->procs = calloc(cache->procs_cap, sizeof(ProcessInfo));
-        if (!cache->procs) {
-            closedir(proc_dir);
-            return;
+typedef enum {
+    PROCESS_REFRESH_INCLUDED = 0,
+    PROCESS_REFRESH_NOT_RELEVANT,
+    PROCESS_REFRESH_READ_GAP,
+    PROCESS_REFRESH_IDENTITY_LOST,
+} ProcessRefreshResult;
+
+static ProcFileResult read_proc_file_at(
+    int dir_fd,
+    const char* filename,
+    char* buf,
+    size_t buf_size
+) {
+    if (!filename || !buf || buf_size == 0) {
+        errno = EINVAL;
+        return PROC_FILE_ERROR;
+    }
+    int fd = openat(dir_fd, filename, O_RDONLY | O_CLOEXEC);
+    if (fd == -1) return PROC_FILE_ERROR;
+
+    ssize_t size;
+    do {
+        size = read(fd, buf, buf_size - 1);
+    } while (size < 0 && errno == EINTR);
+    int saved_errno = errno;
+    close(fd);
+    if (size < 0) {
+        errno = saved_errno;
+        return PROC_FILE_ERROR;
+    }
+    errno = 0;
+    if (size == 0) {
+        buf[0] = '\0';
+        return PROC_FILE_EMPTY;
+    }
+    buf[size] = '\0';
+    return PROC_FILE_OK;
+}
+
+static bool parse_proc_stat(
+    const char* stat_line,
+    char* comm,
+    size_t comm_size,
+    unsigned long long* starttime
+) {
+    if (!stat_line || !starttime) return false;
+    const char* open = strchr(stat_line, '(');
+    const char* close = strrchr(stat_line, ')');
+    if (!open || !close || close <= open) return false;
+
+    if (comm && comm_size > 0) {
+        size_t length = (size_t)(close - open - 1);
+        if (length >= comm_size) length = comm_size - 1;
+        memcpy(comm, open + 1, length);
+        comm[length] = '\0';
+    }
+
+    const char* cursor = close + 1;
+    for (int field = 3; field <= 22; field++) {
+        while (*cursor && isspace((unsigned char)*cursor)) cursor++;
+        if (!*cursor) return false;
+        const char* end = cursor;
+        while (*end && !isspace((unsigned char)*end)) end++;
+        if (field == 22) {
+            char number[32];
+            size_t len = (size_t)(end - cursor);
+            if (len == 0 || len >= sizeof(number)) return false;
+            memcpy(number, cursor, len);
+            number[len] = '\0';
+            char* parse_end = NULL;
+            errno = 0;
+            unsigned long long value = strtoull(number, &parse_end, 10);
+            if (errno == ERANGE || !parse_end || *parse_end != '\0') return false;
+            *starttime = value;
+            return true;
+        }
+        cursor = end;
+    }
+    return false;
+}
+
+static ProcFileResult read_proc_stat_at(
+    int dir_fd,
+    char* comm,
+    size_t comm_size,
+    unsigned long long* starttime
+) {
+    char stat_line[1024];
+    ProcFileResult result = read_proc_file_at(
+        dir_fd, "stat", stat_line, sizeof(stat_line));
+    if (result != PROC_FILE_OK) return result;
+    if (!parse_proc_stat(stat_line, comm, comm_size, starttime)) {
+        errno = EINVAL;
+        return PROC_FILE_ERROR;
+    }
+    return PROC_FILE_OK;
+}
+
+static bool read_starttime_at(int dir_fd, unsigned long long* starttime) {
+    return read_proc_stat_at(dir_fd, NULL, 0, starttime) == PROC_FILE_OK;
+}
+
+static void base_process_name(const char* name, char* out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!name) return;
+    const char* colon = strchr(name, ':');
+    size_t len = colon ? (size_t)(colon - name) : strlen(name);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, name, len);
+    out[len] = '\0';
+}
+
+static void cpuset_dir_for_mask(
+    const AppConfig* cfg,
+    const cpu_set_t* cpus,
+    char* out,
+    size_t out_size
+) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!cfg || !cpus || !cfg->topo.cpuset_enabled || CPU_COUNT(cpus) == 0) return;
+
+    cpu_set_t effective;
+    CPU_AND(&effective, cpus, &cfg->topo.present_cpus);
+    if (CPU_COUNT(&effective) == 0) return;
+    char* dir_name = cpu_set_to_str(&effective);
+    if (!dir_name) return;
+    char path[256];
+    build_str(path, sizeof(path), BASE_CPUSET, "/", dir_name, NULL);
+    if (access(path, F_OK) == 0 ||
+        create_cpuset_dir(path, dir_name, cfg->topo.mems_str)) {
+        build_str(out, out_size, dir_name, NULL);
+    }
+    free(dir_name);
+}
+
+static bool ensure_process_capacity(ProcCache* cache, size_t needed) {
+    if (needed <= cache->procs_cap) return true;
+    size_t new_cap = cache->procs_cap ? cache->procs_cap : 64;
+    while (new_cap < needed) {
+        if (new_cap > SIZE_MAX / 2) {
+            new_cap = needed;
+            break;
+        }
+        new_cap *= 2;
+    }
+    ProcessInfo* resized = realloc(cache->procs, new_cap * sizeof(*resized));
+    if (!resized) return false;
+    memset(resized + cache->procs_cap, 0,
+           (new_cap - cache->procs_cap) * sizeof(*resized));
+    cache->procs = resized;
+    cache->procs_cap = new_cap;
+    return true;
+}
+
+static bool ensure_thread_capacity(ProcessInfo* proc, size_t needed) {
+    if (needed <= proc->threads_cap) return true;
+    size_t new_cap = proc->threads_cap ? proc->threads_cap : 64;
+    while (new_cap < needed) {
+        if (new_cap > SIZE_MAX / 2) {
+            new_cap = needed;
+            break;
+        }
+        new_cap *= 2;
+    }
+    ThreadInfo* resized = realloc(proc->threads, new_cap * sizeof(*resized));
+    if (!resized) return false;
+    proc->threads = resized;
+    proc->threads_cap = new_cap;
+    return true;
+}
+
+static bool ensure_thread_rule_capacity(ProcessInfo* proc, size_t needed) {
+    if (needed <= proc->thread_rules_cap) return true;
+    size_t new_cap = proc->thread_rules_cap ? proc->thread_rules_cap : 8;
+    while (new_cap < needed) {
+        if (new_cap > SIZE_MAX / 2) {
+            new_cap = needed;
+            break;
+        }
+        new_cap *= 2;
+    }
+    AffinityRule** resized = realloc(
+        proc->thread_rules, new_cap * sizeof(*resized));
+    if (!resized) return false;
+    proc->thread_rules = resized;
+    proc->thread_rules_cap = new_cap;
+    return true;
+}
+
+static ssize_t tracked_process_index(const ProcCache* cache, pid_t pid) {
+    for (size_t i = 0; i < cache->num_tracked_procs; i++) {
+        if (cache->tracked_procs[i].pid == pid) return (ssize_t)i;
+    }
+    return -1;
+}
+
+static ssize_t tracked_process_identity_index(
+    const ProcCache* cache,
+    pid_t pid,
+    unsigned long long starttime
+) {
+    for (size_t i = 0; i < cache->num_tracked_procs; i++) {
+        if (cache->tracked_procs[i].pid == pid &&
+            cache->tracked_procs[i].starttime == starttime) {
+            return (ssize_t)i;
+        }
+    }
+    return -1;
+}
+
+static bool ensure_tracked_process_capacity(ProcCache* cache, size_t needed) {
+    if (needed <= cache->tracked_procs_cap) return true;
+    size_t new_cap = cache->tracked_procs_cap ? cache->tracked_procs_cap : 8;
+    while (new_cap < needed) {
+        if (new_cap > SIZE_MAX / 2) {
+            new_cap = needed;
+            break;
+        }
+        new_cap *= 2;
+    }
+    TrackedProcess* resized = realloc(
+        cache->tracked_procs, new_cap * sizeof(*resized));
+    if (!resized) return false;
+    cache->tracked_procs = resized;
+    cache->tracked_procs_cap = new_cap;
+    return true;
+}
+
+static bool merge_tracked_processes(
+    ProcCache* cache,
+    bool* identity_changed
+) {
+    if (identity_changed) *identity_changed = false;
+    if (!ensure_tracked_process_capacity(
+            cache, cache->num_tracked_procs + cache->num_procs)) {
+        return false;
+    }
+    for (size_t i = 0; i < cache->num_procs; i++) {
+        const ProcessInfo* proc = &cache->procs[i];
+        ssize_t index = tracked_process_index(cache, proc->pid);
+        if (index >= 0) {
+            if (cache->tracked_procs[index].starttime != proc->starttime) {
+                if (identity_changed) *identity_changed = true;
+            }
+            cache->tracked_procs[index].starttime = proc->starttime;
+            continue;
+        }
+        TrackedProcess* tracked =
+            &cache->tracked_procs[cache->num_tracked_procs++];
+        tracked->pid = proc->pid;
+        tracked->starttime = proc->starttime;
+    }
+    return true;
+}
+
+static bool replace_tracked_processes(ProcCache* cache) {
+    if (!ensure_tracked_process_capacity(cache, cache->num_procs)) return false;
+    cache->num_tracked_procs = cache->num_procs;
+    for (size_t i = 0; i < cache->num_procs; i++) {
+        cache->tracked_procs[i].pid = cache->procs[i].pid;
+        cache->tracked_procs[i].starttime = cache->procs[i].starttime;
+    }
+    return true;
+}
+
+static bool process_rule_scope(
+    const AppConfig* cfg,
+    const char* name,
+    char* base_pkg,
+    size_t base_pkg_size,
+    bool* is_child,
+    bool* has_exact_process_rule
+) {
+    base_process_name(name, base_pkg, base_pkg_size);
+    *is_child = strchr(name, ':') != NULL;
+    *has_exact_process_rule = false;
+    bool has_exact_owner_rules = false;
+    bool has_base_process_rule = false;
+
+    for (size_t i = 0; i < cfg->num_rules; i++) {
+        const AffinityRule* rule = &cfg->rules[i];
+        bool exact_owner = strcmp(rule->pkg, name) == 0;
+        bool base_process = rule->thread[0] == '\0' &&
+            strcmp(rule->pkg, base_pkg) == 0;
+        if (!exact_owner && !base_process) continue;
+        if (rule_health_rule_disabled(rule)) continue;
+        if (exact_owner) {
+            has_exact_owner_rules = true;
+            if (rule->thread[0] == '\0') *has_exact_process_rule = true;
+        }
+        if (base_process) has_base_process_rule = true;
+    }
+    return has_exact_owner_rules || (*is_child && has_base_process_rule);
+}
+
+static bool configure_process_rules(
+    const AppConfig* cfg,
+    ProcessInfo* proc,
+    const char* name,
+    bool* complete
+) {
+    char base_pkg[MAX_PKG_LEN];
+    bool is_child = false;
+    bool has_exact_process_rule = false;
+    if (!process_rule_scope(
+            cfg, name, base_pkg, sizeof(base_pkg),
+            &is_child, &has_exact_process_rule)) {
+        return false;
+    }
+
+    build_str(proc->pkg, sizeof(proc->pkg), name, NULL);
+    CPU_ZERO(&proc->base_cpus);
+    proc->base_cpuset[0] = '\0';
+    proc->num_thread_rules = 0;
+
+    for (size_t i = 0; i < cfg->num_rules; i++) {
+        const AffinityRule* rule = &cfg->rules[i];
+        bool use_rule = strcmp(rule->pkg, name) == 0;
+        if (!use_rule && is_child && !has_exact_process_rule &&
+            rule->thread[0] == '\0' && strcmp(rule->pkg, base_pkg) == 0) {
+            use_rule = true;
+        }
+        if (!use_rule) continue;
+        if (rule_health_rule_disabled(rule)) continue;
+
+        if (rule->thread[0]) {
+            if (!ensure_thread_rule_capacity(
+                    proc, proc->num_thread_rules + 1)) {
+                *complete = false;
+                continue;
+            }
+            proc->thread_rules[proc->num_thread_rules++] = (AffinityRule*)rule;
+        } else {
+            CPU_OR(&proc->base_cpus, &proc->base_cpus, &rule->cpus);
         }
     }
 
+    cpuset_dir_for_mask(
+        cfg, &proc->base_cpus, proc->base_cpuset, sizeof(proc->base_cpuset));
+    return true;
+}
+
+static void assign_thread_rule(
+    const AppConfig* cfg,
+    const ProcessInfo* proc,
+    ThreadInfo* thread
+) {
+    CPU_ZERO(&thread->cpus);
+    thread->cpuset_dir[0] = '\0';
+    bool matched = false;
+    for (size_t i = 0; i < proc->num_thread_rules; i++) {
+        const AffinityRule* rule = proc->thread_rules[i];
+        if (fnmatch(rule->thread, thread->name, FNM_NOESCAPE) == 0) {
+            CPU_OR(&thread->cpus, &thread->cpus, &rule->cpus);
+            matched = true;
+        }
+    }
+    if (matched) {
+        cpuset_dir_for_mask(
+            cfg, &thread->cpus, thread->cpuset_dir,
+            sizeof(thread->cpuset_dir));
+    } else {
+        thread->cpus = proc->base_cpus;
+        build_str(
+            thread->cpuset_dir, sizeof(thread->cpuset_dir),
+            proc->base_cpuset, NULL);
+    }
+}
+
+static int compare_thread_info(const void* lhs, const void* rhs) {
+    const ThreadInfo* left = lhs;
+    const ThreadInfo* right = rhs;
+    if (left->tid < right->tid) return -1;
+    if (left->tid > right->tid) return 1;
+    return 0;
+}
+
+static bool scan_process_tasks(
+    const AppConfig* cfg,
+    ProcessInfo* proc,
+    int pid_fd
+) {
+    proc->num_threads = 0;
+    int task_fd = openat(
+        pid_fd, "task", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (task_fd == -1) return false;
+    DIR* task_dir = fdopendir(task_fd);
+    if (!task_dir) {
+        close(task_fd);
+        return false;
+    }
+
+    bool complete = true;
+    while (true) {
+        errno = 0;
+        struct dirent* entry = readdir(task_dir);
+        if (!entry) {
+            if (errno != 0) complete = false;
+            break;
+        }
+        char* end = NULL;
+        errno = 0;
+        long value = strtol(entry->d_name, &end, 10);
+        if (errno == ERANGE || !end || *end != '\0' ||
+            value <= 0 || value > INT_MAX) {
+            continue;
+        }
+
+        int tid_fd = openat(
+            task_fd, entry->d_name,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (tid_fd == -1) {
+            complete = false;
+            continue;
+        }
+        char name[MAX_THREAD_LEN] = {0};
+        unsigned long long starttime = 0;
+        ProcFileResult identity = read_proc_stat_at(
+            tid_fd, name, sizeof(name), &starttime);
+        close(tid_fd);
+        if (identity != PROC_FILE_OK) {
+            complete = false;
+            continue;
+        }
+
+        if (!ensure_thread_capacity(proc, proc->num_threads + 1)) {
+            complete = false;
+            continue;
+        }
+        ThreadInfo* thread = &proc->threads[proc->num_threads++];
+        memset(thread, 0, sizeof(*thread));
+        thread->tid = (pid_t)value;
+        thread->starttime = starttime;
+        build_str(thread->name, sizeof(thread->name), strtrim(name), NULL);
+        assign_thread_rule(cfg, proc, thread);
+    }
+    closedir(task_dir);
+    if (proc->num_threads > 1) {
+        qsort(proc->threads, proc->num_threads,
+              sizeof(*proc->threads), compare_thread_info);
+    }
+    return complete;
+}
+
+static bool populate_process(
+    const AppConfig* cfg,
+    ProcessInfo* proc,
+    pid_t pid,
+    unsigned long long starttime,
+    const char* name,
+    int pid_fd
+) {
+    bool complete = true;
+    proc->pid = pid;
+    proc->starttime = starttime;
+    if (!configure_process_rules(cfg, proc, name, &complete)) return false;
+    if (!scan_process_tasks(cfg, proc, pid_fd)) complete = false;
+    return complete;
+}
+
+static bool identity_errno(int error) {
+    return error == ENOENT || error == ESRCH;
+}
+
+static ProcessRefreshResult refresh_known_process(
+    const AppConfig* cfg,
+    ProcessInfo* proc,
+    const TrackedProcess* tracked
+) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d", tracked->pid);
+    int pid_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (pid_fd == -1) {
+        return identity_errno(errno) ?
+            PROCESS_REFRESH_IDENTITY_LOST : PROCESS_REFRESH_READ_GAP;
+    }
+
+    unsigned long long starttime = 0;
+    ProcFileResult stat_result = read_proc_stat_at(
+        pid_fd, NULL, 0, &starttime);
+    if (stat_result != PROC_FILE_OK) {
+        int error = errno;
+        close(pid_fd);
+        return identity_errno(error) ?
+            PROCESS_REFRESH_IDENTITY_LOST : PROCESS_REFRESH_READ_GAP;
+    }
+    if (starttime != tracked->starttime) {
+        close(pid_fd);
+        return PROCESS_REFRESH_IDENTITY_LOST;
+    }
+
+    char cmdline[MAX_PKG_LEN] = {0};
+    ProcFileResult cmd_result = read_proc_file_at(
+        pid_fd, "cmdline", cmdline, sizeof(cmdline));
+    if (cmd_result != PROC_FILE_OK || cmdline[0] == '\0') {
+        int error = errno;
+        close(pid_fd);
+        return cmd_result == PROC_FILE_ERROR && identity_errno(error) ?
+            PROCESS_REFRESH_IDENTITY_LOST : PROCESS_REFRESH_READ_GAP;
+    }
+    char* name = strrchr(cmdline, '/');
+    name = name ? name + 1 : cmdline;
+
+    bool complete = true;
+    proc->pid = tracked->pid;
+    proc->starttime = starttime;
+    /* thread_rules 指向 AppConfig，因此扫描 task 或应用快照前，
+     * 必须使用本轮持有引用的配置重新构建。 */
+    if (!configure_process_rules(cfg, proc, name, &complete)) {
+        close(pid_fd);
+        return PROCESS_REFRESH_NOT_RELEVANT;
+    }
+    /* 已缓存 PID 的刷新只补充最新正向命中；task 读取缺口
+     * 不应影响最近一次完整扫描的完成时间戳。 */
+    scan_process_tasks(cfg, proc, pid_fd);
+    close(pid_fd);
+    return PROCESS_REFRESH_INCLUDED;
+}
+
+static uint64_t process_cache_hash_bytes(
+    uint64_t hash,
+    const void* data,
+    size_t size
+) {
+    const unsigned char* bytes = data;
+    for (size_t i = 0; i < size; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static uint64_t process_cache_fingerprint(const ProcCache* cache) {
+    uint64_t hash = 14695981039346656037ULL;
+    hash = process_cache_hash_bytes(
+        hash, &cache->num_procs, sizeof(cache->num_procs));
+    for (size_t i = 0; i < cache->num_procs; i++) {
+        const ProcessInfo* proc = &cache->procs[i];
+        hash = process_cache_hash_bytes(hash, &proc->pid, sizeof(proc->pid));
+        hash = process_cache_hash_bytes(
+            hash, &proc->starttime, sizeof(proc->starttime));
+        hash = process_cache_hash_bytes(
+            hash, proc->pkg, strlen(proc->pkg) + 1);
+        hash = process_cache_hash_bytes(
+            hash, &proc->base_cpus, sizeof(proc->base_cpus));
+        hash = process_cache_hash_bytes(
+            hash, &proc->num_threads, sizeof(proc->num_threads));
+        for (size_t j = 0; j < proc->num_threads; j++) {
+            const ThreadInfo* thread = &proc->threads[j];
+            hash = process_cache_hash_bytes(
+                hash, &thread->tid, sizeof(thread->tid));
+            hash = process_cache_hash_bytes(
+                hash, &thread->starttime, sizeof(thread->starttime));
+            hash = process_cache_hash_bytes(
+                hash, thread->name, strlen(thread->name) + 1);
+            hash = process_cache_hash_bytes(
+                hash, &thread->cpus, sizeof(thread->cpus));
+        }
+    }
+    return hash;
+}
+
+typedef struct {
+    bool global_complete;
+    char (*incomplete_pkgs)[MAX_PKG_LEN];
+    size_t num_incomplete_pkgs;
+    size_t incomplete_pkgs_cap;
+} ProcScanQuality;
+
+static void proc_scan_quality_init(ProcScanQuality* quality) {
+    memset(quality, 0, sizeof(*quality));
+    quality->global_complete = true;
+}
+
+static void proc_scan_mark_package_gap(
+    ProcScanQuality* quality,
+    const char* process_name
+) {
+    char base_pkg[MAX_PKG_LEN];
+    base_process_name(process_name, base_pkg, sizeof(base_pkg));
+    if (!base_pkg[0]) {
+        quality->global_complete = false;
+        return;
+    }
+    for (size_t i = 0; i < quality->num_incomplete_pkgs; i++) {
+        if (strcmp(quality->incomplete_pkgs[i], base_pkg) == 0) return;
+    }
+    if (quality->num_incomplete_pkgs >= quality->incomplete_pkgs_cap) {
+        size_t new_cap = quality->incomplete_pkgs_cap ?
+            quality->incomplete_pkgs_cap * 2 : 4;
+        if (new_cap < quality->incomplete_pkgs_cap) {
+            quality->global_complete = false;
+            return;
+        }
+        char (*resized)[MAX_PKG_LEN] = realloc(
+            quality->incomplete_pkgs, new_cap * sizeof(*resized));
+        if (!resized) {
+            quality->global_complete = false;
+            return;
+        }
+        quality->incomplete_pkgs = resized;
+        quality->incomplete_pkgs_cap = new_cap;
+    }
+    build_str(
+        quality->incomplete_pkgs[quality->num_incomplete_pkgs++],
+        MAX_PKG_LEN, base_pkg, NULL);
+}
+
+static void proc_scan_quality_release(ProcScanQuality* quality) {
+    free(quality->incomplete_pkgs);
+    memset(quality, 0, sizeof(*quality));
+}
+
+static void proc_cache_commit_full_scan_quality(
+    ProcCache* cache,
+    ProcScanQuality* quality
+) {
+    free(cache->last_full_incomplete_pkgs);
+    cache->last_full_incomplete_pkgs = quality->incomplete_pkgs;
+    cache->num_last_full_incomplete_pkgs = quality->num_incomplete_pkgs;
+    quality->incomplete_pkgs = NULL;
+    quality->num_incomplete_pkgs = 0;
+    quality->incomplete_pkgs_cap = 0;
+}
+
+static bool proc_cache_full_scan_complete_for(
+    const ProcCache* cache,
+    const char* pkg
+) {
+    if (!cache || !pkg || !pkg[0]) return false;
+    char base_pkg[MAX_PKG_LEN];
+    base_process_name(pkg, base_pkg, sizeof(base_pkg));
+    for (size_t i = 0; i < cache->num_last_full_incomplete_pkgs; i++) {
+        if (strcmp(cache->last_full_incomplete_pkgs[i], base_pkg) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool config_has_runtime_rules(const AppConfig* cfg) {
+    for (size_t i = 0; i < cfg->num_rules; i++) {
+        if (!rule_health_rule_disabled(&cfg->rules[i])) return true;
+    }
+    return false;
+}
+
+static void clear_empty_runtime_cache(
+    ProcCache* cache,
+    int* affinity_counter,
+    unsigned long long now_elapsed
+) {
+    cache->num_procs = 0;
+    cache->num_tracked_procs = 0;
+    cache->initialized = true;
+    cache->scan_all_proc = false;
+    cache->proc_growth_pending = false;
+    cache->last_full_scan_attempt_elapsed_ms = 0;
+    cache->last_health_full_scan_attempt_elapsed_ms = 0;
+    cache->last_refresh_elapsed_ms = now_elapsed;
+    free(cache->last_full_incomplete_pkgs);
+    cache->last_full_incomplete_pkgs = NULL;
+    cache->num_last_full_incomplete_pkgs = 0;
+    *affinity_counter = 0;
+}
+
+static bool proc_collect(
+    const AppConfig* cfg,
+    ProcCache* cache,
+    size_t* count,
+    bool full_scan,
+    ProcScanQuality* quality
+) {
+    DIR* proc_dir = opendir("/proc");
+    if (!proc_dir) return false;
+    int proc_fd = dirfd(proc_dir);
+    if (proc_fd < 0) {
+        closedir(proc_dir);
+        return false;
+    }
+    *count = 0;
+
     struct dirent* ent;
     time_t current_time = time(NULL);
-    int current_proc_total = 0;
-    while ((ent = readdir(proc_dir))) {
-        char *end;
-        long pid = strtol(ent->d_name, &end, 10);
-        if (*end != '\0')  continue;
-        current_proc_total++;
-
-        if (!cache->scan_all_proc) {
-            bool is_tracked = false;
-            for (size_t i = 0; i < cache->num_tracked_pids; i++) {
-                if (cache->tracked_pids[i] == pid) {
-                    is_tracked = true;
-                    break;
-                }
-            }
+    while (true) {
+        errno = 0;
+        ent = readdir(proc_dir);
+        if (!ent) {
+            if (errno != 0) quality->global_complete = false;
+            break;
+        }
+        char* end = NULL;
+        errno = 0;
+        long value = strtol(ent->d_name, &end, 10);
+        if (errno == ERANGE || !end || *end != '\0' ||
+            value <= 0 || value > INT_MAX) {
+            continue;
+        }
+        pid_t pid = (pid_t)value;
+        bool is_tracked = tracked_process_index(cache, pid) >= 0;
+        if (!full_scan) {
             if (!is_tracked) {
                 struct stat statbuf;
                 if (fstatat(proc_fd, ent->d_name, &statbuf, AT_SYMLINK_NOFOLLOW) != 0) continue;
@@ -202,272 +884,280 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             }
         }
 
-        int pid_fd = openat(proc_fd, ent->d_name, O_RDONLY | O_DIRECTORY);
-        if (pid_fd == -1) continue;
+        int pid_fd = openat(proc_fd, ent->d_name,O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (pid_fd == -1) {
+            if (is_tracked) quality->global_complete = false;
+            continue;
+        }
 
         char cmd[MAX_PKG_LEN] = {0};
-        if (!read_file(pid_fd, "cmdline", cmd, sizeof(cmd))) {
+        ProcFileResult cmd_result = read_proc_file_at(pid_fd, "cmdline", cmd, sizeof(cmd));
+        if (cmd_result != PROC_FILE_OK || cmd[0] == '\0') {
+            if (is_tracked) quality->global_complete = false;
             close(pid_fd);
             continue;
         }
         char* name = strrchr(cmd, '/');
         name = name ? name + 1 : cmd;
 
-        const char* matched_pkg = NULL;
-        size_t matched_len = 0;
-        for (size_t j = 0; j < cfg->num_pkgs; j++) {
-            size_t plen = strlen(cfg->pkgs[j]);
-            if (strcmp(name, cfg->pkgs[j]) == 0) {
-                matched_pkg = cfg->pkgs[j];
-                break;
-            }
-            if (plen > matched_len && strncmp(name, cfg->pkgs[j], plen) == 0 && name[plen] == ':') {
-                matched_pkg = cfg->pkgs[j];
-                matched_len = plen;
-            }
-        }
-        if (!matched_pkg) {
+        char base_pkg[MAX_PKG_LEN];
+        bool is_child = false;
+        bool has_exact_process_rule = false;
+        if (!process_rule_scope(
+                cfg, name, base_pkg, sizeof(base_pkg),
+                &is_child, &has_exact_process_rule)) {
             close(pid_fd);
             continue;
         }
 
-        bool has_exact_pkg_rules = false;
-        for (size_t i = 0; i < cfg->num_rules; i++) {
-            if (strcmp(cfg->rules[i].pkg, name) == 0) {
-                has_exact_pkg_rules = true;
-                break;
-            }
+        unsigned long long starttime = 0;
+        if (read_proc_stat_at(pid_fd, NULL, 0, &starttime) != PROC_FILE_OK) {
+            proc_scan_mark_package_gap(quality, name);
+            close(pid_fd);
+            continue;
         }
-
-        if (*count >= cache->procs_cap) {
-            size_t new_cap = cache->procs_cap * 2;
-            ProcessInfo* new_procs = realloc(cache->procs, new_cap * sizeof(ProcessInfo));
-            if (!new_procs) {
-                close(pid_fd);
-                continue;
-            }
-            memset(new_procs + cache->procs_cap, 0, (new_cap - cache->procs_cap) * sizeof(ProcessInfo));
-            cache->procs = new_procs;
-            cache->procs_cap = new_cap;
+        if (!ensure_process_capacity(cache, *count + 1)) {
+            quality->global_complete = false;
+            close(pid_fd);
+            continue;
         }
 
         ProcessInfo* proc = &cache->procs[*count];
-
-        proc->pid = pid;
-        build_str(proc->pkg, sizeof(proc->pkg), name, NULL);
-        CPU_ZERO(&proc->base_cpus);
-        proc->base_cpuset[0] = '\0';
-        proc->num_threads = 0;
-        proc->num_thread_rules = 0;
-
-        if (!proc->thread_rules || proc->thread_rules_cap < 8) {
-            size_t new_cap = proc->thread_rules_cap ? proc->thread_rules_cap * 2 : 8;
-            AffinityRule** tmp = realloc(proc->thread_rules, new_cap * sizeof(AffinityRule*));
-            if (!tmp) {
-                close(pid_fd);
-                continue;
-            }
-            proc->thread_rules = tmp;
-            proc->thread_rules_cap = new_cap;
-        }
-
-        for (size_t i = 0; i < cfg->num_rules; i++) {
-            const AffinityRule* rule = &cfg->rules[i];
-            bool use_rule = strcmp(rule->pkg, proc->pkg) == 0;
-            /* 子进程没有独立规则时, 只继承主包进程级兜底, 不继承主进程线程规则。 */
-            if (!use_rule && !has_exact_pkg_rules &&
-                strcmp(rule->pkg, matched_pkg) == 0 && rule->thread[0] == '\0') {
-                use_rule = true;
-            }
-            if (!use_rule) continue;
-
-            if (rule->thread[0]) {
-                if (proc->num_thread_rules >= proc->thread_rules_cap) {
-                    size_t new_cap = proc->thread_rules_cap * 2;
-                    AffinityRule** tmp = realloc(proc->thread_rules, new_cap * sizeof(AffinityRule*));
-                    if (!tmp) break;
-                    proc->thread_rules = tmp;
-                    proc->thread_rules_cap = new_cap;
-                }
-                proc->thread_rules[proc->num_thread_rules++] = (AffinityRule*)rule;
-            } else {
-                CPU_OR(&proc->base_cpus, &proc->base_cpus, &rule->cpus);
-                build_str(proc->base_cpuset, sizeof(proc->base_cpuset), rule->cpuset_dir, NULL);
-            }
-        }
-
-        if (CPU_COUNT(&proc->base_cpus) == 0 && proc->num_thread_rules == 0) {
-            close(pid_fd);
-            continue;
-        }
-
-        int task_fd = openat(pid_fd, "task", O_RDONLY | O_DIRECTORY);
+        bool process_complete = populate_process(
+            cfg, proc, pid, starttime, name, pid_fd);
         close(pid_fd);
-        if (task_fd == -1) {
-            continue;
-        }
-
-        DIR* task_dir = fdopendir(task_fd);
-        if (!task_dir) {
-            close(task_fd);
-            continue;
-        }
-
-        if (!proc->threads || proc->threads_cap < 512) {
-            size_t new_cap = proc->threads_cap ? proc->threads_cap * 2 : 64;
-            ThreadInfo* tmp = realloc(proc->threads, new_cap * sizeof(ThreadInfo));
-            if (!tmp) {
-                closedir(task_dir);
-                continue;
-            }
-            proc->threads = tmp;
-            proc->threads_cap = new_cap;
-        }
-
-        struct dirent* tent;
-        while ((tent = readdir(task_dir))) {
-            char *end2;
-            long tid = strtol(tent->d_name, &end2, 10);
-            if (*end2 != '\0')  continue;
-            char tname[MAX_THREAD_LEN] = {0};
-
-            int tid_fd = openat(task_fd, tent->d_name, O_RDONLY | O_DIRECTORY);
-            if (tid_fd == -1) continue;
-
-            if (!read_file(tid_fd, "comm", tname, sizeof(tname))) {
-                close(tid_fd);
-                continue;
-            }
-            close(tid_fd);
-
-            strtrim(tname);
-
-            if (proc->num_threads >= proc->threads_cap) {
-                size_t new_cap = proc->threads_cap * 2;
-                ThreadInfo* tmp = realloc(proc->threads, new_cap * sizeof(ThreadInfo));
-                if (!tmp) continue;
-                proc->threads = tmp;
-                proc->threads_cap = new_cap;
-            }
-
-            ThreadInfo* ti = &proc->threads[proc->num_threads];
-            ti->tid = tid;
-            build_str(ti->name, sizeof(ti->name), tname, NULL);
-            CPU_ZERO(&ti->cpus);
-            const char* matched = NULL;
-
-            for (size_t i = 0; i < proc->num_thread_rules; i++) {
-                const AffinityRule* rule = proc->thread_rules[i];
-                if (fnmatch(rule->thread, ti->name, FNM_NOESCAPE) == 0) {
-                    CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
-                    matched = rule->cpuset_dir;
-                }
-            }
-
-            if (matched) {
-                build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), matched, NULL);
-            } else {
-                ti->cpus = proc->base_cpus;
-                build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), proc->base_cpuset, NULL);
-            }
-
-            proc->num_threads++;
-        }
-
-        closedir(task_dir);
+        if (!process_complete) proc_scan_mark_package_gap(quality, name);
         (*count)++;
     }
     closedir(proc_dir);
-    if (current_proc_total > cache->last_proc_total) {
-        cache->scan_all_proc = true;
-    } else {
-        cache->scan_all_proc = false;
-    }
-    cache->last_proc_total = current_proc_total;
+    return quality->global_complete;
 }
 
-static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_counter) {
-    bool need_reload = false;
-    struct sysinfo info;
-    if (sysinfo(&info) != 0) {
-        need_reload = true;
-    } else {
-        int current_proc_count = info.procs;
-        if (current_proc_count > cache->last_proc_count) {
-            /* 任何进程数增长都重扫: 新拉起的目标 app 可能就在新增进程里。
-             * proc_collect 在 scan_all_proc=false 时仅扫描已跟踪 PID 或 mtime<60s
-             * 的新进程, 故"每次增长就 reload"开销可控, 且能及时发现新进程
-             * (旧逻辑要求增量>11 才 reload, 单个新 app 上来常漏掉, 延迟发现)。*/
-            need_reload = true;
-        }
-        cache->last_proc_count = current_proc_count;
+static void refresh_tracked_processes(
+    ProcCache* cache,
+    const AppConfig* cfg,
+    int* affinity_counter
+) {
+    uint64_t old_fingerprint = process_cache_fingerprint(cache);
+    if (!ensure_process_capacity(
+            cache, cache->num_procs + cache->num_tracked_procs)) {
+        cache->num_procs = 0;
+        cache->scan_all_proc = true;
+        *affinity_counter = 0;
+        return;
     }
-    if (cache->procs != NULL && !need_reload) {
-        for (size_t i = 0; i < cache->num_procs; i++) {
-            if (kill(cache->procs[i].pid, 0) != 0) {
-                need_reload = true;
+
+    size_t working_count = cache->num_procs;
+    size_t tracked_count = 0;
+    size_t previous_tracked_count = cache->num_tracked_procs;
+    for (size_t i = 0; i < previous_tracked_count; i++) {
+        TrackedProcess tracked = cache->tracked_procs[i];
+        size_t slot = working_count;
+        for (size_t j = 0; j < working_count; j++) {
+            if (cache->procs[j].pid == tracked.pid &&
+                cache->procs[j].starttime == tracked.starttime) {
+                slot = j;
                 break;
             }
         }
-    }
-    if (need_reload) {
-        size_t new_count = 0;
-        proc_collect(cfg, cache, &new_count);
-
-        if (new_count > cache->tracked_pids_cap) {
-            size_t new_cap = cache->tracked_pids_cap ? cache->tracked_pids_cap * 2 : new_count;
-            pid_t* new_pids = realloc(cache->tracked_pids, new_cap * sizeof(pid_t));
-            if (new_pids) {
-                cache->tracked_pids = new_pids;
-                cache->tracked_pids_cap = new_cap;
-            }
-        }
-
-        if (cache->tracked_pids) {
-            cache->num_tracked_pids = 0;
-            for (size_t i = 0; i < new_count; i++) {
-                if (cache->num_tracked_pids < cache->tracked_pids_cap) {
-                    cache->tracked_pids[cache->num_tracked_pids++] = cache->procs[i].pid;
+        if (slot == working_count) {
+            for (size_t j = 0; j < working_count; j++) {
+                if (cache->procs[j].pid == 0) {
+                    slot = j;
+                    break;
                 }
             }
         }
+        if (slot == working_count) working_count++;
 
-        cache->num_procs = new_count;
+        ProcessInfo* proc = &cache->procs[slot];
+        ProcessRefreshResult result = refresh_known_process(cfg, proc, &tracked);
+        if (result == PROCESS_REFRESH_IDENTITY_LOST) {
+            proc->pid = 0;
+            proc->num_threads = 0;
+            cache->scan_all_proc = true;
+            continue;
+        }
+        if (result == PROCESS_REFRESH_NOT_RELEVANT) {
+            proc->pid = 0;
+            proc->num_threads = 0;
+            continue;
+        }
+
+        cache->tracked_procs[tracked_count++] = tracked;
+        if (result == PROCESS_REFRESH_READ_GAP) {
+            proc->pid = 0;
+            proc->num_threads = 0;
+        }
+    }
+
+    cache->num_tracked_procs = tracked_count;
+    for (size_t i = 0; i < working_count; i++) {
+        ProcessInfo* proc = &cache->procs[i];
+        if (proc->pid == 0 ||
+            tracked_process_identity_index(
+                cache, proc->pid, proc->starttime) >= 0) {
+            continue;
+        }
+        proc->pid = 0;
+        proc->num_threads = 0;
+    }
+
+    size_t active_count = 0;
+    for (size_t i = 0; i < working_count; i++) {
+        if (cache->procs[i].pid == 0) continue;
+        if (active_count != i) {
+            ProcessInfo temporary = cache->procs[active_count];
+            cache->procs[active_count] = cache->procs[i];
+            cache->procs[i] = temporary;
+        }
+        active_count++;
+    }
+    cache->num_procs = active_count;
+    cache->last_refresh_elapsed_ms = rule_health_boottime_ms();
+    if (process_cache_fingerprint(cache) != old_fingerprint) {
         *affinity_counter = 0;
     }
+}
+
+static void update_cache(
+    ProcCache* cache,
+    const AppConfig* cfg,
+    int* affinity_counter,
+    bool force_full_scan
+) {
+    unsigned long long now_elapsed = rule_health_boottime_ms();
+    if (!config_has_runtime_rules(cfg)) {
+        clear_empty_runtime_cache(cache, affinity_counter, now_elapsed);
+        return;
+    }
+    bool periodic_full_scan = cache->initialized && now_elapsed > 0 &&
+        (cache->last_full_scan_elapsed_ms == 0 ||
+         now_elapsed - cache->last_full_scan_elapsed_ms >= PROC_FULL_RESCAN_MS);
+    bool full_retry_allowed = now_elapsed == 0 ||
+        cache->last_full_scan_attempt_elapsed_ms == 0 ||
+        now_elapsed - cache->last_full_scan_attempt_elapsed_ms >=
+            RULE_HEALTH_FULL_SCAN_RETRY_MS;
+    bool full_scan_requested = !cache->initialized || cache->scan_all_proc ||
+        periodic_full_scan || force_full_scan;
+    bool full_scan = full_scan_requested && full_retry_allowed;
+    struct sysinfo info;
+    if (sysinfo(&info) == 0) {
+        int current_proc_count = info.procs;
+        if (current_proc_count > cache->last_proc_count) {
+            /* 合并处理进程/线程数量波动，避免线程创建导致 2 秒主循环
+             * 每轮都枚举 /proc。 */
+            cache->proc_growth_pending = true;
+        }
+        cache->last_proc_count = current_proc_count;
+    }
+    bool growth_scan_due = cache->proc_growth_pending &&
+        (now_elapsed == 0 || cache->last_proc_growth_scan_elapsed_ms == 0 ||
+         now_elapsed - cache->last_proc_growth_scan_elapsed_ms >=
+            PROC_GROWTH_SCAN_COOLDOWN_MS);
+    bool incremental_scan = growth_scan_due && !full_scan_requested;
+    if (full_scan || incremental_scan) {
+        if (full_scan && now_elapsed > 0) {
+            cache->last_full_scan_attempt_elapsed_ms = now_elapsed;
+            cache->last_health_full_scan_attempt_elapsed_ms = now_elapsed;
+        }
+        size_t new_count = 0;
+        ProcScanQuality quality;
+        proc_scan_quality_init(&quality);
+        bool scan_complete = proc_collect(
+            cfg, cache, &new_count, full_scan, &quality);
+        cache->num_procs = new_count;
+        bool full_cache_complete = scan_complete &&
+            quality.num_incomplete_pkgs == 0;
+        bool identity_changed = false;
+        bool tracked_cache_complete = full_scan && full_cache_complete ?
+            replace_tracked_processes(cache) :
+            merge_tracked_processes(cache, &identity_changed);
+        cache->initialized = true;
+        if (full_scan) {
+            cache->scan_all_proc = identity_changed ||
+                !scan_complete || !tracked_cache_complete;
+        } else {
+            cache->scan_all_proc = cache->scan_all_proc ||
+                identity_changed || !scan_complete || !tracked_cache_complete;
+        }
+        unsigned long long completed_at = rule_health_boottime_ms();
+        cache->last_refresh_elapsed_ms = completed_at;
+        if (incremental_scan) {
+            cache->last_proc_growth_scan_elapsed_ms = completed_at;
+            if (scan_complete) cache->proc_growth_pending = false;
+        }
+        if (full_scan && scan_complete) {
+            proc_cache_commit_full_scan_quality(cache, &quality);
+            cache->last_full_scan_elapsed_ms = completed_at;
+            if (tracked_cache_complete) {
+                cache->last_full_scan_attempt_elapsed_ms = 0;
+                cache->last_proc_growth_scan_elapsed_ms = completed_at;
+                cache->proc_growth_pending = false;
+            }
+        }
+        proc_scan_quality_release(&quality);
+        *affinity_counter = 0;
+        return;
+    }
+    refresh_tracked_processes(cache, cfg, affinity_counter);
 }
 
 static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
     for (size_t i = 0; i < cache->num_procs; i++) {
         const ProcessInfo* proc = &cache->procs[i];
+        char proc_path[64];
+        snprintf(proc_path, sizeof(proc_path), "/proc/%d", proc->pid);
+        int proc_fd = open(proc_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        unsigned long long process_starttime = 0;
+        if (proc_fd == -1 || !read_starttime_at(proc_fd, &process_starttime) ||
+            process_starttime != proc->starttime) {
+            if (proc_fd != -1) close(proc_fd);
+            cache->scan_all_proc = true;
+            continue;
+        }
+        int task_fd = openat(proc_fd, "task", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        close(proc_fd);
+        if (task_fd == -1) continue;
         for (size_t j = 0; j < proc->num_threads; j++) {
             const ThreadInfo* ti = &proc->threads[j];
+            bool has_requested_cpus = CPU_COUNT(&ti->cpus) > 0;
+            cpu_set_t effective_cpus;
+            CPU_AND(&effective_cpus, &ti->cpus, &topo->present_cpus);
+            if (!has_requested_cpus || CPU_COUNT(&effective_cpus) == 0) continue;
+            char tid_name[32];
+            snprintf(tid_name, sizeof(tid_name), "%d", ti->tid);
+            int tid_fd = openat(task_fd, tid_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            unsigned long long thread_starttime = 0;
+            if (tid_fd == -1 || !read_starttime_at(tid_fd, &thread_starttime) ||
+                thread_starttime != ti->starttime) {
+                if (tid_fd != -1) close(tid_fd);
+                continue;
+            }
+            close(tid_fd);
             if (topo->cpuset_enabled && topo->base_cpuset_fd != -1) {
                 char tid_str[32];
                 snprintf(tid_str, sizeof(tid_str), "%d\n", ti->tid);
-                if (CPU_COUNT(&ti->cpus) == 0) {
-                    cpu_set_t curr;
-                    if (sched_getaffinity(ti->tid, sizeof(curr), &curr) == -1) continue;
-                    if (CPU_EQUAL(&topo->present_cpus, &curr)) continue;
-                    write_file(topo->base_cpuset_fd, "tasks", tid_str, O_WRONLY | O_APPEND);
-                } else {
-                    cpu_set_t curr;
-                    if (sched_getaffinity(ti->tid, sizeof(curr), &curr) == -1) continue;
-                    if (CPU_EQUAL(&ti->cpus, &curr)) continue;
-                    if (ti->cpuset_dir[0]) {
-                        int fd = openat(topo->base_cpuset_fd, ti->cpuset_dir, O_RDONLY | O_DIRECTORY);
-                        if (fd != -1) {
-                            write_file(fd, "tasks", tid_str, O_WRONLY | O_APPEND);
-                            close(fd);
-                        }
+                cpu_set_t current_cpus;
+                if (sched_getaffinity(
+                        ti->tid, sizeof(current_cpus), &current_cpus) == -1) {
+                    continue;
+                }
+                if (CPU_EQUAL(&effective_cpus, &current_cpus)) continue;
+                if (ti->cpuset_dir[0]) {
+                    int fd = openat(
+                        topo->base_cpuset_fd, ti->cpuset_dir,
+                        O_RDONLY | O_DIRECTORY);
+                    if (fd != -1) {
+                        write_file(fd, "tasks", tid_str, O_WRONLY | O_APPEND);
+                        close(fd);
                     }
                 }
             }
-            if (CPU_COUNT(&ti->cpus) == 0) continue;
-            if (sched_setaffinity(ti->tid, sizeof(ti->cpus), &ti->cpus) == -1 && errno == ESRCH) {
-                cache->last_proc_count = 0;
-            }
+            sched_setaffinity(
+                ti->tid, sizeof(effective_cpus), &effective_cpus);
         }
+        close(task_fd);
     }
 }
 

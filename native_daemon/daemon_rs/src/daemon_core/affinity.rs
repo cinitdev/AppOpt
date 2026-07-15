@@ -9,15 +9,19 @@
 fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
     let mut stats = ApplyStats::default();
     let mut invalid_details = 0usize;
+    let mut restricted_details = 0usize;
     let mut read_failed_details = 0usize;
     let mut cpuset_failed_details = 0usize;
     let mut affinity_failed_details = 0usize;
     let mut mismatch_details = 0usize;
+    let mut identity_details = 0usize;
+
+    let present_mask = read_present_cpus().and_then(|cpus| CpuMask::parse(&cpus));
 
     for hit in hits {
         for action in &hit.actions {
             // cpus 解析失败不终止整个 daemon，只统计并打印错误，避免一条坏规则影响其他应用。
-            let Some(mask) = CpuMask::parse(&action.cpus) else {
+            let Some(requested_mask) = CpuMask::parse(&action.cpus) else {
                 stats.invalid_rules += 1;
                 if should_log_detail(detail_log, &mut invalid_details) {
                     eprintln!(
@@ -27,6 +31,43 @@ fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
                 }
                 continue;
             };
+            let mask = if let Some(present) = &present_mask {
+                let clipped = requested_mask.intersection(present);
+                if clipped.is_empty() {
+                    stats.restricted += 1;
+                    if should_log_detail(detail_log, &mut restricted_details) {
+                        eprintln!(
+                            "[RS] CPU规则不包含当前设备核心 进程={} 线程={} 线程名={} 规则={} 请求={} present={}",
+                            hit.pid,
+                            action.tid,
+                            action.name,
+                            action.rule,
+                            action.cpus,
+                            present.to_list()
+                        );
+                    }
+                    continue;
+                }
+                if clipped != requested_mask {
+                    stats.restricted += 1;
+                    if should_log_detail(detail_log, &mut restricted_details) {
+                        eprintln!(
+                            "[RS] CPU规则已裁剪到当前设备核心 进程={} 线程={} 线程名={} 规则={} 请求={} 实际={} present={}",
+                            hit.pid,
+                            action.tid,
+                            action.name,
+                            action.rule,
+                            action.cpus,
+                            clipped.to_list(),
+                            present.to_list()
+                        );
+                    }
+                }
+                clipped
+            } else {
+                requested_mask
+            };
+            let effective_cpus = mask.to_list();
 
             // 已经在目标核心上就不重复写 affinity，减少长期守护进程对系统的打扰。
             match read_allowed_mask(hit.pid, action.tid) {
@@ -52,6 +93,12 @@ fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
                 }
             }
 
+            if !action_identity_is_current(hit, action, "cpuset", detail_log, &mut identity_details)
+            {
+                stats.skipped += 1;
+                continue;
+            }
+
             if let Err(err) = move_tid_to_cpuset(action.tid, &mask) {
                 if is_thread_gone_error(&err) {
                     stats.skipped += 1;
@@ -69,10 +116,21 @@ fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
                         action.tid,
                         action.name,
                         action.rule,
-                        action.cpus,
+                        effective_cpus,
                         error_text_zh(&err)
                     );
                 }
+            }
+
+            if !action_identity_is_current(
+                hit,
+                action,
+                "affinity",
+                detail_log,
+                &mut identity_details,
+            ) {
+                stats.skipped += 1;
+                continue;
             }
 
             match set_affinity(action.tid, &mask) {
@@ -93,7 +151,7 @@ fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
                                         action.tid,
                                         action.name,
                                         action.rule,
-                                        action.cpus,
+                                        effective_cpus,
                                         current.to_list()
                                     );
                                 }
@@ -127,13 +185,50 @@ fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
 
     if detail_log {
         log_limited_detail_count("无效CPU规则", invalid_details);
+        log_limited_detail_count("CPU规则受设备核心范围限制", restricted_details);
         log_limited_detail_count("读取绑核状态失败", read_failed_details);
         log_limited_detail_count("cpuset辅助写入失败", cpuset_failed_details);
         log_limited_detail_count("绑核失败", affinity_failed_details);
         log_limited_detail_count("绑核被系统改写", mismatch_details);
+        log_limited_detail_count("进程/线程身份已变化", identity_details);
     }
 
     stats
+}
+
+fn action_identity_is_current(
+    hit: &ProcHit,
+    action: &ThreadAction,
+    phase: &str,
+    detail_log: bool,
+    identity_details: &mut usize,
+) -> bool {
+    match proc_thread_identity_matches(hit, action) {
+        Ok(true) => true,
+        Ok(false) => {
+            if should_log_detail(detail_log, identity_details) {
+                eprintln!(
+                    "[RS] 跳过已变化的进程/线程身份 阶段={} 进程={} 线程={} 线程名={} 规则={}",
+                    phase, hit.pid, action.tid, action.name, action.rule
+                );
+            }
+            false
+        }
+        Err(err) => {
+            if should_log_detail(detail_log, identity_details) {
+                eprintln!(
+                    "[RS] 复核进程/线程身份失败 阶段={} 进程={} 线程={} 线程名={} 规则={} 错误={}",
+                    phase,
+                    hit.pid,
+                    action.tid,
+                    action.name,
+                    action.rule,
+                    error_text_zh(&err)
+                );
+            }
+            false
+        }
+    }
 }
 
 fn should_log_detail(detail_log: bool, detail_count: &mut usize) -> bool {
@@ -187,7 +282,9 @@ fn error_text_zh(err: &io::Error) -> String {
         None => match err.kind() {
             io::ErrorKind::NotFound => "路径不存在, 目标进程或线程可能已经退出".to_string(),
             io::ErrorKind::PermissionDenied => "权限不足, 内核或安全策略拒绝操作".to_string(),
-            io::ErrorKind::InvalidInput => "无效参数, CPU 核心范围对当前线程不可用或 CPU mask 非法".to_string(),
+            io::ErrorKind::InvalidInput => {
+                "无效参数, CPU 核心范围对当前线程不可用或 CPU mask 非法".to_string()
+            }
             _ => "I/O 操作失败".to_string(),
         },
     }
@@ -249,6 +346,23 @@ impl CpuMask {
         for (left, right) in self.words.iter_mut().zip(other.words.iter()) {
             *left |= *right;
         }
+    }
+
+    fn intersection(&self, other: &Self) -> Self {
+        let mut mask = Self::empty();
+        for ((out, left), right) in mask
+            .words
+            .iter_mut()
+            .zip(self.words.iter())
+            .zip(other.words.iter())
+        {
+            *out = left & right;
+        }
+        mask
+    }
+
+    fn is_empty(&self) -> bool {
+        self.words.iter().all(|word| *word == 0)
     }
 
     fn to_list(&self) -> String {

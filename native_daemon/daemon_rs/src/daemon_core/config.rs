@@ -10,7 +10,18 @@
 // package_uid.map 由 App/前台 helper 通过 PackageManager 写入，daemon 只读取，不自己解析系统包数据库，
 // 也不 fork cmd/pm/dumpsys。这样长期运行更稳，ROM 差异也少一点。
 fn parse_config(path: &Path) -> io::Result<Vec<Rule>> {
-    let text = fs::read_to_string(path)?;
+    parse_config_with_key(path).map(|(rules, _)| rules)
+}
+
+fn parse_config_with_key(path: &Path) -> io::Result<(Vec<Rule>, FileKey)> {
+    let bytes = fs::read(path)?;
+    let key = content_file_key(&bytes);
+    let text =
+        String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    Ok((parse_config_text(&text), key))
+}
+
+fn parse_config_text(text: &str) -> Vec<Rule> {
     let mut rules = Vec::new();
 
     for raw in text.lines() {
@@ -38,20 +49,27 @@ fn parse_config(path: &Path) -> io::Result<Vec<Rule>> {
         }
     }
 
-    Ok(rules)
+    rules
 }
 
 fn parse_rule_key(left: &str, cpus: &str) -> Option<Rule> {
     if let Some(open) = left.find('{') {
         // 线程规则：com.pkg{thread-pattern}=0-3。
         // pattern 后续用 glob_match 支持 *、?、[0-9] 这类 AppOpt 规则写法。
-        let close = left.rfind('}')?;
+        let close = left[open + 1..].find('}')? + open + 1;
         if close <= open {
             return None;
         }
         let owner = left[..open].trim();
         let thread = left[open + 1..close].trim();
-        if owner.is_empty() || thread.is_empty() {
+        if thread.contains('{') || !left[close + 1..].trim().is_empty() {
+            return None;
+        }
+        if owner.is_empty()
+            || owner.len() > MAX_CONFIG_OWNER_BYTES
+            || thread.is_empty()
+            || thread.len() > MAX_CONFIG_THREAD_BYTES
+        {
             return None;
         }
         return Some(Rule {
@@ -62,7 +80,7 @@ fn parse_rule_key(left: &str, cpus: &str) -> Option<Rule> {
         });
     }
 
-    if left.is_empty() {
+    if left.is_empty() || left.contains('}') || left.len() > MAX_CONFIG_OWNER_BYTES {
         return None;
     }
 
@@ -75,13 +93,20 @@ fn parse_rule_key(left: &str, cpus: &str) -> Option<Rule> {
 }
 
 fn parse_uid_map(path: &Path) -> io::Result<HashMap<String, u32>> {
+    parse_uid_map_with_key(path).map(|(map, _)| map)
+}
+
+fn parse_uid_map_with_key(path: &Path) -> io::Result<(HashMap<String, u32>, Option<FileKey>)> {
     // package_uid.map 由 App/前台 helper 写入，格式为 com.example.app=10123。
     // 让 Android Framework 负责包名到 UID 的真实映射，daemon 不解析 packages.list，也不 fork cmd/pm。
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((HashMap::new(), None)),
         Err(err) => return Err(err),
     };
+    let key = content_file_key(&bytes);
+    let text =
+        String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let mut map = HashMap::new();
 
     for raw in text.lines() {
@@ -98,7 +123,7 @@ fn parse_uid_map(path: &Path) -> io::Result<HashMap<String, u32>> {
         }
     }
 
-    Ok(map)
+    Ok((map, Some(key)))
 }
 
 fn build_scan_plan(
@@ -109,12 +134,12 @@ fn build_scan_plan(
     let mut plan = ScanPlan::default();
 
     // 把规则整理成“扫描计划”：
-    // - 有 UID 的包走 by_uid，扫描 /proc 时先比较目录 owner uid。
-    // - 没 UID 的包走 fallback_pkgs，只能读 cmdline 判断。
+    // - 有 UID 的包按 appId 建索引，同包名的 Android 多用户/应用分身共享 appId。
+    // - all_pkgs 为所有包提供严格 cmdline 兜底；fallback_pkgs 只记录缺少映射的包。
     // - --pkg 只用于调试/单包扫描，不影响正常守护模式。
     //
     // 规则 owner 可能是主包名或子进程名；UID 映射只按基础包名建立。
-    for rule in rules {
+    for rule in rules.iter().filter(|rule| !rule.auto) {
         let Some(base_pkg) = base_package(&rule.owner) else {
             continue;
         };
@@ -123,9 +148,10 @@ fn build_scan_plan(
                 continue;
             }
         }
+        plan.all_pkgs.insert(base_pkg.to_string());
         if let Some(uid) = uid_map.get(base_pkg) {
-            plan.by_uid
-                .entry(*uid)
+            plan.by_app_id
+                .entry(android_app_id(*uid))
                 .or_default()
                 .insert(base_pkg.to_string());
         } else {
@@ -134,6 +160,10 @@ fn build_scan_plan(
     }
 
     plan
+}
+
+fn android_app_id(uid: u32) -> u32 {
+    uid % ANDROID_UID_USER_RANGE
 }
 
 fn base_package(owner: &str) -> Option<&str> {
@@ -145,18 +175,17 @@ fn base_package(owner: &str) -> Option<&str> {
     }
 }
 
-fn file_key(path: &Path) -> Option<FileKey> {
-    let meta = fs::metadata(path).ok()?;
-    let modified_ms = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    Some(FileKey {
-        len: meta.len(),
-        modified_ms,
-    })
+fn content_file_key(bytes: &[u8]) -> FileKey {
+    // 固定 FNV-1a 指纹足以检测本地配置变化，且不会受到文件系统 mtime 精度影响。
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    FileKey {
+        len: bytes.len() as u64,
+        content_hash: hash,
+    }
 }
 
 fn build_rules_by_owner(rules: &[Rule]) -> HashMap<&str, Vec<&Rule>> {

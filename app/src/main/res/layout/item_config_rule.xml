@@ -3,7 +3,7 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:layout_marginBottom="8dp"
+    android:layout_marginBottom="6dp"
     app:cardBackgroundColor="@color/card_bg"
     app:cardCornerRadius="8dp"
     app:cardElevation="0dp"
@@ -12,27 +12,29 @@
 
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="72dp"
+        android:layout_height="wrap_content"
         android:gravity="center_vertical"
+        android:minHeight="52dp"
         android:orientation="horizontal"
-        android:paddingStart="10dp"
-        android:paddingEnd="10dp">
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp">
 
         <TextView
             android:id="@+id/ruleType"
-            android:layout_width="58dp"
-            android:layout_height="30dp"
+            android:layout_width="46dp"
+            android:layout_height="26dp"
             android:background="@drawable/bg_rule_type_thread"
             android:gravity="center"
+            android:includeFontPadding="false"
             android:maxLines="1"
             android:textColor="@color/brand_primary_dark"
-            android:textSize="11sp"
+            android:textSize="10sp"
             android:textStyle="bold" />
 
         <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_marginStart="10dp"
+            android:layout_marginStart="8dp"
             android:layout_weight="1"
             android:orientation="vertical">
 
@@ -40,42 +42,48 @@
                 android:id="@+id/ruleTarget"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:ellipsize="end"
-                android:maxLines="1"
+                android:ellipsize="marquee"
+                android:gravity="center_vertical"
+                android:includeFontPadding="false"
+                android:marqueeRepeatLimit="marquee_forever"
+                android:requiresFadingEdge="horizontal"
+                android:singleLine="true"
                 android:textColor="@color/text_primary"
-                android:textSize="14sp"
+                android:textSize="13sp"
                 android:textStyle="bold" />
 
             <TextView
                 android:id="@+id/ruleOwner"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
+                android:layout_marginTop="1dp"
                 android:ellipsize="middle"
+                android:includeFontPadding="false"
                 android:maxLines="1"
                 android:textColor="@color/text_secondary"
-                android:textSize="11sp" />
+                android:textSize="9.5sp" />
         </LinearLayout>
 
         <TextView
             android:id="@+id/ruleCpus"
             android:layout_width="wrap_content"
-            android:layout_height="30dp"
-            android:layout_marginStart="8dp"
+            android:layout_height="24dp"
+            android:layout_marginStart="5dp"
             android:background="@drawable/bg_rule_cpu"
             android:gravity="center"
-            android:minWidth="42dp"
-            android:paddingStart="8dp"
-            android:paddingEnd="8dp"
+            android:includeFontPadding="false"
+            android:minWidth="38dp"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
             android:textColor="#167A70"
-            android:textSize="12sp"
+            android:textSize="10sp"
             android:textStyle="bold" />
 
         <ImageButton
             android:id="@+id/ruleEdit"
             android:layout_width="38dp"
             android:layout_height="38dp"
-            android:layout_marginStart="8dp"
+            android:layout_marginStart="6dp"
             android:background="@drawable/bg_rule_icon_button"
             android:contentDescription="编辑规则"
             android:padding="9dp"
@@ -85,7 +93,7 @@
             android:id="@+id/ruleDelete"
             android:layout_width="38dp"
             android:layout_height="38dp"
-            android:layout_marginStart="6dp"
+            android:layout_marginStart="4dp"
             android:background="@drawable/bg_rule_delete_button"
             android:contentDescription="删除规则"
             android:padding="9dp"

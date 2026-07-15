@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
@@ -40,7 +41,10 @@ class HistoryActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_PKG = "pkg"
         const val EXTRA_LABEL = "label"
-        private const val THREAD_RENDER_BATCH_SIZE = 12
+        private const val THREAD_RENDER_BATCH_SIZE = 6
+        private const val THREAD_INITIAL_RENDER_SIZE = 12
+        private const val THREAD_RENDER_PAGE_SIZE = 24
+        private const val THREAD_PRELOAD_DISTANCE_DP = 280f
     }
 
     /** 单个线程的负载折线 */
@@ -66,6 +70,17 @@ class HistoryActivity : AppCompatActivity() {
         val threadCount: Int
     )
 
+    private data class ThreadPageState(
+        val card: ItemCalibSessionBinding,
+        val inflater: LayoutInflater,
+        val loads: List<ThreadLoad>,
+        val durationSec: Int,
+        val generation: Int,
+        var nextIndex: Int = 0,
+        var rendering: Boolean = false,
+        var loadMoreView: View? = null
+    )
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityHistoryBinding.inflate(layoutInflater)
@@ -78,6 +93,9 @@ class HistoryActivity : AppCompatActivity() {
         binding.historyTitle.text = label
         binding.historyPkg.text = pkg
         binding.historyBack.setOnClickListener { finish() }
+        binding.historyScroll.setOnScrollChangeListener { _, _, _, _, _ ->
+            maybeLoadNextThreadPage()
+        }
         try {
             binding.historyIcon.setImageDrawable(packageManager.getApplicationIcon(pkg))
         } catch (_: Exception) {
@@ -141,6 +159,7 @@ class HistoryActivity : AppCompatActivity() {
 
     /** 当前展开的卡片绑定; 每次只展开一张, 点新的先折叠旧的。 */
     private var expandedCard: ItemCalibSessionBinding? = null
+    private val threadPageStates = mutableMapOf<ItemCalibSessionBinding, ThreadPageState>()
 
     private fun setCardExpanded(card: ItemCalibSessionBinding, expanded: Boolean) {
         card.threadRows.visibility = if (expanded) View.VISIBLE else View.GONE
@@ -159,6 +178,7 @@ class HistoryActivity : AppCompatActivity() {
         binding.historyCount.text = "${sessions.size} 次校准"
         binding.sessionContainer.removeAllViews()
         expandedCard = null
+        threadPageStates.clear()
         val inflater = LayoutInflater.from(this)
 
         for (s in sessions) {
@@ -351,6 +371,10 @@ class HistoryActivity : AppCompatActivity() {
         }
     }
 
+    private fun dp(value: Float): Int {
+        return (value * resources.displayMetrics.density + 0.5f).toInt()
+    }
+
     private fun formatHistoryTime(epochSeconds: Long): String {
         return SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
             .format(Date(epochSeconds * 1000))
@@ -411,21 +435,85 @@ class HistoryActivity : AppCompatActivity() {
                     return@runOnUiThreadIfAlive
                 }
                 val inflater = LayoutInflater.from(this)
-                renderThreadPage(card, inflater, loads, durationSec, 0, generation)
+                val state = ThreadPageState(
+                    card = card,
+                    inflater = inflater,
+                    loads = loads,
+                    durationSec = durationSec,
+                    generation = generation
+                )
+                threadPageStates[card] = state
+                renderNextThreadPage(state)
             }
         }
     }
 
-    private fun renderThreadPage(
-        card: ItemCalibSessionBinding,
-        inflater: LayoutInflater,
-        loads: List<ThreadLoad>,
-        durationSec: Int,
-        startIndex: Int,
-        generation: Int
-    ) {
-        if (isThreadRenderStale(card, generation) || startIndex >= loads.size) return
-        renderThreadBatch(card, inflater, loads, durationSec, startIndex, loads.size, generation) {}
+    private fun renderNextThreadPage(state: ThreadPageState) {
+        if (state.rendering || state.nextIndex >= state.loads.size ||
+            isThreadRenderStale(state.card, state.generation)) {
+            return
+        }
+        state.rendering = true
+        state.loadMoreView?.let(state.card.threadRows::removeView)
+        state.loadMoreView = null
+        val pageSize = if (state.nextIndex == 0) {
+            THREAD_INITIAL_RENDER_SIZE
+        } else {
+            THREAD_RENDER_PAGE_SIZE
+        }
+        val pageEnd = minOf(state.nextIndex + pageSize, state.loads.size)
+        renderThreadBatch(
+            state.card,
+            state.inflater,
+            state.loads,
+            state.durationSec,
+            state.nextIndex,
+            pageEnd,
+            state.generation
+        ) {
+            state.nextIndex = pageEnd
+            state.rendering = false
+            if (state.nextIndex < state.loads.size) {
+                addLoadMoreView(state)
+            }
+        }
+    }
+
+    private fun addLoadMoreView(state: ThreadPageState) {
+        if (isThreadRenderStale(state.card, state.generation)) return
+        val remaining = state.loads.size - state.nextIndex
+        val nextCount = minOf(THREAD_RENDER_PAGE_SIZE, remaining)
+        val more = android.widget.TextView(this).apply {
+            text = "继续加载 $nextCount 条 · 剩余 $remaining 条"
+            gravity = Gravity.CENTER
+            setTextColor(ContextCompat.getColor(this@HistoryActivity, R.color.brand_primary))
+            textSize = 12f
+            setPadding(0, dp(12f), 0, dp(12f))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { renderNextThreadPage(state) }
+        }
+        state.loadMoreView = more
+        state.card.threadRows.addView(more)
+        state.card.threadRows.post { maybeLoadNextThreadPage() }
+    }
+
+    private fun maybeLoadNextThreadPage() {
+        val card = expandedCard ?: return
+        val state = threadPageStates[card] ?: return
+        if (state.rendering) return
+        val marker = state.loadMoreView ?: return
+        if (!marker.isShown) return
+
+        val markerPosition = IntArray(2)
+        val scrollPosition = IntArray(2)
+        marker.getLocationOnScreen(markerPosition)
+        binding.historyScroll.getLocationOnScreen(scrollPosition)
+        val preloadBottom = scrollPosition[1] + binding.historyScroll.height +
+            dp(THREAD_PRELOAD_DISTANCE_DP)
+        if (markerPosition[1] <= preloadBottom) {
+            renderNextThreadPage(state)
+        }
     }
 
     private fun renderThreadBatch(

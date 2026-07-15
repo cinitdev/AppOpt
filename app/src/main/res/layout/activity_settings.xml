@@ -178,7 +178,7 @@
                                     android:layout_weight="1"
                                     android:ellipsize="end"
                                     android:maxLines="1"
-                                    android:text="C进程日志"
+                                    android:text="守护进程日志"
                                     android:textColor="@color/text_primary"
                                     android:textSize="14sp"
                                     android:textStyle="bold" />

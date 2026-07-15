@@ -8,19 +8,44 @@
 fn run_once(args: &Args, apply: bool) -> io::Result<()> {
     let rules = parse_config(&args.config)?;
     let uid_map = parse_uid_map(&args.uid_map)?;
-    let plan = build_scan_plan(&rules, &uid_map, args.target_pkg.as_deref());
+    let mut health_state = DaemonState::default();
+    if let Err(err) = ensure_rule_health_loaded(&mut health_state) {
+        eprintln!("[RS] 规则健康状态读取失败，本次调试不禁用任何规则: {err}");
+    }
+    let runtime_rules = runtime_rule_health_rules(&rules, &health_state);
+    let plan = build_scan_plan(&runtime_rules, &uid_map, args.target_pkg.as_deref());
 
     println!(
-        "[RS] 调试参数: 配置={} 规则={} UID映射={} 目标包数={} 指定目标={} 模式={}",
+        "[RS] 调试参数: 配置={} 运行规则={}/{} UID映射={} 目标包数={} 指定目标={} 模式={}",
         args.config.display(),
+        runtime_rules.len(),
         rules.len(),
         args.uid_map.display(),
         plan.package_count(),
         args.target_pkg.as_deref().unwrap_or("*"),
-        if apply { "执行一次绑核" } else { "仅扫描" }
+        if apply {
+            "执行一次绑核"
+        } else {
+            "仅扫描"
+        }
     );
 
-    let hits = scan_proc(&rules, &plan)?;
+    let scan_result = scan_proc(&runtime_rules, &plan, &BTreeSet::new())?;
+    if !scan_result.complete {
+        eprintln!("[RS] 本次扫描存在瞬时读取缺口，正向命中可用，不能用于健康负向结论");
+    }
+    if !scan_result.health_incomplete_packages.is_empty() {
+        eprintln!(
+            "[RS] 本次扫描的包级健康读取缺口: {}",
+            scan_result
+                .health_incomplete_packages
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let hits = scan_result.hits;
     print_hits(&hits, apply);
 
     if apply {

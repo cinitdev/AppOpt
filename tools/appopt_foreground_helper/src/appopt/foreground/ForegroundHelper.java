@@ -21,6 +21,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -35,12 +36,17 @@ import java.util.TreeMap;
  */
 public final class ForegroundHelper {
     private static final long LISTENER_RECONCILE_MS = 5000L;
+    private static final long LISTENER_REGISTER_RETRY_MS = 5000L;
+    private static final long BOOT_ID_READ_RETRY_MS = 60000L;
     private static final long POLL_RETRY_MS = 1200L;
     private static final long UID_MAP_INITIAL_DELAY_MS = 1500L;
     private static final long UID_MAP_RECONCILE_MS = 30000L;
     private static final long UID_MAP_FORCE_REFRESH_MS = 300000L;
     private static final long EVENT_DEBOUNCE_MS = 80L;
     private static final int MAX_TASKS = 24;
+    private static final int MAX_EXIT_RECORDS = 64;
+    private static final int MAX_RESTORED_LIFECYCLE_RECORDS = 64;
+    private static final File BOOT_ID_FILE = new File("/proc/sys/kernel/random/boot_id");
 
     private static final Object SCHEDULE_LOCK = new Object();
     private static Handler handler;
@@ -55,13 +61,22 @@ public final class ForegroundHelper {
     private static Method unregisterMethod;
     private static Listener listener;
     private static boolean listenerRegistered;
+    private static long lastListenerRegisterAttemptElapsed;
     private static boolean refreshScheduled;
+    private static long pendingReliableEventElapsed;
+    private static final List<FrontMoveEvent> pendingFrontMoveEvents = new ArrayList<>();
     private static long generation;
     private static long lastUidMapConfigMtime = -1L;
     private static long lastUidMapConfigLength = -1L;
     private static long lastUidMapSyncElapsed = 0L;
     private static int lastUidMapCount = -1;
     private static String startupError = "";
+    private static String bootId = "";
+    private static long lastBootIdReadAttemptElapsed;
+    private static String lastReliableFrontPackage;
+    private static Set<String> lastInScopePackages = new LinkedHashSet<>();
+    private static final TreeMap<String, Long> lastExitElapsed = new TreeMap<>();
+    private static final TreeMap<String, LifecycleRecord> lifecyclePackages = new TreeMap<>();
 
     private ForegroundHelper() {
     }
@@ -81,6 +96,9 @@ public final class ForegroundHelper {
         configDir = parent == null ? new File("/data/adb/modules/AppOpt/config") : parent;
         appListFile = new File(configDir, "applist.conf");
         uidMapFile = new File(configDir, "package_uid.map");
+        lastBootIdReadAttemptElapsed = SystemClock.elapsedRealtime();
+        bootId = readBootId();
+        restorePreviousState();
 
         Looper.prepare();
         handler = new Handler(Looper.myLooper());
@@ -111,16 +129,7 @@ public final class ForegroundHelper {
             unregisterMethod = managerClass.getMethod("unregisterTaskStackListener", listenerClass);
             listener = new Listener();
 
-            try {
-                invoke(registerMethod, activityTaskManager, listener);
-                listenerRegistered = true;
-                startupError = "";
-                System.out.println("[前台助手] TaskStackListener 已注册, SDK=" + Build.VERSION.SDK_INT);
-            } catch (Throwable listenerError) {
-                listenerRegistered = false;
-                startupError = "listener=" + errorText(listenerError);
-                System.err.println("[前台助手] TaskStackListener 注册失败, 降级轮询: " + startupError);
-            }
+            tryRegisterListener("connect");
         } catch (Throwable error) {
             activityTaskManager = null;
             getTasksMethod = null;
@@ -135,31 +144,119 @@ public final class ForegroundHelper {
     }
 
     private static void reconcile() {
-        synchronized (SCHEDULE_LOCK) {
-            refreshScheduled = false;
+        long nowElapsed = SystemClock.elapsedRealtime();
+        if (!listenerRegistered
+                && nowElapsed - lastListenerRegisterAttemptElapsed >= LISTENER_REGISTER_RETRY_MS) {
+            tryRegisterListener("retry");
         }
-        refreshState(listenerRegistered ? "reconcile" : "poll");
+        final boolean listenerRefreshPending;
+        synchronized (SCHEDULE_LOCK) {
+            listenerRefreshPending = refreshScheduled;
+        }
+        // 已入队的监听器刷新持有捕获到的事件时间。此处若直接校准，可能提前消耗状态变化，
+        // 导致监听器刷新时无法再把应用离开事件关联到原来的事件时间。
+        if (!listenerRefreshPending) {
+            refreshState(listenerRegistered ? "reconcile" : "poll", 0L);
+        }
         handler.postDelayed(ForegroundHelper::reconcile, listenerRegistered
             ? LISTENER_RECONCILE_MS : POLL_RETRY_MS);
     }
 
+    private static boolean tryRegisterListener(String reason) {
+        if (listenerRegistered) {
+            return true;
+        }
+        if (activityTaskManager == null || registerMethod == null || listener == null) {
+            return false;
+        }
+
+        lastListenerRegisterAttemptElapsed = SystemClock.elapsedRealtime();
+        try {
+            invoke(registerMethod, activityTaskManager, listener);
+            listenerRegistered = true;
+            startupError = "";
+            System.out.println("[前台助手] TaskStackListener 已注册, SDK="
+                + Build.VERSION.SDK_INT + " reason=" + reason);
+            return true;
+        } catch (Throwable listenerError) {
+            listenerRegistered = false;
+            String error = "listener=" + errorText(listenerError);
+            boolean changed = !error.equals(startupError);
+            startupError = error;
+            if (changed || "connect".equals(reason)) {
+                System.err.println("[前台助手] TaskStackListener 注册失败, 降级轮询: "
+                    + startupError);
+            }
+            return false;
+        }
+    }
+
     private static void requestRefresh(String reason, long delayMs) {
+        final long eventElapsed = reason.startsWith("task_")
+            ? SystemClock.elapsedRealtime() : 0L;
+        requestRefresh(reason, delayMs, eventElapsed, null);
+    }
+
+    private static void requestMovedToFrontRefresh(
+            String movedPackage,
+            long eventElapsed,
+            long delayMs
+    ) {
+        requestRefresh("task_moved_to_front", delayMs, eventElapsed, movedPackage);
+    }
+
+    private static void requestRefresh(
+            String reason,
+            long delayMs,
+            long eventElapsed,
+            String movedPackage
+    ) {
         synchronized (SCHEDULE_LOCK) {
+            if (eventElapsed > 0L && (pendingReliableEventElapsed == 0L
+                    || eventElapsed < pendingReliableEventElapsed)) {
+                pendingReliableEventElapsed = eventElapsed;
+            }
+            if (eventElapsed > 0L && movedPackage != null && !movedPackage.isEmpty()) {
+                pendingFrontMoveEvents.add(new FrontMoveEvent(movedPackage, eventElapsed));
+            }
             if (refreshScheduled) {
                 return;
             }
             refreshScheduled = true;
         }
         handler.postDelayed(() -> {
+            final long reliableEventElapsed;
+            final List<FrontMoveEvent> frontMoveEvents;
             synchronized (SCHEDULE_LOCK) {
                 refreshScheduled = false;
+                reliableEventElapsed = pendingReliableEventElapsed;
+                pendingReliableEventElapsed = 0L;
+                frontMoveEvents = new ArrayList<>(pendingFrontMoveEvents);
+                pendingFrontMoveEvents.clear();
             }
-            refreshState(reason);
+            applyFrontMoveEvents(frontMoveEvents);
+            refreshState(reason, reliableEventElapsed);
         }, delayMs);
     }
 
+    private static void applyFrontMoveEvents(List<FrontMoveEvent> events) {
+        events.sort((left, right) -> Long.compare(left.elapsed, right.elapsed));
+        for (FrontMoveEvent event : events) {
+            String previous = lastReliableFrontPackage;
+            if (previous != null && !previous.equals(event.packageName)
+                    && (lifecyclePackages.containsKey(previous)
+                        || lastInScopePackages.contains(previous))) {
+                recordExit(previous, event.elapsed);
+                lifecyclePackages.remove(previous);
+            }
+            lastReliableFrontPackage = event.packageName;
+        }
+        pruneExitRecords();
+    }
+
     @SuppressWarnings("unchecked")
-    private static void refreshState(String reason) {
+    private static void refreshState(String reason, long reliableEventElapsed) {
+        refreshBootIdIfNeeded();
         if (activityTaskManager == null || getTasksMethod == null) {
             connectActivityTaskManager();
             if (activityTaskManager == null || getTasksMethod == null) {
@@ -168,10 +265,17 @@ public final class ForegroundHelper {
         }
 
         try {
+            // 此时间戳描述快照查询的开始时刻；若使用查询结束时间，可能把健康检查截止前
+            // 刚发生的状态变化误判到截止后。
+            long snapshotElapsed = SystemClock.elapsedRealtime();
+            long snapshotWall = System.currentTimeMillis();
             Object value = invoke(getTasksMethod, activityTaskManager, MAX_TASKS);
-            List<ActivityManager.RunningTaskInfo> tasks = value instanceof List
-                ? (List<ActivityManager.RunningTaskInfo>) value : null;
-            writeTaskState(tasks, reason);
+            if (!(value instanceof List)) {
+                throw new IllegalStateException("ActivityTaskManager.getTasks returned no list");
+            }
+            List<ActivityManager.RunningTaskInfo> tasks =
+                (List<ActivityManager.RunningTaskInfo>) value;
+            writeTaskState(tasks, reason, snapshotElapsed, snapshotWall, reliableEventElapsed);
         } catch (Throwable error) {
             writeErrorState(reason, error);
             unregisterListener();
@@ -185,19 +289,27 @@ public final class ForegroundHelper {
         }
     }
 
-    private static void writeTaskState(List<ActivityManager.RunningTaskInfo> tasks, String reason) {
+    private static void writeTaskState(
+            List<ActivityManager.RunningTaskInfo> tasks,
+            String reason,
+            long snapshotElapsed,
+            long snapshotWall,
+            long reliableEventElapsed
+    ) {
         TaskRecord focused = null;
         TaskRecord defaultVisible = null;
         TaskRecord firstVisible = null;
         TaskRecord first = null;
         Set<String> visiblePackages = new LinkedHashSet<>();
         int taskCount = tasks == null ? 0 : tasks.size();
+        int usableTaskCount = 0;
 
         if (tasks != null) {
             for (ActivityManager.RunningTaskInfo task : tasks) {
                 if (task == null || task.topActivity == null) {
                     continue;
                 }
+                usableTaskCount++;
                 TaskRecord record = TaskRecord.from(task);
                 if (first == null) {
                     first = record;
@@ -216,6 +328,9 @@ public final class ForegroundHelper {
                 }
             }
         }
+        if (taskCount > 0 && usableTaskCount == 0) {
+            throw new IllegalStateException("task snapshot contains no usable top activity");
+        }
 
         TaskRecord selected = focused != null ? focused
             : defaultVisible != null ? defaultVisible
@@ -226,16 +341,41 @@ public final class ForegroundHelper {
             : firstVisible != null ? "visible"
             : first != null ? "first" : "none";
         final TaskRecord result = selected;
+        lastReliableFrontPackage = result != null && isHealthSelection(selection)
+            ? result.component.getPackageName() : null;
+        Set<String> inScopePackages = new LinkedHashSet<>(visiblePackages);
+        if (result != null && isHealthSelection(selection)) {
+            inScopePackages.add(result.component.getPackageName());
+        }
+        long observedExitElapsed = reliableEventElapsed > 0L
+            ? Math.min(reliableEventElapsed, snapshotElapsed) : snapshotElapsed;
+        for (String pkg : lastInScopePackages) {
+            if (inScopePackages.contains(pkg)) {
+                continue;
+            }
+            recordExit(pkg, observedExitElapsed);
+            lifecyclePackages.remove(pkg);
+        }
+        for (String pkg : inScopePackages) {
+            if (!lifecyclePackages.containsKey(pkg)) {
+                lifecyclePackages.put(pkg, new LifecycleRecord(snapshotElapsed, snapshotWall));
+            }
+        }
+        // 应用快速重新进入后仍保留退出记录。消费者会将退出时间与生命周期进入时间比较，
+        // 因此旧退出记录不会中断新生命周期，也不会在两次读取之间丢失。
+        lastInScopePackages = new LinkedHashSet<>(inScopePackages);
+        pruneExitRecords();
         final long currentGeneration = ++generation;
         writeState(out -> {
-            line(out, "version", "1");
+            line(out, "version", "2");
+            line(out, "boot_id", bootId);
             line(out, "status", result == null ? "empty" : "ok");
             line(out, "mode", listenerRegistered ? "listener" : "poll");
             line(out, "sdk", String.valueOf(Build.VERSION.SDK_INT));
             line(out, "pid", String.valueOf(Process.myPid()));
             line(out, "generation", String.valueOf(currentGeneration));
-            line(out, "updated_elapsed_ms", String.valueOf(SystemClock.elapsedRealtime()));
-            line(out, "updated_wall_ms", String.valueOf(System.currentTimeMillis()));
+            line(out, "updated_elapsed_ms", String.valueOf(snapshotElapsed));
+            line(out, "updated_wall_ms", String.valueOf(snapshotWall));
             line(out, "reason", reason);
             line(out, "selection", selection);
             line(out, "focused_package", result == null ? "" : result.component.getPackageName());
@@ -245,6 +385,8 @@ public final class ForegroundHelper {
             line(out, "focused_flag", result != null && result.focused ? "1" : "0");
             line(out, "focused_visible", result != null && result.visible ? "1" : "0");
             line(out, "visible_packages", join(visiblePackages));
+            line(out, "lifecycle_packages", joinLifecycleRecords());
+            line(out, "exited_packages", joinExitRecords());
             line(out, "task_count", String.valueOf(taskCount));
             line(out, "error", startupError);
         });
@@ -256,7 +398,8 @@ public final class ForegroundHelper {
         }
         final long currentGeneration = ++generation;
         writeState(out -> {
-            line(out, "version", "1");
+            line(out, "version", "2");
+            line(out, "boot_id", bootId);
             line(out, "status", "error");
             line(out, "mode", listenerRegistered ? "listener" : "poll");
             line(out, "sdk", String.valueOf(Build.VERSION.SDK_INT));
@@ -265,8 +408,17 @@ public final class ForegroundHelper {
             line(out, "updated_elapsed_ms", String.valueOf(SystemClock.elapsedRealtime()));
             line(out, "updated_wall_ms", String.valueOf(System.currentTimeMillis()));
             line(out, "reason", reason);
+            line(out, "selection", "none");
             line(out, "focused_package", "");
+            line(out, "focused_activity", "");
+            line(out, "focused_task_id", "0");
+            line(out, "focused_display_id", "-1");
+            line(out, "focused_flag", "0");
+            line(out, "focused_visible", "0");
             line(out, "visible_packages", "");
+            line(out, "lifecycle_packages", joinLifecycleRecords());
+            line(out, "exited_packages", joinExitRecords());
+            line(out, "task_count", "0");
             line(out, "error", errorText(error));
         });
     }
@@ -513,6 +665,8 @@ public final class ForegroundHelper {
         try {
             invoke(unregisterMethod, activityTaskManager, listener);
         } catch (Throwable ignored) {
+        } finally {
+            listenerRegistered = false;
         }
     }
 
@@ -569,6 +723,198 @@ public final class ForegroundHelper {
         return out.toString();
     }
 
+    private static String readBootId() {
+        try {
+            String value = new String(
+                java.nio.file.Files.readAllBytes(BOOT_ID_FILE.toPath()),
+                StandardCharsets.UTF_8
+            ).trim();
+            if (!value.isEmpty() && value.length() <= 128
+                    && value.indexOf('\n') < 0 && value.indexOf('\r') < 0) {
+                return value;
+            }
+        } catch (Throwable error) {
+            System.err.println("[前台助手] 读取 boot_id 失败: " + errorText(error));
+        }
+        return "";
+    }
+
+    private static void refreshBootIdIfNeeded() {
+        if (!bootId.isEmpty()) {
+            return;
+        }
+        long nowElapsed = SystemClock.elapsedRealtime();
+        if (lastBootIdReadAttemptElapsed > 0L
+                && nowElapsed - lastBootIdReadAttemptElapsed < BOOT_ID_READ_RETRY_MS) {
+            return;
+        }
+        lastBootIdReadAttemptElapsed = nowElapsed;
+        bootId = readBootId();
+    }
+
+    private static void restorePreviousState() {
+        if (bootId.isEmpty() || stateFile == null || !stateFile.isFile()) {
+            return;
+        }
+
+        try {
+            String text = new String(
+                java.nio.file.Files.readAllBytes(stateFile.toPath()),
+                StandardCharsets.UTF_8
+            );
+            TreeMap<String, String> values = new TreeMap<>();
+            for (String raw : text.split("\\r?\\n")) {
+                int eq = raw.indexOf('=');
+                if (eq > 0) {
+                    values.put(raw.substring(0, eq).trim(), raw.substring(eq + 1).trim());
+                }
+            }
+            if (!bootId.equals(values.get("boot_id"))) {
+                return;
+            }
+
+            parseExitRecords(values.get("exited_packages"));
+            parseLifecycleRecords(values.get("lifecycle_packages"));
+            lastInScopePackages = new LinkedHashSet<>(lifecyclePackages.keySet());
+            String restoredSelection = values.get("selection");
+            String restoredFrontPackage = values.get("focused_package");
+            if (isHealthSelection(restoredSelection)
+                    && isSafePackageName(restoredFrontPackage)
+                    && lifecyclePackages.containsKey(restoredFrontPackage)) {
+                lastReliableFrontPackage = restoredFrontPackage;
+            }
+            pruneExitRecords();
+        } catch (Throwable error) {
+            lastExitElapsed.clear();
+            lifecyclePackages.clear();
+            lastInScopePackages.clear();
+            lastReliableFrontPackage = null;
+            System.err.println("[前台助手] 恢复前台状态失败: " + errorText(error));
+        }
+    }
+
+    private static void parseExitRecords(String encoded) {
+        if (encoded == null || encoded.isEmpty()) {
+            return;
+        }
+        for (String item : encoded.split(",")) {
+            int at = item.lastIndexOf('@');
+            if (at <= 0 || at == item.length() - 1) {
+                continue;
+            }
+            String pkg = item.substring(0, at);
+            long elapsed = parsePositiveLong(item.substring(at + 1));
+            if (isSafePackageName(pkg) && elapsed > 0L
+                    && elapsed <= SystemClock.elapsedRealtime()) {
+                recordExit(pkg, elapsed);
+            }
+        }
+    }
+
+    private static void parseLifecycleRecords(String encoded) {
+        if (encoded == null || encoded.isEmpty()) {
+            return;
+        }
+        for (String item : encoded.split(",")) {
+            if (lifecyclePackages.size() >= MAX_RESTORED_LIFECYCLE_RECORDS) {
+                return;
+            }
+            int secondAt = item.lastIndexOf('@');
+            int firstAt = secondAt <= 0 ? -1 : item.lastIndexOf('@', secondAt - 1);
+            if (firstAt <= 0 || secondAt == item.length() - 1) {
+                continue;
+            }
+            String pkg = item.substring(0, firstAt);
+            long enteredElapsed = parsePositiveLong(item.substring(firstAt + 1, secondAt));
+            long enteredWall = parsePositiveLong(item.substring(secondAt + 1));
+            if (isSafePackageName(pkg) && enteredElapsed > 0L && enteredWall > 0L
+                    && enteredElapsed <= SystemClock.elapsedRealtime()) {
+                lifecyclePackages.put(pkg, new LifecycleRecord(enteredElapsed, enteredWall));
+            }
+        }
+    }
+
+    private static long parsePositiveLong(String value) {
+        try {
+            long parsed = Long.parseLong(value);
+            return parsed > 0L ? parsed : 0L;
+        } catch (NumberFormatException ignored) {
+            return 0L;
+        }
+    }
+
+    private static boolean isSafePackageName(String value) {
+        if (value == null || value.isEmpty() || value.length() > 255 || value.indexOf('.') < 0) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            boolean ok = (ch >= 'a' && ch <= 'z')
+                || (ch >= 'A' && ch <= 'Z')
+                || (ch >= '0' && ch <= '9')
+                || ch == '_' || ch == '.';
+            if (!ok) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isHealthSelection(String selection) {
+        return "focused".equals(selection)
+            || "default-visible".equals(selection)
+            || "visible".equals(selection);
+    }
+
+    private static void recordExit(String pkg, long elapsed) {
+        Long previous = lastExitElapsed.get(pkg);
+        if (previous == null || elapsed > previous) {
+            lastExitElapsed.put(pkg, elapsed);
+        }
+    }
+
+    private static void pruneExitRecords() {
+        while (lastExitElapsed.size() > MAX_EXIT_RECORDS) {
+            String oldestKey = null;
+            long oldestTime = Long.MAX_VALUE;
+            for (java.util.Map.Entry<String, Long> entry : lastExitElapsed.entrySet()) {
+                if (entry.getValue() < oldestTime) {
+                    oldestKey = entry.getKey();
+                    oldestTime = entry.getValue();
+                }
+            }
+            if (oldestKey == null) {
+                return;
+            }
+            lastExitElapsed.remove(oldestKey);
+        }
+    }
+
+    private static String joinExitRecords() {
+        StringBuilder out = new StringBuilder();
+        for (java.util.Map.Entry<String, Long> entry : lastExitElapsed.entrySet()) {
+            if (out.length() > 0) {
+                out.append(',');
+            }
+            out.append(entry.getKey()).append('@').append(entry.getValue());
+        }
+        return out.toString();
+    }
+
+    private static String joinLifecycleRecords() {
+        StringBuilder out = new StringBuilder();
+        for (java.util.Map.Entry<String, LifecycleRecord> entry : lifecyclePackages.entrySet()) {
+            if (out.length() > 0) {
+                out.append(',');
+            }
+            LifecycleRecord lifecycle = entry.getValue();
+            out.append(entry.getKey())
+                .append('@').append(lifecycle.enteredElapsed)
+                .append('@').append(lifecycle.enteredWall);
+        }
+        return out.toString();
+    }
+
     private static void line(PrintWriter out, String key, String value) {
         out.println(key + "=" + clean(value));
     }
@@ -590,12 +936,25 @@ public final class ForegroundHelper {
         @Override
         public void onTaskMovedToFront(ActivityManager.RunningTaskInfo taskInfo)
                 throws RemoteException {
-            requestRefresh("task_moved_to_front", EVENT_DEBOUNCE_MS);
+            long eventElapsed = SystemClock.elapsedRealtime();
+            String movedPackage = taskInfo == null || taskInfo.topActivity == null
+                ? null : taskInfo.topActivity.getPackageName();
+            requestMovedToFrontRefresh(movedPackage, eventElapsed, EVENT_DEBOUNCE_MS);
         }
 
         @Override
         public void onTaskFocusChanged(int taskId, boolean focused) throws RemoteException {
             requestRefresh("task_focus_changed", EVENT_DEBOUNCE_MS);
+        }
+    }
+
+    private static final class FrontMoveEvent {
+        final String packageName;
+        final long elapsed;
+
+        FrontMoveEvent(String packageName, long elapsed) {
+            this.packageName = packageName;
+            this.elapsed = elapsed;
         }
     }
 
@@ -620,7 +979,7 @@ public final class ForegroundHelper {
             try {
                 visible = task.isVisible();
             } catch (Throwable ignored) {
-                visible = readBooleanField(task, "isVisible", true);
+                visible = readBooleanField(task, "isVisible", false);
             }
             return new TaskRecord(
                 task.topActivity,
@@ -629,6 +988,16 @@ public final class ForegroundHelper {
                 readBooleanField(task, "isFocused", false),
                 visible
             );
+        }
+    }
+
+    private static final class LifecycleRecord {
+        final long enteredElapsed;
+        final long enteredWall;
+
+        LifecycleRecord(long enteredElapsed, long enteredWall) {
+            this.enteredElapsed = enteredElapsed;
+            this.enteredWall = enteredWall;
         }
     }
 }

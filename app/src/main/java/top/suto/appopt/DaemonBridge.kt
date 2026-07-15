@@ -5,6 +5,7 @@ import android.os.SystemClock
 import java.io.BufferedReader
 import java.io.DataOutputStream
 import java.io.InputStreamReader
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import java.util.UUID
@@ -40,6 +41,7 @@ object DaemonBridge {
     private const val CMD_FILE = "$CONFIG_DIR/calibrate.cmd"
     private const val STATE_FILE = "$CONFIG_DIR/calibrate.state"
     private const val CONFIG_FILE = "$CONFIG_DIR/applist.conf"
+    private const val RULE_HEALTH_FILE = "$CONFIG_DIR/rule_health.tsv"
     private const val CONFIG_LOCK_DIR = "$CONFIG_DIR/applist.conf.lock"
     private const val POLICY_FILE = "$CONFIG_DIR/calib_policy.conf"
     private const val POLICY_LOCK_DIR = "$CONFIG_DIR/calib_policy.conf.lock"
@@ -52,8 +54,8 @@ object DaemonBridge {
     private const val FOREGROUND_TASK_MAX_AGE_MS = 12_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 176
-    const val REQUIRED_MODULE_VERSION_NAME = "1.7.6"
+    const val REQUIRED_MODULE_VERSION_CODE = 177
+    const val REQUIRED_MODULE_VERSION_NAME = "1.7.7"
     private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
@@ -101,9 +103,126 @@ object DaemonBridge {
         val raw: String
     )
 
+    data class DaemonRuntime(
+        val running: Boolean,
+        val kind: String? = null,
+        val versionName: String? = null,
+        val pid: Int? = null,
+        val raw: String = ""
+    ) {
+        val kindLabel: String?
+            get() = when (kind?.lowercase(Locale.ROOT)) {
+                "rust", "rs", "appoptrs" -> "Rust 版"
+                "c", "native", "appopt" -> "C 版"
+                else -> null
+            }
+    }
+
+    enum class RuleHealthStatus {
+        VALID,
+        MISSED,
+        PENDING
+    }
+
+    data class RuleHealth(
+        val kind: String,
+        val owner: String,
+        val target: String?,
+        val status: RuleHealthStatus,
+        val missCount: Int,
+        val firstObservedAt: Long,
+        val lastMatchedAt: Long,
+        val lastCheckedAt: Long,
+        val ruleLine: String
+    ) {
+        val key: String
+            get() = ruleHealthKey(kind, owner, target)
+    }
+
+    fun readRuleHealth(): Map<String, RuleHealth> = readRuleHealthOrNull().orEmpty()
+
+    fun readRuleHealthOrNull(): Map<String, RuleHealth>? {
+        val result = readRootCommandResult(
+            "if [ -f '$RULE_HEALTH_FILE' ]; then cat '$RULE_HEALTH_FILE' || exit 1; " +
+                "elif [ ! -e '$RULE_HEALTH_FILE' ]; then :; else exit 1; fi"
+        )
+        if (!result.success) return null
+        val content = result.output
+        if (content.isBlank()) return emptyMap()
+        return parseRuleHealth(content)
+    }
+
+    internal fun parseRuleHealth(text: String): Map<String, RuleHealth> {
+        val result = LinkedHashMap<String, RuleHealth>()
+        for (raw in text.lineSequence()) {
+            val parts = raw.split('\t')
+            if (parts.size < 9) continue
+            val kind = parts[0]
+            val owner = unescapeRuleHealthField(parts[1])
+            val target = unescapeRuleHealthField(parts[2]).ifBlank { null }
+            val status = when (parts[3]) {
+                "valid" -> RuleHealthStatus.VALID
+                "missed" -> RuleHealthStatus.MISSED
+                else -> RuleHealthStatus.PENDING
+            }
+            val health = RuleHealth(
+                kind = kind,
+                owner = owner,
+                target = target,
+                status = status,
+                missCount = parts[4].toIntOrNull() ?: 0,
+                firstObservedAt = parts[5].toLongOrNull() ?: 0L,
+                lastMatchedAt = parts[6].toLongOrNull() ?: 0L,
+                lastCheckedAt = parts[7].toLongOrNull() ?: 0L,
+                ruleLine = unescapeRuleHealthField(
+                    parts.drop(if (parts.size >= 11) 10 else 8).joinToString("\t")
+                )
+            )
+            result[health.key] = health
+        }
+        return result
+    }
+
+    fun ruleHealthKey(kind: String, owner: String, target: String?): String {
+        return "${kind.uppercase(Locale.ROOT)}\t${owner.trim()}\t${target.orEmpty().trim()}"
+    }
+
+    fun ruleHealthKey(owner: String, thread: String?): String? {
+        return when {
+            thread != null -> ruleHealthKey("T", owner, thread)
+            owner.contains(':') -> ruleHealthKey("P", owner, null)
+            else -> null
+        }
+    }
+
+    internal fun unescapeRuleHealthField(value: String): String {
+        val output = StringBuilder(value.length)
+        var index = 0
+        while (index < value.length) {
+            val ch = value[index++]
+            if (ch != '\\' || index >= value.length) {
+                output.append(ch)
+                continue
+            }
+            when (val escaped = value[index++]) {
+                't' -> output.append('\t')
+                'n' -> output.append('\n')
+                '\\' -> output.append('\\')
+                else -> output.append('\\').append(escaped)
+            }
+        }
+        return output.toString()
+    }
     fun readRootFile(path: String): String? {
-        val out = runAsRoot("cat ${shellQuote(path)} 2>/dev/null")
-        return if (out.isNotErrored()) out else null
+        val result = readRootCommandResult("cat ${shellQuote(path)} 2>/dev/null")
+        return result.output.takeIf { result.success }
+    }
+
+    private fun readRootCommandResult(
+        cmd: String,
+        timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS
+    ): RootCommandResult {
+        return runAsRootStreaming(cmd, timeoutSeconds) { }
     }
 
     fun runRootCommand(cmd: String, timeoutSeconds: Long = 15L): RootCommandResult {
@@ -170,12 +289,19 @@ object DaemonBridge {
      * 这里不使用 pgrep 判断进程名，因为开源后二改版本也可能叫 AppOpt。
      * 只有守护进程能按随机 token 反连 App 的一次性 socket，才认为验证通过。
      */
-    fun isDaemonRunning(): Boolean = verifyDaemonSocketReverse()
+    fun isDaemonRunning(): Boolean = readDaemonRuntime().running
 
-    private fun verifyDaemonSocketReverse(): Boolean {
+    fun readDaemonRuntime(): DaemonRuntime {
+        val runtime = verifyDaemonSocketReverse()
+        if (!runtime.running || runtime.kind != null) return runtime
+        val inferredKind = inferDaemonKindByPid(runtime.pid)
+        return if (inferredKind != null) runtime.copy(kind = inferredKind) else runtime
+    }
+
+    private fun verifyDaemonSocketReverse(): DaemonRuntime {
         val socketName = "appopt_verify_${android.os.Process.myPid()}_${System.nanoTime()}"
         val token = UUID.randomUUID().toString().replace("-", "")
-        val callbackOk = AtomicReference(false)
+        val callbackRuntime = AtomicReference<DaemonRuntime?>(null)
         var server: LocalServerSocket? = null
 
         return try {
@@ -189,10 +315,10 @@ object DaemonBridge {
                         val line = BufferedReader(
                             InputStreamReader(socket.inputStream, Charsets.UTF_8)
                         ).readLine()?.trim().orEmpty()
-                        callbackOk.set(isValidDaemonCallback(line, token))
+                        callbackRuntime.set(parseDaemonCallback(line, token))
                     }
                 } catch (_: Exception) {
-                    callbackOk.set(false)
+                    callbackRuntime.set(null)
                 }
             }, "AppOptDaemonVerify").apply {
                 isDaemon = true
@@ -208,35 +334,60 @@ object DaemonBridge {
             }
 
             acceptThread.join(3000)
-            val ok = callbackOk.get() == true
-            if (!ok) {
+            val runtime = callbackRuntime.get()
+            if (runtime?.running != true) {
                 try { localServer.close() } catch (_: Exception) {}
                 acceptThread.join(300)
             }
             rootThread.join(500)
-            ok
+            runtime ?: DaemonRuntime(running = false)
         } catch (_: Exception) {
-            false
+            DaemonRuntime(running = false)
         } finally {
             try { server?.close() } catch (_: Exception) {}
         }
     }
 
-    private fun isValidDaemonCallback(line: String, token: String): Boolean {
-        return line.startsWith(DAEMON_SOCKET_CALLBACK_PREFIX) &&
-            line.contains("token=$token") &&
-            line.contains("version=") &&
-            line.contains("pid=") &&
-            callbackVersionCode(line)?.let { it >= REQUIRED_MODULE_VERSION_CODE } == true
+    private fun parseDaemonCallback(line: String, token: String): DaemonRuntime? {
+        if (!line.startsWith(DAEMON_SOCKET_CALLBACK_PREFIX)) return null
+        if (callbackField(line, "token") != token) return null
+        val version = callbackField(line, "version")?.removePrefix("v") ?: return null
+        val pid = callbackField(line, "pid")?.toIntOrNull() ?: return null
+        val versionCode = versionNameToCode(version) ?: return null
+        if (versionCode < REQUIRED_MODULE_VERSION_CODE) return null
+        val kind = callbackField(line, "kind")
+            ?: callbackField(line, "impl")
+            ?: callbackField(line, "name")
+        return DaemonRuntime(
+            running = true,
+            kind = normalizeDaemonKind(kind),
+            versionName = version,
+            pid = pid,
+            raw = line
+        )
     }
 
-    private fun callbackVersionCode(line: String): Int? {
-        val version = Regex("""(?:^|\s)version=([^\s]+)""")
-            .find(line)
-            ?.groupValues
-            ?.getOrNull(1)
-            .orEmpty()
-        return versionNameToCode(version)
+    private fun callbackField(line: String, key: String): String? {
+        val prefix = "$key="
+        return line.splitToSequence(' ')
+            .firstOrNull { it.startsWith(prefix) }
+            ?.removePrefix(prefix)
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun inferDaemonKindByPid(pid: Int?): String? {
+        if (pid == null || pid <= 0) return null
+        val out = runAsRoot("cat /proc/$pid/comm 2>/dev/null")
+        if (!out.isNotErrored()) return null
+        return normalizeDaemonKind(out.substringBefore('\n').trim())
+    }
+
+    private fun normalizeDaemonKind(kind: String?): String? {
+        return when (kind?.trim()?.lowercase(Locale.ROOT)) {
+            "rust", "rs", "appoptrs" -> "rust"
+            "c", "native", "appopt" -> "c"
+            else -> null
+        }
     }
 
     /**
@@ -533,8 +684,11 @@ object DaemonBridge {
         return sortConfigRuleLines(result)
     }
 
-    fun readPkgRules(pkgs: Collection<String>): List<String> {
-        val text = readConfigRaw()
+    fun readPkgRules(pkgs: Collection<String>): List<String> =
+        readPkgRulesOrNull(pkgs).orEmpty()
+
+    fun readPkgRulesOrNull(pkgs: Collection<String>): List<String>? {
+        val text = readConfigRawOrNull() ?: return null
         if (text.isBlank()) return emptyList()
         val targets = pkgs.map { it.replace("'", "").trim() }
             .filter { it.isNotEmpty() }
@@ -567,11 +721,17 @@ object DaemonBridge {
         return result
     }
 
-    /** 读取 applist.conf 原始内容；读不到时返回空字符串。 */
-    fun readConfigRaw(): String {
-        val out = runAsRoot("cat $CONFIG_FILE 2>/dev/null")
-        return if (out.isNotErrored()) out else ""
+    /** 读取 applist.conf 原始内容；文件不存在视为空，Root/IO 失败返回 null。 */
+    fun readConfigRawOrNull(): String? {
+        val result = readRootCommandResult(
+            "if [ -f '$CONFIG_FILE' ]; then cat '$CONFIG_FILE' || exit 1; " +
+                "elif [ ! -e '$CONFIG_FILE' ]; then :; else exit 1; fi"
+        )
+        return result.output.takeIf { result.success }
     }
+
+    /** 兼容无需区分失败原因的旧调用。 */
+    fun readConfigRaw(): String = readConfigRawOrNull().orEmpty()
 
     /** 自动校准策略文件内容及来源状态。 */
     data class PolicyFile(
@@ -612,7 +772,7 @@ object DaemonBridge {
     /** 把应用追加为 pkg=auto，占位后可在“待校准”里启动采样。 */
     fun addAutoPackage(pkg: String): Boolean {
         val safe = pkg.replace("'", "")
-        if (safe.isBlank()) return false
+        if (safe.isBlank() || !RuleConfigLogic.ownerFitsNativeBuffer(safe)) return false
         return withConfigMutation(false) { token ->
             val raw = readConfigRawForMutation() ?: return@withConfigMutation false
             val blocks = parseConfigBlocks(raw)
@@ -677,9 +837,12 @@ object DaemonBridge {
 
         for (line in editedText.lineSequence().map { it.trim() }) {
             if (line.isEmpty() || line.startsWith("#")) continue
-            val owner = configLineOwner(line)
+            val identity = parseConfigRuleIdentity(line)
+            val owner = identity?.owner
             val value = line.substringAfter("=", "").trim()
-            if (owner == null || value.isEmpty()) {
+            if (identity == null || owner == null || value.isEmpty() ||
+                !RuleConfigLogic.ownerFitsNativeBuffer(owner) ||
+                (identity.thread != null && !RuleConfigLogic.threadFitsNativeBuffer(identity.thread))) {
                 invalid.add(line)
                 continue
             }
@@ -850,15 +1013,29 @@ object DaemonBridge {
         return if (text.isBlank()) "" else "$text\n"
     }
 
-    private fun sortConfigRuleLines(lines: List<String>): List<String> {
-        return lines.withIndex()
+    internal fun sortConfigRuleLines(lines: List<String>): List<String> {
+        data class SortableRule(
+            val index: Int,
+            val line: String,
+            val fallback: Boolean,
+            val cpuBounds: RuleConfigLogic.CpuBounds?
+        )
+
+        return lines.mapIndexed { index, line ->
+            SortableRule(
+                index = index,
+                line = line,
+                fallback = configRuleIsFallback(line),
+                cpuBounds = RuleConfigLogic.cpuBoundsFromRuleLine(line)
+            )
+        }
             .sortedWith(
-                compareBy<IndexedValue<String>> { if (configRuleIsFallback(it.value)) 1 else 0 }
-                    .thenByDescending { configRuleMaxCpu(it.value) }
-                    .thenByDescending { configRuleMinCpu(it.value) }
+                compareBy<SortableRule> { if (it.fallback) 1 else 0 }
+                    .thenByDescending { it.cpuBounds?.first ?: -1 }
+                    .thenByDescending { it.cpuBounds?.last ?: -1 }
                     .thenBy { it.index }
             )
-            .map { it.value }
+            .map { it.line }
     }
 
     private fun configRuleIsFallback(line: String): Boolean {
@@ -866,43 +1043,8 @@ object DaemonBridge {
         return !left.contains("{") && !left.contains(":")
     }
 
-    private fun configRuleMaxCpu(line: String): Int {
-        return parseConfigRuleCpus(line).maxOrNull() ?: -1
-    }
-
-    private fun configRuleMinCpu(line: String): Int {
-        return parseConfigRuleCpus(line).minOrNull() ?: -1
-    }
-
-    private fun parseConfigRuleCpus(line: String): Set<Int> {
-        return parseConfigRuleCpusStrict(line.substringAfter("=", "").trim()).orEmpty()
-    }
-
     private fun parseConfigRuleCpusStrict(value: String): Set<Int>? {
-        val cpus = linkedSetOf<Int>()
-        if (value.isBlank()) return null
-        fun parseCpuToken(text: String): Int? {
-            if (text.isEmpty()) return null
-            if (text.length > 1 && text.startsWith("0")) return null
-            if (!text.all { it.isDigit() }) return null
-            return text.toIntOrNull()?.takeIf { it >= 0 && it <= 1024 }
-        }
-        val token = value.trim()
-        if (token.contains(",")) return null
-        val dash = token.indexOf('-')
-        if (dash >= 0) {
-            if (token.indexOf('-', dash + 1) >= 0) return null
-            val start = parseCpuToken(token.substring(0, dash)) ?: return null
-            val end = parseCpuToken(token.substring(dash + 1)) ?: return null
-            if (start >= end) return null
-            for (cpu in start..end) {
-                cpus.add(cpu)
-            }
-        } else {
-            val cpu = parseCpuToken(token) ?: return null
-            cpus.add(cpu)
-        }
-        return cpus
+        return RuleConfigLogic.parseCpuRangeList(value)?.takeIf { it.isNotEmpty() }
     }
 
     fun readPresentCpus(): Set<Int> {
@@ -925,22 +1067,7 @@ object DaemonBridge {
     }
 
     private fun parseCpuRangeList(text: String): Set<Int> {
-        val cpus = linkedSetOf<Int>()
-        for (part in text.split(',')) {
-            val token = part.trim()
-            if (token.isEmpty()) continue
-            val dash = token.indexOf('-')
-            if (dash >= 0) {
-                val start = token.substring(0, dash).toIntOrNull()
-                val end = token.substring(dash + 1).toIntOrNull()
-                if (start != null && end != null && start <= end) {
-                    for (cpu in start..end) cpus.add(cpu)
-                }
-            } else {
-                token.toIntOrNull()?.let { cpus.add(it) }
-            }
-        }
-        return cpus
+        return RuleConfigLogic.parseCpuRangeList(text).orEmpty()
     }
 
     private fun configLineOwner(rawLine: String): String? {
@@ -952,6 +1079,31 @@ object DaemonBridge {
         val brace = key.indexOf('{')
         if (brace >= 0) key = key.substring(0, brace).trim()
         return key.ifBlank { null }
+    }
+
+    private data class ConfigRuleIdentity(val owner: String, val thread: String?)
+
+    private fun parseConfigRuleIdentity(rawLine: String): ConfigRuleIdentity? {
+        val line = rawLine.trim()
+        if (line.isEmpty() || line.startsWith("#")) return null
+        val eq = line.indexOf('=')
+        if (eq <= 0) return null
+        val key = line.substring(0, eq).trim()
+        if (key.isEmpty()) return null
+
+        val open = key.indexOf('{')
+        if (open < 0) {
+            if (key.contains('}')) return null
+            return ConfigRuleIdentity(key, null)
+        }
+        if (open == 0 || !key.endsWith('}') || key.indexOf('{', open + 1) >= 0) return null
+        val close = key.indexOf('}', open + 1)
+        if (close != key.lastIndex) return null
+
+        val owner = key.substring(0, open).trim()
+        val thread = key.substring(open + 1, close).trim()
+        if (owner.isEmpty() || thread.isEmpty()) return null
+        return ConfigRuleIdentity(owner, thread)
     }
 
     private fun configGroupName(pkg: String): String {
@@ -1141,14 +1293,14 @@ object DaemonBridge {
 
     /** 锁内读取时区分“文件不存在”和“Root 读取失败”，避免把读取失败误当成空配置。 */
     private fun readConfigRawForMutation(): String? {
-        val missingMarker = "__APPOPT_CONFIG_MISSING__"
-        val out = runAsRoot(
+        val missingMarker = "__APPOPT_CONFIG_MISSING_${UUID.randomUUID()}__"
+        val result = readRootCommandResult(
             "if [ -f '$CONFIG_FILE' ]; then cat '$CONFIG_FILE' || exit 1; " +
                 "else printf '$missingMarker'; fi"
         )
-        if (!out.isNotErrored()) return null
-        val content = out.substringBefore(ERR_MARK)
-        return if (content == missingMarker) "" else content
+        if (!result.success) return null
+        val content = result.output
+        return if (content.trimEnd('\r', '\n') == missingMarker) "" else content
     }
 
     /** 锁内原子写入 applist.conf，避免 App 与守护进程相互覆盖或留下半文件。 */
@@ -1163,12 +1315,15 @@ object DaemonBridge {
             tmp='$tmp'
             [ "${'$'}(cat "${'$'}lock/owner" 2>/dev/null)" = '$token' ] || exit 1
             trap 'rm -f "${'$'}tmp"' EXIT
-            base64 -d > "${'$'}tmp" << 'EOF_BASE64'
+            if ! base64 -d > "${'$'}tmp" << 'EOF_BASE64'
             $b64
             EOF_BASE64
+            then
+                exit 1
+            fi
             chmod 0644 "${'$'}tmp" 2>/dev/null || true
             chown 0:0 "${'$'}tmp" 2>/dev/null || true
-            mv -f "${'$'}tmp" "${'$'}target"
+            mv -f "${'$'}tmp" "${'$'}target" || exit 1
         """.trimIndent()
         return runAsRoot(cmd).isNotErrored()
     }

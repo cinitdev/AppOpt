@@ -31,14 +31,21 @@ fn daemon_loop(args: &Args) -> io::Result<()> {
 
 fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     let round_start = Instant::now();
-    let rules = parse_config(&args.config)?;
-    let uid_map = parse_uid_map(&args.uid_map)?;
-    let plan = build_scan_plan(&rules, &uid_map, args.target_pkg.as_deref());
-    let config_key = file_key(&args.config);
-    let uid_key = file_key(&args.uid_map);
-    let config_changed = state.last_config_key != config_key || state.last_uid_map_key != uid_key;
+    let (rules, config_key) = parse_config_with_key(&args.config)?;
+    let (uid_map, uid_key) = parse_uid_map_with_key(&args.uid_map)?;
+    if let Err(err) = ensure_rule_health_loaded(state) {
+        eprintln!("[RS] 规则健康状态读取失败，本轮不禁用任何规则: {err}");
+    }
+    let runtime_rules = runtime_rule_health_rules(&rules, state);
+    let plan = build_scan_plan(&runtime_rules, &uid_map, args.target_pkg.as_deref());
+    let config_changed =
+        state.last_config_key != Some(config_key) || state.last_uid_map_key != uid_key;
     if config_changed {
         log_config_summary(&rules, &uid_map, &plan);
+        let disabled = rules.len().saturating_sub(runtime_rules.len());
+        if disabled > 0 {
+            println!("[RS] 规则健康已停用: {} 条连续两次未检测到的规则", disabled);
+        }
     }
 
     let proc_total = system_process_count();
@@ -46,36 +53,84 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
         (state.last_proc_total, proc_total),
         (Some(last), Some(current)) if current > last
     );
-    let cache_empty = state.known_pids.is_empty();
-    let periodic_rescan = state.rounds_since_full_scan >= FULL_RESCAN_ROUNDS;
+    if proc_count_grew {
+        state.proc_growth_scan_pending = true;
+    }
+    let cache_uninitialized = !state.proc_scan_initialized;
+    let scan_clock = elapsed_realtime_ms();
+    let periodic_rescan = state.last_full_scan_elapsed_ms.is_some_and(|last| {
+        scan_clock >= last && scan_clock.saturating_sub(last) >= FULL_RESCAN_MAX_MS
+    });
+    let proc_growth_cooldown_elapsed = state.last_full_scan_elapsed_ms.is_none_or(|last| {
+        scan_clock >= last && scan_clock.saturating_sub(last) >= PROC_GROWTH_RESCAN_COOLDOWN_MS
+    });
+    let proc_growth_rescan = state.proc_growth_scan_pending && proc_growth_cooldown_elapsed;
+    let full_scan_retry_pending = state.last_full_scan_attempt_elapsed_ms.is_some();
+    let full_scan_retry_allowed = state
+        .last_full_scan_attempt_elapsed_ms
+        .is_none_or(|last| {
+            scan_clock >= last
+                && scan_clock.saturating_sub(last) >= RULE_HEALTH_FULL_SCAN_RETRY_MS
+        });
+    let health_due = rule_health_full_scan_due(state);
+    let foreground_discovery_due = foreground_discovery_scan_due(
+        &runtime_rules,
+        args.target_pkg.as_deref(),
+        state,
+    );
 
     // Rust 版的核心优化点：
     // - 配置刚变化时必须全量扫，因为规则目标可能完全变了。
-    // - 第一次启动或缓存为空时必须全量扫，因为还不知道目标 PID。
-    // - 系统进程数增长时全量扫，及时发现新启动的目标 App。
+    // - 第一次启动时必须全量扫；全扫结果为空后也视为缓存已经初始化。
+    // - 系统进程数增长会设置门闩，冷却到期后全量扫，避免进程起落导致连续扫描。
     // - 缓存连续跑一段时间后周期性全量扫，补捉极端情况下漏掉的子进程。
-    // - 如果缓存扫描没有任何命中，立刻全量扫，避免 App 重启后 PID 变化导致长期失效。
-    let mut full_scan = config_changed || cache_empty || proc_count_grew || periodic_rescan;
+    // - 只有原本持有 PID 的缓存整体失效时才立刻全量扫；已确认空结果不会每轮重扫。
+    let full_scan_requested = config_changed
+        || cache_uninitialized
+        || full_scan_retry_pending
+        || proc_growth_rescan
+        || periodic_rescan
+        || health_due
+        || foreground_discovery_due;
+    let mut full_scan = full_scan_requested && full_scan_retry_allowed;
     let mut scan_reason = if config_changed {
         "配置变更"
-    } else if cache_empty {
-        "缓存为空"
-    } else if proc_count_grew {
-        "进程数增长"
+    } else if cache_uninitialized {
+        "初始扫描"
+    } else if full_scan_retry_pending {
+        "不完整全扫重试"
+    } else if proc_growth_rescan {
+        "进程数增长冷却到期"
     } else if periodic_rescan {
         "周期校验"
+    } else if health_due {
+        "健康观察到期"
+    } else if foreground_discovery_due {
+        "前台生命周期进程发现"
     } else {
         "PID缓存"
     };
     let scan_started = Instant::now();
     let previous_known_pids = state.known_pids.clone();
-    let mut hits = if full_scan {
-        scan_proc(&rules, &plan)?
+    let had_cached_pids = !state.known_pids.is_empty();
+    let mut scan_result = if full_scan {
+        match scan_proc(&runtime_rules, &plan, &state.known_pids) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("[RS] 全量扫描失败，本轮仅保留正向结果并等待冷却重试: {err}");
+                ProcScanResult::default()
+            }
+        }
     } else {
-        scan_known_pids(&rules, &plan, &mut state.known_pids)
+        scan_known_pids(&runtime_rules, &plan, &mut state.known_pids)
     };
 
-    if !full_scan && hits.is_empty() && !plan.is_empty() {
+    if !full_scan
+        && full_scan_retry_allowed
+        && had_cached_pids
+        && scan_result.hits.is_empty()
+        && !plan.is_empty()
+    {
         full_scan = true;
         println!(
             "[RS] PID缓存未命中，触发全量扫描: 已知PID={} 目标包={}",
@@ -83,19 +138,46 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
             plan.package_count()
         );
         scan_reason = "缓存未命中";
-        hits = scan_proc(&rules, &plan)?;
+        scan_result = match scan_proc(&runtime_rules, &plan, &state.known_pids) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("[RS] 缓存失效后的全量扫描失败，将在冷却后重试: {err}");
+                ProcScanResult::default()
+            }
+        };
+    }
+    let scan_finished_at = elapsed_realtime_ms();
+    let ProcScanResult {
+        hits,
+        complete: scan_complete,
+        health_incomplete_packages,
+    } = scan_result;
+    let full_scan_evidence = full_scan.then_some(FullScanEvidence {
+        completed_at: scan_finished_at,
+        global_complete: scan_complete,
+        incomplete_packages: health_incomplete_packages,
+    });
+    if full_scan {
+        state.last_health_full_scan_attempt_elapsed_ms = Some(scan_finished_at);
     }
     let scan_elapsed = scan_started.elapsed();
     state.last_proc_total = proc_total;
 
     if full_scan {
-        state.known_pids.clear();
+        if scan_complete {
+            state.known_pids.clear();
+        } else {
+            state.known_pids = previous_known_pids.clone();
+        }
         state.known_pids.extend(hits.iter().map(|hit| hit.pid));
-        state.rounds_since_full_scan = 0;
-        state.last_config_key = config_key;
+        state.proc_scan_initialized = true;
+        state.last_full_scan_attempt_elapsed_ms = (!scan_complete).then_some(scan_finished_at);
+        if scan_complete {
+            state.last_full_scan_elapsed_ms = Some(scan_finished_at);
+            state.proc_growth_scan_pending = false;
+        }
+        state.last_config_key = Some(config_key);
         state.last_uid_map_key = uid_key;
-    } else {
-        state.rounds_since_full_scan += 1;
     }
 
     let known_pids = state.known_pids.len();
@@ -106,9 +188,20 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     let detail_log = config_changed
         || !state.logged_round_once
         || has_new_hit_pid
+        || (full_scan && !scan_complete)
         || known_pids != state.last_logged_known_pids
         || processes != state.last_logged_processes
         || (state.round_index + 1) % ROUND_SUMMARY_EVERY == 0;
+
+    if let Err(err) = update_rule_health(
+        &rules,
+        &hits,
+        full_scan_evidence.as_ref(),
+        args.target_pkg.as_deref(),
+        state,
+    ) {
+        eprintln!("[RS] 规则健康状态更新失败: {err}");
+    }
 
     let apply_started = Instant::now();
     let stats = apply_hits(&hits, detail_log);
@@ -129,9 +222,10 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     let should_log = detail_log;
     if should_log {
         println!(
-            "[RS] 运行摘要: 轮次={} 模式={} 原因={} 配置变更={} 目标包={} 已知PID={} 命中进程={} 扫描线程={} 进程规则={} 线程规则命中={} 进程规则应用={} 已应用={} 已跳过={} 失败={} 无效规则={} 抢写={} 扫描耗时={}ms 应用耗时={}ms 总耗时={}ms",
+            "[RS] 运行摘要: 轮次={} 模式={} 扫描完整={} 原因={} 配置变更={} 目标包={} 已知PID={} 命中进程={} 扫描线程={} 进程规则={} 线程规则命中={} 进程规则应用={} 已应用={} 已跳过={} 系统限制={} 失败={} 无效规则={} 抢写={} 扫描耗时={}ms 应用耗时={}ms 总耗时={}ms",
             state.round_index,
             if full_scan { "全量扫描" } else { "PID缓存" },
+            if scan_complete { "是" } else { "否" },
             scan_reason,
             if config_changed { "是" } else { "否" },
             plan.package_count(),
@@ -143,6 +237,7 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
             process_actions,
             stats.applied,
             stats.skipped,
+            stats.restricted,
             stats.failed,
             stats.invalid_rules,
             stats.mismatched,
@@ -157,8 +252,8 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
             log_hit_preview(&hits, 5, &previous_known_pids);
         } else if !plan.is_empty() {
             println!(
-                "[RS] 未命中任何进程: UID过滤包={} 命令行兜底包={}",
-                plan.by_uid.values().map(BTreeSet::len).sum::<usize>(),
+                "[RS] 未命中任何进程: appId映射包={} 缺少映射包={}",
+                plan.by_app_id.values().map(BTreeSet::len).sum::<usize>(),
                 plan.fallback_pkgs.len()
             );
         }
@@ -180,7 +275,7 @@ fn log_config_summary(rules: &[Rule], uid_map: &HashMap<String, u32>, plan: &Sca
             base_pkgs.insert(base);
         }
     }
-    let uid_bound_pkgs = plan.by_uid.values().map(BTreeSet::len).sum::<usize>();
+    let app_id_bound_pkgs = plan.by_app_id.values().map(BTreeSet::len).sum::<usize>();
     println!(
         "[RS] 规则加载完成: 规则={} auto={} 应用/进程={} 基础包={}",
         active_rules,
@@ -189,23 +284,23 @@ fn log_config_summary(rules: &[Rule], uid_map: &HashMap<String, u32>, plan: &Sca
         base_pkgs.len()
     );
     println!(
-        "[RS] 包名 UID 映射: 已加载 {} 个, UID过滤 {} 个, 命令行兜底 {} 个",
+        "[RS] 包名 UID 映射: 已加载 {} 个, appId快路径 {} 个, 缺少映射 {} 个",
         uid_map.len(),
-        uid_bound_pkgs,
+        app_id_bound_pkgs,
         plan.fallback_pkgs.len()
     );
     println!(
-        "[RS] 扫描计划: UID过滤=[{}] 命令行兜底=[{}]",
-        plan_uid_preview(plan, 8),
+        "[RS] 扫描计划: appId快路径=[{}] 缺少映射=[{}]",
+        plan_app_id_preview(plan, 8),
         preview_set(&plan.fallback_pkgs, 8)
     );
 }
 
-fn plan_uid_preview(plan: &ScanPlan, limit: usize) -> String {
+fn plan_app_id_preview(plan: &ScanPlan, limit: usize) -> String {
     let mut rows = Vec::new();
-    for (uid, pkgs) in &plan.by_uid {
+    for (app_id, pkgs) in &plan.by_app_id {
         for pkg in pkgs {
-            rows.push(format!("{pkg}:{uid}"));
+            rows.push(format!("{pkg}:{app_id}"));
         }
     }
     rows.sort();

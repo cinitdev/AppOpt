@@ -19,13 +19,18 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.text.Editable
+import android.text.Spannable
+import android.text.SpannableStringBuilder
 import android.text.TextWatcher
+import android.text.style.ReplacementSpan
 import android.util.LruCache
+import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.LinearInterpolator
 import android.widget.GridLayout
 import android.widget.ImageView
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.DiffUtil
@@ -65,6 +70,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var hasRoot = false
     private var daemonRunning = false
+    private var daemonRuntime = DaemonBridge.DaemonRuntime(running = false)
+    private var ruleHealth: Map<String, DaemonBridge.RuleHealth> = emptyMap()
     private var foregroundHelperStatus = ForegroundHelperStatus()
     private var moduleVersion: DaemonBridge.ModuleVersion? = null
     private var moduleCompatible = false
@@ -88,6 +95,17 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val iconExecutor = Executors.newSingleThreadExecutor()
     private val rulesLoadingPackages = mutableSetOf<String>()
+    private val environmentRequests = RequestGeneration()
+    private val appListRequests = RequestGeneration()
+    private val mutationRequests = RequestGeneration()
+    private val ruleDialogRequests = RequestGeneration()
+    private val lifecycleRequests = RequestGeneration()
+    private var ruleHealthRevision = 0L
+    private var configMutationInFlight = 0
+    private var activityResumed = false
+    private var resumedAt = 0L
+    private var settledHealthRefresh: Runnable? = null
+    private var activeRuleHealthObserver: ((Map<String, DaemonBridge.RuleHealth>) -> Unit)? = null
     @Volatile private var activityDestroyed = false
     private var firstResume = true
     private lateinit var appAdapter: AppAdapter
@@ -102,6 +120,8 @@ class MainActivity : AppCompatActivity() {
         const val PREF_HIDE_MISSING_CONFIGURED = "hide_missing_configured"
         const val MIN_ENV_LOADING_MS = 1800L
         const val RULE_TOOLS_THRESHOLD = 9
+        const val RULE_HEALTH_SETTLE_MS = 2600L
+        const val MAX_EDITOR_CPU_COUNT = 128
     }
 
     private enum class AppTab(val title: String) {
@@ -117,7 +137,11 @@ class MainActivity : AppCompatActivity() {
         val component: ComponentKind,
         val installTime: Long,
         val configPkgs: List<String>,
-        val ruleCount: Int
+        val ruleCount: Int,
+        val missedRuleCount: Int = 0,
+        val pendingReviewRuleCount: Int = 0,
+        val missedRuleKinds: Set<RuleHealthKind> = emptySet(),
+        val pendingReviewRuleKinds: Set<RuleHealthKind> = emptySet()
     )
 
     private enum class ComponentKind {
@@ -146,7 +170,8 @@ class MainActivity : AppCompatActivity() {
 
     private data class ConfigRuleListItem(
         val listIndex: Int,
-        val rule: EditableConfigRule
+        val rule: EditableConfigRule,
+        val health: DaemonBridge.RuleHealth?
     )
 
     private enum class ConfigRuleFilter {
@@ -154,6 +179,11 @@ class MainActivity : AppCompatActivity() {
         MAIN,
         CHILD,
         THREAD
+    }
+
+    private enum class RuleHealthKind {
+        THREAD,
+        CHILD_PROCESS
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -181,36 +211,69 @@ class MainActivity : AppCompatActivity() {
         buildAppList()
 
         // root 检测 + 读配置 + 批量导入旧 .log 放后台线程，避免 su 弹窗阻塞 UI
+        val startupEnvironmentGeneration = environmentRequests.next()
+        val startupAppListGeneration = appListRequests.next()
         thread {
             val r = DaemonBridge.hasRoot()
             val pendingUpdate = if (r) DaemonBridge.hasPendingModuleUpdate() else false
             val version = if (r && !pendingUpdate) DaemonBridge.readModuleVersion() else null
             val compatible = isCompatibleModule(version)
-            val running = if (r && compatible && !pendingUpdate) DaemonBridge.isDaemonRunning() else false
+            val runtime = if (r && compatible && !pendingUpdate) {
+                DaemonBridge.readDaemonRuntime()
+            } else {
+                DaemonBridge.DaemonRuntime(running = false)
+            }
+            val running = runtime.running
             val helperStatus = if (r && compatible && !pendingUpdate) queryForegroundHelperStatus() else ForegroundHelperStatus()
             val enabled = r && compatible && running
-            val config = if (enabled) ConfigReader.readPackages() else ConfigReader.ConfigPackages(emptyList(), emptyList())
-            val resolvedNames = resolveProcessComponentNames(config, enabled)
-            val visibleLists = if (enabled) buildConfiguredLists(config, resolvedNames) else AppLists()
+            val config = if (enabled) {
+                ConfigReader.readPackagesOrNull()
+            } else {
+                ConfigReader.ConfigPackages(emptyList(), emptyList())
+            }
+            val health = if (enabled) DaemonBridge.readRuleHealthOrNull().orEmpty() else emptyMap()
+            val resolvedNames = config?.let { resolveProcessComponentNames(it, enabled) }.orEmpty()
+            val visibleLists = when {
+                !enabled -> AppLists()
+                config != null -> buildConfiguredLists(config, resolvedNames, health)
+                else -> null
+            }
 
-            runOnUiThreadIfAlive {
+            runOnUiThreadIfEnvironmentCurrent(startupEnvironmentGeneration) {
                 runAfterEnvironmentLoadingMinimum {
+                    if (!environmentRequests.isCurrent(startupEnvironmentGeneration)) {
+                        return@runAfterEnvironmentLoadingMinimum
+                    }
                     hasRoot = r
                     pendingModuleUpdate = pendingUpdate
                     moduleVersion = version
                     moduleCompatible = compatible
                     daemonRunning = running
+                    daemonRuntime = runtime
                     foregroundHelperStatus = helperStatus
                     environmentLoading = false
-                    appListsLoading = false
-                    processNames = resolvedNames
-                    appLists = if (addableAppsLoading) {
-                        visibleLists
+                    if (!enabled) {
+                        appListRequests.next()
+                        updateRuleHealthSnapshot(emptyMap())
+                        appListsLoading = false
+                        addableAppsLoading = false
+                        processNames = emptySet()
+                        appLists = AppLists()
+                    } else if (config != null && visibleLists != null &&
+                        appListRequests.isCurrent(startupAppListGeneration)) {
+                        updateRuleHealthSnapshot(health)
+                        appListsLoading = false
+                        processNames = resolvedNames
+                        appLists = if (addableAppsLoading) {
+                            visibleLists
+                        } else {
+                            appLists.copy(
+                                pending = visibleLists.pending,
+                                configured = visibleLists.configured
+                            )
+                        }
                     } else {
-                        appLists.copy(
-                            pending = visibleLists.pending,
-                            configured = visibleLists.configured
-                        )
+                        refreshAppList(scrollAddableToTop = false)
                     }
                     refresh()
                     buildAppList()
@@ -219,14 +282,20 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            val fullLists = if (enabled) buildAppLists(config, resolvedNames) else AppLists()
-            runOnUiThreadIfAlive {
-                addableAppsLoading = false
-                appLists = fullLists
-                buildAppList()
+            val fullLists = when {
+                !enabled -> AppLists()
+                config != null -> buildAppLists(config, resolvedNames, health)
+                else -> null
+            }
+            if (fullLists != null) {
+                runOnUiThreadIfAppListCurrent(startupAppListGeneration) {
+                    addableAppsLoading = false
+                    appLists = fullLists
+                    buildAppList()
+                }
             }
 
-            migrateLogsLater(enabled, config)
+            config?.let { migrateLogsLater(enabled, it) }
         }
     }
 
@@ -246,45 +315,114 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
+        val lifecycleGeneration = lifecycleRequests.next()
+        resumedAt = SystemClock.uptimeMillis()
         refresh()
         val shouldRefreshConfig = firstResume.not()
         firstResume = false
         // 守护进程、Root 授权和配置可能在后台变化，回到前台时后台重查一次。
-        if (shouldRefreshConfig) refreshForegroundState(refreshConfig = true)
+        if (shouldRefreshConfig) {
+            refreshForegroundState(
+                refreshConfig = true,
+                lifecycleGeneration = lifecycleGeneration
+            )
+        }
+        scheduleSettledHealthRefresh(resumedAt)
     }
 
-    private fun refreshForegroundState(refreshConfig: Boolean) {
+    override fun onPause() {
+        activityResumed = false
+        lifecycleRequests.next()
+        cancelSettledHealthRefresh()
+        super.onPause()
+    }
+
+    private fun refreshForegroundState(
+        refreshConfig: Boolean,
+        lifecycleGeneration: Long? = null,
+        forceFullAppListRefresh: Boolean = false
+    ) {
+        if (configMutationInFlight > 0) {
+            return
+        }
+        val environmentGeneration = environmentRequests.next()
+        val appListGeneration = if (refreshConfig) {
+            appListRequests.next()
+        } else {
+            appListRequests.current()
+        }
         val previousAddable = appLists.addable
+        val previousHealth = ruleHealth
+        val previousProcessNames = processNames
+        val completeInitialAppLists = environmentLoading && addableAppsLoading
         thread {
             val root = DaemonBridge.hasRoot()
             val pendingUpdate = if (root) DaemonBridge.hasPendingModuleUpdate() else false
             val version = if (root && !pendingUpdate) DaemonBridge.readModuleVersion() else null
             val compatible = root && isCompatibleModule(version)
-            val running = if (root && compatible && !pendingUpdate) DaemonBridge.isDaemonRunning() else false
+            val runtime = if (root && compatible && !pendingUpdate) {
+                DaemonBridge.readDaemonRuntime()
+            } else {
+                DaemonBridge.DaemonRuntime(running = false)
+            }
+            val running = runtime.running
             val helperStatus = if (root && compatible && !pendingUpdate) queryForegroundHelperStatus() else ForegroundHelperStatus()
             val enabled = root && compatible && running
-            val config = if (enabled && refreshConfig) ConfigReader.readPackages() else null
-            val resolvedNames = config?.let { resolveProcessComponentNames(it, enabled) } ?: processNames
+            val config = if (enabled && refreshConfig) ConfigReader.readPackagesOrNull() else null
+            val health = if (enabled && refreshConfig) {
+                DaemonBridge.readRuleHealthOrNull() ?: previousHealth
+            } else {
+                previousHealth
+            }
+            val resolvedNames = config?.let { resolveProcessComponentNames(it, enabled) } ?: previousProcessNames
             val visibleLists = when {
                 !enabled -> AppLists()
-                config != null -> buildConfiguredLists(config, resolvedNames).copy(addable = previousAddable)
+                config != null -> buildConfiguredLists(config, resolvedNames, health).copy(addable = previousAddable)
                 else -> null
             }
-            runOnUiThreadIfAlive {
+            runOnUiThreadIfEnvironmentCurrent(environmentGeneration, lifecycleGeneration) {
+                val appListCurrent = appListRequests.isCurrent(appListGeneration)
                 hasRoot = root
                 pendingModuleUpdate = pendingUpdate
                 moduleVersion = version
                 moduleCompatible = compatible
                 daemonRunning = running
+                daemonRuntime = runtime
                 foregroundHelperStatus = helperStatus
-                if (visibleLists != null) {
+                environmentLoading = false
+                var needsAppListRefresh = false
+                if (!enabled) {
+                    appListRequests.next()
+                    updateRuleHealthSnapshot(emptyMap())
+                    appListsLoading = false
+                    addableAppsLoading = false
+                    processNames = emptySet()
+                    appLists = AppLists()
+                    buildAppList()
+                } else if (refreshConfig && appListCurrent && visibleLists != null) {
+                    updateRuleHealthSnapshot(health)
                     appListsLoading = false
                     processNames = resolvedNames
                     appLists = visibleLists
                     buildAppList()
+                    needsAppListRefresh = completeInitialAppLists || forceFullAppListRefresh
+                } else if (refreshConfig && !appListCurrent) {
+                    // 仅刷新列表的请求可能在较慢的 daemon/root 检查期间启动。
+                    // 发布权威环境结果后需重新读取列表，避免展示过期数据。
+                    needsAppListRefresh = true
+                } else if (refreshConfig && config == null) {
+                    binding.appRefresh.isRefreshing = false
                 }
                 refresh()
-                if (!enabled) buildAppList()
+                if (needsAppListRefresh) {
+                    refreshAppList(
+                        scrollAddableToTop = false,
+                        lifecycleGeneration = lifecycleGeneration
+                    )
+                } else {
+                    binding.appRefresh.isRefreshing = false
+                }
                 showModuleWarningIfNeeded()
                 maybeCheckStartupUpdate()
             }
@@ -293,6 +431,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         activityDestroyed = true
+        cancelSettledHealthRefresh()
+        activeRuleHealthObserver = null
         appSearchRender?.let { binding.appSection.appRecycler.removeCallbacks(it) }
         updateEmptyAnimation(false)
         pendingIconLoads.clear()
@@ -308,6 +448,95 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun runOnUiThreadIfEnvironmentCurrent(
+        generation: Long,
+        lifecycleGeneration: Long? = null,
+        action: () -> Unit
+    ) {
+        runOnUiThreadIfAlive {
+            val lifecycleCurrent = lifecycleGeneration == null ||
+                (activityResumed && lifecycleRequests.isCurrent(lifecycleGeneration))
+            if (environmentRequests.isCurrent(generation) && lifecycleCurrent) action()
+        }
+    }
+
+    private fun runOnUiThreadIfAppListCurrent(
+        generation: Long,
+        lifecycleGeneration: Long? = null,
+        action: () -> Unit
+    ) {
+        runOnUiThreadIfAlive {
+            val lifecycleCurrent = lifecycleGeneration == null ||
+                (activityResumed && lifecycleRequests.isCurrent(lifecycleGeneration))
+            if (appListRequests.isCurrent(generation) && lifecycleCurrent) action()
+        }
+    }
+
+    private fun beginConfigMutation(): Long {
+        cancelSettledHealthRefresh()
+        configMutationInFlight++
+        environmentRequests.next()
+        appListRequests.next()
+        ruleDialogRequests.next()
+        return mutationRequests.next()
+    }
+
+    private fun finishConfigMutation(generation: Long, action: () -> Unit) {
+        runOnUiThreadIfAlive {
+            val current = mutationRequests.isCurrent(generation)
+            try {
+                if (current) action()
+            } finally {
+                configMutationInFlight = (configMutationInFlight - 1).coerceAtLeast(0)
+                if (configMutationInFlight == 0) {
+                    if (activityResumed) {
+                        refreshForegroundState(
+                            refreshConfig = true,
+                            forceFullAppListRefresh = true
+                        )
+                        scheduleSettledHealthRefresh()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateRuleHealthSnapshot(health: Map<String, DaemonBridge.RuleHealth>) {
+        ruleHealth = health
+        ruleHealthRevision = if (ruleHealthRevision == Long.MAX_VALUE) 1L else ruleHealthRevision + 1L
+        activeRuleHealthObserver?.invoke(health)
+    }
+
+    private fun scheduleSettledHealthRefresh(observedAt: Long = SystemClock.uptimeMillis()) {
+        cancelSettledHealthRefresh()
+        if (!activityResumed) return
+        val lifecycleGeneration = lifecycleRequests.current()
+        val delay = (observedAt + RULE_HEALTH_SETTLE_MS - SystemClock.uptimeMillis()).coerceAtLeast(0L)
+        val refreshTask = Runnable {
+            settledHealthRefresh = null
+            if (!activityResumed || activityDestroyed) return@Runnable
+            if (!lifecycleRequests.isCurrent(lifecycleGeneration)) return@Runnable
+            if (configMutationInFlight > 0) {
+                return@Runnable
+            }
+            if (environmentLoading) {
+                refreshForegroundState(refreshConfig = true, lifecycleGeneration = lifecycleGeneration)
+            } else {
+                refreshAppList(
+                    scrollAddableToTop = false,
+                    lifecycleGeneration = lifecycleGeneration
+                )
+            }
+        }
+        settledHealthRefresh = refreshTask
+        mainHandler.postDelayed(refreshTask, delay)
+    }
+
+    private fun cancelSettledHealthRefresh() {
+        settledHealthRefresh?.let(mainHandler::removeCallbacks)
+        settledHealthRefresh = null
+    }
+
     private fun hasOverlay(): Boolean = Settings.canDrawOverlays(this)
 
     private fun isCompatibleModule(version: DaemonBridge.ModuleVersion?): Boolean {
@@ -321,6 +550,17 @@ class MainActivity : AppCompatActivity() {
     private fun moduleVersionLabel(): String {
         val version = moduleVersion ?: return "未检测到"
         return "${version.versionName} (${version.versionCode})"
+    }
+
+    private fun daemonRuntimeLabel(): String {
+        val kind = daemonRuntime.kindLabel
+        val version = daemonRuntime.versionName?.takeIf { it.isNotBlank() }
+        return when {
+            kind != null && version != null -> "$kind $version"
+            kind != null -> kind
+            version != null -> "运行中 $version"
+            else -> "运行中"
+        }
     }
 
     private fun queryForegroundHelperStatus(): ForegroundHelperStatus {
@@ -425,7 +665,7 @@ class MainActivity : AppCompatActivity() {
                 setDot(s.dotDaemon, R.color.status_warn)
             }
             daemonRunning -> {
-                s.daemonState.text = "运行中"
+                s.daemonState.text = daemonRuntimeLabel()
                 setDot(s.dotDaemon, R.color.status_ok)
             }
             else -> {
@@ -563,7 +803,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 下拉刷新：重新读取配置文件并更新应用列表 */
-    private fun refreshAppList() {
+    private fun refreshAppList(
+        scrollAddableToTop: Boolean = true,
+        lifecycleGeneration: Long? = null
+    ) {
+        if (configMutationInFlight > 0) {
+            return
+        }
+        val generation = appListRequests.next()
         if (!canUseModuleFeatures()) {
             appListsLoading = false
             addableAppsLoading = false
@@ -573,27 +820,48 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val previousAddable = appLists.addable
+        val previousAddableLoading = addableAppsLoading
+        val previousHealth = ruleHealth
+        val rootAvailable = hasRoot
         addableAppsLoading = true
         if (appTab == AppTab.ADD && previousAddable.isEmpty()) {
             buildAppList()
         }
         thread {
-            val config = if (hasRoot) ConfigReader.readPackages() else ConfigReader.ConfigPackages(emptyList(), emptyList())
-            val resolvedNames = resolveProcessComponentNames(config, hasRoot)
-            val visibleLists = buildConfiguredLists(config, resolvedNames).copy(addable = previousAddable)
-            runOnUiThreadIfAlive {
+            val config = if (rootAvailable) {
+                ConfigReader.readPackagesOrNull()
+            } else {
+                ConfigReader.ConfigPackages(emptyList(), emptyList())
+            }
+            if (config == null) {
+                runOnUiThreadIfAppListCurrent(generation, lifecycleGeneration) {
+                    addableAppsLoading = previousAddableLoading
+                    binding.appRefresh.isRefreshing = false
+                    buildAppList()
+                }
+                return@thread
+            }
+            val health = if (rootAvailable) {
+                DaemonBridge.readRuleHealthOrNull() ?: previousHealth
+            } else {
+                emptyMap()
+            }
+            val resolvedNames = resolveProcessComponentNames(config, rootAvailable)
+            val visibleLists = buildConfiguredLists(config, resolvedNames, health).copy(addable = previousAddable)
+            runOnUiThreadIfAppListCurrent(generation, lifecycleGeneration) {
                 appListsLoading = false
+                updateRuleHealthSnapshot(health)
                 processNames = resolvedNames
                 appLists = visibleLists
                 buildAppList()
             }
 
-            val fullLists = buildAppLists(config, resolvedNames)
-            runOnUiThreadIfAlive {
+            val fullLists = buildAppLists(config, resolvedNames, health)
+            runOnUiThreadIfAppListCurrent(generation, lifecycleGeneration) {
                 addableAppsLoading = false
                 appLists = fullLists
                 buildAppList()
-                if (appTab == AppTab.ADD) {
+                if (scrollAddableToTop && appTab == AppTab.ADD) {
                     binding.appSection.appRecycler.stopScroll()
                     binding.appSection.appRecycler.post {
                         binding.appSection.appRecycler.scrollToPosition(0)
@@ -707,6 +975,30 @@ class MainActivity : AppCompatActivity() {
             ComponentKind.SYSTEM_COMPONENT -> "系统组件 · ${entry.ruleCount} 条规则"
             ComponentKind.MISSING_APP -> "未安装/配置残留 · ${entry.ruleCount} 条规则"
         }
+        val hasMissedRules = entry.missedRuleCount > 0
+        val hasPendingReviewRules = entry.pendingReviewRuleCount > 0
+        val missedKindLabel = ruleHealthKindLabel(entry.missedRuleKinds)
+        val pendingKindLabel = ruleHealthKindLabel(entry.pendingReviewRuleKinds)
+        val combinedKindLabel = ruleHealthKindLabel(
+            entry.missedRuleKinds + entry.pendingReviewRuleKinds
+        )
+        val appHealthLabel = when {
+            hasMissedRules && hasPendingReviewRules -> "${combinedKindLabel}状态需检查"
+            hasMissedRules -> "${missedKindLabel}可能无效"
+            hasPendingReviewRules -> "${pendingKindLabel}未发现 · 将复查"
+            else -> null
+        }
+        val appHealthDescription = when {
+            hasMissedRules && hasPendingReviewRules ->
+                "${entry.missedRuleCount} 条${missedKindLabel}规则连续两次未检测到目标，可能无效；" +
+                    "${entry.pendingReviewRuleCount} 条${pendingKindLabel}规则首次未检测到目标，下次启动时再次检查"
+            hasMissedRules ->
+                "${entry.missedRuleCount} 条${missedKindLabel}规则连续两次未检测到目标，可能无效"
+            hasPendingReviewRules ->
+                "${entry.pendingReviewRuleCount} 条${pendingKindLabel}规则首次未检测到目标，下次启动时再次检查"
+            else -> null
+        }
+        bindHealthHint(item.configHealth, appHealthLabel, appHealthDescription)
         bindEntryIcon(item.configIcon, entry)
         val usable = canUseModuleFeatures()
         item.btnView.isEnabled = usable
@@ -900,6 +1192,117 @@ class MainActivity : AppCompatActivity() {
         return (value * resources.displayMetrics.density + 0.5f).toInt()
     }
 
+    private fun bindHealthHint(view: TextView, label: String?, description: String?) {
+        view.text = label.orEmpty()
+        view.contentDescription = description
+        view.tooltipText = description
+        if (label == null) {
+            view.setCompoundDrawables(null, null, null, null)
+            view.visibility = View.GONE
+            return
+        }
+        val icon = ContextCompat.getDrawable(this, R.drawable.ic_warning)?.mutate()
+        val iconSize = dp(13f)
+        icon?.setBounds(0, 0, iconSize, iconSize)
+        view.setCompoundDrawables(icon, null, null, null)
+        view.compoundDrawablePadding = dp(3f)
+        view.visibility = View.VISIBLE
+    }
+
+    private fun buildRuleTargetText(target: String, healthLabel: String?): CharSequence {
+        if (healthLabel == null) return target
+
+        val text = SpannableStringBuilder(target)
+        val healthStart = text.length
+        text.append('\uFFFC')
+        text.setSpan(
+            InlineHealthSpan(
+                icon = ContextCompat.getDrawable(this, R.drawable.ic_warning)?.mutate(),
+                label = healthLabel,
+                iconSize = dp(12f),
+                leadingSpace = dp(3f),
+                iconTextSpace = dp(3f),
+                textSize = TypedValue.applyDimension(
+                    TypedValue.COMPLEX_UNIT_SP,
+                    9.5f,
+                    resources.displayMetrics
+                ),
+                textColor = ContextCompat.getColor(this, R.color.status_warn)
+            ),
+            healthStart,
+            text.length,
+            Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        return text
+    }
+
+    private class InlineHealthSpan(
+        private val icon: Drawable?,
+        private val label: String,
+        private val iconSize: Int,
+        private val leadingSpace: Int,
+        private val iconTextSpace: Int,
+        private val textSize: Float,
+        private val textColor: Int
+    ) : ReplacementSpan() {
+        override fun getSize(
+            paint: Paint,
+            text: CharSequence,
+            start: Int,
+            end: Int,
+            fontMetrics: Paint.FontMetricsInt?
+        ): Int {
+            val labelPaint = Paint(paint).apply {
+                this.textSize = this@InlineHealthSpan.textSize
+                color = textColor
+            }
+            val iconWidth = if (icon == null) 0 else iconSize + iconTextSpace
+            return leadingSpace + iconWidth + kotlin.math.ceil(labelPaint.measureText(label).toDouble()).toInt()
+        }
+
+        override fun draw(
+            canvas: Canvas,
+            text: CharSequence,
+            start: Int,
+            end: Int,
+            x: Float,
+            top: Int,
+            y: Int,
+            bottom: Int,
+            paint: Paint
+        ) {
+            val centerY = (top + bottom) / 2f
+            var drawX = x + leadingSpace
+            icon?.let { drawable ->
+                val iconTop = (centerY - iconSize / 2f).toInt()
+                drawable.setBounds(
+                    drawX.toInt(),
+                    iconTop,
+                    drawX.toInt() + iconSize,
+                    iconTop + iconSize
+                )
+                drawable.draw(canvas)
+                drawX += iconSize + iconTextSpace
+            }
+            val labelPaint = Paint(paint).apply {
+                textSize = this@InlineHealthSpan.textSize
+                color = textColor
+            }
+            val metrics = labelPaint.fontMetrics
+            val baseline = centerY - (metrics.ascent + metrics.descent) / 2f
+            canvas.drawText(label, drawX, baseline, labelPaint)
+        }
+    }
+
+    private fun ruleHealthKindLabel(kinds: Set<RuleHealthKind>): String {
+        return when {
+            RuleHealthKind.THREAD in kinds && RuleHealthKind.CHILD_PROCESS in kinds -> "线程/子进程"
+            RuleHealthKind.THREAD in kinds -> "线程"
+            RuleHealthKind.CHILD_PROCESS in kinds -> "子进程"
+            else -> "规则"
+        }
+    }
+
     private inner class AppAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
         private val payloadIcon = "icon"
         private val viewTypeAdd = 1
@@ -1069,8 +1472,8 @@ class MainActivity : AppCompatActivity() {
             )
             !daemonRunning -> EmptyState(
                 R.drawable.ic_warning,
-                "C进程未运行",
-                "请确认模块已启用并重启设备\n仍异常可在「设置」中查看C进程日志"
+                "守护进程未运行",
+                "请确认模块已启用并重启设备\n仍异常可在「设置」中查看守护进程日志"
             )
             else -> null
         }
@@ -1136,9 +1539,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildAppLists(
         config: ConfigReader.ConfigPackages,
-        names: Set<String> = processNames
+        names: Set<String> = processNames,
+        health: Map<String, DaemonBridge.RuleHealth> = ruleHealth
     ): AppLists {
-        val base = buildConfiguredLists(config, names)
+        val base = buildConfiguredLists(config, names, health)
         val configuredSet = (config.autoPackages + config.configuredPackages)
             .flatMap { listOf(it, configOwnerName(it), packageLookupName(it)) }
             .toHashSet()
@@ -1150,7 +1554,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildConfiguredLists(
         config: ConfigReader.ConfigPackages,
-        names: Set<String> = processNames
+        names: Set<String> = processNames,
+        health: Map<String, DaemonBridge.RuleHealth> = ruleHealth
     ): AppLists {
         val pending = config.autoPackages
             .map { appEntry(it, names) }
@@ -1164,7 +1569,27 @@ class MainActivity : AppCompatActivity() {
                 val groupPkgs = configPkgs.toList()
                 val ruleCount = groupPkgs.sumOf { config.configuredRuleCounts[it] ?: 0 }
                     .takeIf { it > 0 } ?: groupPkgs.size
-                appEntry(pkg, names, groupPkgs, ruleCount)
+                val appHealth = health.values.filter {
+                    it.key in config.ruleHealthKeys && configOwnerName(it.owner) == pkg
+                }
+                val missedRules = appHealth.filter {
+                    it.status == DaemonBridge.RuleHealthStatus.MISSED
+                }
+                val pendingReviewRules = appHealth.filter {
+                    it.status == DaemonBridge.RuleHealthStatus.PENDING && it.missCount > 0
+                }
+                val missedRuleKinds = missedRules.mapNotNull { ruleHealthKind(it) }.toSet()
+                val pendingReviewRuleKinds = pendingReviewRules.mapNotNull { ruleHealthKind(it) }.toSet()
+                appEntry(
+                    pkg,
+                    names,
+                    groupPkgs,
+                    ruleCount,
+                    missedRules.size,
+                    pendingReviewRules.size,
+                    missedRuleKinds,
+                    pendingReviewRuleKinds
+                )
             }
             .sortedByInstallTime()
         return AppLists(
@@ -1190,7 +1615,11 @@ class MainActivity : AppCompatActivity() {
         pkg: String,
         names: Set<String> = processNames,
         configPkgs: List<String> = listOf(pkg),
-        ruleCount: Int = 0
+        ruleCount: Int = 0,
+        missedRuleCount: Int = 0,
+        pendingReviewRuleCount: Int = 0,
+        missedRuleKinds: Set<RuleHealthKind> = emptySet(),
+        pendingReviewRuleKinds: Set<RuleHealthKind> = emptySet()
     ): AppEntry {
         val installed = isInstalled(pkg)
         return AppEntry(
@@ -1200,8 +1629,20 @@ class MainActivity : AppCompatActivity() {
             component = componentKind(pkg, installed, names),
             installTime = installTime(pkg),
             configPkgs = configPkgs.distinct(),
-            ruleCount = ruleCount
+            ruleCount = ruleCount,
+            missedRuleCount = missedRuleCount,
+            pendingReviewRuleCount = pendingReviewRuleCount,
+            missedRuleKinds = missedRuleKinds,
+            pendingReviewRuleKinds = pendingReviewRuleKinds
         )
+    }
+
+    private fun ruleHealthKind(health: DaemonBridge.RuleHealth): RuleHealthKind? {
+        return when (health.kind.uppercase(Locale.ROOT)) {
+            "T" -> RuleHealthKind.THREAD
+            "P" -> RuleHealthKind.CHILD_PROCESS
+            else -> null
+        }
     }
 
     private fun componentKind(pkg: String, installed: Boolean, names: Set<String>): ComponentKind {
@@ -1355,7 +1796,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val pkg = entry.pkg
+        val generation = beginConfigMutation()
         val previousLists = appLists
+        val previousProcessNames = processNames
+        val healthSnapshot = ruleHealth
+        val rootAvailable = hasRoot
         val optimisticPending = (previousLists.pending + entry.copy(configPkgs = listOf(pkg)))
             .distinctBy { it.pkg }
             .sortedByInstallTime()
@@ -1367,23 +1812,35 @@ class MainActivity : AppCompatActivity() {
         selectAppTab(AppTab.PENDING)
 
         thread {
-            val ok = DaemonBridge.addAutoPackage(pkg)
-            val config = if (ok) ConfigReader.readPackages() else null
-            val resolvedNames = config?.let { resolveProcessComponentNames(it, hasRoot) } ?: processNames
-            val visibleLists = config?.let {
-                buildConfiguredLists(it, resolvedNames).copy(
-                    addable = optimisticLists.addable
-                )
-            } ?: optimisticLists
-            runOnUiThreadIfAlive {
-                if (ok) {
-                    processNames = resolvedNames
-                    appLists = visibleLists
-                    buildAppList()
-                } else {
+            try {
+                val ok = DaemonBridge.addAutoPackage(pkg)
+                val config = if (ok) ConfigReader.readPackagesOrNull() else null
+                val resolvedNames = config?.let {
+                    resolveProcessComponentNames(it, rootAvailable)
+                } ?: previousProcessNames
+                val visibleLists = config?.let {
+                    buildConfiguredLists(it, resolvedNames, healthSnapshot).copy(
+                        addable = optimisticLists.addable
+                    )
+                } ?: optimisticLists
+                finishConfigMutation(generation) {
+                    addableAppsLoading = false
+                    if (ok) {
+                        processNames = resolvedNames
+                        appLists = visibleLists
+                        buildAppList()
+                    } else {
+                        appLists = previousLists
+                        buildAppList()
+                        toast("添加配置失败，请检查 Root 或模块权限")
+                    }
+                }
+            } catch (error: Exception) {
+                android.util.Log.e("AppOpt", "add config failed: $pkg", error)
+                finishConfigMutation(generation) {
                     appLists = previousLists
                     buildAppList()
-                    toast("添加配置失败，请检查 Root 或模块权限")
+                    toast("添加配置失败，请重试")
                 }
             }
         }
@@ -1437,6 +1894,7 @@ class MainActivity : AppCompatActivity() {
                 targets.flatMap { DaemonBridge.readPkgConfigLines(it) }
             }
             runOnUiThreadIfAlive {
+                if (!dialog.isShowing) return@runOnUiThreadIfAlive
                 view.deleteRules.text = result.fold(
                     onSuccess = { rules ->
                         if (rules.isEmpty()) {
@@ -1467,7 +1925,11 @@ class MainActivity : AppCompatActivity() {
             buildAppList()
             return
         }
+        val generation = beginConfigMutation()
         val previousLists = appLists
+        val previousProcessNames = processNames
+        val previousHealth = ruleHealth
+        val rootAvailable = hasRoot
         val targetSet = pkgs.toSet()
         val optimisticLists = appLists.copy(
             pending = appLists.pending.filterNot { entry ->
@@ -1483,20 +1945,43 @@ class MainActivity : AppCompatActivity() {
         buildAppList()
 
         thread {
-            val ok = DaemonBridge.deleteConfigPackages(pkgs)
-            val config = if (ok) ConfigReader.readPackages() else null
-            val resolvedNames = config?.let { resolveProcessComponentNames(it, hasRoot) } ?: processNames
-            val visibleLists = config?.let { buildAppLists(it, resolvedNames) } ?: appLists
-            runOnUiThreadIfAlive {
-                if (ok) {
-                    processNames = resolvedNames
-                    appLists = visibleLists
-                    buildAppList()
-                    toast("已删除配置")
+            try {
+                val ok = DaemonBridge.deleteConfigPackages(pkgs)
+                val config = if (ok) ConfigReader.readPackagesOrNull() else null
+                val resolvedNames = config?.let {
+                    resolveProcessComponentNames(it, rootAvailable)
+                } ?: previousProcessNames
+                val latestHealth = if (ok) {
+                    DaemonBridge.readRuleHealthOrNull() ?: previousHealth
                 } else {
+                    previousHealth
+                }
+                val updatedHealth = config?.let { current ->
+                    latestHealth.filterKeys { it in current.ruleHealthKeys }
+                } ?: previousHealth
+                val visibleLists = config?.let {
+                    buildAppLists(it, resolvedNames, updatedHealth)
+                } ?: appLists
+                finishConfigMutation(generation) {
+                    addableAppsLoading = false
+                    if (ok) {
+                        updateRuleHealthSnapshot(updatedHealth)
+                        processNames = resolvedNames
+                        appLists = visibleLists
+                        buildAppList()
+                        toast("已删除配置")
+                    } else {
+                        appLists = previousLists
+                        buildAppList()
+                        toast("删除配置失败，请检查 Root 或模块权限")
+                    }
+                }
+            } catch (error: Exception) {
+                android.util.Log.e("AppOpt", "delete config failed: $pkgs", error)
+                finishConfigMutation(generation) {
                     appLists = previousLists
                     buildAppList()
-                    toast("删除配置失败，请检查 Root 或模块权限")
+                    toast("删除配置失败，请重试")
                 }
             }
         }
@@ -1541,10 +2026,16 @@ class MainActivity : AppCompatActivity() {
         }
         toast("正在读取规则")
         val targets = entry.configPkgs.distinct()
+        val generation = ruleDialogRequests.next()
+        val lifecycleGeneration = lifecycleRequests.current()
+        val healthRevisionAtLoad = ruleHealthRevision
+        val healthSnapshot = ruleHealth
         thread {
             try {
-                val lines = DaemonBridge.readPkgRules(targets)
+                val lines = DaemonBridge.readPkgRulesOrNull(targets)
+                    ?: error("applist.conf read failed")
                 val allowedCpus = DaemonBridge.readConfigAllowedCpus()
+                val health = DaemonBridge.readRuleHealthOrNull() ?: healthSnapshot
                 val historyCandidates = try {
                     RuleHistoryCandidates.build(
                         entry.pkg,
@@ -1556,12 +2047,33 @@ class MainActivity : AppCompatActivity() {
                 }
                 runOnUiThreadIfAlive {
                     rulesLoadingPackages.remove(entry.pkg)
-                    showConfiguredRulesDialog(entry, targets, lines, allowedCpus, historyCandidates)
+                    if (!ruleDialogRequests.isCurrent(generation)) return@runOnUiThreadIfAlive
+                    if (!activityResumed || !lifecycleRequests.isCurrent(lifecycleGeneration)) {
+                        return@runOnUiThreadIfAlive
+                    }
+                    val currentHealth = if (ruleHealthRevision == healthRevisionAtLoad) {
+                        updateRuleHealthSnapshot(health)
+                        health
+                    } else {
+                        ruleHealth
+                    }
+                    showConfiguredRulesDialog(
+                        entry,
+                        targets,
+                        lines,
+                        allowedCpus,
+                        historyCandidates,
+                        currentHealth
+                    )
                 }
             } catch (e: Exception) {
                 android.util.Log.e("AppOpt", "read configured rules failed: ${entry.pkg}", e)
                 runOnUiThreadIfAlive {
                     rulesLoadingPackages.remove(entry.pkg)
+                    if (!ruleDialogRequests.isCurrent(generation)) return@runOnUiThreadIfAlive
+                    if (!activityResumed || !lifecycleRequests.isCurrent(lifecycleGeneration)) {
+                        return@runOnUiThreadIfAlive
+                    }
                     toast("读取规则失败，请重试")
                 }
             }
@@ -1573,7 +2085,8 @@ class MainActivity : AppCompatActivity() {
         targets: List<String>,
         lines: List<String>,
         allowedCpus: Set<Int>,
-        historyCandidates: List<RuleHistoryCandidate>
+        historyCandidates: List<RuleHistoryCandidate>,
+        health: Map<String, DaemonBridge.RuleHealth>
     ) {
                 val rules = lines.mapIndexedNotNull { index, line ->
                     parseEditableConfigRule(line, index)
@@ -1586,6 +2099,7 @@ class MainActivity : AppCompatActivity() {
                 var ruleSearchQuery = ""
                 var ruleFilter = ConfigRuleFilter.ALL
                 var rulesSaving = false
+                var currentHealth = health
 
                 val view = DialogConfigRulesBinding.inflate(layoutInflater)
                 view.rulesTitle.text = if (entry.installed) entry.label else entry.pkg
@@ -1642,10 +2156,22 @@ class MainActivity : AppCompatActivity() {
                         view,
                         rules,
                         ruleSearchQuery,
-                        ruleFilter,
-                        rulesSaving,
-                        adapter
-                    )
+                         ruleFilter,
+                         rulesSaving,
+                         currentHealth,
+                         adapter
+                     )
+                 }
+
+                val healthObserver: (Map<String, DaemonBridge.RuleHealth>) -> Unit = { latest ->
+                    currentHealth = latest
+                    if (dialog.isShowing) renderRules()
+                }
+                activeRuleHealthObserver = healthObserver
+                dialog.setOnDismissListener {
+                    if (activeRuleHealthObserver === healthObserver) {
+                        activeRuleHealthObserver = null
+                    }
                 }
 
                 view.rulesSearch.addTextChangedListener(object : TextWatcher {
@@ -1727,9 +2253,10 @@ class MainActivity : AppCompatActivity() {
                         renderRules()
                     }
                 }
-                renderRules()
-                dialog.show()
-    }
+                 renderRules()
+                 dialog.show()
+                scheduleSettledHealthRefresh()
+     }
 
     private fun parseEditableConfigRule(line: String, sourceIndex: Int?): EditableConfigRule? {
         val eq = line.indexOf('=')
@@ -1770,6 +2297,7 @@ class MainActivity : AppCompatActivity() {
         searchQuery: String,
         filter: ConfigRuleFilter,
         saving: Boolean,
+        health: Map<String, DaemonBridge.RuleHealth>,
         adapter: ConfigRuleAdapter
     ) {
         view.rulesCount.text = if (rules.isEmpty()) "暂无规则" else "${rules.size} 条规则"
@@ -1783,17 +2311,22 @@ class MainActivity : AppCompatActivity() {
         }
 
         val normalizedQuery = searchQuery.lowercase(Locale.ROOT)
-        val filteredRules = rules.withIndex().filter { indexedRule ->
-            val rule = indexedRule.value
-            val typeMatches = when (filter) {
-                ConfigRuleFilter.ALL -> true
-                ConfigRuleFilter.MAIN -> rule.thread == null && !rule.owner.contains(':')
-                ConfigRuleFilter.CHILD -> rule.thread == null && rule.owner.contains(':')
-                ConfigRuleFilter.THREAD -> rule.thread != null
-            }
-            typeMatches && (normalizedQuery.isEmpty() ||
-                rule.asLine().lowercase(Locale.ROOT).contains(normalizedQuery))
+        val cpuBoundsByIndex = rules.indices.associateWith { index ->
+            RuleConfigLogic.parseCpuBounds(rules[index].cpus)
         }
+        val filteredRules = rules.withIndex()
+            .filter { indexedRule ->
+                val rule = indexedRule.value
+                val typeMatches = when (filter) {
+                    ConfigRuleFilter.ALL -> true
+                    ConfigRuleFilter.MAIN -> rule.thread == null && !rule.owner.contains(':')
+                    ConfigRuleFilter.CHILD -> rule.thread == null && rule.owner.contains(':')
+                    ConfigRuleFilter.THREAD -> rule.thread != null
+                }
+                typeMatches && (normalizedQuery.isEmpty() ||
+                    rule.asLine().lowercase(Locale.ROOT).contains(normalizedQuery))
+            }
+            .sortedWith(configRuleDisplayComparator(cpuBoundsByIndex))
         val showTools = rules.size >= RULE_TOOLS_THRESHOLD ||
             searchQuery.isNotEmpty() || filter != ConfigRuleFilter.ALL
         view.rulesTools.visibility = if (showTools) View.VISIBLE else View.GONE
@@ -1807,7 +2340,43 @@ class MainActivity : AppCompatActivity() {
         view.rulesEmpty.visibility = if (filteredRules.isEmpty()) View.VISIBLE else View.GONE
         view.rulesList.visibility = if (filteredRules.isEmpty()) View.GONE else View.VISIBLE
         adapter.interactionsEnabled = !saving
-        adapter.submitList(filteredRules.map { ConfigRuleListItem(it.index, it.value) })
+        adapter.submitList(filteredRules.map {
+            val key = DaemonBridge.ruleHealthKey(it.value.owner, it.value.thread)
+            ConfigRuleListItem(it.index, it.value, key?.let(health::get))
+        })
+    }
+
+    private fun configRuleDisplayComparator(
+        cpuBoundsByIndex: Map<Int, RuleConfigLogic.CpuBounds?>
+    ): Comparator<IndexedValue<EditableConfigRule>> {
+        fun group(rule: EditableConfigRule): Int = when {
+            rule.thread != null -> 0
+            rule.owner.contains(':') -> 1
+            else -> 2
+        }
+
+        return Comparator { left, right ->
+            val leftRule = left.value
+            val rightRule = right.value
+            val groupOrder = group(leftRule).compareTo(group(rightRule))
+            if (groupOrder != 0) return@Comparator groupOrder
+
+            if (leftRule.thread != null && rightRule.thread != null) {
+                val leftBounds = cpuBoundsByIndex[left.index]
+                val rightBounds = cpuBoundsByIndex[right.index]
+                val startOrder = (rightBounds?.first ?: Int.MIN_VALUE)
+                    .compareTo(leftBounds?.first ?: Int.MIN_VALUE)
+                if (startOrder != 0) return@Comparator startOrder
+                val endOrder = (rightBounds?.last ?: Int.MIN_VALUE)
+                    .compareTo(leftBounds?.last ?: Int.MIN_VALUE)
+                if (endOrder != 0) return@Comparator endOrder
+            }
+
+            val leftName = leftRule.thread ?: leftRule.owner
+            val rightName = rightRule.thread ?: rightRule.owner
+            val nameOrder = leftName.compareTo(rightName, ignoreCase = true)
+            if (nameOrder != 0) nameOrder else left.index.compareTo(right.index)
+        }
     }
 
     private inner class ConfigRuleAdapter(
@@ -1865,12 +2434,35 @@ class MainActivity : AppCompatActivity() {
                     if (isThread) R.color.brand_primary_dark else R.color.brand_secondary
                 )
             )
-            item.ruleTarget.text = when {
+            val targetLabel = when {
                 isThread -> rule.thread
                 isChildProcess -> rule.owner.substringAfter(':')
                 else -> "主进程"
             }
-            item.ruleOwner.text = rule.owner
+            item.ruleOwner.text = rule.owner.substringBefore(':')
+            val health = listItem.health
+            val healthKindLabel = if (isThread) "线程" else "子进程"
+            val healthLabel = when {
+                health?.status == DaemonBridge.RuleHealthStatus.MISSED ->
+                    "${healthKindLabel}可能无效"
+                health?.status == DaemonBridge.RuleHealthStatus.PENDING &&
+                    health.missCount > 0 -> "${healthKindLabel}未发现 · 将复查"
+                else -> null
+            }
+            val healthDescription = when {
+                health?.status == DaemonBridge.RuleHealthStatus.MISSED ->
+                    "连续两次观察未检测到$healthKindLabel，规则可能无效"
+                health?.status == DaemonBridge.RuleHealthStatus.PENDING &&
+                    health.missCount > 0 ->
+                        "首次观察未检测到$healthKindLabel，下次启动时再次检查"
+                else -> null
+            }
+            item.ruleTarget.text = buildRuleTargetText(targetLabel.orEmpty(), healthLabel)
+            item.ruleTarget.contentDescription = healthDescription?.let {
+                "$targetLabel，$it"
+            } ?: targetLabel
+            item.ruleTarget.tooltipText = healthDescription
+            item.ruleTarget.isSelected = true
             item.ruleCpus.text = rule.cpus
             item.root.isEnabled = interactionsEnabled
             item.ruleEdit.isEnabled = interactionsEnabled
@@ -1967,8 +2559,11 @@ class MainActivity : AppCompatActivity() {
             view.ruleCpuWarning.visibility = View.VISIBLE
         }
 
-        view.ruleCpuGrid.columnCount = minOf(4, allowedCpus.size.coerceAtLeast(1))
-        for (cpu in allowedCpus.sorted()) {
+        val sortedAllowedCpus = allowedCpus.sorted()
+        val cpuListTooLarge = sortedAllowedCpus.size > MAX_EDITOR_CPU_COUNT
+        val editorCpus = if (cpuListTooLarge) emptyList() else sortedAllowedCpus
+        view.ruleCpuGrid.columnCount = minOf(4, editorCpus.size.coerceAtLeast(1))
+        for (cpu in editorCpus) {
             val box = MaterialCheckBox(this).apply {
                 text = "CPU$cpu"
                 textSize = 15f
@@ -2011,7 +2606,7 @@ class MainActivity : AppCompatActivity() {
             cpuBoxes[cpu] = box
             view.ruleCpuGrid.addView(box, params)
         }
-        if (allowedCpus.isEmpty()) {
+        if (allowedCpus.isEmpty() || cpuListTooLarge) {
             view.ruleEditConfirm.isEnabled = false
         }
 
@@ -2022,7 +2617,10 @@ class MainActivity : AppCompatActivity() {
             cpuBoxes.forEach { (cpu, box) -> box.isChecked = cpu in selected }
             suppressCpuChange = false
             view.ruleCpuSummary.text = if (selected.isEmpty()) "未选择" else formatCpuSet(selected)
-            if (allowedCpus.isEmpty()) {
+            if (cpuListTooLarge) {
+                view.ruleCpuSummary.text = "不可用"
+                showCpuWarning("CPU 核心列表异常，请重新打开后重试")
+            } else if (allowedCpus.isEmpty()) {
                 view.ruleCpuSummary.text = "不可用"
                 showCpuWarning("CPU 核心读取失败，请重新打开后重试")
             } else {
@@ -2149,12 +2747,13 @@ class MainActivity : AppCompatActivity() {
                 else -> baseOwner
             }
             when {
-                baseOwner.isEmpty() -> {
+                baseOwner.isEmpty() || (!isChild && !RuleConfigLogic.ownerFitsNativeBuffer(owner)) -> {
                     view.ruleEditError.text = "未识别到当前应用主进程"
                     view.ruleEditError.visibility = View.VISIBLE
                     return@setOnClickListener
                 }
-                isChild && (childSuffix.isEmpty() || childSuffix.length > 63) -> {
+                isChild && (childSuffix.isEmpty() || childSuffix.length > 63 ||
+                    !RuleConfigLogic.ownerFitsNativeBuffer(owner)) -> {
                     view.ruleChildBox.error = "请输入不超过 63 个字符的子进程后缀"
                     return@setOnClickListener
                 }
@@ -2166,7 +2765,9 @@ class MainActivity : AppCompatActivity() {
                     view.ruleThreadBox.error = "请输入线程名称"
                     return@setOnClickListener
                 }
-                isThread && (threadName.length > 31 || threadName.any { it == '{' || it == '}' || it == '=' }) -> {
+                isThread && (threadName.length > 31 ||
+                    !RuleConfigLogic.threadFitsNativeBuffer(threadName) ||
+                    threadName.any { it == '{' || it == '}' || it == '=' }) -> {
                     view.ruleThreadBox.error = "线程名称不能超过 31 个字符或包含 { } ="
                     return@setOnClickListener
                 }
@@ -2414,20 +3015,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun parseCpuSet(ranges: String): Set<Int> {
-        val cpus = linkedSetOf<Int>()
-        for (part in ranges.split(',')) {
-            val value = part.trim()
-            if (value.isEmpty()) continue
-            val bounds = value.split('-', limit = 2)
-            if (bounds.size == 2) {
-                val start = bounds[0].toIntOrNull() ?: continue
-                val end = bounds[1].toIntOrNull() ?: continue
-                cpus.addAll(if (start <= end) start..end else end..start)
-            } else {
-                value.toIntOrNull()?.let(cpus::add)
-            }
-        }
-        return cpus
+        return RuleConfigLogic.parseCpuRangeList(ranges).orEmpty()
     }
 
     private fun isContinuousCpuSelection(cpus: Set<Int>): Boolean {
@@ -2480,40 +3068,64 @@ class MainActivity : AppCompatActivity() {
             }
         }
         showRulesError(view, null)
+        val generation = beginConfigMutation()
+        val healthSnapshot = ruleHealth
+        val processNamesSnapshot = processNames
         thread {
-            val allowedCpus = DaemonBridge.readConfigAllowedCpus().takeIf { it.isNotEmpty() }
-            val result = DaemonBridge.replaceConfigRulesPreservingLayout(
-                pkgs = targets,
-                expectedOriginalLines = expectedOriginalLines,
-                replacements = replacements,
-                addedLines = addedLines,
-                allowedCpus = allowedCpus
-            )
-            val ok = result == DaemonBridge.ConfigReplaceResult.SUCCESS
-            val config = if (ok) ConfigReader.readPackages() else null
-            val fullLists = config?.let { buildAppLists(it, processNames) }
-            runOnUiThreadIfAlive {
-                if (ok) {
-                    if (fullLists != null) {
-                        appLists = fullLists
-                        buildAppList()
-                    } else {
-                        refreshAppList()
-                    }
-                    dialog.dismiss()
-                    toast("配置已保存")
+            try {
+                val allowedCpus = DaemonBridge.readConfigAllowedCpus().takeIf { it.isNotEmpty() }
+                val result = DaemonBridge.replaceConfigRulesPreservingLayout(
+                    pkgs = targets,
+                    expectedOriginalLines = expectedOriginalLines,
+                    replacements = replacements,
+                    addedLines = addedLines,
+                    allowedCpus = allowedCpus
+                )
+                val ok = result == DaemonBridge.ConfigReplaceResult.SUCCESS
+                val config = if (ok) ConfigReader.readPackagesOrNull() else null
+                val latestHealth = if (ok) {
+                    DaemonBridge.readRuleHealthOrNull() ?: healthSnapshot
                 } else {
-                    onFailed()
-                    showRulesError(
-                        view,
-                        when (result) {
-                            DaemonBridge.ConfigReplaceResult.SOURCE_CHANGED ->
-                                "配置文件已被其他程序修改，请关闭弹窗后重新打开"
-                            DaemonBridge.ConfigReplaceResult.INVALID ->
-                                "规则校验失败，请检查规则和 CPU 核心范围"
-                            else -> "保存失败，请检查 Root 权限"
+                    healthSnapshot
+                }
+                val updatedHealth = config?.let { current ->
+                    latestHealth.filterKeys { it in current.ruleHealthKeys }
+                } ?: healthSnapshot
+                val fullLists = config?.let {
+                    buildAppLists(it, processNamesSnapshot, updatedHealth)
+                }
+                finishConfigMutation(generation) {
+                    addableAppsLoading = false
+                    if (ok) {
+                        updateRuleHealthSnapshot(updatedHealth)
+                        if (fullLists != null) {
+                            appLists = fullLists
+                            buildAppList()
+                        } else {
+                            refreshAppList()
                         }
-                    )
+                        dialog.dismiss()
+                        toast("配置已保存")
+                    } else {
+                        onFailed()
+                        showRulesError(
+                            view,
+                            when (result) {
+                                DaemonBridge.ConfigReplaceResult.SOURCE_CHANGED ->
+                                    "配置文件已被其他程序修改，请关闭弹窗后重新打开"
+                                DaemonBridge.ConfigReplaceResult.INVALID ->
+                                    "规则校验失败，请检查规则和 CPU 核心范围"
+                                else -> "保存失败，请检查 Root 权限"
+                            }
+                        )
+                        toast("保存配置失败")
+                    }
+                }
+            } catch (error: Exception) {
+                android.util.Log.e("AppOpt", "save config rules failed: $targets", error)
+                finishConfigMutation(generation) {
+                    onFailed()
+                    showRulesError(view, "保存失败，请重试")
                     toast("保存配置失败")
                 }
             }

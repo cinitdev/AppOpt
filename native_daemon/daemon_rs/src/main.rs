@@ -11,6 +11,7 @@ include!("daemon_core/loop.rs");
 include!("daemon_core/cli.rs");
 include!("daemon_core/config.rs");
 include!("daemon_core/scan.rs");
+include!("daemon_core/rule_health.rs");
 include!("daemon_core/affinity.rs");
 include!("daemon_core/procfs.rs");
 include!("daemon_core/app_state.rs");

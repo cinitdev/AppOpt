@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -47,7 +48,7 @@
 #include "fps_fallback.h"
 #include "foreground_monitor.h"
 
-#define VERSION            "1.7.6"
+#define VERSION            "1.7.7"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -62,6 +63,17 @@
 #define CALIB_POLICY_LOCK  CONFIG_DIR "/calib_policy.conf.lock"
 #define CALIB_CONFIG_LOCK  CONFIG_DIR "/applist.conf.lock"
 #define HISTORY_DIR        MODULE_DIR "/history"
+#define RULE_HEALTH_FILE    CONFIG_DIR "/rule_health.tsv"
+#define FOREGROUND_TASK_STATE_FILE CONFIG_DIR "/foreground_task.state"
+#define FOREGROUND_TASK_MAX_AGE_MS 12000ULL
+#define RULE_HEALTH_OBSERVE_SECS 30
+#define RULE_HEALTH_EXIT_BUFFER_SIZE 32768
+#define RULE_HEALTH_LIFECYCLE_BUFFER_SIZE 32768
+#define PROC_FULL_RESCAN_MS 60000ULL
+#define PROC_GROWTH_SCAN_COOLDOWN_MS 10000ULL
+#define RULE_HEALTH_FULL_SCAN_RETRY_MS 5000ULL
+#define FOREGROUND_DISCOVERY_DELAY_MS 2000ULL
+#define FOREGROUND_DISCOVERY_COOLDOWN_MS 10000ULL
 
 /* ---- 真实帧率(FPS)监测 ----
  * App 写 FPS_CMD_FILE: "start <pkg> [socket token]" / "stop"  通知守护开/关监测
@@ -97,6 +109,7 @@ typedef struct {
 
 typedef struct {
     pid_t tid;
+    unsigned long long starttime;
     char name[MAX_THREAD_LEN];
     char cpuset_dir[256];
     cpu_set_t cpus;
@@ -104,6 +117,7 @@ typedef struct {
 
 typedef struct {
     pid_t pid;
+    unsigned long long starttime;
     char pkg[MAX_PKG_LEN];
     char base_cpuset[128];
     cpu_set_t base_cpus;
@@ -114,6 +128,11 @@ typedef struct {
     size_t num_thread_rules;
     size_t thread_rules_cap;
 } ProcessInfo;
+
+typedef struct {
+    pid_t pid;
+    unsigned long long starttime;
+} TrackedProcess;
 
 typedef struct {
     int first_cpu;          /* 簇内第一个逻辑 CPU 编号 */
@@ -161,10 +180,18 @@ typedef struct {
     size_t procs_cap;
     int last_proc_count;
     bool scan_all_proc;
-    pid_t* tracked_pids;
-    size_t num_tracked_pids;
-    size_t tracked_pids_cap;
-    int last_proc_total;
+    bool proc_growth_pending;
+    TrackedProcess* tracked_procs;
+    size_t num_tracked_procs;
+    size_t tracked_procs_cap;
+    bool initialized;
+    unsigned long long last_refresh_elapsed_ms;
+    unsigned long long last_proc_growth_scan_elapsed_ms;
+    unsigned long long last_full_scan_elapsed_ms;
+    unsigned long long last_full_scan_attempt_elapsed_ms;
+    unsigned long long last_health_full_scan_attempt_elapsed_ms;
+    char (*last_full_incomplete_pkgs)[MAX_PKG_LEN];
+    size_t num_last_full_incomplete_pkgs;
 } ProcCache;
 
 static atomic_int config_updated = ATOMIC_VAR_INIT(0);
@@ -181,8 +208,13 @@ static CpuTopology g_topo;                 /* 校准线程使用的全局拓扑�
 static char g_config_file[4096] = "";      /* 校准线程回写用的配置文件路径 */
 static volatile sig_atomic_t shutdown_requested = 0;
 
+static unsigned long long rule_health_boottime_ms(void);
+static bool rule_health_sync_config(const AppConfig* cfg, bool* changed);
+static bool rule_health_rule_disabled(const AffinityRule* rule);
+
 #include "core.c"
 #include "config.c"
+#include "rule_health.c"
 #include "calibration.c"
 #include "surfaceflinger.c"
 #include "daemon_socket.c"

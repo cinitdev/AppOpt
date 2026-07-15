@@ -217,6 +217,58 @@ static void parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* 
     free(copy);
 }
 
+static bool parse_cpu_ranges_strict(
+    const char* spec,
+    cpu_set_t* set,
+    const cpu_set_t* present
+) {
+    if (!spec || !set) return false;
+    const char* cursor = spec;
+    bool parsed_any = false;
+
+    while (*cursor) {
+        const char* segment_end = strchr(cursor, ',');
+        if (!segment_end) segment_end = cursor + strlen(cursor);
+
+        const char* start = cursor;
+        while (start < segment_end && isspace((unsigned char)*start)) start++;
+        const char* end = segment_end;
+        while (end > start && isspace((unsigned char)end[-1])) end--;
+
+        /* 与 Rust CpuMask::parse 保持一致：忽略逗号分隔中的空段。 */
+        if (start < end) {
+            if (!isdigit((unsigned char)*start)) return false;
+            errno = 0;
+            char* number_end = NULL;
+            unsigned long first = strtoul(start, &number_end, 10);
+            if (errno == ERANGE || number_end == start || number_end > end) return false;
+            while (number_end < end && isspace((unsigned char)*number_end)) number_end++;
+
+            unsigned long last = first;
+            if (number_end < end && *number_end == '-') {
+                const char* second = number_end + 1;
+                while (second < end && isspace((unsigned char)*second)) second++;
+                if (second == end || !isdigit((unsigned char)*second)) return false;
+                errno = 0;
+                last = strtoul(second, &number_end, 10);
+                if (errno == ERANGE || number_end == second || number_end > end) return false;
+                while (number_end < end && isspace((unsigned char)*number_end)) number_end++;
+            }
+            if (number_end != end || first > last || last >= CPU_SETSIZE) return false;
+
+            for (unsigned long cpu = first; cpu <= last; cpu++) {
+                if (!present || CPU_ISSET((int)cpu, present)) CPU_SET((int)cpu, set);
+            }
+            parsed_any = true;
+        }
+
+        if (!*segment_end) break;
+        cursor = segment_end + 1;
+    }
+
+    return parsed_any && CPU_COUNT(set) > 0;
+}
+
 static char* cpu_set_to_str(const cpu_set_t *set) {
     size_t buf_size = 8 * CPU_SETSIZE;
     char *buf = malloc(buf_size);
