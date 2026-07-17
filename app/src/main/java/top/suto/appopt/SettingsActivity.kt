@@ -22,6 +22,7 @@ import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 import top.suto.appopt.databinding.ActivitySettingsBinding
 import top.suto.appopt.databinding.DialogPolicyModeBinding
+import top.suto.appopt.databinding.DialogRuleOutputFormatBinding
 
 class SettingsActivity : AppCompatActivity() {
 
@@ -36,6 +37,8 @@ class SettingsActivity : AppCompatActivity() {
     private var policyEditable = false
     private var suppressPolicyChange = false
     private var currentWildcardGroup = CalibPolicy.WildcardGroup.MAX_MEMBER
+    private var currentRuleOutputFormat = CalibPolicy.RuleOutputFormat.LEGACY
+    private var formatConversionBusy = false
     private var currentDetectedTopologyBlock = ""
     private var availableCpus: List<Int> = (0..7).toList()
     private val bestCores = linkedSetOf<Int>()
@@ -78,6 +81,9 @@ class SettingsActivity : AppCompatActivity() {
         binding.wildcardModeRow.setOnClickListener {
             if (policyEditable) showWildcardModeDialog()
         }
+        binding.ruleOutputFormatRow.setOnClickListener {
+            if (policyEditable) showRuleOutputFormatDialog()
+        }
 
         setupAutoSave()
         binding.resetPolicy.setOnClickListener {
@@ -113,7 +119,7 @@ class SettingsActivity : AppCompatActivity() {
             val root = DaemonBridge.hasRoot()
             val version = if (root) DaemonBridge.readModuleVersion() else null
             val file = if (root) DaemonBridge.readCalibPolicyRaw() else null
-            val rawPolicy = file?.content?.takeIf { it.isNotBlank() }
+            val rawPolicy = file?.takeIf { it.readSuccess }?.content?.takeIf { it.isNotBlank() }
             val policy = rawPolicy
                 ?.takeIf { it.isNotBlank() }
                 ?.let { CalibPolicy.parse(it) }
@@ -144,12 +150,13 @@ class SettingsActivity : AppCompatActivity() {
                     !root -> "需要 Root 权限读取和保存策略"
                     version == null -> "未检测到模块版本，策略已锁定"
                     !moduleOk -> "当前模块版本 $moduleLabel，低于要求 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE)，策略已锁定"
+                    file?.readSuccess == false -> "策略文件读取失败，请检查 Root 权限后重试"
                     lockedByPendingUpdate -> "读取待生效更新配置：${file?.path.orEmpty()}"
                     file?.exists == false -> "策略文件不存在，可点击恢复默认重新生成；修改任意设置也会重新创建"
-                    file?.content.isNullOrBlank() -> "策略文件为空或读取失败，修改后会自动保存当前策略"
+                    file?.content.isNullOrBlank() -> "策略文件为空，修改后会自动保存当前策略"
                     else -> "当前配置：${file?.path.orEmpty()}，修改后自动保存"
                 })
-                policyEditable = root && moduleOk && !lockedByPendingUpdate
+                policyEditable = root && moduleOk && !lockedByPendingUpdate && file?.readSuccess == true
                 setPolicyInputsEnabled(policyEditable)
             }
         }
@@ -161,6 +168,7 @@ class SettingsActivity : AppCompatActivity() {
             clearPolicyInputErrors()
             currentDetectedTopologyBlock = policy.detectedTopologyBlock
             currentWildcardGroup = policy.wildcardGroup
+            currentRuleOutputFormat = policy.ruleOutputFormat
 
             val topology = parseDetectedTopology(currentDetectedTopologyBlock)
             availableCpus = availableCpuList(policy, topology)
@@ -183,6 +191,7 @@ class SettingsActivity : AppCompatActivity() {
             )
             renderCoreSelectors()
             updateWildcardModeText()
+            updateRuleOutputFormatText()
         } finally {
             suppressPolicyChange = false
         }
@@ -246,6 +255,7 @@ class SettingsActivity : AppCompatActivity() {
             midCores = formatCpuSet(midCores),
             maxThreadRules = maxRules!!,
             wildcardGroup = currentWildcardGroup,
+            ruleOutputFormat = currentRuleOutputFormat,
             fallbackCores = formatCpuSet(fallbackCores),
             detectedTopologyBlock = currentDetectedTopologyBlock
         ).normalized()
@@ -490,6 +500,8 @@ class SettingsActivity : AppCompatActivity() {
         }
         binding.wildcardModeRow.isEnabled = enabled
         binding.wildcardModeRow.alpha = alpha
+        binding.ruleOutputFormatRow.isEnabled = enabled
+        binding.ruleOutputFormatRow.alpha = alpha
         setCoreGridEnabled(binding.bestCoresGrid, enabled, alpha)
         setCoreGridEnabled(binding.highCoresGrid, enabled, alpha)
         setCoreGridEnabled(binding.midCoresGrid, enabled, alpha)
@@ -534,6 +546,211 @@ class SettingsActivity : AppCompatActivity() {
         currentWildcardGroup = mode
         updateWildcardModeText()
         schedulePolicySave(delayMs = 0)
+    }
+
+    private fun updateRuleOutputFormatText() {
+        when (currentRuleOutputFormat) {
+            CalibPolicy.RuleOutputFormat.LEGACY -> {
+                binding.ruleOutputFormatValue.text = "旧版单行"
+                binding.ruleOutputFormatDesc.text = "每条线程和子进程单独一行，默认使用此格式"
+            }
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "原作者区块"
+                binding.ruleOutputFormatDesc.text = "线程写入原作者新增区块，子进程仍单独一行"
+            }
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "首行兜底紧凑区块"
+                binding.ruleOutputFormatDesc.text = "主进程兜底写在紧贴左花括号的区块首行"
+            }
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "区块外兜底（空格）"
+                binding.ruleOutputFormatDesc.text = "线程和子进程写入区块，主进程兜底单独写在区块后"
+            }
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "区块外兜底（紧凑）"
+                binding.ruleOutputFormatDesc.text = "紧凑区块写线程和子进程，主进程兜底单独写在区块后"
+            }
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "区块尾部兜底（空格）"
+                binding.ruleOutputFormatDesc.text = "线程和子进程写入同一区块，兜底核心放在区块尾部"
+            }
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "区块尾部兜底（紧凑）"
+                binding.ruleOutputFormatDesc.text = "紧凑区块写线程和子进程，兜底核心放在区块尾部"
+            }
+        }
+    }
+
+    private fun showRuleOutputFormatDialog() {
+        val view = DialogRuleOutputFormatBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(this)
+        val current = currentRuleOutputFormat
+        setRuleOutputFormatTitle(
+            view.formatLegacyTitle,
+            view.formatLegacySelected,
+            current,
+            CalibPolicy.RuleOutputFormat.LEGACY,
+            "旧版单行格式（默认）"
+        )
+        setRuleOutputFormatTitle(
+            view.formatAuthorBlockTitle,
+            view.formatAuthorBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK,
+            "区块格式 1（原作者新增）"
+        )
+        setRuleOutputFormatTitle(
+            view.formatCompactHeaderBlockTitle,
+            view.formatCompactHeaderBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
+            "区块格式 2（首行兜底，紧凑）"
+        )
+        setRuleOutputFormatTitle(
+            view.formatSeparateFallbackBlockTitle,
+            view.formatSeparateFallbackBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
+            "区块格式 3（区块外兜底，空格）"
+        )
+        setRuleOutputFormatTitle(
+            view.formatCompactSeparateFallbackBlockTitle,
+            view.formatCompactSeparateFallbackBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
+            "区块格式 4（区块外兜底，紧凑）"
+        )
+        setRuleOutputFormatTitle(
+            view.formatExtendedBlockTitle,
+            view.formatExtendedBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK,
+            "区块格式 5（尾部兜底，空格）"
+        )
+        setRuleOutputFormatTitle(
+            view.formatCompactExtendedBlockTitle,
+            view.formatCompactExtendedBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK,
+            "区块格式 6（尾部兜底，紧凑）"
+        )
+        view.formatLegacy.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.LEGACY)
+        }
+        view.formatAuthorBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK)
+        }
+        view.formatCompactHeaderBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK)
+        }
+        view.formatSeparateFallbackBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK)
+        }
+        view.formatCompactSeparateFallbackBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK)
+        }
+        view.formatExtendedBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK)
+        }
+        view.formatCompactExtendedBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK)
+        }
+        view.formatCancel.setOnClickListener { dialog.dismiss() }
+        dialog.setContentView(view.root)
+        dialog.setOnShowListener {
+            val maxHeight = (resources.displayMetrics.heightPixels * 0.9f).toInt()
+            view.root.layoutParams = view.root.layoutParams.apply { height = maxHeight }
+            dialog.behavior.peekHeight = maxHeight
+            dialog.behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+            dialog.behavior.skipCollapsed = true
+        }
+        dialog.show()
+    }
+
+    private fun setRuleOutputFormatTitle(
+        title: TextView,
+        selectedIndicator: View,
+        current: CalibPolicy.RuleOutputFormat,
+        option: CalibPolicy.RuleOutputFormat,
+        label: String
+    ) {
+        title.text = label
+        selectedIndicator.visibility = if (current == option) View.VISIBLE else View.GONE
+    }
+
+    private fun setRuleOutputFormat(format: CalibPolicy.RuleOutputFormat) {
+        if (formatConversionBusy) return
+        cancelAutoSave()
+        val previous = currentRuleOutputFormat
+        currentRuleOutputFormat = format
+        updateRuleOutputFormatText()
+        val policy = readPolicyFromInputs()
+        if (policy == null) {
+            currentRuleOutputFormat = previous
+            updateRuleOutputFormatText()
+            toast("请先修正校准策略中的无效参数")
+            return
+        }
+
+        formatConversionBusy = true
+        setPolicyInputsEnabled(false)
+        val formatName = ruleOutputFormatName(format)
+        setPolicyStatus("正在把现有规则转换为$formatName")
+        ++saveSeq
+        POLICY_IO_EXECUTOR.execute {
+            val result = DaemonBridge.applyRuleOutputFormat(format, policy.toConfigText())
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                formatConversionBusy = false
+                if (result.success) {
+                    val message = if (result.ruleCount == 0) {
+                        "已切换为$formatName，当前没有需要转换的规则"
+                    } else if (result.changed) {
+                        "已转换为$formatName，共 ${result.ruleCount} 条规则"
+                    } else {
+                        "现有规则已经是$formatName"
+                    }
+                    setPolicyStatus("$message，修改后自动保存")
+                    toast(message)
+                } else {
+                    currentRuleOutputFormat = previous
+                    updateRuleOutputFormatText()
+                    val message = when (result.status) {
+                        DaemonBridge.RuleOutputFormatApplyStatus.INVALID_CONFIG ->
+                            "规则格式转换失败：${result.detail ?: "配置中存在无法解析的规则"}"
+                        DaemonBridge.RuleOutputFormatApplyStatus.CONFIG_WRITE_FAILED ->
+                            "规则格式转换失败：${result.detail ?: "无法写入规则配置"}"
+                        DaemonBridge.RuleOutputFormatApplyStatus.POLICY_WRITE_FAILED ->
+                            result.detail ?: "策略保存失败，现有规则已恢复"
+                        DaemonBridge.RuleOutputFormatApplyStatus.ROLLBACK_FAILED ->
+                            result.detail ?: "转换失败且恢复原规则失败，请立即检查 applist.conf"
+                        DaemonBridge.RuleOutputFormatApplyStatus.SUCCESS -> "规则格式转换失败"
+                    }
+                    setPolicyStatus(message)
+                    toast(message)
+                }
+                setPolicyInputsEnabled(policyEditable)
+            }
+        }
+    }
+
+    private fun ruleOutputFormatName(format: CalibPolicy.RuleOutputFormat): String {
+        return when (format) {
+            CalibPolicy.RuleOutputFormat.LEGACY -> "旧版单行格式"
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> "区块格式 1"
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK -> "区块格式 2"
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK -> "区块格式 3"
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK -> "区块格式 4"
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> "区块格式 5"
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> "区块格式 6"
+        }
     }
 
     private fun renderCoreSelectors() {

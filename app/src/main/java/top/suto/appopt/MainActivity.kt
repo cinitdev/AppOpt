@@ -226,6 +226,11 @@ class MainActivity : AppCompatActivity() {
             val running = runtime.running
             val helperStatus = if (r && compatible && !pendingUpdate) queryForegroundHelperStatus() else ForegroundHelperStatus()
             val enabled = r && compatible && running
+            val startupFormatResult = if (r && compatible && !pendingUpdate) {
+                DaemonBridge.detectAndApplyRuleOutputFormat()
+            } else {
+                null
+            }
             val config = if (enabled) {
                 ConfigReader.readPackagesOrNull()
             } else {
@@ -277,6 +282,15 @@ class MainActivity : AppCompatActivity() {
                     }
                     refresh()
                     buildAppList()
+                    if (startupFormatResult?.success == true && startupFormatResult.changed) {
+                        val formatName = startupRuleOutputFormatName(startupFormatResult.format)
+                        val mixedHint = if (startupFormatResult.mixed) "（按主要写法识别）" else ""
+                        toast("已识别现有规则为$formatName$mixedHint")
+                    } else if (startupFormatResult != null && !startupFormatResult.success) {
+                        val message = startupFormatResult.detail ?: "现有规则自动转换失败"
+                        android.util.Log.w("AppOpt", "startup rule format conversion failed: $message")
+                        toast(message)
+                    }
                     showModuleWarningIfNeeded()
                     maybeCheckStartupUpdate()
                 }
@@ -2259,19 +2273,21 @@ class MainActivity : AppCompatActivity() {
      }
 
     private fun parseEditableConfigRule(line: String, sourceIndex: Int?): EditableConfigRule? {
-        val eq = line.indexOf('=')
-        if (eq <= 0) return null
-        val key = line.substring(0, eq).trim()
-        val cpus = line.substring(eq + 1).trim()
-        if (key.isEmpty() || cpus.isEmpty()) return null
+        val rule = RuleSyntax.parseLegacyRule(line) ?: return null
+        return EditableConfigRule(sourceIndex, rule.owner, rule.thread, rule.cpus)
+    }
 
-        val brace = key.indexOf('{')
-        if (brace < 0) return EditableConfigRule(sourceIndex, key, null, cpus)
-        if (brace == 0 || !key.endsWith('}')) return null
-        val owner = key.substring(0, brace).trim()
-        val thread = key.substring(brace + 1, key.length - 1).trim()
-        if (owner.isEmpty() || thread.isEmpty()) return null
-        return EditableConfigRule(sourceIndex, owner, thread, cpus)
+    private fun startupRuleOutputFormatName(format: CalibPolicy.RuleOutputFormat?): String {
+        return when (format) {
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> "区块格式 1"
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK -> "区块格式 2"
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK -> "区块格式 3"
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK -> "区块格式 4"
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> "区块格式 5"
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> "区块格式 6"
+            CalibPolicy.RuleOutputFormat.LEGACY,
+            null -> "旧版单行格式"
+        }
     }
 
     private fun findEditableRuleIndex(
@@ -3105,7 +3121,7 @@ class MainActivity : AppCompatActivity() {
                             refreshAppList()
                         }
                         dialog.dismiss()
-                        toast("配置已保存")
+                        toast("配置已按所选规则格式保存")
                     } else {
                         onFailed()
                         showRulesError(

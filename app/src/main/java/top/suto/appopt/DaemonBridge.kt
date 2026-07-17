@@ -54,8 +54,8 @@ object DaemonBridge {
     private const val FOREGROUND_TASK_MAX_AGE_MS = 12_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 177
-    const val REQUIRED_MODULE_VERSION_NAME = "1.7.7"
+    const val REQUIRED_MODULE_VERSION_CODE = 178
+    const val REQUIRED_MODULE_VERSION_NAME = "1.7.8"
     private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
@@ -671,16 +671,11 @@ object DaemonBridge {
         val text = readConfigRaw()
         if (text.isBlank()) return emptyList()
 
-        val result = ArrayList<String>()
-        for (raw in text.lineSequence()) {
-            val line = raw.trim()
-            val owner = configLineOwner(line) ?: continue
-            val value = line.substringAfter('=', "").trim()
-            val belongsToApp = owner == target || owner.startsWith("$target:")
-            if (belongsToApp && !value.equals("auto", ignoreCase = true)) {
-                result.add(line)
-            }
-        }
+        val result = RuleSyntax.parse(text).rules.asSequence()
+            .filter { it.owner == target || it.owner.startsWith("$target:") }
+            .filterNot { it.thread == null && it.cpus.equals("auto", ignoreCase = true) }
+            .map(RuleSyntax.Rule::canonicalLine)
+            .toList()
         return sortConfigRuleLines(result)
     }
 
@@ -696,29 +691,21 @@ object DaemonBridge {
         if (targets.isEmpty()) return emptyList()
         val targetSet = targets.toSet()
         val targetGroups = targets.map { configGroupName(it) }.toSet()
-        val result = ArrayList<String>()
-        for (raw in text.lineSequence()) {
-            val line = raw.trim()
-            val owner = configLineOwner(line) ?: continue
-            val value = line.substringAfter('=', "").trim()
-            if ((owner in targetSet || configGroupName(owner) in targetGroups) &&
-                !value.equals("auto", ignoreCase = true)) {
-                result.add(line)
-            }
-        }
-        return result
+        return RuleSyntax.parse(text).rules.asSequence()
+            .filter { it.owner in targetSet || configGroupName(it.owner) in targetGroups }
+            .filterNot { it.thread == null && it.cpus.equals("auto", ignoreCase = true) }
+            .map(RuleSyntax.Rule::canonicalLine)
+            .toList()
     }
 
     /** 读取某包名的全部配置行，包括 pkg=auto 占位。 */
     fun readPkgConfigLines(pkg: String): List<String> {
         val text = readConfigRaw()
         if (text.isBlank()) return emptyList()
-        val result = ArrayList<String>()
-        for (raw in text.lineSequence()) {
-            val line = raw.trim()
-            if (lineBelongsToPackage(line, pkg)) result.add(line)
-        }
-        return result
+        return RuleSyntax.parse(text).rules.asSequence()
+            .filter { it.owner == pkg }
+            .map(RuleSyntax.Rule::canonicalLine)
+            .toList()
     }
 
     /** 读取 applist.conf 原始内容；文件不存在视为空，Root/IO 失败返回 null。 */
@@ -738,7 +725,8 @@ object DaemonBridge {
         val content: String,
         val lockedByPendingUpdate: Boolean,
         val path: String,
-        val exists: Boolean
+        val exists: Boolean,
+        val readSuccess: Boolean
     )
 
     /**
@@ -747,26 +735,193 @@ object DaemonBridge {
      * 这时读取待生效文件并锁定 UI，避免用户改完后重启又被更新目录覆盖。
      */
     fun readCalibPolicyRaw(): PolicyFile {
-        val hasPending = runAsRoot("[ -f '$POLICY_UPDATE_FILE' ] && printf 1 || printf 0")
-            .trim() == "1"
-        val path = if (hasPending) POLICY_UPDATE_FILE else POLICY_FILE
-        val exists = runAsRoot("[ -f '$path' ] && printf 1 || printf 0")
-            .trim() == "1"
-        val out = runAsRoot("cat '$path' 2>/dev/null")
-        return PolicyFile(
-            content = if (out.isNotErrored()) out else "",
-            lockedByPendingUpdate = hasPending,
-            path = path,
-            exists = exists
+        val pendingResult = readRootCommandResult(
+            "if [ -f '$POLICY_UPDATE_FILE' ]; then printf 1; " +
+                "elif [ ! -e '$POLICY_UPDATE_FILE' ]; then printf 0; else exit 1; fi"
         )
+        if (!pendingResult.success) {
+            return PolicyFile("", false, POLICY_FILE, exists = false, readSuccess = false)
+        }
+        val hasPending = pendingResult.output.trim() == "1"
+        val path = if (hasPending) POLICY_UPDATE_FILE else POLICY_FILE
+        val existsMarker = "__APPOPT_POLICY_EXISTS_${UUID.randomUUID()}__"
+        val missingMarker = "__APPOPT_POLICY_MISSING_${UUID.randomUUID()}__"
+        val result = readRootCommandResult(
+            "if [ -f '$path' ]; then printf '%s\\n' '$existsMarker'; cat '$path' || exit 1; " +
+                "elif [ ! -e '$path' ]; then printf '%s\\n' '$missingMarker'; else exit 1; fi"
+        )
+        if (!result.success) {
+            return PolicyFile("", hasPending, path, exists = false, readSuccess = false)
+        }
+        val markerEnd = result.output.indexOf('\n')
+        if (markerEnd < 0) {
+            return PolicyFile("", hasPending, path, exists = false, readSuccess = false)
+        }
+        val marker = result.output.substring(0, markerEnd).trimEnd('\r')
+        return when (marker) {
+            existsMarker -> PolicyFile(
+                content = result.output.substring(markerEnd + 1),
+                lockedByPendingUpdate = hasPending,
+                path = path,
+                exists = true,
+                readSuccess = true
+            )
+            missingMarker -> PolicyFile("", hasPending, path, exists = false, readSuccess = true)
+            else -> PolicyFile("", hasPending, path, exists = false, readSuccess = false)
+        }
     }
 
     /** 写入当前生效模块目录的自动校准策略；存在待生效更新时拒绝写入。 */
     fun writeCalibPolicyRaw(content: String): Boolean {
-        val locked = runAsRoot("[ -f '$POLICY_UPDATE_FILE' ] && printf 1 || printf 0")
-            .trim() == "1"
-        if (locked) return false
+        val pendingResult = readRootCommandResult(
+            "if [ -f '$POLICY_UPDATE_FILE' ]; then printf 1; " +
+                "elif [ ! -e '$POLICY_UPDATE_FILE' ]; then printf 0; else exit 1; fi"
+        )
+        if (!pendingResult.success || pendingResult.output.trim() != "0") return false
         return writePolicyFileAsRoot(content)
+    }
+
+    enum class RuleOutputFormatApplyStatus {
+        SUCCESS,
+        INVALID_CONFIG,
+        CONFIG_WRITE_FAILED,
+        POLICY_WRITE_FAILED,
+        ROLLBACK_FAILED
+    }
+
+    data class RuleOutputFormatApplyResult(
+        val status: RuleOutputFormatApplyStatus,
+        val format: CalibPolicy.RuleOutputFormat? = null,
+        val ruleCount: Int = 0,
+        val groupCount: Int = 0,
+        val changed: Boolean = false,
+        val mixed: Boolean = false,
+        val detail: String? = null
+    ) {
+        val success: Boolean
+            get() = status == RuleOutputFormatApplyStatus.SUCCESS
+    }
+
+    /**
+     * 在配置锁内转换现有规则并保存策略。策略写入失败时恢复原始 applist.conf，
+     * 避免现有规则格式与后续 C/Rust 校准生成格式不一致。
+     */
+    fun applyRuleOutputFormat(
+        format: CalibPolicy.RuleOutputFormat,
+        policyContent: String
+    ): RuleOutputFormatApplyResult {
+        val lockFailure = RuleOutputFormatApplyResult(
+            RuleOutputFormatApplyStatus.CONFIG_WRITE_FAILED,
+            detail = "无法获取规则配置锁"
+        )
+        return withConfigMutation(lockFailure) { token ->
+            val raw = readConfigRawForMutation() ?: return@withConfigMutation lockFailure.copy(
+                detail = "读取 applist.conf 失败"
+            )
+            val result = RuleFormatConverter.convert(raw, format)
+            val conversion = result.conversion ?: return@withConfigMutation RuleOutputFormatApplyResult(
+                RuleOutputFormatApplyStatus.INVALID_CONFIG,
+                detail = result.error
+            )
+
+            if (conversion.changed && !writeConfigFileLocked(conversion.content, token)) {
+                return@withConfigMutation RuleOutputFormatApplyResult(
+                    RuleOutputFormatApplyStatus.CONFIG_WRITE_FAILED,
+                    detail = "写入 applist.conf 失败"
+                )
+            }
+
+            if (writeCalibPolicyRaw(policyContent)) {
+                return@withConfigMutation RuleOutputFormatApplyResult(
+                    status = RuleOutputFormatApplyStatus.SUCCESS,
+                    format = format,
+                    ruleCount = conversion.ruleCount,
+                    groupCount = conversion.groupCount,
+                    changed = conversion.changed
+                )
+            }
+
+            val rollbackOk = !conversion.changed || writeConfigFileLocked(raw, token)
+            RuleOutputFormatApplyResult(
+                status = if (rollbackOk) {
+                    RuleOutputFormatApplyStatus.POLICY_WRITE_FAILED
+                } else {
+                    RuleOutputFormatApplyStatus.ROLLBACK_FAILED
+                },
+                ruleCount = conversion.ruleCount,
+                groupCount = conversion.groupCount,
+                changed = conversion.changed,
+                detail = if (rollbackOk) {
+                    "策略保存失败，现有规则已恢复"
+                } else {
+                    "策略保存失败，且现有规则恢复失败"
+                }
+            )
+        }
+    }
+
+    /** App 首次启动时识别现有规则写法，并让校准生成格式跟随该写法。 */
+    fun detectAndApplyRuleOutputFormat(): RuleOutputFormatApplyResult {
+        val lockFailure = RuleOutputFormatApplyResult(
+            RuleOutputFormatApplyStatus.CONFIG_WRITE_FAILED,
+            detail = "无法获取规则配置锁"
+        )
+        return withConfigMutation(lockFailure) { _ ->
+            val raw = readConfigRawForMutation() ?: return@withConfigMutation lockFailure.copy(
+                detail = "读取 applist.conf 失败"
+            )
+            val policyFile = readCalibPolicyRaw()
+            if (!policyFile.readSuccess) {
+                return@withConfigMutation RuleOutputFormatApplyResult(
+                    RuleOutputFormatApplyStatus.POLICY_WRITE_FAILED,
+                    detail = "校准策略文件读取失败，已保留原规则"
+                )
+            }
+            val currentPolicy = if (policyFile.exists) {
+                CalibPolicy.parse(policyFile.content)
+            } else {
+                CalibPolicy.DEFAULT
+            }
+            val detection = RuleFormatConverter.detectFormat(raw)
+                ?: return@withConfigMutation RuleOutputFormatApplyResult(
+                    status = RuleOutputFormatApplyStatus.SUCCESS,
+                    format = currentPolicy.ruleOutputFormat,
+                    ruleCount = RuleSyntax.parse(raw).rules.size
+                )
+            if (detection.format == currentPolicy.ruleOutputFormat) {
+                return@withConfigMutation RuleOutputFormatApplyResult(
+                    status = RuleOutputFormatApplyStatus.SUCCESS,
+                    format = detection.format,
+                    ruleCount = detection.ruleCount,
+                    mixed = detection.mixed
+                )
+            }
+            val updatedPolicyContent = if (policyFile.exists) {
+                updatePolicyValuePreservingText(
+                    policyFile.content,
+                    "rule_output_format",
+                    detection.format.wire
+                )
+            } else {
+                currentPolicy.copy(ruleOutputFormat = detection.format).toConfigText()
+            }
+            if (writeCalibPolicyRaw(updatedPolicyContent)) {
+                RuleOutputFormatApplyResult(
+                    status = RuleOutputFormatApplyStatus.SUCCESS,
+                    format = detection.format,
+                    ruleCount = detection.ruleCount,
+                    changed = true,
+                    mixed = detection.mixed
+                )
+            } else {
+                RuleOutputFormatApplyResult(
+                    status = RuleOutputFormatApplyStatus.POLICY_WRITE_FAILED,
+                    format = currentPolicy.ruleOutputFormat,
+                    ruleCount = detection.ruleCount,
+                    detail = "识别到现有规则格式，但策略保存失败"
+                )
+            }
+        }
     }
 
     /** 把应用追加为 pkg=auto，占位后可在“待校准”里启动采样。 */
@@ -775,13 +930,15 @@ object DaemonBridge {
         if (safe.isBlank() || !RuleConfigLogic.ownerFitsNativeBuffer(safe)) return false
         return withConfigMutation(false) { token ->
             val raw = readConfigRawForMutation() ?: return@withConfigMutation false
-            val blocks = parseConfigBlocks(raw)
+            val document = RuleSyntax.parse(raw)
             val group = configGroupName(safe)
-            if (blocks.any { safe in it.owners || it.group == group }) {
+            if (document.rules.any { it.owner == safe || configGroupName(it.owner) == group } ||
+                document.segments.any { it.ownerHint?.let(::configGroupName) == group }) {
                 return@withConfigMutation true
             }
-            blocks.add(ConfigBlock(group, mutableListOf("$safe=auto"), mutableSetOf(safe)))
-            writeConfigFileLocked(formatConfigBlocks(blocks), token)
+            val prefix = raw.trimEnd()
+            val content = if (prefix.isEmpty()) "$safe=auto\n" else "$prefix\n\n$safe=auto\n"
+            writeConfigFileLocked(content, token)
         }
     }
 
@@ -796,9 +953,21 @@ object DaemonBridge {
             if (raw.isBlank()) return@withConfigMutation true
             val targetSet = targets.toSet()
             val targetGroups = targets.map { configGroupName(it) }.toSet()
-            val kept = parseConfigBlocks(raw)
-                .filterNot { block -> block.group in targetGroups || block.owners.any { it in targetSet } }
-            writeConfigFileLocked(formatConfigBlocks(kept), token)
+            val document = RuleSyntax.parse(raw)
+            val keptLines = document.segments
+                .filterNot { segment ->
+                    val hintedOwner = segment.ownerHint
+                    (hintedOwner != null &&
+                        (hintedOwner in targetSet || configGroupName(hintedOwner) in targetGroups)) ||
+                        segment.rules.any {
+                            it.owner in targetSet || configGroupName(it.owner) in targetGroups
+                        }
+                }
+                .flatMap(RuleSyntax.Segment::rawLines)
+            val content = keptLines.joinToString("\n").trimEnd().let {
+                if (it.isEmpty()) "" else "$it\n"
+            }
+            writeConfigFileLocked(content, token)
         }
     }
 
@@ -835,18 +1004,22 @@ object DaemonBridge {
         val foreign = ArrayList<String>()
         val invalidCore = ArrayList<String>()
 
-        for (line in editedText.lineSequence().map { it.trim() }) {
-            if (line.isEmpty() || line.startsWith("#")) continue
-            val identity = parseConfigRuleIdentity(line)
-            val owner = identity?.owner
-            val value = line.substringAfter("=", "").trim()
-            if (identity == null || owner == null || value.isEmpty() ||
-                !RuleConfigLogic.ownerFitsNativeBuffer(owner) ||
-                (identity.thread != null && !RuleConfigLogic.threadFitsNativeBuffer(identity.thread))) {
+        val document = RuleSyntax.parse(editedText)
+        document.segments.asSequence()
+            .filterNot(RuleSyntax.Segment::valid)
+            .map { it.rawLines.joinToString("\n").trim() }
+            .filter(String::isNotEmpty)
+            .forEach(invalid::add)
+
+        for (rule in document.rules) {
+            val line = rule.canonicalLine
+            val owner = rule.owner
+            if (!RuleConfigLogic.ownerFitsNativeBuffer(owner) ||
+                (rule.thread != null && !RuleConfigLogic.threadFitsNativeBuffer(rule.thread))) {
                 invalid.add(line)
                 continue
             }
-            val cpus = parseConfigRuleCpusStrict(value)
+            val cpus = parseConfigRuleCpusStrict(rule.cpus)
             if (cpus == null || (allowedCpus != null && !allowedCpus.containsAll(cpus))) {
                 invalidCore.add(line)
                 continue
@@ -874,8 +1047,8 @@ object DaemonBridge {
     }
 
     /**
-     * 按打开编辑器时的规则序号替换当前应用规则，保留原文件中的注释、空行和规则顺序。
-     * 写入前会核对原始规则快照，避免覆盖其他进程在编辑期间产生的修改。
+     * 按打开编辑器时的规则序号替换当前应用规则，保留原文件中的注释和应用顺序。
+     * 写入前会核对原始规则快照，最后按校准策略选择的格式统一写回。
      */
     fun replaceConfigRulesPreservingLayout(
         pkgs: Collection<String>,
@@ -908,34 +1081,40 @@ object DaemonBridge {
             val targetSet = targets.toSet()
             val targetGroups = targets.map { configGroupName(it) }.toSet()
 
-            fun isEditableTargetRule(rawLine: String): Boolean {
-                val line = rawLine.trim()
-                val owner = configLineOwner(line) ?: return false
-                val value = line.substringAfter('=', "").trim()
-                return !value.equals("auto", ignoreCase = true) &&
-                    (owner in targetSet || configGroupName(owner) in targetGroups)
+            fun isEditableTargetRule(rule: RuleSyntax.Rule): Boolean {
+                return !(rule.thread == null && rule.cpus.equals("auto", ignoreCase = true)) &&
+                    (rule.owner in targetSet || configGroupName(rule.owner) in targetGroups)
             }
 
-            val rawLines = raw.lineSequence().toList()
-            val currentOriginalLines = rawLines.asSequence()
+            val document = RuleSyntax.parse(raw)
+            val currentOriginalLines = document.rules.asSequence()
                 .filter(::isEditableTargetRule)
-                .map(String::trim)
+                .map(RuleSyntax.Rule::canonicalLine)
                 .toList()
             if (currentOriginalLines != expectedOriginalLines.map(String::trim)) {
                 return@withConfigMutation ConfigReplaceResult.SOURCE_CHANGED
             }
 
-            val output = ArrayList<String>(rawLines.size + addedLines.size)
+            val output = ArrayList<String>()
             var sourceIndex = 0
             var additionsInserted = false
-            for (rawLine in rawLines) {
-                if (!isEditableTargetRule(rawLine)) {
-                    output.add(rawLine)
+            for (segment in document.segments) {
+                val editableRules = segment.rules.filter(::isEditableTargetRule)
+                if (editableRules.isEmpty()) {
+                    output.addAll(segment.rawLines)
                     continue
                 }
 
-                replacements[sourceIndex]?.let(output::add)
-                sourceIndex++
+                // 先保留区块及规则旁的注释，再展开成统一规则；写入前会重新转换为用户选择的格式。
+                output.addAll(RuleFormatConverter.preservedTrivia(segment.rawLines))
+                for (rule in segment.rules) {
+                    if (isEditableTargetRule(rule)) {
+                        replacements[sourceIndex]?.let(output::add)
+                        sourceIndex++
+                    } else {
+                        output.add(rule.canonicalLine)
+                    }
+                }
                 if (sourceIndex == expectedOriginalLines.size && !additionsInserted) {
                     output.addAll(addedLines)
                     additionsInserted = true
@@ -946,71 +1125,24 @@ object DaemonBridge {
             }
             if (!additionsInserted) output.addAll(addedLines)
 
-            val content = output.joinToString("\n").trimEnd() + "\n"
-            if (writeConfigFileLocked(content, token)) {
+            val expandedContent = output.joinToString("\n").trimEnd() + "\n"
+            val policyFile = readCalibPolicyRaw()
+            if (!policyFile.readSuccess) {
+                return@withConfigMutation ConfigReplaceResult.WRITE_FAILED
+            }
+            val outputFormat = if (policyFile.exists) {
+                CalibPolicy.parse(policyFile.content).ruleOutputFormat
+            } else {
+                CalibPolicy.DEFAULT.ruleOutputFormat
+            }
+            val formatted = RuleFormatConverter.convert(expandedContent, outputFormat).conversion
+                ?: return@withConfigMutation ConfigReplaceResult.INVALID
+            if (writeConfigFileLocked(formatted.content, token)) {
                 ConfigReplaceResult.SUCCESS
             } else {
                 ConfigReplaceResult.WRITE_FAILED
             }
         }
-    }
-
-    private data class ConfigBlock(
-        val group: String,
-        val lines: MutableList<String>,
-        val owners: MutableSet<String>
-    )
-
-    /**
-     * 把 applist.conf 规整成“同一应用一块, 不同应用之间空一行”。
-     *
-     * 这样无论原文件尾部有没有换行, 添加/删除配置都不会把两个应用挤在一起,
-     * 也不会因为重复操作不断累积多余空行。
-     */
-    private fun parseConfigBlocks(text: String): MutableList<ConfigBlock> {
-        val blocks = mutableListOf<ConfigBlock>()
-        val pendingComments = mutableListOf<String>()
-        var current: ConfigBlock? = null
-
-        for (raw in text.lineSequence()) {
-            val line = raw.trim()
-            if (line.isEmpty()) continue
-            val owner = configLineOwner(line)
-            if (owner == null) {
-                pendingComments.add(line)
-                continue
-            }
-
-            val group = configGroupName(owner)
-            val block = if (current?.group == group) {
-                current!!
-            } else {
-                ConfigBlock(group, mutableListOf(), mutableSetOf()).also {
-                    blocks.add(it)
-                    current = it
-                }
-            }
-            if (pendingComments.isNotEmpty()) {
-                block.lines.addAll(pendingComments)
-                pendingComments.clear()
-            }
-            block.lines.add(line)
-            block.owners.add(owner)
-        }
-
-        if (pendingComments.isNotEmpty()) {
-            val block = current ?: ConfigBlock("", mutableListOf(), mutableSetOf()).also { blocks.add(it) }
-            block.lines.addAll(pendingComments)
-        }
-        return blocks
-    }
-
-    private fun formatConfigBlocks(blocks: List<ConfigBlock>): String {
-        val text = blocks
-            .map { block -> block.lines.joinToString("\n") }
-            .filter { it.isNotBlank() }
-            .joinToString("\n\n")
-        return if (text.isBlank()) "" else "$text\n"
     }
 
     internal fun sortConfigRuleLines(lines: List<String>): List<String> {
@@ -1070,60 +1202,24 @@ object DaemonBridge {
         return RuleConfigLogic.parseCpuRangeList(text).orEmpty()
     }
 
-    private fun configLineOwner(rawLine: String): String? {
-        val line = rawLine.trim()
-        if (line.isEmpty() || line.startsWith("#")) return null
-        val eq = line.indexOf('=')
-        if (eq <= 0) return null
-        var key = line.substring(0, eq).trim()
-        val brace = key.indexOf('{')
-        if (brace >= 0) key = key.substring(0, brace).trim()
-        return key.ifBlank { null }
-    }
-
-    private data class ConfigRuleIdentity(val owner: String, val thread: String?)
-
-    private fun parseConfigRuleIdentity(rawLine: String): ConfigRuleIdentity? {
-        val line = rawLine.trim()
-        if (line.isEmpty() || line.startsWith("#")) return null
-        val eq = line.indexOf('=')
-        if (eq <= 0) return null
-        val key = line.substring(0, eq).trim()
-        if (key.isEmpty()) return null
-
-        val open = key.indexOf('{')
-        if (open < 0) {
-            if (key.contains('}')) return null
-            return ConfigRuleIdentity(key, null)
-        }
-        if (open == 0 || !key.endsWith('}') || key.indexOf('{', open + 1) >= 0) return null
-        val close = key.indexOf('}', open + 1)
-        if (close != key.lastIndex) return null
-
-        val owner = key.substring(0, open).trim()
-        val thread = key.substring(open + 1, close).trim()
-        if (owner.isEmpty() || thread.isEmpty()) return null
-        return ConfigRuleIdentity(owner, thread)
-    }
-
     private fun configGroupName(pkg: String): String {
         val base = pkg.substringBefore(':')
         return if (base != pkg && base.contains('.')) base else pkg
     }
 
-    /**
-     * 判断 applist.conf 的一行是否属于指定包名/进程名。
-     * 支持 pkg=...、pkg{thread}=... 和 pkg:child=...; 注释行和空行不会匹配。
-     */
-    private fun lineBelongsToPackage(rawLine: String, pkg: String): Boolean {
-        val line = rawLine.trim()
-        if (line.isEmpty() || line.startsWith("#")) return false
-        val eq = line.indexOf('=')
-        if (eq <= 0) return false
-        var key = line.substring(0, eq).trim()
-        val brace = key.indexOf('{')
-        if (brace >= 0) key = key.substring(0, brace).trim()
-        return key == pkg
+    internal fun updatePolicyValuePreservingText(raw: String, key: String, value: String): String {
+        val pattern = Regex(
+            "(?m)^([ \\t]*${Regex.escape(key)}[ \\t]*=[ \\t]*)" +
+                "[^#\\r\\n]*?([ \\t]*(?:#.*)?)(\\r?)$"
+        )
+        var found = false
+        val updated = pattern.replace(raw) { match ->
+            found = true
+            match.groupValues[1] + value + match.groupValues[2] + match.groupValues[3]
+        }
+        if (found) return updated
+        val separator = if (updated.isEmpty() || updated.endsWith('\n')) "" else "\n"
+        return "$updated$separator$key=$value\n"
     }
 
     private const val HISTORY_IMPORT_SUFFIX = ".appopt-importing"

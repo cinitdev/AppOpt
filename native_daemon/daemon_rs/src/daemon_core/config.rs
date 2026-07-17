@@ -24,28 +24,21 @@ fn parse_config_with_key(path: &Path) -> io::Result<(Vec<Rule>, FileKey)> {
 fn parse_config_text(text: &str) -> Vec<Rule> {
     let mut rules = Vec::new();
 
-    for raw in text.lines() {
-        let line = raw.trim();
-        // 配置文件里保留原作者规则注释；daemon 只解析有效规则行，不改写这里的格式。
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((left, right)) = line.split_once('=') else {
-            continue;
-        };
-
-        let left = left.trim();
-        let cpus = right.trim();
-        if cpus.is_empty() {
-            continue;
-        }
-
-        if !cpus.eq_ignore_ascii_case("auto") && CpuMask::parse(cpus).is_none() {
-            continue;
-        }
-
-        if let Some(rule) = parse_rule_key(left, cpus) {
-            rules.push(rule);
+    for group in rule_syntax::parse_config_groups(text) {
+        let expected_count = group.rules.len();
+        let parsed: Vec<Rule> = group
+            .rules
+            .into_iter()
+            .filter_map(|canonical| {
+                let cpus = canonical.cpus.as_str();
+                if !cpus.eq_ignore_ascii_case("auto") && CpuMask::parse(cpus).is_none() {
+                    return None;
+                }
+                parse_rule_key(&canonical.key, cpus).filter(|rule| !(rule.auto && rule.thread.is_some()))
+            })
+            .collect();
+        if !group.block || parsed.len() == expected_count {
+            rules.extend(parsed);
         }
     }
 

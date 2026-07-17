@@ -12,6 +12,7 @@ data class CalibPolicy(
     val midCores: String = DEFAULT_MID_CORES,
     val maxThreadRules: Int = 6,
     val wildcardGroup: WildcardGroup = WildcardGroup.MAX_MEMBER,
+    val ruleOutputFormat: RuleOutputFormat = RuleOutputFormat.LEGACY,
     val fallbackCores: String = DEFAULT_FALLBACK_CORES,
     val detectedTopologyBlock: String = ""
 ) {
@@ -23,6 +24,23 @@ data class CalibPolicy(
             fun fromWire(value: String): WildcardGroup {
                 return values().firstOrNull { it.wire.equals(value.trim(), ignoreCase = true) }
                     ?: MAX_MEMBER
+            }
+        }
+    }
+
+    enum class RuleOutputFormat(val wire: String) {
+        LEGACY("legacy"),
+        AUTHOR_BLOCK("author_block"),
+        COMPACT_HEADER_BLOCK("compact_header_block"),
+        SEPARATE_FALLBACK_BLOCK("separate_fallback_block"),
+        COMPACT_SEPARATE_FALLBACK_BLOCK("compact_separate_fallback_block"),
+        EXTENDED_BLOCK("extended_block"),
+        COMPACT_EXTENDED_BLOCK("compact_extended_block");
+
+        companion object {
+            fun fromWire(value: String): RuleOutputFormat {
+                return values().firstOrNull { it.wire.equals(value.trim(), ignoreCase = true) }
+                    ?: LEGACY
             }
         }
     }
@@ -65,6 +83,7 @@ data class CalibPolicy(
             appendLine("group_high=avg:${fmt(p.highAvg)},max:${fmt(p.highMax)},cores:${p.highCores}")
             appendLine("group_mid=avg:${fmt(p.midAvg)},max:${fmt(p.midMax)},cores:${p.midCores}")
             appendLine("wildcard_group=${p.wildcardGroup.wire}")
+            appendLine("rule_output_format=${p.ruleOutputFormat.wire}")
             appendLine("max_thread_rules=${p.maxThreadRules}")
             appendLine("fallback=cores:${p.fallbackCores}")
             if (p.detectedTopologyBlock.isNotBlank()) {
@@ -135,6 +154,9 @@ data class CalibPolicy(
                     }
                     "wildcard_group" -> {
                         policy = policy.copy(wildcardGroup = WildcardGroup.fromWire(value))
+                    }
+                    "rule_output_format" -> {
+                        policy = policy.copy(ruleOutputFormat = RuleOutputFormat.fromWire(value))
                     }
                     "max_thread_rules" -> {
                         policy = policy.copy(maxThreadRules = value.toIntOrNull() ?: policy.maxThreadRules)

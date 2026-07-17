@@ -33,27 +33,16 @@ object ConfigReader {
         val configured = LinkedHashSet<String>()
         val configuredRuleCounts = LinkedHashMap<String, Int>()
         val ruleHealthKeys = LinkedHashSet<String>()
-        for (rawLine in text.lineSequence()) {
-            val line = rawLine.trim()
-            if (line.isEmpty() || line.startsWith("#")) continue
-            val eq = line.indexOf('=')
-            if (eq <= 0) continue
-            val value = line.substring(eq + 1).trim()
-            // 等号左侧形如 pkg 或 pkg{Thread}; 取 '{' 之前作为包名
-            val left = line.substring(0, eq).trim()
-            val brace = left.indexOf('{')
-            val key = if (brace >= 0) left.substring(0, brace).trim() else left
-            if (key.isEmpty()) continue
-            if (value.equals("auto", ignoreCase = true)) {
-                auto.add(key)
+        for (rule in RuleSyntax.parse(text).rules) {
+            if (rule.thread != null && rule.cpus.equals("auto", ignoreCase = true)) continue
+            val key = rule.owner
+            if (rule.thread == null && rule.cpus.equals("auto", ignoreCase = true)) {
+                auto.add(rule.owner)
             } else {
                 configured.add(key)
                 configuredRuleCounts[key] = (configuredRuleCounts[key] ?: 0) + 1
-                val healthKey = if (brace >= 0) {
-                    val close = left.lastIndexOf('}')
-                    val target = if (close > brace) left.substring(brace + 1, close).trim() else ""
-                    target.takeIf { it.isNotEmpty() }
-                        ?.let { DaemonBridge.ruleHealthKey("T", key, it) }
+                val healthKey = if (rule.thread != null) {
+                    DaemonBridge.ruleHealthKey("T", key, rule.thread)
                 } else if (key.contains(':')) {
                     DaemonBridge.ruleHealthKey("P", key, null)
                 } else {

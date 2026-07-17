@@ -6,6 +6,8 @@ mod fps;
 // daemon_core 里的文件是按功能拆出来的，但仍通过 include! 保持在同一个 crate 根作用域。
 // 这么做是低风险拆分：不需要把大量私有函数改成 pub(crate)，也不会因为模块边界改变行为。
 include!("daemon_core/preamble.rs");
+#[path = "daemon_core/rule_syntax.rs"]
+mod rule_syntax;
 include!("daemon_core/entry.rs");
 include!("daemon_core/loop.rs");
 include!("daemon_core/cli.rs");

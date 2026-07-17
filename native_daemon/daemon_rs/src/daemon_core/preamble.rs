@@ -25,7 +25,7 @@ use std::os::unix::fs::MetadataExt;
 // 3. 找到目标进程后缓存 PID，后续优先只扫描这些 PID 的 task 目录。
 // 4. 写 affinity 前先读当前 Cpus_allowed_list，相同则跳过，避免重复抢系统调度配置。
 // 5. 写入后再读回一次，用于发现移植系统/厂商服务把线程绑核抢写回去的情况。
-const VERSION: &str = "1.7.7";
+const VERSION: &str = "1.7.8";
 const DEFAULT_CONFIG: &str = "/data/adb/modules/AppOpt/config/applist.conf";
 const DEFAULT_UID_MAP: &str = "/data/adb/modules/AppOpt/config/package_uid.map";
 const RULE_HEALTH_FILE: &str = "/data/adb/modules/AppOpt/config/rule_health.tsv";

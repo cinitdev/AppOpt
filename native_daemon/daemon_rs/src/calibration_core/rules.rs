@@ -170,7 +170,7 @@ fn generate_rules(pkg: &str, records: &[LoadRecord]) -> Vec<String> {
         &mut used,
         format!("{pkg}={}", policy.fallback_cores),
     );
-    rules
+    format_generated_rules(pkg, rules, policy.rule_output_format)
 }
 
 fn process_preview(processes: &[ProcInfo], limit: usize) -> String {

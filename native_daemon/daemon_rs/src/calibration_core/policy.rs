@@ -5,6 +5,7 @@
 // - group_high: avg/max/cores
 // - group_mid: avg/max/cores
 // - max_thread_rules
+// - rule_output_format: 旧版单行或六种区块生成格式
 // - fallback
 //
 // 如果配置缺失或写 auto，就回到 CPU 拓扑自动推导。这里不要因为一行策略写错而中止校准，
@@ -20,6 +21,7 @@ struct CalibPolicy {
     mid_max: f64,
     mid_cores: String,
     max_thread_rules: usize,
+    rule_output_format: RuleOutputFormat,
     fallback_cores: String,
 }
 
@@ -108,6 +110,10 @@ pub(crate) fn print_version_diagnostics(version: &str) {
         policy.max_thread_rules
     );
     println!(
+        "[校准策略] rule_output_format: {}; 只改变规则写回格式, 不改变绑核效果",
+        policy.rule_output_format.wire()
+    );
+    println!(
         "[校准策略] fallback: 没有单独线程规则的线程使用包名兜底; 档位=非最高性能核心; 核心={} ({})",
         policy.fallback_cores,
         fallback_core_source(policy_text.as_deref(), &topo)
@@ -155,6 +161,9 @@ fn parse_policy_for_diagnostics(topo: &CpuTiers, text: &str) -> CalibPolicy {
                         policy.max_thread_rules = max;
                     }
                 }
+            }
+            "rule_output_format" => {
+                policy.rule_output_format = RuleOutputFormat::from_wire(value);
             }
             "fallback" => {
                 if let Some(cores) = policy_cores(value, topo.cpu_count)
@@ -255,6 +264,7 @@ impl CalibPolicy {
             mid_max: 18.0,
             mid_cores: topo.mid.clone(),
             max_thread_rules: MAX_THREAD_RULES,
+            rule_output_format: RuleOutputFormat::Legacy,
             fallback_cores: topo.fallback.clone(),
         }
     }
@@ -306,6 +316,9 @@ impl CalibPolicy {
                         }
                     }
                 }
+                "rule_output_format" => {
+                    policy.rule_output_format = RuleOutputFormat::from_wire(value);
+                }
                 "fallback" => {
                     if let Some(cores) = policy_cores(value, topo.cpu_count)
                         .or_else(|| normalize_core_range(value, topo.cpu_count))
@@ -318,7 +331,7 @@ impl CalibPolicy {
         }
 
         println!(
-            "[CALIB] 校准策略: 最重线程 avg>={:.1} max>={:.1} 核心={} 高负载 avg>={:.1} max>={:.1} 核心={} 中负载 avg>={:.1} max>={:.1} 核心={} 线程规则上限={} 兜底={}",
+            "[CALIB] 校准策略: 最重线程 avg>={:.1} max>={:.1} 核心={} 高负载 avg>={:.1} max>={:.1} 核心={} 中负载 avg>={:.1} max>={:.1} 核心={} 线程规则上限={} 生成格式={} 兜底={}",
             policy.best_avg,
             policy.best_max,
             policy.best_cores,
@@ -329,6 +342,7 @@ impl CalibPolicy {
             policy.mid_max,
             policy.mid_cores,
             policy.max_thread_rules,
+            policy.rule_output_format.wire(),
             policy.fallback_cores
         );
         policy

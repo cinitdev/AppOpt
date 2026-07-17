@@ -356,99 +356,10 @@ add_default_rules() {
 		ui_print "- 线程规则配置：已从旧路径迁移"
 		return
 	fi
-
-# format_cpu_ranges函数用法：
-# $(format_cpu_ranges "$e_core")           表示最低频性能簇
-# $(format_cpu_ranges "$p_core")           表示中间性能簇
-# $(format_cpu_ranges "$hp_core")          表示最高频/Prime 性能簇
-# 也可以组合一起用：
-# $(format_cpu_ranges "$e_core $p_core")  为非最高性能簇
-# $(format_cpu_ranges "$p_core $hp_core") 为主性能簇与最高性能簇
-common_rules="
-# 将 '微信' 渲染线程与主线程绑定到中大核
-com.tencent.mm=$(format_cpu_ranges "$e_core $p_core")
-com.tencent.mm{RenderThread}=$(format_cpu_ranges "$hp_core")
-com.tencent.mm{com.tencent.mm}=$(format_cpu_ranges "$p_core $hp_core")
-
-# 将 '微信' 消息推送进程绑定到小核
-com.tencent.mm:push=$(format_cpu_ranges "$e_core")
-
-# 将 'QQ' 主线程与渲染线程绑定到中大核
-com.tencent.mobileqq{encent.mobileqq}=$(format_cpu_ranges "$p_core $hp_core")
-com.tencent.mobileqq{RenderThread}=$(format_cpu_ranges "$hp_core")
-
-# 将 'QQ' 消息推送进程绑定到小核
-com.tencent.mobileqq:MSF=$(format_cpu_ranges "$e_core")
-
-# 将 '淘宝' 主线程绑定到大核
-com.taobao.taobao{m.taobao.taobao}=$(format_cpu_ranges "$hp_core")
-com.taobao.taobao{RenderThread}=$(format_cpu_ranges "$p_core $hp_core")
-
-# 将 '酷安' 渲染线程绑定到大核
-com.coolapk.market{RenderThread}=$(format_cpu_ranges "$hp_core")
-com.coolapk.market{.coolapk.market}=$(format_cpu_ranges "$p_core $hp_core")
-
-# 将 '抖音' 关键线程绑定到中大核
-com.ss.android.ugc.aweme{main}=$(format_cpu_ranges "$hp_core")
-com.ss.android.ugc.aweme{RenderThread}=$(format_cpu_ranges "$hp_core")
-com.ss.android.ugc.aweme{droid.ugc.aweme}=$(format_cpu_ranges "$p_core $hp_core")
-
-# 将 '支付宝' 渲染线程、主线程与扫一扫线程绑定到中大核
-com.eg.android.AlipayGphone{RenderThread}=$(format_cpu_ranges "$hp_core")
-com.eg.android.AlipayGphone{id.AlipayGphone}=$(format_cpu_ranges "$p_core $hp_core")
-com.eg.android.AlipayGphone{ScanRecognize}=$(format_cpu_ranges "$hp_core")
-
-# 将 '高德地图' 渲染线程与主线程绑定到中大核
-com.autonavi.minimap{RenderThread}=$(format_cpu_ranges "$hp_core")
-com.autonavi.minimap{utonavi.minimap}=$(format_cpu_ranges "$p_core $hp_core")
-
-# 将 'Android图形显示组件'渲染引擎线程绑定到大核
-surfaceflinger{RenderEngine}=$(format_cpu_ranges "$hp_core")
-
-# 允许 'Android图形显示组件' 使用所有CPU核心$all_core
-surfaceflinger=$all_core
-
-# 将 '系统界面' 渲染引擎线程与主线程绑定到中大核
-com.android.systemui{RenderThread}=$(format_cpu_ranges "$hp_core")
-com.android.systemui{ndroid.systemui}=$(format_cpu_ranges "$p_core $hp_core")
-"
-game_rules="
-# 将 '和平精英' 主线程绑定到中大核
-com.tencent.tmgp.pubgmhd{Thread-[0-9]?}=$(format_cpu_ranges "$hp_core")
-com.tencent.tmgp.pubgmhd{Thread-?}=$(format_cpu_ranges "$hp_core")
-com.tencent.tmgp.pubgmhd{RenderThread*}=$(format_cpu_ranges "$p_core $hp_core")
-com.tencent.tmgp.pubgmhd{RHIThread}=$(format_cpu_ranges "$e_core $p_core")
-com.tencent.tmgp.pubgmhd=$(format_cpu_ranges "$e_core $p_core")
-
-# 将 '蛋仔派对' 主线程绑定到大核
-com.netease.party{MainThread}=$(format_cpu_ranges "$hp_core")
-com.netease.party{Compute*}=$(format_cpu_ranges "$p_core $hp_core")
-com.netease.party=$(format_cpu_ranges "$e_core $p_core")
-
-# 将 '原神' Unity引擎线程绑定到中大核
-com.miHoYo.Yuanshen{UnityMain}=$(format_cpu_ranges "$hp_core")
-com.miHoYo.Yuanshen{UnityGfx*}=$(format_cpu_ranges "$p_core $hp_core")
-com.miHoYo.Yuanshen=$(format_cpu_ranges "$e_core $p_core")
-
-# '三角洲行动' 主线程绑定到大核
-com.tencent.tmgp.dfm{GameThread}=$(format_cpu_ranges "$hp_core")
-com.tencent.tmgp.dfm{Thread*}=$(format_cpu_ranges "$p_core $hp_core")
-com.tencent.tmgp.dfm{TaskGraphNP*}=$(format_cpu_ranges "$p_core $hp_core")
-com.tencent.tmgp.dfm{AudioTrack}=$(format_cpu_ranges "$e_core")
-com.tencent.tmgp.dfm=$(format_cpu_ranges "$e_core $p_core")
-
-# '金铲铲' Unity线程绑定到大核
-com.tencent.jkchess{UnityMain}=$(format_cpu_ranges "$hp_core")
-com.tencent.jkchess{UnityGfx*}=$(format_cpu_ranges "$p_core $hp_core")
-com.tencent.jkchess=$(format_cpu_ranges "$e_core $p_core")
-
-# '第五人格' 主线程绑定到大核
-com.netease.dwrg{Thread-*}=$(format_cpu_ranges "$p_core $hp_core")
-com.netease.dwrg{NativeThread}=$(format_cpu_ranges "$p_core $hp_core")
-com.netease.dwrg=$(format_cpu_ranges "$e_core $p_core")
-"
-	echo "$common_rules" >> "$CONFIG_FILE"
-	echo "$game_rules" >> "$CONFIG_FILE"
+	[ -f "$MODPATH/rules.sh" ] || abort "! 找不到默认规则文件 rules.sh"
+	APPOPT_RULES_FILE="$CONFIG_FILE"
+	. "$MODPATH/rules.sh"
+	unset APPOPT_RULES_FILE
 	ui_print "- 已生成默认线程规则配置"
 }
 prepare_calib_policy() {
@@ -482,6 +393,7 @@ best_thread=avg:18,max:30,cores:$BEST_CORES
 group_high=avg:13,max:22,cores:$HIGH_CORES
 group_mid=avg:8,max:18,cores:$MID_CORES
 wildcard_group=max_member
+rule_output_format=legacy
 max_thread_rules=6
 fallback=cores:$FALLBACK_CORES
 EOF
@@ -494,6 +406,7 @@ extract_bin
 remove_sys_perf_config
 module_instructions
 add_default_rules
+rm -f "$MODPATH/rules.sh"
 prepare_calib_policy
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOpt $MODPATH/config/bin/AppOptRs" 0 2000 0755 0755 u:object_r:magisk_file:s0

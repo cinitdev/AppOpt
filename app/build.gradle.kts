@@ -11,8 +11,8 @@ android {
         applicationId = "top.suto.appopt"
         minSdk = 31
         targetSdk = 36
-        versionCode = 177
-        versionName = "v1.7.7"
+        versionCode = 178
+        versionName = "v1.7.8"
     }
 
     signingConfigs {

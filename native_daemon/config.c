@@ -1,3 +1,218 @@
+typedef struct {
+    char* owner;
+    char* thread;
+    char* cpus;
+} ParsedConfigRule;
+
+static void free_parsed_config_rules(ParsedConfigRule* rules, size_t count) {
+    if (!rules) return;
+    for (size_t i = 0; i < count; i++) {
+        free(rules[i].owner);
+        free(rules[i].thread);
+        free(rules[i].cpus);
+    }
+    free(rules);
+}
+
+static int add_parsed_config_rule(
+    ParsedConfigRule** rules,
+    size_t* count,
+    const char* owner,
+    const char* thread,
+    const char* cpus
+) {
+    ParsedConfigRule* resized = realloc(*rules, (*count + 1) * sizeof(**rules));
+    if (!resized) return -1;
+    *rules = resized;
+    ParsedConfigRule* rule = &resized[*count];
+    memset(rule, 0, sizeof(*rule));
+    rule->owner = strdup(owner);
+    rule->thread = strdup(thread ? thread : "");
+    rule->cpus = strdup(cpus);
+    if (!rule->owner || !rule->thread || !rule->cpus) {
+        free(rule->owner);
+        free(rule->thread);
+        free(rule->cpus);
+        memset(rule, 0, sizeof(*rule));
+        return -1;
+    }
+    (*count)++;
+    return 0;
+}
+
+static int add_unique_config_name(char*** names, size_t* count, const char* name) {
+    for (size_t i = 0; i < *count; i++) {
+        if (strcmp((*names)[i], name) == 0) return 0;
+    }
+    char** resized = realloc(*names, (*count + 1) * sizeof(**names));
+    if (!resized) return -1;
+    *names = resized;
+    resized[*count] = strdup(name);
+    if (!resized[*count]) return -1;
+    (*count)++;
+    return 0;
+}
+
+static bool parsed_config_rule_valid(const ParsedConfigRule* rule) {
+    if (!rule || !rule->owner || !rule->thread || !rule->cpus ||
+        !rule->owner[0] || strlen(rule->owner) >= MAX_PKG_LEN ||
+        strlen(rule->thread) >= MAX_THREAD_LEN) {
+        return false;
+    }
+    if (!rule->thread[0] && strcasecmp(rule->cpus, "auto") == 0) return true;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    return parse_cpu_ranges_strict(rule->cpus, &set, NULL);
+}
+
+/* 返回 0 表示成功，1 表示规则无效，-1 表示内存不足。 */
+static int append_config_rule(
+    AppConfig* cfg,
+    AffinityRule** rules,
+    size_t* rules_count,
+    char*** packages,
+    size_t* package_count,
+    char*** auto_packages,
+    size_t* auto_count,
+    const ParsedConfigRule* parsed
+) {
+    if (!parsed_config_rule_valid(parsed)) return 1;
+
+    if (!parsed->thread[0] && strcasecmp(parsed->cpus, "auto") == 0) {
+        if (add_unique_config_name(auto_packages, auto_count, parsed->owner) < 0 ||
+            add_unique_config_name(packages, package_count, parsed->owner) < 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (!parse_cpu_ranges_strict(parsed->cpus, &set, NULL)) return 1;
+
+    cpu_set_t effective_set;
+    CPU_AND(&effective_set, &set, &cfg->topo.present_cpus);
+    char* dir_name = CPU_COUNT(&effective_set) > 0 ? cpu_set_to_str(&effective_set) : NULL;
+    if (CPU_COUNT(&effective_set) > 0 && !dir_name) return -1;
+
+    AffinityRule rule = {0};
+    build_str(rule.pkg, sizeof(rule.pkg), parsed->owner, NULL);
+    build_str(rule.thread, sizeof(rule.thread), parsed->thread, NULL);
+    if (cfg->topo.cpuset_enabled && dir_name) {
+        char path[256];
+        build_str(path, sizeof(path), BASE_CPUSET, "/", dir_name, NULL);
+        if (create_cpuset_dir(path, dir_name, cfg->topo.mems_str)) {
+            build_str(rule.cpuset_dir, sizeof(rule.cpuset_dir), dir_name, NULL);
+        } else {
+            printf("cpuset 创建失败，规则降级为仅 sched_setaffinity: %s{%s}=%s\n",
+                   parsed->owner, parsed->thread, dir_name);
+            cfg->topo.cpuset_enabled = false;
+        }
+    }
+    rule.cpus = set;
+    free(dir_name);
+
+    AffinityRule* resized = realloc(*rules, (*rules_count + 1) * sizeof(**rules));
+    if (!resized) return -1;
+    *rules = resized;
+    memcpy(&resized[*rules_count], &rule, sizeof(rule));
+    (*rules_count)++;
+    return add_unique_config_name(packages, package_count, parsed->owner) < 0 ? -1 : 0;
+}
+
+static bool parse_legacy_config_rule(char* line, ParsedConfigRule* parsed) {
+    char* eq = strchr(line, '=');
+    if (!eq) return false;
+    *eq++ = '\0';
+
+    char* thread = "";
+    char* open = strchr(line, '{');
+    if (open) {
+        *open++ = '\0';
+        char* close = strchr(open, '}');
+        if (!close) return false;
+        *close = '\0';
+        if (strchr(open, '{') || strtrim(close + 1)[0]) return false;
+        thread = strtrim(open);
+        if (!thread[0]) return false;
+    } else if (strchr(line, '}')) {
+        return false;
+    }
+
+    parsed->owner = strtrim(line);
+    parsed->thread = thread;
+    parsed->cpus = strtrim(eq);
+    return parsed->owner[0] && parsed->cpus[0];
+}
+
+static bool config_block_header(
+    char* line,
+    char** owner,
+    char** fallback_cpus
+) {
+    char* open = strchr(line, '{');
+    if (!open || open == line || strtrim(open + 1)[0]) return false;
+    *open = '\0';
+    char* prefix = strtrim(line);
+    if (!prefix[0] || strchr(prefix, '{') || strchr(prefix, '}')) return false;
+
+    char* eq = strchr(prefix, '=');
+    if (eq) {
+        *eq++ = '\0';
+        *fallback_cpus = strtrim(eq);
+    } else {
+        *fallback_cpus = NULL;
+    }
+    *owner = strtrim(prefix);
+    return true;
+}
+
+/* 返回 1 表示结束行，0 表示普通内容，-1 表示形似结束行但格式错误。 */
+static int config_block_close(char* line, char** fallback_cpus) {
+    if (line[0] != '}') return 0;
+    char* tail = strtrim(line + 1);
+    if (!tail[0]) {
+        *fallback_cpus = NULL;
+        return 1;
+    }
+    if (*tail != '=') return -1;
+    tail = strtrim(tail + 1);
+    if (!tail[0] || strchr(tail, '=')) return -1;
+    *fallback_cpus = tail;
+    return 1;
+}
+
+static int add_config_block_body_rule(
+    ParsedConfigRule** rules,
+    size_t* count,
+    const char* block_owner,
+    char* line
+) {
+    char* eq = strchr(line, '=');
+    if (!eq) return 1;
+    *eq++ = '\0';
+    char* name = strtrim(line);
+    char* cpus = strtrim(eq);
+    if (!name[0] || !cpus[0] || strchr(name, '=') || strchr(name, '{') || strchr(name, '}')) {
+        return 1;
+    }
+
+    char child_owner[MAX_PKG_LEN * 2];
+    const char* owner = block_owner;
+    const char* thread = name;
+    size_t owner_len = strlen(block_owner);
+    if (name[0] == ':' && name[1]) {
+        if (snprintf(child_owner, sizeof(child_owner), "%s%s", block_owner, name) >=
+            (int)sizeof(child_owner)) return 1;
+        owner = child_owner;
+        thread = "";
+    } else if (strncmp(name, block_owner, owner_len) == 0 && name[owner_len] == ':' && name[owner_len + 1]) {
+        owner = name;
+        thread = "";
+    }
+    return add_parsed_config_rule(rules, count, owner, thread, cpus) < 0 ? -1 : 0;
+}
+
 static AppConfig* load_config(const char* config_file, const CpuTopology* topo, struct timespec* last_mtime) {
     struct stat st;
     if (stat(config_file, &st)) return NULL;
@@ -24,113 +239,94 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
     size_t rules_cnt = 0, pkgs_cnt = 0, auto_cnt = 0;
     char* line = NULL;
     size_t line_cap = 0;
+    ParsedConfigRule* block_rules = NULL;
+    size_t block_rule_count = 0;
+    char* block_owner = NULL;
+    char* block_fallback = NULL;
+    bool block_valid = true;
 
     while (getline(&line, &line_cap, fp) != -1) {
         char* p = strtrim(line);
-        if (*p == '#' || !*p) continue;
-
-        char* eq = strchr(p, '=');
-        if (!eq) continue;
-        *eq++ = 0;
-
-        char* br = strchr(p, '{');
-        char* thread = "";
-        if (br) {
-            *br++ = 0;
-            char* eb = strchr(br, '}');
-            if (!eb) continue;
-            *eb = 0;
-            if (strchr(br, '{') || strtrim(eb + 1)[0]) continue;
-            thread = strtrim(br);
-            if (!thread[0]) continue;
-        } else if (strchr(p, '}')) {
-            continue;
+        char* comment = strstr(p, "//");
+        if (comment) {
+            *comment = '\0';
+            p = strtrim(p);
         }
 
-        char* pkg = strtrim(p);
-        char* cpus = strtrim(eq);
-        if (!pkg[0] || strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) continue;
-
-        /* 包名=auto: 标记为待校准, 不生成绑核规则, 但仍需被进程扫描发现 */
-        if (!thread[0] && strcasecmp(cpus, "auto") == 0) {
-            bool aexists = false;
-            for (size_t i = 0; i < auto_cnt; i++) {
-                if (strcmp(new_auto[i], pkg) == 0) { aexists = true; break; }
-            }
-            if (!aexists) {
-                char** tmp_auto = realloc(new_auto, (auto_cnt + 1) * sizeof(char*));
-                if (!tmp_auto) goto error;
-                new_auto = tmp_auto;
-                new_auto[auto_cnt] = strdup(pkg);
-                if (!new_auto[auto_cnt]) goto error;
-                auto_cnt++;
-            }
-            bool pexists = false;
-            for (size_t i = 0; i < pkgs_cnt; i++) {
-                if (strcmp(new_pkgs[i], pkg) == 0) { pexists = true; break; }
-            }
-            if (!pexists) {
-                char** tmp_pkgs = realloc(new_pkgs, (pkgs_cnt + 1) * sizeof(char*));
-                if (!tmp_pkgs) goto error;
-                new_pkgs = tmp_pkgs;
-                new_pkgs[pkgs_cnt] = strdup(pkg);
-                if (!new_pkgs[pkgs_cnt]) goto error;
-                pkgs_cnt++;
-            }
-            continue;
-        }
-
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        if (!parse_cpu_ranges_strict(cpus, &set, NULL)) continue;
-
-        cpu_set_t effective_set;
-        CPU_AND(&effective_set, &set, &cfg->topo.present_cpus);
-        char* dir_name = CPU_COUNT(&effective_set) > 0 ?
-            cpu_set_to_str(&effective_set) : NULL;
-        if (CPU_COUNT(&effective_set) > 0 && !dir_name) continue;
-
-        AffinityRule rule = {0};
-        build_str(rule.pkg, sizeof(rule.pkg), pkg, NULL);
-        build_str(rule.thread, sizeof(rule.thread), thread, NULL);
-        if (cfg->topo.cpuset_enabled && dir_name) {
-            char path[256];
-            build_str(path, sizeof(path), BASE_CPUSET, "/", dir_name, NULL);
-            if (create_cpuset_dir(path, dir_name, cfg->topo.mems_str)) {
-                build_str(rule.cpuset_dir, sizeof(rule.cpuset_dir), dir_name, NULL);
-            } else {
-                printf("cpuset 创建失败，规则降级为仅 sched_setaffinity: %s{%s}=%s\n",
-                       pkg, thread, dir_name);
-                cfg->topo.cpuset_enabled = false;
-            }
-        }
-        rule.cpus = set;
-        free(dir_name);
-
-        AffinityRule* tmp_rules = realloc(new_rules, (rules_cnt + 1) * sizeof(AffinityRule));
-        if (!tmp_rules) goto error;
-        new_rules = tmp_rules;
-        memcpy(&new_rules[rules_cnt], &rule, sizeof(AffinityRule));
-        rules_cnt++;
-
-        bool exists = false;
-        if (new_pkgs != NULL) {
-            for (size_t i = 0; i < pkgs_cnt; i++) {
-                if (strcmp(new_pkgs[i], pkg) == 0) {
-                    exists = true;
-                    break;
+        if (block_owner) {
+            if (!p[0] || p[0] == '#') continue;
+            char* tail_fallback = NULL;
+            int close_result = config_block_close(p, &tail_fallback);
+            if (close_result != 0) {
+                if (close_result < 0 || (block_fallback && tail_fallback)) block_valid = false;
+                const char* fallback = block_fallback ? block_fallback : tail_fallback;
+                if (block_valid && fallback &&
+                    add_parsed_config_rule(&block_rules, &block_rule_count,
+                                           block_owner, "", fallback) < 0) goto error;
+                if (block_valid) {
+                    for (size_t i = 0; i < block_rule_count; i++) {
+                        if (!parsed_config_rule_valid(&block_rules[i])) {
+                            block_valid = false;
+                            break;
+                        }
+                    }
                 }
+                if (block_valid) {
+                    for (size_t i = 0; i < block_rule_count; i++) {
+                        int result = append_config_rule(
+                            cfg, &new_rules, &rules_cnt, &new_pkgs, &pkgs_cnt,
+                            &new_auto, &auto_cnt, &block_rules[i]);
+                        if (result < 0) goto error;
+                    }
+                }
+                free_parsed_config_rules(block_rules, block_rule_count);
+                block_rules = NULL;
+                block_rule_count = 0;
+                free(block_owner);
+                free(block_fallback);
+                block_owner = NULL;
+                block_fallback = NULL;
+                block_valid = true;
+                continue;
             }
+
+            int body_result = add_config_block_body_rule(
+                &block_rules, &block_rule_count, block_owner, p);
+            if (body_result < 0) goto error;
+            if (body_result > 0) block_valid = false;
+            continue;
         }
-        if (!exists) {
-            char** tmp_pkgs = realloc(new_pkgs, (pkgs_cnt + 1) * sizeof(char*));
-            if (!tmp_pkgs) goto error;
-            new_pkgs = tmp_pkgs;
-            new_pkgs[pkgs_cnt] = strdup(pkg);
-            if (!new_pkgs[pkgs_cnt]) goto error;
-            pkgs_cnt++;
+
+        if (!p[0] || p[0] == '#') continue;
+        char* header_owner = NULL;
+        char* header_fallback = NULL;
+        if (config_block_header(p, &header_owner, &header_fallback)) {
+            block_owner = strdup(header_owner);
+            block_fallback = header_fallback ? strdup(header_fallback) : NULL;
+            if (!block_owner || (header_fallback && !block_fallback)) goto error;
+            block_valid = block_owner[0] && strlen(block_owner) < MAX_PKG_LEN &&
+                !strchr(block_owner, '=') &&
+                (!block_fallback || (block_fallback[0] && !strchr(block_fallback, '=')));
+            continue;
+        }
+
+        ParsedConfigRule parsed = {0};
+        if (parse_legacy_config_rule(p, &parsed)) {
+            int result = append_config_rule(
+                cfg, &new_rules, &rules_cnt, &new_pkgs, &pkgs_cnt,
+                &new_auto, &auto_cnt, &parsed);
+            if (result < 0) goto error;
         }
     }
+
+    /* 未闭合区块中的内容全部丢弃，不把半块规则带入运行状态。 */
+    free_parsed_config_rules(block_rules, block_rule_count);
+    block_rules = NULL;
+    block_rule_count = 0;
+    free(block_owner);
+    free(block_fallback);
+    block_owner = NULL;
+    block_fallback = NULL;
 
     if (cfg->rules) free(cfg->rules);
     if (cfg->pkgs) {
@@ -153,6 +349,9 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
     return cfg;
 
     error:
+    free_parsed_config_rules(block_rules, block_rule_count);
+    free(block_owner);
+    free(block_fallback);
     free(line);
     if (new_rules) free(new_rules);
     if (new_pkgs) {

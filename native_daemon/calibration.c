@@ -529,6 +529,55 @@ typedef enum {
 } CalibWildcardMode;
 
 typedef enum {
+    CALIB_RULE_OUTPUT_LEGACY = 0,
+    CALIB_RULE_OUTPUT_AUTHOR_BLOCK = 1,
+    CALIB_RULE_OUTPUT_COMPACT_HEADER_BLOCK = 2,
+    CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK = 3,
+    CALIB_RULE_OUTPUT_COMPACT_SEPARATE_FALLBACK_BLOCK = 4,
+    CALIB_RULE_OUTPUT_EXTENDED_BLOCK = 5,
+    CALIB_RULE_OUTPUT_COMPACT_EXTENDED_BLOCK = 6
+} CalibRuleOutputFormat;
+
+static const char* calib_rule_output_format_wire(CalibRuleOutputFormat format) {
+    switch (format) {
+        case CALIB_RULE_OUTPUT_AUTHOR_BLOCK:
+            return "author_block";
+        case CALIB_RULE_OUTPUT_COMPACT_HEADER_BLOCK:
+            return "compact_header_block";
+        case CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK:
+            return "separate_fallback_block";
+        case CALIB_RULE_OUTPUT_COMPACT_SEPARATE_FALLBACK_BLOCK:
+            return "compact_separate_fallback_block";
+        case CALIB_RULE_OUTPUT_EXTENDED_BLOCK:
+            return "extended_block";
+        case CALIB_RULE_OUTPUT_COMPACT_EXTENDED_BLOCK:
+            return "compact_extended_block";
+        case CALIB_RULE_OUTPUT_LEGACY:
+        default:
+            return "legacy";
+    }
+}
+
+static CalibRuleOutputFormat calib_rule_output_format_from_wire(const char* value) {
+    if (!value) return CALIB_RULE_OUTPUT_LEGACY;
+    if (strcmp(value, "author_block") == 0) return CALIB_RULE_OUTPUT_AUTHOR_BLOCK;
+    if (strcmp(value, "compact_header_block") == 0) {
+        return CALIB_RULE_OUTPUT_COMPACT_HEADER_BLOCK;
+    }
+    if (strcmp(value, "separate_fallback_block") == 0) {
+        return CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK;
+    }
+    if (strcmp(value, "compact_separate_fallback_block") == 0) {
+        return CALIB_RULE_OUTPUT_COMPACT_SEPARATE_FALLBACK_BLOCK;
+    }
+    if (strcmp(value, "extended_block") == 0) return CALIB_RULE_OUTPUT_EXTENDED_BLOCK;
+    if (strcmp(value, "compact_extended_block") == 0) {
+        return CALIB_RULE_OUTPUT_COMPACT_EXTENDED_BLOCK;
+    }
+    return CALIB_RULE_OUTPUT_LEGACY;
+}
+
+typedef enum {
     CALIB_CORE_BIG = 0,
     CALIB_CORE_MIDDLE_HIGH = 1,
     CALIB_CORE_MIDDLE = 2,
@@ -550,6 +599,7 @@ typedef struct {
     char mid_cores[64];
     int max_thread_rules;
     CalibWildcardMode wildcard_mode;
+    CalibRuleOutputFormat rule_output_format;
     CalibCoreTier fallback_tier;
     char fallback_cores[64];
 } CalibPolicy;
@@ -570,6 +620,7 @@ static CalibPolicy calib_default_policy(void) {
     p.mid_cores[0] = '\0';
     p.max_thread_rules = 6;
     p.wildcard_mode = CALIB_WILDCARD_MAX_MEMBER;
+    p.rule_output_format = CALIB_RULE_OUTPUT_LEGACY;
     p.fallback_tier = CALIB_CORE_NONBIG;
     p.fallback_cores[0] = '\0';
     return p;
@@ -813,6 +864,8 @@ static void calib_log_policy(const CalibPolicy* p, const CpuTopology* topo,
            "通配线程组只按组内最高单线程平均负载判断, 避免低负载线程累加误升档");
     printf("[校准策略] max_thread_rules: %d; 最多生成 %d 条线程级规则, 其余线程走包名兜底\n",
            p->max_thread_rules, p->max_thread_rules);
+    printf("[校准策略] rule_output_format: %s; 只改变规则写回格式, 不改变绑核效果\n",
+           calib_rule_output_format_wire(p->rule_output_format));
     printf("[校准策略] fallback: 没有单独线程规则的线程使用包名兜底; 档位=%s; 核心=%s (%s)\n",
            calib_core_tier_label(p->fallback_tier),
            calib_policy_core_range(topo, p->fallback_tier, p->fallback_cores),
@@ -1029,6 +1082,8 @@ static CalibPolicy calib_load_policy(const CpuTopology* topo) {
             } else {
                 p.wildcard_mode = CALIB_WILDCARD_MAX_MEMBER;
             }
+        } else if (strcmp(key, "rule_output_format") == 0) {
+            p.rule_output_format = calib_rule_output_format_from_wire(val);
         } else if (strcmp(key, "fallback") == 0) {
             char text[64];
             if (calib_rule_text(val, "cores", text, sizeof(text))) {
@@ -1084,6 +1139,208 @@ static bool calib_append_rule(char** out, size_t* remain, int* lines,
     *remain -= (size_t)need;
     (*lines)++;
     return true;
+}
+
+typedef struct {
+    char* owner;
+    char* thread;
+    char* cpus;
+} CalibGeneratedRule;
+
+static bool calib_generated_child_rule(const CalibGeneratedRule* rule,
+                                       const char* pkg, size_t pkg_len) {
+    if (!rule || !pkg || (rule->thread && rule->thread[0])) return false;
+    size_t owner_len = strlen(rule->owner);
+    return owner_len > pkg_len + 1 &&
+        strncmp(rule->owner, pkg, pkg_len) == 0 && rule->owner[pkg_len] == ':';
+}
+
+static bool calib_format_append(char** out, size_t* remain, const char* format, ...) {
+    if (!out || !*out || !remain || !format) return false;
+    va_list args;
+    va_start(args, format);
+    int need = vsnprintf(*out, *remain + 1, format, args);
+    va_end(args);
+    if (need < 0 || (size_t)need > *remain) return false;
+    *out += need;
+    *remain -= (size_t)need;
+    return true;
+}
+
+static bool calib_format_generated_rules(const char* pkg, const char* legacy,
+                                         CalibRuleOutputFormat output_format,
+                                         char* out, size_t out_sz) {
+    if (!pkg || !legacy || !out || out_sz == 0) return false;
+    if (output_format == CALIB_RULE_OUTPUT_LEGACY) {
+        size_t length = strlen(legacy);
+        if (length >= out_sz) return false;
+        memcpy(out, legacy, length + 1);
+        return true;
+    }
+
+    char* copy = strdup(legacy);
+    if (!copy) return false;
+    CalibGeneratedRule* rules = NULL;
+    size_t count = 0;
+    char* save = NULL;
+    for (char* line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq++ = '\0';
+        char* key = strtrim(line);
+        char* cpus = strtrim(eq);
+        if (!key[0] || !cpus[0]) continue;
+
+        char* thread = NULL;
+        char* open = strchr(key, '{');
+        if (open) {
+            *open++ = '\0';
+            char* close = strrchr(open, '}');
+            if (!close || strtrim(close + 1)[0]) continue;
+            *close = '\0';
+            thread = strtrim(open);
+        }
+
+        CalibGeneratedRule* resized = realloc(rules, (count + 1) * sizeof(*rules));
+        if (!resized) {
+            free(rules);
+            free(copy);
+            return false;
+        }
+        rules = resized;
+        rules[count++] = (CalibGeneratedRule) {
+            .owner = strtrim(key),
+            .thread = thread,
+            .cpus = cpus
+        };
+    }
+
+    const char* fallback = NULL;
+    size_t thread_count = 0;
+    size_t child_count = 0;
+    size_t pkg_len = strlen(pkg);
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(rules[i].owner, pkg) == 0) {
+            if (rules[i].thread && rules[i].thread[0]) thread_count++;
+            else fallback = rules[i].cpus;
+        } else if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+            child_count++;
+        }
+    }
+
+    char* cursor = out;
+    size_t remain = out_sz - 1;
+    out[0] = '\0';
+    bool ok = true;
+    if (output_format == CALIB_RULE_OUTPUT_AUTHOR_BLOCK) {
+        if (thread_count > 0) {
+            ok = fallback ?
+                calib_format_append(&cursor, &remain, "%s=%s {\n", pkg, fallback) :
+                calib_format_append(&cursor, &remain, "%s {\n", pkg);
+            for (size_t i = 0; ok && i < count; i++) {
+                if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
+                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
+                                             rules[i].thread, rules[i].cpus);
+                }
+            }
+            if (ok) ok = calib_format_append(&cursor, &remain, "}\n");
+        } else if (fallback) {
+            ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
+        }
+        for (size_t i = 0; ok && i < count; i++) {
+            if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+                ok = calib_format_append(&cursor, &remain, "%s=%s\n",
+                                         rules[i].owner, rules[i].cpus);
+            }
+        }
+    } else if (output_format == CALIB_RULE_OUTPUT_COMPACT_HEADER_BLOCK) {
+        if (thread_count + child_count > 0) {
+            ok = fallback ?
+                calib_format_append(&cursor, &remain, "%s=%s{\n", pkg, fallback) :
+                calib_format_append(&cursor, &remain, "%s{\n", pkg);
+            for (size_t i = 0; ok && i < count; i++) {
+                if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
+                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
+                                             rules[i].thread, rules[i].cpus);
+                }
+            }
+            for (size_t i = 0; ok && i < count; i++) {
+                if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
+                                             rules[i].owner + pkg_len, rules[i].cpus);
+                }
+            }
+            if (ok) ok = calib_format_append(&cursor, &remain, "}\n");
+        } else if (fallback) {
+            ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
+        }
+    } else if (output_format == CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK ||
+               output_format == CALIB_RULE_OUTPUT_COMPACT_SEPARATE_FALLBACK_BLOCK) {
+        if (thread_count + child_count > 0) {
+            const char* separator =
+                output_format == CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK ? " " : "";
+            ok = calib_format_append(&cursor, &remain, "%s%s{\n", pkg, separator);
+            for (size_t i = 0; ok && i < count; i++) {
+                if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
+                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
+                                             rules[i].thread, rules[i].cpus);
+                }
+            }
+            for (size_t i = 0; ok && i < count; i++) {
+                if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
+                                             rules[i].owner + pkg_len, rules[i].cpus);
+                }
+            }
+            if (ok) ok = calib_format_append(&cursor, &remain, "}\n");
+            if (ok && fallback) {
+                ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
+            }
+        } else if (fallback) {
+            ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
+        }
+    } else {
+        if (thread_count + child_count > 0) {
+            const char* separator = output_format == CALIB_RULE_OUTPUT_EXTENDED_BLOCK ? " " : "";
+            ok = calib_format_append(&cursor, &remain, "%s%s{\n", pkg, separator);
+            for (size_t i = 0; ok && i < count; i++) {
+                if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
+                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
+                                             rules[i].thread, rules[i].cpus);
+                }
+            }
+            for (size_t i = 0; ok && i < count; i++) {
+                if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
+                                             rules[i].owner + pkg_len, rules[i].cpus);
+                }
+            }
+            if (ok) {
+                ok = fallback ?
+                    calib_format_append(&cursor, &remain, "}=%s\n", fallback) :
+                    calib_format_append(&cursor, &remain, "}\n");
+            }
+        } else if (fallback) {
+            ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
+        }
+    }
+
+    /* 理论上校准只生成当前包名、线程和子进程规则；仍保留未知规则以避免未来扩展丢行。 */
+    for (size_t i = 0; ok && i < count; i++) {
+        bool main_rule = strcmp(rules[i].owner, pkg) == 0;
+        bool child_rule = calib_generated_child_rule(&rules[i], pkg, pkg_len);
+        if (!main_rule && !child_rule) {
+            ok = rules[i].thread && rules[i].thread[0] ?
+                calib_format_append(&cursor, &remain, "%s{%s}=%s\n",
+                                    rules[i].owner, rules[i].thread, rules[i].cpus) :
+                calib_format_append(&cursor, &remain, "%s=%s\n",
+                                    rules[i].owner, rules[i].cpus);
+        }
+    }
+    if (ok) *cursor = '\0';
+    free(rules);
+    free(copy);
+    return ok;
 }
 
 /* 根据采样结果生成规则文本, 追加写入 out_buf (调用方保证足够大)。
@@ -1264,6 +1521,16 @@ append_fallback:
         calib_append_rule(&p, &remain, &lines, data->pkg, NULL, base_tier);
     }
     *p = '\0';
+    if (policy.rule_output_format != CALIB_RULE_OUTPUT_LEGACY) {
+        char* legacy = strdup(out_buf);
+        if (legacy) {
+            if (!calib_format_generated_rules(data->pkg, legacy, policy.rule_output_format,
+                                              out_buf, out_sz)) {
+                build_str(out_buf, out_sz, legacy, NULL);
+            }
+            free(legacy);
+        }
+    }
     free(groups);
     return lines;
 }
@@ -1548,6 +1815,103 @@ static bool calib_config_line_group(const char* raw_line, char* out, size_t out_
     return out[0] != '\0';
 }
 
+static bool calib_rule_syntax_block_group(const char* raw_line, char* out, size_t out_sz) {
+    if (!raw_line || !out || out_sz == 0) return false;
+    out[0] = '\0';
+    char* copy = strdup(raw_line);
+    if (!copy) return false;
+    char* line = strtrim(copy);
+    char* comment = strstr(line, "//");
+    if (comment) {
+        *comment = '\0';
+        line = strtrim(line);
+    }
+    char* owner = NULL;
+    char* fallback = NULL;
+    bool header = config_block_header(line, &owner, &fallback);
+    if (header && owner && owner[0]) calib_config_group_name(owner, out, out_sz);
+    free(copy);
+    return header && out[0] != '\0';
+}
+
+static bool calib_rule_syntax_block_close(const char* raw_line) {
+    if (!raw_line) return false;
+    while (*raw_line && isspace((unsigned char)*raw_line)) raw_line++;
+    return *raw_line == '}';
+}
+
+static bool calib_validate_rule_syntax_blocks(FILE* in) {
+    if (!in || fseek(in, 0, SEEK_SET) != 0) return false;
+    char* line = NULL;
+    size_t line_cap = 0;
+    bool in_block = false;
+    bool header_has_fallback = false;
+    bool valid = true;
+
+    while (valid && getline(&line, &line_cap, in) != -1) {
+        char* copy = strdup(line);
+        if (!copy) {
+            valid = false;
+            break;
+        }
+        char* code = strtrim(copy);
+        char* comment = strstr(code, "//");
+        if (comment) {
+            *comment = '\0';
+            code = strtrim(code);
+        }
+
+        if (in_block) {
+            if (!code[0] || code[0] == '#') {
+                free(copy);
+                continue;
+            }
+            char* tail_fallback = NULL;
+            int close_result = config_block_close(code, &tail_fallback);
+            if (close_result != 0) {
+                valid = close_result > 0 && !(header_has_fallback && tail_fallback);
+                in_block = false;
+                header_has_fallback = false;
+                free(copy);
+                continue;
+            }
+
+            char* eq = strchr(code, '=');
+            if (!eq) {
+                valid = false;
+            } else {
+                *eq++ = '\0';
+                char* name = strtrim(code);
+                char* cpus = strtrim(eq);
+                valid = name[0] && cpus[0] && !strchr(name, '=') &&
+                    !strchr(name, '{') && !strchr(name, '}');
+            }
+            free(copy);
+            continue;
+        }
+
+        if (!code[0] || code[0] == '#') {
+            free(copy);
+            continue;
+        }
+        char* owner = NULL;
+        char* fallback = NULL;
+        if (config_block_header(code, &owner, &fallback)) {
+            valid = owner && owner[0] && strlen(owner) < MAX_PKG_LEN &&
+                !strchr(owner, '=') &&
+                (!fallback || (fallback[0] && !strchr(fallback, '=')));
+            in_block = valid;
+            header_has_fallback = fallback != NULL;
+        }
+        free(copy);
+    }
+    if (ferror(in) || in_block) valid = false;
+    free(line);
+    clearerr(in);
+    if (fseek(in, 0, SEEK_SET) != 0) valid = false;
+    return valid;
+}
+
 static bool calib_write_config_block(FILE* out, const CalibConfigBlock* block, bool* wrote_any) {
     if (!out || !block || block->count == 0) return true;
     if (wrote_any && *wrote_any) {
@@ -1598,6 +1962,12 @@ static bool calib_write_back(const char* config_file, const char* pkg,
         calib_config_lock_release();
         return false;
     }
+    if (!calib_validate_rule_syntax_blocks(in)) {
+        printf("[校准] 规则配置中存在未闭合或格式错误的区块，已取消写回\n");
+        fclose(in);
+        calib_config_lock_release();
+        return false;
+    }
     char tmp_path[4096 + 8];
     build_str(tmp_path, sizeof(tmp_path), config_file, ".tmp", NULL);
     FILE* out = fopen(tmp_path, "w");
@@ -1616,11 +1986,20 @@ static bool calib_write_back(const char* config_file, const char* pkg,
     bool inserted = false;
     bool wrote_any = false;
     bool write_ok = true;
+    bool in_rule_syntax_block = false;
     while (write_ok && getline(&line, &line_cap, in) != -1) {
         if (calib_line_is_blank(line)) continue;
 
         char line_group[MAX_PKG_LEN];
-        bool has_owner = calib_config_line_group(line, line_group, sizeof(line_group));
+        bool block_header = !in_rule_syntax_block &&
+            calib_rule_syntax_block_group(line, line_group, sizeof(line_group));
+        if (in_rule_syntax_block) {
+            write_ok = calib_config_block_add(&block, line);
+            if (calib_rule_syntax_block_close(line)) in_rule_syntax_block = false;
+            continue;
+        }
+        bool has_owner = block_header ||
+            calib_config_line_group(line, line_group, sizeof(line_group));
         if (has_owner) {
             if (block.count > 0) {
                 if (!block.has_owner || strcmp(block.group, line_group) != 0) {
@@ -1640,8 +2019,12 @@ static bool calib_write_back(const char* config_file, const char* pkg,
         }
 
         write_ok = calib_config_block_add(&block, line);
+        if (block_header) in_rule_syntax_block = true;
     }
-    if (write_ok) {
+    if (write_ok && in_rule_syntax_block) {
+        write_ok = false;
+        calib_config_block_clear(&block);
+    } else if (write_ok) {
         write_ok = calib_flush_config_block(out, &block, target_group, rules_text,
                                             &wrote_any, &inserted);
     } else {

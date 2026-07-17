@@ -1,0 +1,371 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/bg_bottom_sheet_card"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="20dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="18dp">
+
+        <View
+            android:layout_width="42dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="16dp"
+            android:background="@drawable/bg_banner" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="校准规则生成格式"
+            android:textColor="@color/text_primary"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="旧版单行格式默认使用，六种区块格式可分别选择。只改变写入排版，不改变规则效果"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <RelativeLayout
+            android:id="@+id/formatLegacy"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatLegacyTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatLegacySelected"
+                android:text="旧版单行格式（默认）"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:layout_below="@id/formatLegacyTitle"
+                android:layout_toStartOf="@id/formatLegacySelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm{RenderThread}=6-7&#10;com.tencent.mm:push=0-3&#10;com.tencent.mm=0-3"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatLegacySelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatAuthorBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatAuthorBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatAuthorBlockSelected"
+                android:text="区块格式 1（原作者新增）"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:layout_below="@id/formatAuthorBlockTitle"
+                android:layout_toStartOf="@id/formatAuthorBlockSelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm=0-3 {&#10;    RenderThread=6-7&#10;}&#10;com.tencent.mm:push=0-3"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatAuthorBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatCompactHeaderBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatCompactHeaderBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatCompactHeaderBlockSelected"
+                android:text="区块格式 2（首行兜底，紧凑）"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:layout_below="@id/formatCompactHeaderBlockTitle"
+                android:layout_toStartOf="@id/formatCompactHeaderBlockSelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm=0-3{&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatCompactHeaderBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatSeparateFallbackBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatSeparateFallbackBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatSeparateFallbackBlockSelected"
+                android:text="区块格式 3（区块外兜底，空格）"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:layout_below="@id/formatSeparateFallbackBlockTitle"
+                android:layout_toStartOf="@id/formatSeparateFallbackBlockSelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm {&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}&#10;com.tencent.mm=0-3"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatSeparateFallbackBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatCompactSeparateFallbackBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatCompactSeparateFallbackBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatCompactSeparateFallbackBlockSelected"
+                android:text="区块格式 4（区块外兜底，紧凑）"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:layout_below="@id/formatCompactSeparateFallbackBlockTitle"
+                android:layout_toStartOf="@id/formatCompactSeparateFallbackBlockSelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm{&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}&#10;com.tencent.mm=0-3"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatCompactSeparateFallbackBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatExtendedBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatExtendedBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatExtendedBlockSelected"
+                android:text="区块格式 5（尾部兜底，空格）"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:layout_below="@id/formatExtendedBlockTitle"
+                android:layout_toStartOf="@id/formatExtendedBlockSelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm {&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}=0-3"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatExtendedBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatCompactExtendedBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatCompactExtendedBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatCompactExtendedBlockSelected"
+                android:text="区块格式 6（尾部兜底，紧凑）"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:layout_below="@id/formatCompactExtendedBlockTitle"
+                android:layout_toStartOf="@id/formatCompactExtendedBlockSelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm{&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}=0-3"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatCompactExtendedBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/formatCancel"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="取消" />
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>

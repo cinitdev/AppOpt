@@ -48,7 +48,7 @@
 #include "fps_fallback.h"
 #include "foreground_monitor.h"
 
-#define VERSION            "1.7.7"
+#define VERSION            "1.7.8"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
