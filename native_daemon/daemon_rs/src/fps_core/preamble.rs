@@ -41,12 +41,20 @@
     const FPS_PROBE_FAIL: u32 = 4;
     const FPS_FRESH_NS: u64 = 5_000_000_000;
 
-    pub fn start_fps_thread() {
-        thread::spawn(|| {
+    pub fn start_fps_thread() -> bool {
+        match thread::Builder::new()
+            .name("AppOptRsFps".to_string())
+            .spawn(|| {
             if let Err(err) = fps_loop() {
                 eprintln!("[FPS] 帧率监测线程已停止: {err}");
             }
-        });
+            }) {
+            Ok(_) => true,
+            Err(err) => {
+                eprintln!("[FPS] 帧率监测线程创建失败: {err}");
+                false
+            }
+        }
     }
 
     struct FpsMonitor {

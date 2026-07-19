@@ -253,8 +253,8 @@ int main(int argc, char **argv) {
         if (cfg) {
             bool health_ready = rule_health_sync_config(cfg, NULL);
             bool health_full_scan = health_ready && rule_health_full_scan_due(&cache);
-            bool foreground_discovery_scan =
-                rule_health_foreground_discovery_scan_due(cfg, &cache);
+            bool foreground_discovery_scan = health_ready &&
+                rule_health_foreground_discovery_scan_due(&cache);
             update_cache(
                 &cache, cfg, &affinity_counter,
                 health_full_scan || foreground_discovery_scan);

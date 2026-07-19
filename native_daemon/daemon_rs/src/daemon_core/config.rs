@@ -42,7 +42,39 @@ fn parse_config_text(text: &str) -> Vec<Rule> {
         }
     }
 
-    rules
+    deduplicate_config_rules(rules)
+}
+
+/* 同一线程、子进程或主进程兜底只保留覆盖核心最多的一条。 */
+fn deduplicate_config_rules(rules: Vec<Rule>) -> Vec<Rule> {
+    let mut selected = Vec::<Rule>::new();
+    let mut indices = HashMap::<(String, Option<String>), usize>::new();
+    for rule in rules {
+        let key = (rule.owner.clone(), rule.thread.clone());
+        if let Some(index) = indices.get(&key).copied() {
+            if rule_cpu_preference(&rule) > rule_cpu_preference(&selected[index]) {
+                selected[index] = rule;
+            }
+        } else {
+            indices.insert(key, selected.len());
+            selected.push(rule);
+        }
+    }
+    selected
+}
+
+fn rule_cpu_preference(rule: &Rule) -> (u8, u32, usize, usize) {
+    if rule.auto {
+        return (1, 0, 0, 0);
+    }
+    let Some(mask) = CpuMask::parse(&rule.cpus) else {
+        return (0, 0, 0, 0);
+    };
+    let count = mask.words.iter().map(|word| word.count_ones()).sum();
+    let limit = CPU_MASK_WORDS * 64;
+    let highest = (0..limit).rev().find(|cpu| mask.contains(*cpu)).unwrap_or(0);
+    let lowest = (0..limit).find(|cpu| mask.contains(*cpu)).unwrap_or(limit);
+    (2, count, highest, limit.saturating_sub(lowest))
 }
 
 fn parse_rule_key(left: &str, cpus: &str) -> Option<Rule> {

@@ -135,7 +135,7 @@ start_foreground_helper() {
 	sh "$FOREGROUND_HELPER" start
 }
 
-start_foreground_helper || echo "- ActivityTaskManager helper start failed, App fallback will be used" >> "$LOG"
+start_foreground_helper || echo "- 前台助手启动失败：App 使用 UsageStats/cgroup/焦点检测降级，规则健康负向观察暂停" >> "$LOG"
 
 # Check only the daemon started from this module path.
 is_our_daemon_running() {

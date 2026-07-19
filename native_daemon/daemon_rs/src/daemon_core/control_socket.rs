@@ -7,12 +7,20 @@
 // - App 收到匹配 token 后，才能确认这是当前模块里的守护进程。
 //
 // 这套逻辑只做身份验证，不承载 FPS 数据；FPS 另有独立 socket。
-fn start_daemon_socket_thread() {
-    thread::spawn(|| {
-        if let Err(err) = daemon_socket_thread() {
-            eprintln!("[CTRL] 守护验证 socket 已停止: {err}");
+fn start_daemon_socket_thread() -> bool {
+    match thread::Builder::new()
+        .name("AppOptRsControlSocket".to_string())
+        .spawn(|| {
+            if let Err(err) = daemon_socket_thread() {
+                eprintln!("[CTRL] 守护验证 socket 已停止: {err}");
+            }
+        }) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("[CTRL] 守护验证 socket 线程创建失败: {err}");
+            false
         }
-    });
+    }
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]

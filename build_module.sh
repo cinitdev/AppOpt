@@ -24,25 +24,36 @@ APP_GRADLE="$ROOT/app/build.gradle.kts"
 DAEMON_BRIDGE="$ROOT/app/src/main/java/top/suto/appopt/DaemonBridge.kt"
 UPDATE_JSON="$ROOT/modules_update/AppOpt.json"
 UPDATE_BRANCH="modules-update"
+GITHUB_OWNER="cinitdev"
+GITHUB_REPO="AppOpt"
+GITHUB_REMOTE_URL="${APPOPT_GITHUB_REMOTE_URL:-https://github.com/$GITHUB_OWNER/$GITHUB_REPO.git}"
+GITEE_OWNER="cinitdev"
+GITEE_REPO="AppOpt"
+GITEE_REMOTE_URL="${APPOPT_GITEE_REMOTE_URL:-https://gitee.com/$GITEE_OWNER/$GITEE_REPO.git}"
+GITEE_API_BASE="https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO"
+PUBLISH_UPDATE_JSON="$ROOT/build/AppOpt.publish.json"
 
 usage() {
     cat <<EOF
-用法: ./build_module.sh [release|debug|no|publish] [--publish] [--dry-run]
+用法: ./build_module.sh [release|debug|no|publish] [--publish] [--github|--gitee] [--dry-run]
 
   release  编译 release APK 并打包进模块（默认）
   debug    编译 debug APK 并打包进模块
   no       只编译模块，不打包 App
-  publish  编译 release 模块，发布 GitHub Release，并更新 modules-update 分支的 AppOpt.json
+  publish  编译 release 模块，发布到所选平台，并更新该平台 modules-update 分支
 
 选项:
-  --publish  构建完成后发布 release 产物并更新 modules-update 分支
+  --publish  构建完成后发布 Release 并更新 modules-update 分支
+  --github   发布到 GitHub（使用 gh）
+  --gitee    发布到 Gitee（默认，使用 Gitee API）
   --dry-run  完整预演发布流程，不创建 Release、不提交、不推送
 EOF
 }
 
 APP_VARIANT="${1:-release}"
-PUBLISH_GITHUB_RELEASE=0
+PUBLISH_RELEASE=0
 PUBLISH_DRY_RUN=0
+PUBLISH_TARGET="${APPOPT_PUBLISH_TARGET:-gitee}"
 if [ "$#" -gt 0 ]; then
     shift
 fi
@@ -51,23 +62,44 @@ case "$APP_VARIANT" in
     release) APP_VARIANT="release" ;;
     debug) APP_VARIANT="debug" ;;
     no|module) APP_VARIANT="" ;;
-    publish|release-publish|--publish) APP_VARIANT="release"; PUBLISH_GITHUB_RELEASE=1 ;;
-    --dry-run) APP_VARIANT="release"; PUBLISH_GITHUB_RELEASE=1; PUBLISH_DRY_RUN=1 ;;
+    publish|release-publish|--publish) APP_VARIANT="release"; PUBLISH_RELEASE=1 ;;
+    --dry-run) APP_VARIANT="release"; PUBLISH_RELEASE=1; PUBLISH_DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "! Unknown command: $APP_VARIANT"; usage; exit 1 ;;
 esac
 
 for ARG in "$@"; do
     case "$ARG" in
-        --publish|publish) PUBLISH_GITHUB_RELEASE=1 ;;
-        --dry-run) PUBLISH_GITHUB_RELEASE=1; PUBLISH_DRY_RUN=1 ;;
+        --publish|publish) PUBLISH_RELEASE=1 ;;
+        --dry-run) PUBLISH_RELEASE=1; PUBLISH_DRY_RUN=1 ;;
+        github|--github) PUBLISH_TARGET="github" ;;
+        gitee|--gitee) PUBLISH_TARGET="gitee" ;;
         -h|--help) usage; exit 0 ;;
         *) echo "! Unknown option: $ARG"; usage; exit 1 ;;
     esac
 done
 
-if [ "$PUBLISH_GITHUB_RELEASE" = "1" ] && [ "$APP_VARIANT" != "release" ]; then
-    echo "! GitHub Release 发布只支持 release 模块构建"
+case "$PUBLISH_TARGET" in
+    github)
+        PUBLISH_REMOTE_URL="$GITHUB_REMOTE_URL"
+        PUBLISH_REMOTE_LABEL="GitHub"
+        PUBLISH_UPDATE_URL="https://raw.githubusercontent.com/$GITHUB_OWNER/$GITHUB_REPO/$UPDATE_BRANCH/modules_update/AppOpt.json"
+        PUBLISH_RELEASE_BASE="https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/download"
+        ;;
+    gitee)
+        PUBLISH_REMOTE_URL="$GITEE_REMOTE_URL"
+        PUBLISH_REMOTE_LABEL="Gitee"
+        PUBLISH_UPDATE_URL="https://raw.giteeusercontent.com/$GITEE_OWNER/$GITEE_REPO/raw/$UPDATE_BRANCH/modules_update/AppOpt.json"
+        PUBLISH_RELEASE_BASE="https://gitee.com/$GITEE_OWNER/$GITEE_REPO/releases/download"
+        ;;
+    *)
+        echo "! 不支持的发布平台: $PUBLISH_TARGET（仅支持 github 或 gitee）"
+        exit 1
+        ;;
+esac
+
+if [ "$PUBLISH_RELEASE" = "1" ] && [ "$APP_VARIANT" != "release" ]; then
+    echo "! Release 发布只支持 release 模块构建"
     exit 1
 fi
 
@@ -417,27 +449,41 @@ if data.get("version") != expected_tag:
 if data.get("versionCode") != expected_code:
     raise SystemExit(f"! AppOpt.json versionCode={data.get('versionCode')!r}, 预期 {expected_code}")
 
-release_path = f"/releases/download/{expected_tag}/"
-for key in ("zipUrl", "changelog"):
-    value = data.get(key)
-    if not isinstance(value, str) or release_path not in value:
-        raise SystemExit(f"! AppOpt.json {key} 未指向 {expected_tag} Release")
+PY
+}
+
+prepare_publish_update_json() {
+    local tag="$1" version_code
+    version_code="$(read_app_version_code)"
+    python - "$UPDATE_JSON" "$PUBLISH_UPDATE_JSON" "$tag" "$version_code" "$PUBLISH_RELEASE_BASE" <<'PY'
+import json
+import sys
+
+source, target, tag, version_code, release_base = sys.argv[1:]
+with open(source, encoding="utf-8") as f:
+    data = json.load(f)
+data["version"] = tag
+data["versionCode"] = int(version_code)
+data["zipUrl"] = f"{release_base}/{tag}/AppOpt.zip"
+data["changelog"] = f"{release_base}/{tag}/changelog.md"
+with open(target, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+    f.write("\n")
 PY
 }
 
 publish_update_json() (
     set -e
-    local tag="$1" dry_run="$2" repo_root worktree remote_ref base_commit latest_commit
+    local tag="$1" dry_run="$2" repo_root worktree base_commit latest_commit
     repo_root="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)" || {
         echo "! 当前目录不是 Git 仓库: $ROOT"
         exit 1
     }
-    remote_ref="refs/remotes/origin/$UPDATE_BRANCH"
 
-    echo "- 同步远端更新分支: origin/$UPDATE_BRANCH"
-    git -C "$repo_root" fetch --no-tags origin "$UPDATE_BRANCH"
-    base_commit="$(git -C "$repo_root" rev-parse "$remote_ref^{commit}")" || {
-        echo "! 找不到远端分支: origin/$UPDATE_BRANCH"
+    echo "- 同步 $PUBLISH_REMOTE_LABEL 远端更新分支: $UPDATE_BRANCH"
+    git -C "$repo_root" fetch --no-tags "$PUBLISH_REMOTE_URL" "$UPDATE_BRANCH"
+    base_commit="$(git -C "$repo_root" rev-parse 'FETCH_HEAD^{commit}')" || {
+        echo "! 找不到 $PUBLISH_REMOTE_LABEL 远端分支: $UPDATE_BRANCH"
         exit 1
     }
 
@@ -452,19 +498,19 @@ publish_update_json() (
 
     git -C "$repo_root" worktree add --detach "$worktree" "$base_commit" >/dev/null
     mkdir -p "$worktree/modules_update"
-    cp -f "$UPDATE_JSON" "$worktree/modules_update/AppOpt.json"
+    cp -f "$PUBLISH_UPDATE_JSON" "$worktree/modules_update/AppOpt.json"
     git -C "$worktree" add -- modules_update/AppOpt.json
 
     if git -C "$worktree" diff --cached --quiet; then
-        echo "- origin/$UPDATE_BRANCH 的 AppOpt.json 已是 $tag"
+        echo "- $PUBLISH_REMOTE_LABEL/$UPDATE_BRANCH 的 AppOpt.json 已是 $tag"
         exit 0
     fi
 
     if [ "$dry_run" = "1" ]; then
-        echo "- [预演] 将基于远端提交 $base_commit 更新 modules_update/AppOpt.json"
+        echo "- [预演] 将基于 $PUBLISH_REMOTE_LABEL 远端提交 $base_commit 更新 modules_update/AppOpt.json"
         git -C "$worktree" diff --cached --stat
         git -C "$worktree" diff --cached -- modules_update/AppOpt.json
-        echo "- [预演] 未提交、未推送 modules-update 分支"
+        echo "- [预演] 未提交、未推送 $PUBLISH_REMOTE_LABEL modules-update 分支"
         exit 0
     fi
 
@@ -472,16 +518,145 @@ publish_update_json() (
         -m "发布：更新 $tag 远程更新信息" >/dev/null
 
     # 推送前再次抓取。网页端若在发布过程中产生新提交，拒绝非快进推送。
-    git -C "$repo_root" fetch --no-tags origin "$UPDATE_BRANCH"
-    latest_commit="$(git -C "$repo_root" rev-parse "$remote_ref^{commit}")"
+    git -C "$repo_root" fetch --no-tags "$PUBLISH_REMOTE_URL" "$UPDATE_BRANCH"
+    latest_commit="$(git -C "$repo_root" rev-parse 'FETCH_HEAD^{commit}')"
     if [ "$latest_commit" != "$base_commit" ]; then
-        echo "! origin/$UPDATE_BRANCH 在发布期间发生变化，已停止推送，请重新执行发布"
+        echo "! $PUBLISH_REMOTE_LABEL/$UPDATE_BRANCH 在发布期间发生变化，已停止推送，请重新执行发布"
         exit 1
     fi
 
-    git -C "$worktree" push origin "HEAD:refs/heads/$UPDATE_BRANCH"
-    echo "- 已更新 origin/$UPDATE_BRANCH: modules_update/AppOpt.json -> $tag"
+    git -C "$worktree" push "$PUBLISH_REMOTE_URL" "HEAD:refs/heads/$UPDATE_BRANCH"
+    echo "- 已更新 $PUBLISH_REMOTE_LABEL/$UPDATE_BRANCH: modules_update/AppOpt.json -> $tag"
 )
+
+gitee_release_id() {
+    local tag="$1" response status
+    response="$(mktemp "$ROOT/build/gitee-release.XXXXXX")"
+    status="$(curl -sS -o "$response" -w '%{http_code}' --get \
+        "$GITEE_API_BASE/releases/tags/$tag" \
+        --data-urlencode "access_token=$GITEE_TOKEN")" || {
+        rm -f "$response"
+        return 1
+    }
+    case "$status" in
+        200)
+            python - "$response" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+if isinstance(data, dict) and data.get("id") is not None:
+    print(data["id"])
+PY
+            ;;
+        404) ;;
+        *) cat "$response" >&2; rm -f "$response"; return 1 ;;
+    esac
+    rm -f "$response"
+}
+
+load_gitee_token() {
+    [ -n "${GITEE_TOKEN:-}" ] && return 0
+    if command -v powershell.exe >/dev/null 2>&1; then
+        # 已打开的 Git Bash 不会继承后来写入的 Windows 变量，这里主动读取一次。
+        GITEE_TOKEN="$(powershell.exe -NoProfile -Command \
+            '$value = [Environment]::GetEnvironmentVariable("GITEE_TOKEN", "User"); if ([string]::IsNullOrWhiteSpace($value)) { $value = [Environment]::GetEnvironmentVariable("GITEE_TOKEN", "Machine") }; $value' \
+            2>/dev/null | tr -d '\r')"
+        export GITEE_TOKEN
+    fi
+}
+
+publish_gitee_release() {
+    local tag title changelog release_id response zip_upload changelog_upload
+    command -v curl >/dev/null 2>&1 || {
+        echo "! 找不到 curl，无法发布 Gitee Release"
+        exit 1
+    }
+    load_gitee_token
+    [ -n "${GITEE_TOKEN:-}" ] || {
+        echo "! 未设置 GITEE_TOKEN，无法发布 Gitee Release"
+        echo "! 请先设置 Gitee Personal Access Token（例如: export GITEE_TOKEN=...）"
+        exit 1
+    }
+
+    tag="$(read_release_tag)"
+    title="AppOpt $tag"
+    changelog="$ROOT/modules_update/changelog.md"
+
+    [ -s "$ZIP" ] || { echo "! 找不到模块 zip: $ZIP"; exit 1; }
+    [ -s "$changelog" ] || { echo "! 找不到更新日志: $changelog"; exit 1; }
+    zip_upload="$(path_for_cargo "$ZIP")"
+    changelog_upload="$(path_for_cargo "$changelog")"
+    validate_update_json "$tag"
+    prepare_publish_update_json "$tag"
+
+    if [ "$PUBLISH_DRY_RUN" = "1" ]; then
+        if release_id="$(gitee_release_id "$tag")" && [ -n "$release_id" ]; then
+            echo "- [预演] 将更新 Gitee Release: $tag"
+        else
+            echo "- [预演] 将创建 Gitee Release: $tag"
+        fi
+        echo "- [预演] 将上传: $ZIP 和 $changelog"
+        publish_update_json "$tag" 1
+        echo "- 发布预演完成: $tag（未写入 Gitee）"
+        return 0
+    fi
+
+    release_id="$(gitee_release_id "$tag")" || {
+        echo "! 查询 Gitee Release 失败: $tag"
+        exit 1
+    }
+    if [ -n "$release_id" ]; then
+        echo "- Gitee Release 已存在: $tag"
+        echo "- 更新 Release 说明并重新上传资产"
+        curl --fail-with-body -sS -X PATCH "$GITEE_API_BASE/releases/$release_id" \
+            --data-urlencode "access_token=$GITEE_TOKEN" \
+            --data-urlencode "tag_name=$tag" \
+            --data-urlencode "name=$title" \
+            --data-urlencode "body@$changelog_upload" >/dev/null
+    else
+        echo "- 创建 Gitee Release: $tag"
+        response="$(mktemp "$ROOT/build/gitee-release.XXXXXX")"
+        if ! curl --fail-with-body -sS -o "$response" -X POST "$GITEE_API_BASE/releases" \
+            --data-urlencode "access_token=$GITEE_TOKEN" \
+            --data-urlencode "tag_name=$tag" \
+            --data-urlencode "name=$title" \
+            --data-urlencode "body@$changelog_upload" \
+            --data-urlencode "target_commitish=master"; then
+            echo "! Gitee 创建 Release 失败，接口返回：" >&2
+            cat "$response" >&2
+            rm -f "$response"
+            exit 1
+        fi
+        release_id="$(python - "$response" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+if isinstance(data, dict) and data.get("id") is not None:
+    print(data["id"])
+PY
+)"
+        rm -f "$response"
+        if [ -z "$release_id" ]; then
+            release_id="$(gitee_release_id "$tag")" || {
+                echo "! Gitee Release 创建后查询失败: $tag"
+                exit 1
+            }
+        fi
+    fi
+
+    [ -n "$release_id" ] || { echo "! 无法确定 Gitee Release ID: $tag"; exit 1; }
+    curl --fail-with-body -sS -X POST "$GITEE_API_BASE/releases/$release_id/attach_files" \
+        --form "access_token=$GITEE_TOKEN" \
+        --form "file=@$zip_upload;filename=AppOpt.zip" >/dev/null
+    curl --fail-with-body -sS -X POST "$GITEE_API_BASE/releases/$release_id/attach_files" \
+        --form "access_token=$GITEE_TOKEN" \
+        --form "file=@$changelog_upload;filename=changelog.md" >/dev/null
+
+    publish_update_json "$tag" 0
+    echo "- Gitee 发布完成: $tag"
+}
 
 publish_github_release() {
     local gh_bin tag title changelog
@@ -498,6 +673,7 @@ publish_github_release() {
     [ -s "$ZIP" ] || { echo "! 找不到模块 zip: $ZIP"; exit 1; }
     [ -s "$changelog" ] || { echo "! 找不到更新日志: $changelog"; exit 1; }
     validate_update_json "$tag"
+    prepare_publish_update_json "$tag"
 
     "$gh_bin" auth status >/dev/null 2>&1 || {
         echo "! GitHub CLI 尚未登录，请先执行: gh auth login"
@@ -529,7 +705,7 @@ publish_github_release() {
     fi
 
     publish_update_json "$tag" 0
-    echo "- 发布完成: $tag"
+    echo "- GitHub 发布完成: $tag"
 }
 
 build_and_embed_app() {
@@ -642,6 +818,14 @@ echo "- 准备模块工作目录: $WORK"
 rm -rf "$WORK"
 mkdir -p "$WORK"
 cp -r "$BASE_DIR/." "$WORK/"
+if [ "$PUBLISH_RELEASE" = "1" ]; then
+    sed -E -i "s|^updateJson=.*|updateJson=$PUBLISH_UPDATE_URL|" "$WORK/module.prop"
+    grep -Fxq "updateJson=$PUBLISH_UPDATE_URL" "$WORK/module.prop" || {
+        echo "! 写入 $PUBLISH_REMOTE_LABEL updateJson 失败"
+        exit 1
+    }
+    echo "- 本次模块更新源: $PUBLISH_REMOTE_LABEL"
+fi
 build_pkg_helper
 build_foreground_helper
 build_and_embed_app
@@ -740,6 +924,9 @@ rm -f "$ZIP"
 python "$ROOT/scripts/ziptool.py" pack "$WORK" "$ZIP"
 echo "- 完成: $ZIP"
 
-if [ "$PUBLISH_GITHUB_RELEASE" = "1" ]; then
-    publish_github_release
+if [ "$PUBLISH_RELEASE" = "1" ]; then
+    case "$PUBLISH_TARGET" in
+        github) publish_github_release ;;
+        gitee) publish_gitee_release ;;
+    esac
 fi

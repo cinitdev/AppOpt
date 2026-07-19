@@ -577,16 +577,6 @@ static bool rule_health_foreground_contains(const RuleHealthForegroundC* state, 
     return strcmp(state->focused, pkg) == 0 || rule_health_visible_contains(state->visible, pkg);
 }
 
-static bool rule_health_config_contains_base_pkg(const AppConfig* cfg, const char* pkg) {
-    if (!cfg || !pkg || !pkg[0]) return false;
-    for (size_t i = 0; i < cfg->num_pkgs; i++) {
-        char base[MAX_PKG_LEN];
-        rule_health_base_pkg(cfg->pkgs[i], base, sizeof(base));
-        if (strcmp(base, pkg) == 0) return true;
-    }
-    return false;
-}
-
 static bool rule_health_parse_u64_span(
     const char* start,
     const char* end,
@@ -634,15 +624,13 @@ static bool rule_health_lifecycle(
     return false;
 }
 
-/* 配置应用每次进入新的可靠前台生命周期时只补一次全量发现扫描。
+/* 待观察规则所属应用每次进入新的可靠前台生命周期时只补一次全量发现扫描。
  * 这能覆盖系统进程总数净值未增长的进程替换场景，又不会按守护轮次反复遍历 /proc。 */
 static bool rule_health_foreground_discovery_scan_due(
-    const AppConfig* cfg,
     const ProcCache* cache
 ) {
     for (size_t i = 0; i < rule_health_discovery_lifecycle_count;) {
-        if (rule_health_config_contains_base_pkg(
-                cfg, rule_health_discovery_lifecycles[i].pkg)) {
+        if (rule_health_has_pending(rule_health_discovery_lifecycles[i].pkg)) {
             i++;
             continue;
         }
@@ -653,7 +641,7 @@ static bool rule_health_foreground_discovery_scan_due(
     if (now_elapsed == 0) return false;
     RuleHealthForegroundC foreground = rule_health_read_foreground(now_elapsed);
     if (!rule_health_start_selection(&foreground) || !foreground.focused[0] ||
-        !rule_health_config_contains_base_pkg(cfg, foreground.focused)) {
+        !rule_health_has_pending(foreground.focused)) {
         return false;
     }
 

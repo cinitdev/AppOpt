@@ -5,11 +5,34 @@
 // - group_high: avg/max/cores
 // - group_mid: avg/max/cores
 // - max_thread_rules
-// - rule_output_format: 旧版单行或六种区块生成格式
+// - rule_output_format: 选择校准规则写回格式，执行语义不随排版改变
 // - fallback
 //
 // 如果配置缺失或写 auto，就回到 CPU 拓扑自动推导。这里不要因为一行策略写错而中止校准，
 // 错误项应该回退默认值，保证用户还能得到基础规则。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WildcardGroup {
+    MaxMember,
+    Sum,
+}
+
+impl WildcardGroup {
+    fn from_wire(value: &str) -> Self {
+        if value.trim().eq_ignore_ascii_case("sum") {
+            Self::Sum
+        } else {
+            Self::MaxMember
+        }
+    }
+
+    fn wire(self) -> &'static str {
+        match self {
+            Self::MaxMember => "max_member",
+            Self::Sum => "sum",
+        }
+    }
+}
+
 struct CalibPolicy {
     best_avg: f64,
     best_max: f64,
@@ -21,6 +44,7 @@ struct CalibPolicy {
     mid_max: f64,
     mid_cores: String,
     max_thread_rules: usize,
+    wildcard_group: WildcardGroup,
     rule_output_format: RuleOutputFormat,
     fallback_cores: String,
 }
@@ -102,7 +126,13 @@ pub(crate) fn print_version_diagnostics(version: &str) {
         "[校准策略] child_process: 汇总子进程全部线程负载, 使用 group_high/group_mid 阈值生成进程级规则, 不参与 best_thread"
     );
     println!(
-        "[校准策略] wildcard_group: max_member; 通配线程组只按组内最高单线程平均负载判断, 避免低负载线程累加误升档"
+        "[校准策略] wildcard_group: {}; {}",
+        policy.wildcard_group.wire(),
+        if policy.wildcard_group == WildcardGroup::Sum {
+            "通配线程组按组内成员平均负载相加后判断档位"
+        } else {
+            "通配线程组只按组内最高单线程平均负载判断, 避免低负载线程累加误升档"
+        }
     );
     println!(
         "[校准策略] max_thread_rules: {}; 最多生成 {} 条线程级规则, 其余线程走包名兜底",
@@ -161,6 +191,9 @@ fn parse_policy_for_diagnostics(topo: &CpuTiers, text: &str) -> CalibPolicy {
                         policy.max_thread_rules = max;
                     }
                 }
+            }
+            "wildcard_group" => {
+                policy.wildcard_group = WildcardGroup::from_wire(value);
             }
             "rule_output_format" => {
                 policy.rule_output_format = RuleOutputFormat::from_wire(value);
@@ -264,6 +297,7 @@ impl CalibPolicy {
             mid_max: 18.0,
             mid_cores: topo.mid.clone(),
             max_thread_rules: MAX_THREAD_RULES,
+            wildcard_group: WildcardGroup::MaxMember,
             rule_output_format: RuleOutputFormat::Legacy,
             fallback_cores: topo.fallback.clone(),
         }
@@ -316,6 +350,9 @@ impl CalibPolicy {
                         }
                     }
                 }
+                "wildcard_group" => {
+                    policy.wildcard_group = WildcardGroup::from_wire(value);
+                }
                 "rule_output_format" => {
                     policy.rule_output_format = RuleOutputFormat::from_wire(value);
                 }
@@ -331,7 +368,7 @@ impl CalibPolicy {
         }
 
         println!(
-            "[CALIB] 校准策略: 最重线程 avg>={:.1} max>={:.1} 核心={} 高负载 avg>={:.1} max>={:.1} 核心={} 中负载 avg>={:.1} max>={:.1} 核心={} 线程规则上限={} 生成格式={} 兜底={}",
+            "[CALIB] 校准策略: 最重线程 avg>={:.1} max>={:.1} 核心={} 高负载 avg>={:.1} max>={:.1} 核心={} 中负载 avg>={:.1} max>={:.1} 核心={} 线程规则上限={} 通配聚合={} 生成格式={} 兜底={}",
             policy.best_avg,
             policy.best_max,
             policy.best_cores,
@@ -342,6 +379,7 @@ impl CalibPolicy {
             policy.mid_max,
             policy.mid_cores,
             policy.max_thread_rules,
+            policy.wildcard_group.wire(),
             policy.rule_output_format.wire(),
             policy.fallback_cores
         );

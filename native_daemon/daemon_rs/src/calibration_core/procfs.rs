@@ -41,7 +41,11 @@ fn read_command() -> io::Result<Option<String>> {
         return Ok(None);
     }
     let valid = text.starts_with("start ") || text == "stop" || text.starts_with("stop ");
-    fs::write(CALIB_CMD_FILE, "")?;
+    match fs::remove_file(CALIB_CMD_FILE) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
     if valid {
         Ok(Some(text))
     } else {

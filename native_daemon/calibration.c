@@ -531,27 +531,30 @@ typedef enum {
 typedef enum {
     CALIB_RULE_OUTPUT_LEGACY = 0,
     CALIB_RULE_OUTPUT_AUTHOR_BLOCK = 1,
-    CALIB_RULE_OUTPUT_COMPACT_HEADER_BLOCK = 2,
-    CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK = 3,
-    CALIB_RULE_OUTPUT_COMPACT_SEPARATE_FALLBACK_BLOCK = 4,
-    CALIB_RULE_OUTPUT_EXTENDED_BLOCK = 5,
-    CALIB_RULE_OUTPUT_COMPACT_EXTENDED_BLOCK = 6
+    CALIB_RULE_OUTPUT_COMPACT_EXTENDED_BLOCK = 2,
+    CALIB_RULE_OUTPUT_TAGGED_BLOCK = 3,
+    CALIB_RULE_OUTPUT_NATURAL_BLOCK = 4,
+    CALIB_RULE_OUTPUT_NESTED_BLOCK = 5,
+    CALIB_RULE_OUTPUT_FUNCTION_BLOCK = 6,
+    CALIB_RULE_OUTPUT_YAML = 7
 } CalibRuleOutputFormat;
 
 static const char* calib_rule_output_format_wire(CalibRuleOutputFormat format) {
     switch (format) {
         case CALIB_RULE_OUTPUT_AUTHOR_BLOCK:
             return "author_block";
-        case CALIB_RULE_OUTPUT_COMPACT_HEADER_BLOCK:
-            return "compact_header_block";
-        case CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK:
-            return "separate_fallback_block";
-        case CALIB_RULE_OUTPUT_COMPACT_SEPARATE_FALLBACK_BLOCK:
-            return "compact_separate_fallback_block";
-        case CALIB_RULE_OUTPUT_EXTENDED_BLOCK:
-            return "extended_block";
         case CALIB_RULE_OUTPUT_COMPACT_EXTENDED_BLOCK:
             return "compact_extended_block";
+        case CALIB_RULE_OUTPUT_TAGGED_BLOCK:
+            return "tagged_block";
+        case CALIB_RULE_OUTPUT_NATURAL_BLOCK:
+            return "natural_block";
+        case CALIB_RULE_OUTPUT_NESTED_BLOCK:
+            return "nested_block";
+        case CALIB_RULE_OUTPUT_FUNCTION_BLOCK:
+            return "function_block";
+        case CALIB_RULE_OUTPUT_YAML:
+            return "yaml";
         case CALIB_RULE_OUTPUT_LEGACY:
         default:
             return "legacy";
@@ -561,19 +564,20 @@ static const char* calib_rule_output_format_wire(CalibRuleOutputFormat format) {
 static CalibRuleOutputFormat calib_rule_output_format_from_wire(const char* value) {
     if (!value) return CALIB_RULE_OUTPUT_LEGACY;
     if (strcmp(value, "author_block") == 0) return CALIB_RULE_OUTPUT_AUTHOR_BLOCK;
-    if (strcmp(value, "compact_header_block") == 0) {
-        return CALIB_RULE_OUTPUT_COMPACT_HEADER_BLOCK;
+    if (strcmp(value, "compact_header_block") == 0 ||
+        strcmp(value, "separate_fallback_block") == 0 ||
+        strcmp(value, "compact_separate_fallback_block") == 0 ||
+        strcmp(value, "extended_block") == 0) {
+        return CALIB_RULE_OUTPUT_AUTHOR_BLOCK;
     }
-    if (strcmp(value, "separate_fallback_block") == 0) {
-        return CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK;
-    }
-    if (strcmp(value, "compact_separate_fallback_block") == 0) {
-        return CALIB_RULE_OUTPUT_COMPACT_SEPARATE_FALLBACK_BLOCK;
-    }
-    if (strcmp(value, "extended_block") == 0) return CALIB_RULE_OUTPUT_EXTENDED_BLOCK;
     if (strcmp(value, "compact_extended_block") == 0) {
         return CALIB_RULE_OUTPUT_COMPACT_EXTENDED_BLOCK;
     }
+    if (strcmp(value, "tagged_block") == 0) return CALIB_RULE_OUTPUT_TAGGED_BLOCK;
+    if (strcmp(value, "natural_block") == 0) return CALIB_RULE_OUTPUT_NATURAL_BLOCK;
+    if (strcmp(value, "nested_block") == 0) return CALIB_RULE_OUTPUT_NESTED_BLOCK;
+    if (strcmp(value, "function_block") == 0) return CALIB_RULE_OUTPUT_FUNCTION_BLOCK;
+    if (strcmp(value, "yaml") == 0) return CALIB_RULE_OUTPUT_YAML;
     return CALIB_RULE_OUTPUT_LEGACY;
 }
 
@@ -1141,6 +1145,25 @@ static bool calib_append_rule(char** out, size_t* remain, int* lines,
     return true;
 }
 
+/* 按本次采样规模预留规则空间，避免规则较多时静默丢失后续条目。 */
+static bool calib_rules_buffer_capacity(const CalibData* data, size_t* capacity_out) {
+    if (!data || !capacity_out) return false;
+
+    const size_t max_rule_line = MAX_PKG_LEN + MAX_THREAD_LEN + 128;
+    if (data->count > (SIZE_MAX - 4) / 2) return false;
+    size_t max_rule_lines = data->count * 2 + 4;
+    if (max_rule_lines > (SIZE_MAX - 1) / max_rule_line) return false;
+    size_t legacy_bytes = max_rule_lines * max_rule_line;
+    if (legacy_bytes > (SIZE_MAX - 1) / 3) return false;
+
+    size_t capacity = legacy_bytes * 3 + 1;
+    if (capacity < CALIB_RULES_MIN_BUFFER_SIZE) {
+        capacity = CALIB_RULES_MIN_BUFFER_SIZE;
+    }
+    *capacity_out = capacity;
+    return true;
+}
+
 typedef struct {
     char* owner;
     char* thread;
@@ -1232,7 +1255,12 @@ static bool calib_format_generated_rules(const char* pkg, const char* legacy,
     size_t remain = out_sz - 1;
     out[0] = '\0';
     bool ok = true;
-    if (output_format == CALIB_RULE_OUTPUT_AUTHOR_BLOCK) {
+    /* 只有主进程兜底时保持单行，避免生成没有实际成员的空区块。 */
+    if (thread_count == 0 && child_count == 0) {
+        if (fallback) {
+            ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
+        }
+    } else if (output_format == CALIB_RULE_OUTPUT_AUTHOR_BLOCK) {
         if (thread_count > 0) {
             ok = fallback ?
                 calib_format_append(&cursor, &remain, "%s=%s {\n", pkg, fallback) :
@@ -1253,56 +1281,9 @@ static bool calib_format_generated_rules(const char* pkg, const char* legacy,
                                          rules[i].owner, rules[i].cpus);
             }
         }
-    } else if (output_format == CALIB_RULE_OUTPUT_COMPACT_HEADER_BLOCK) {
+    } else if (output_format == CALIB_RULE_OUTPUT_COMPACT_EXTENDED_BLOCK) {
         if (thread_count + child_count > 0) {
-            ok = fallback ?
-                calib_format_append(&cursor, &remain, "%s=%s{\n", pkg, fallback) :
-                calib_format_append(&cursor, &remain, "%s{\n", pkg);
-            for (size_t i = 0; ok && i < count; i++) {
-                if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
-                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
-                                             rules[i].thread, rules[i].cpus);
-                }
-            }
-            for (size_t i = 0; ok && i < count; i++) {
-                if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
-                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
-                                             rules[i].owner + pkg_len, rules[i].cpus);
-                }
-            }
-            if (ok) ok = calib_format_append(&cursor, &remain, "}\n");
-        } else if (fallback) {
-            ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
-        }
-    } else if (output_format == CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK ||
-               output_format == CALIB_RULE_OUTPUT_COMPACT_SEPARATE_FALLBACK_BLOCK) {
-        if (thread_count + child_count > 0) {
-            const char* separator =
-                output_format == CALIB_RULE_OUTPUT_SEPARATE_FALLBACK_BLOCK ? " " : "";
-            ok = calib_format_append(&cursor, &remain, "%s%s{\n", pkg, separator);
-            for (size_t i = 0; ok && i < count; i++) {
-                if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
-                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
-                                             rules[i].thread, rules[i].cpus);
-                }
-            }
-            for (size_t i = 0; ok && i < count; i++) {
-                if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
-                    ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
-                                             rules[i].owner + pkg_len, rules[i].cpus);
-                }
-            }
-            if (ok) ok = calib_format_append(&cursor, &remain, "}\n");
-            if (ok && fallback) {
-                ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
-            }
-        } else if (fallback) {
-            ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
-        }
-    } else {
-        if (thread_count + child_count > 0) {
-            const char* separator = output_format == CALIB_RULE_OUTPUT_EXTENDED_BLOCK ? " " : "";
-            ok = calib_format_append(&cursor, &remain, "%s%s{\n", pkg, separator);
+            ok = calib_format_append(&cursor, &remain, "%s{\n", pkg);
             for (size_t i = 0; ok && i < count; i++) {
                 if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
                     ok = calib_format_append(&cursor, &remain, "    %s=%s\n",
@@ -1323,6 +1304,101 @@ static bool calib_format_generated_rules(const char* pkg, const char* legacy,
         } else if (fallback) {
             ok = calib_format_append(&cursor, &remain, "%s=%s\n", pkg, fallback);
         }
+    } else if (output_format == CALIB_RULE_OUTPUT_TAGGED_BLOCK) {
+        ok = calib_format_append(&cursor, &remain, "%s={\n", pkg);
+        for (size_t i = 0; ok && i < count; i++) {
+            if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
+                ok = calib_format_append(&cursor, &remain, "    thread:%s=%s\n",
+                                         rules[i].thread, rules[i].cpus);
+            }
+        }
+        for (size_t i = 0; ok && i < count; i++) {
+            if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+                ok = calib_format_append(&cursor, &remain, "    process:%s=%s\n",
+                                         rules[i].owner + pkg_len + 1, rules[i].cpus);
+            }
+        }
+        if (ok && fallback) ok = calib_format_append(&cursor, &remain, "    fallback=%s\n", fallback);
+        if (ok) ok = calib_format_append(&cursor, &remain, "}\n");
+    } else if (output_format == CALIB_RULE_OUTPUT_NATURAL_BLOCK) {
+        ok = fallback ?
+            calib_format_append(&cursor, &remain, "app %s fallback %s {\n", pkg, fallback) :
+            calib_format_append(&cursor, &remain, "app %s {\n", pkg);
+        for (size_t i = 0; ok && i < count; i++) {
+            if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
+                ok = calib_format_append(&cursor, &remain, "    thread %s=%s\n",
+                                         rules[i].thread, rules[i].cpus);
+            }
+        }
+        for (size_t i = 0; ok && i < count; i++) {
+            if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+                ok = calib_format_append(&cursor, &remain, "    process %s=%s\n",
+                                         rules[i].owner + pkg_len + 1, rules[i].cpus);
+            }
+        }
+        if (ok) ok = calib_format_append(&cursor, &remain, "}\n");
+    } else if (output_format == CALIB_RULE_OUTPUT_NESTED_BLOCK) {
+        ok = calib_format_append(&cursor, &remain, "%s={\n", pkg);
+        if (ok && thread_count > 0) {
+            ok = calib_format_append(&cursor, &remain, "    threads {\n");
+            for (size_t i = 0; ok && i < count; i++) {
+                if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
+                    ok = calib_format_append(&cursor, &remain, "        %s=%s\n",
+                                             rules[i].thread, rules[i].cpus);
+                }
+            }
+            if (ok) ok = calib_format_append(&cursor, &remain, "    }\n");
+        }
+        if (ok && child_count > 0) {
+            ok = calib_format_append(&cursor, &remain, "    processes {\n");
+            for (size_t i = 0; ok && i < count; i++) {
+                if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+                    ok = calib_format_append(&cursor, &remain, "        %s=%s\n",
+                                             rules[i].owner + pkg_len + 1, rules[i].cpus);
+                }
+            }
+            if (ok) ok = calib_format_append(&cursor, &remain, "    }\n");
+        }
+        if (ok && fallback) ok = calib_format_append(&cursor, &remain, "    fallback=%s\n", fallback);
+        if (ok) ok = calib_format_append(&cursor, &remain, "}\n");
+    } else if (output_format == CALIB_RULE_OUTPUT_FUNCTION_BLOCK) {
+        ok = fallback ?
+            calib_format_append(&cursor, &remain, "app(%s, %s) {\n", pkg, fallback) :
+            calib_format_append(&cursor, &remain, "app(%s) {\n", pkg);
+        for (size_t i = 0; ok && i < count; i++) {
+            if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
+                ok = calib_format_append(&cursor, &remain, "    thread(%s, %s)\n",
+                                         rules[i].thread, rules[i].cpus);
+            }
+        }
+        for (size_t i = 0; ok && i < count; i++) {
+            if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+                ok = calib_format_append(&cursor, &remain, "    process(%s, %s)\n",
+                                         rules[i].owner + pkg_len + 1, rules[i].cpus);
+            }
+        }
+        if (ok) ok = calib_format_append(&cursor, &remain, "}\n");
+    } else if (output_format == CALIB_RULE_OUTPUT_YAML) {
+        ok = calib_format_append(&cursor, &remain, "%s:\n", pkg);
+        if (ok && thread_count > 0) {
+            ok = calib_format_append(&cursor, &remain, "    threads:\n");
+            for (size_t i = 0; ok && i < count; i++) {
+                if (strcmp(rules[i].owner, pkg) == 0 && rules[i].thread && rules[i].thread[0]) {
+                    ok = calib_format_append(&cursor, &remain, "        %s: %s\n",
+                                             rules[i].thread, rules[i].cpus);
+                }
+            }
+        }
+        if (ok && child_count > 0) {
+            ok = calib_format_append(&cursor, &remain, "    processes:\n");
+            for (size_t i = 0; ok && i < count; i++) {
+                if (calib_generated_child_rule(&rules[i], pkg, pkg_len)) {
+                    ok = calib_format_append(&cursor, &remain, "        %s: %s\n",
+                                             rules[i].owner + pkg_len + 1, rules[i].cpus);
+                }
+            }
+        }
+        if (ok && fallback) ok = calib_format_append(&cursor, &remain, "    fallback: %s\n", fallback);
     }
 
     /* 理论上校准只生成当前包名、线程和子进程规则；仍保留未知规则以避免未来扩展丢行。 */
@@ -1526,9 +1602,12 @@ append_fallback:
         if (legacy) {
             if (!calib_format_generated_rules(data->pkg, legacy, policy.rule_output_format,
                                               out_buf, out_sz)) {
+                printf("[校准] 警告: %s 规则格式转换空间不足，已保留单行格式\n", data->pkg);
                 build_str(out_buf, out_sz, legacy, NULL);
             }
             free(legacy);
+        } else {
+            printf("[校准] 警告: %s 规则格式转换内存不足，已保留单行格式\n", data->pkg);
         }
     }
     free(groups);
@@ -1753,13 +1832,13 @@ static void calib_config_block_clear(CalibConfigBlock* block) {
 
 static bool calib_config_block_add(CalibConfigBlock* block, const char* raw_line) {
     if (!block || !raw_line) return false;
-    char* copy = strdup(raw_line);
-    if (!copy) return false;
-    char* trimmed = strtrim(copy);
-    char* line = strdup(trimmed);
-    free(copy);
+    size_t len = strlen(raw_line);
+    while (len > 0 && (raw_line[len - 1] == '\n' || raw_line[len - 1] == '\r')) len--;
+    char* line = malloc(len + 1);
     if (!line) return false;
-    if (line[0] == '\0') { free(line); return true; }
+    memcpy(line, raw_line, len);
+    line[len] = '\0';
+    if (len == 0) { free(line); return true; }
 
     if (block->count == block->cap) {
         size_t next = block->cap ? block->cap * 2 : 8;
@@ -1770,6 +1849,13 @@ static bool calib_config_block_add(CalibConfigBlock* block, const char* raw_line
     }
     block->lines[block->count++] = line;
     return true;
+}
+
+static bool calib_config_top_level_comment(const char* raw_line) {
+    if (!raw_line || !raw_line[0] ||
+        raw_line[0] == ' ' || raw_line[0] == '\t') return false;
+    return raw_line[0] == '#' ||
+        (raw_line[0] == '/' && raw_line[1] == '/');
 }
 
 static void calib_config_group_name(const char* owner, char* out, size_t out_sz) {
@@ -1815,7 +1901,7 @@ static bool calib_config_line_group(const char* raw_line, char* out, size_t out_
     return out[0] != '\0';
 }
 
-static bool calib_rule_syntax_block_group(const char* raw_line, char* out, size_t out_sz) {
+static bool calib_rule_syntax_block_group(const char* raw_line, char* out, size_t out_sz, ConfigBlockKind* out_kind) {
     if (!raw_line || !out || out_sz == 0) return false;
     out[0] = '\0';
     char* copy = strdup(raw_line);
@@ -1828,27 +1914,79 @@ static bool calib_rule_syntax_block_group(const char* raw_line, char* out, size_
     }
     char* owner = NULL;
     char* fallback = NULL;
-    bool header = config_block_header(line, &owner, &fallback);
+    ConfigBlockKind kind = CONFIG_BLOCK_STANDARD;
+    int custom_header = config_custom_block_header(line, &owner, &fallback, &kind);
+    bool header = custom_header > 0;
+    if (custom_header < 0) {
+        free(copy);
+        return false;
+    }
+    if (custom_header == 0) {
+        free(copy);
+        copy = strdup(raw_line);
+        if (!copy) return false;
+        line = strtrim(copy);
+        comment = strstr(line, "//");
+        if (comment) {
+            *comment = '\0';
+            line = strtrim(line);
+        }
+        header = config_block_header(line, &owner, &fallback);
+        kind = CONFIG_BLOCK_STANDARD;
+    }
     if (header && owner && owner[0]) calib_config_group_name(owner, out, out_sz);
+    if (header && out_kind) *out_kind = kind;
     free(copy);
     return header && out[0] != '\0';
 }
 
-static bool calib_rule_syntax_block_close(const char* raw_line) {
-    if (!raw_line) return false;
-    while (*raw_line && isspace((unsigned char)*raw_line)) raw_line++;
-    return *raw_line == '}';
+static int calib_rule_syntax_brace_delta(const char* raw_line) {
+    if (!raw_line) return 0;
+    const char* code = raw_line;
+    while (*code == ' ' || *code == '\t') code++;
+    if (*code == '#') return 0;
+    int delta = 0;
+    for (const char* p = code; *p; p++) {
+        if (p[0] == '/' && p[1] == '/') break;
+        if (*p == '{') delta++;
+        else if (*p == '}') delta--;
+    }
+    return delta;
+}
+
+static bool calib_parsed_block_valid(const ParsedConfigRule* rules, size_t count,
+                                     const char* owner, const char* fallback, bool valid) {
+    if (!valid || !owner || !owner[0] || strlen(owner) >= MAX_PKG_LEN) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (!parsed_config_rule_valid(&rules[i])) return false;
+    }
+    if (fallback) {
+        ParsedConfigRule rule = {
+            .owner = (char*)owner,
+            .thread = "",
+            .cpus = (char*)fallback
+        };
+        if (!parsed_config_rule_valid(&rule)) return false;
+    }
+    return true;
 }
 
 static bool calib_validate_rule_syntax_blocks(FILE* in) {
     if (!in || fseek(in, 0, SEEK_SET) != 0) return false;
     char* line = NULL;
     size_t line_cap = 0;
-    bool in_block = false;
-    bool header_has_fallback = false;
+    ParsedConfigRule* rules = NULL;
+    size_t rule_count = 0;
+    char* owner = NULL;
+    char* fallback = NULL;
+    ConfigBlockKind kind = CONFIG_BLOCK_STANDARD;
+    int section = 0;
+    bool block_valid = true;
     bool valid = true;
 
     while (valid && getline(&line, &line_cap, in) != -1) {
+        size_t indent = 0;
+        while (line[indent] == ' ' || line[indent] == '\t') indent++;
         char* copy = strdup(line);
         if (!copy) {
             valid = false;
@@ -1861,31 +1999,52 @@ static bool calib_validate_rule_syntax_blocks(FILE* in) {
             code = strtrim(code);
         }
 
-        if (in_block) {
+validate_config_line:
+        if (owner) {
             if (!code[0] || code[0] == '#') {
                 free(copy);
                 continue;
             }
+            bool finish = false;
+            bool reprocess = false;
             char* tail_fallback = NULL;
-            int close_result = config_block_close(code, &tail_fallback);
-            if (close_result != 0) {
-                valid = close_result > 0 && !(header_has_fallback && tail_fallback);
-                in_block = false;
-                header_has_fallback = false;
+            if (kind == CONFIG_BLOCK_YAML && indent == 0) {
+                finish = true;
+                reprocess = true;
+            } else if (kind == CONFIG_BLOCK_STANDARD) {
+                int close_result = config_block_close(code, &tail_fallback);
+                if (close_result != 0) {
+                    block_valid &= close_result > 0 && !(fallback && tail_fallback);
+                    finish = true;
+                }
+            } else if (kind != CONFIG_BLOCK_YAML && code[0] == '}' && section == 0) {
+                if (strcmp(code, "}") != 0) block_valid = false;
+                finish = true;
+            }
+            if (finish) {
+                const char* effective_fallback = fallback ? fallback : tail_fallback;
+                valid = calib_parsed_block_valid(rules, rule_count, owner,
+                                                  effective_fallback, block_valid);
+                free_parsed_config_rules(rules, rule_count);
+                rules = NULL;
+                rule_count = 0;
+                free(owner);
+                free(fallback);
+                owner = NULL;
+                fallback = NULL;
+                kind = CONFIG_BLOCK_STANDARD;
+                section = 0;
+                block_valid = true;
+                if (valid && reprocess) goto validate_config_line;
                 free(copy);
                 continue;
             }
-
-            char* eq = strchr(code, '=');
-            if (!eq) {
-                valid = false;
-            } else {
-                *eq++ = '\0';
-                char* name = strtrim(code);
-                char* cpus = strtrim(eq);
-                valid = name[0] && cpus[0] && !strchr(name, '=') &&
-                    !strchr(name, '{') && !strchr(name, '}');
-            }
+            int result = kind == CONFIG_BLOCK_STANDARD ?
+                add_config_block_body_rule(&rules, &rule_count, owner, code) :
+                config_custom_block_body_rule(&rules, &rule_count, owner, code,
+                                              &kind, &section, &fallback, indent);
+            if (result < 0) valid = false;
+            else if (result > 0) block_valid = false;
             free(copy);
             continue;
         }
@@ -1894,18 +2053,43 @@ static bool calib_validate_rule_syntax_blocks(FILE* in) {
             free(copy);
             continue;
         }
-        char* owner = NULL;
-        char* fallback = NULL;
-        if (config_block_header(code, &owner, &fallback)) {
-            valid = owner && owner[0] && strlen(owner) < MAX_PKG_LEN &&
-                !strchr(owner, '=') &&
-                (!fallback || (fallback[0] && !strchr(fallback, '=')));
-            in_block = valid;
-            header_has_fallback = fallback != NULL;
+        char* custom = strdup(code);
+        if (!custom) {
+            free(copy);
+            valid = false;
+            break;
+        }
+        char* header_owner = NULL;
+        char* header_fallback = NULL;
+        ConfigBlockKind header_kind = CONFIG_BLOCK_STANDARD;
+        int custom_header = config_custom_block_header(
+            custom, &header_owner, &header_fallback, &header_kind);
+        if (custom_header != 0) {
+            owner = strdup(header_owner);
+            fallback = header_fallback ? strdup(header_fallback) : NULL;
+            kind = header_kind;
+            block_valid = custom_header > 0 && owner && (!header_fallback || fallback);
+            free(custom);
+            free(copy);
+            continue;
+        }
+        free(custom);
+        if (config_block_header(code, &header_owner, &header_fallback)) {
+            owner = strdup(header_owner);
+            fallback = header_fallback ? strdup(header_fallback) : NULL;
+            block_valid = owner && (!header_fallback || fallback);
         }
         free(copy);
     }
-    if (ferror(in) || in_block) valid = false;
+    if (valid && owner && kind == CONFIG_BLOCK_YAML) {
+        valid = calib_parsed_block_valid(rules, rule_count, owner, fallback, block_valid);
+    } else if (owner) {
+        valid = false;
+    }
+    if (ferror(in)) valid = false;
+    free_parsed_config_rules(rules, rule_count);
+    free(owner);
+    free(fallback);
     free(line);
     clearerr(in);
     if (fseek(in, 0, SEEK_SET) != 0) valid = false;
@@ -1944,6 +2128,13 @@ static bool calib_flush_config_block(FILE* out, CalibConfigBlock* block,
         if (inserted && !*inserted) {
             ok = calib_write_rules_block_separated(out, rules_text, wrote_any);
             *inserted = ok;
+        }
+        /* YAML 区块会把下一个顶层规则前的注释纳入范围。替换目标规则时保留这些注释，
+         * 避免校准一次就删除用户写在应用块之间的说明。 */
+        for (size_t i = 0; ok && i < block->count; i++) {
+            if (calib_config_top_level_comment(block->lines[i])) {
+                ok = calib_write_line_normalized(out, block->lines[i]);
+            }
         }
     } else {
         ok = calib_write_config_block(out, block, wrote_any);
@@ -1987,15 +2178,31 @@ static bool calib_write_back(const char* config_file, const char* pkg,
     bool wrote_any = false;
     bool write_ok = true;
     bool in_rule_syntax_block = false;
+    ConfigBlockKind rule_syntax_kind = CONFIG_BLOCK_STANDARD;
+    int rule_syntax_depth = 0;
     while (write_ok && getline(&line, &line_cap, in) != -1) {
         if (calib_line_is_blank(line)) continue;
 
+process_write_line:
+        if (in_rule_syntax_block && rule_syntax_kind == CONFIG_BLOCK_YAML) {
+            const char* p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (p == line && *p && *p != '#' && !(p[0] == '/' && p[1] == '/')) {
+                in_rule_syntax_block = false;
+                goto process_write_line;
+            }
+        }
         char line_group[MAX_PKG_LEN];
+        ConfigBlockKind header_kind = CONFIG_BLOCK_STANDARD;
         bool block_header = !in_rule_syntax_block &&
-            calib_rule_syntax_block_group(line, line_group, sizeof(line_group));
+            calib_rule_syntax_block_group(line, line_group, sizeof(line_group), &header_kind);
         if (in_rule_syntax_block) {
             write_ok = calib_config_block_add(&block, line);
-            if (calib_rule_syntax_block_close(line)) in_rule_syntax_block = false;
+            if (rule_syntax_kind != CONFIG_BLOCK_YAML) {
+                rule_syntax_depth += calib_rule_syntax_brace_delta(line);
+                if (rule_syntax_depth == 0) in_rule_syntax_block = false;
+                else if (rule_syntax_depth < 0) write_ok = false;
+            }
             continue;
         }
         bool has_owner = block_header ||
@@ -2019,9 +2226,15 @@ static bool calib_write_back(const char* config_file, const char* pkg,
         }
 
         write_ok = calib_config_block_add(&block, line);
-        if (block_header) in_rule_syntax_block = true;
+        if (block_header) {
+            in_rule_syntax_block = true;
+            rule_syntax_kind = header_kind;
+            rule_syntax_depth = header_kind == CONFIG_BLOCK_YAML ? 0 :
+                calib_rule_syntax_brace_delta(line);
+            if (header_kind != CONFIG_BLOCK_YAML && rule_syntax_depth <= 0) write_ok = false;
+        }
     }
-    if (write_ok && in_rule_syntax_block) {
+    if (write_ok && in_rule_syntax_block && rule_syntax_kind != CONFIG_BLOCK_YAML) {
         write_ok = false;
         calib_config_block_clear(&block);
     } else if (write_ok) {
@@ -2142,13 +2355,21 @@ static void* calib_thread(void* arg) {
                         continue;
                     }
 
-                    char rules[4096];
-                    int n = calib_generate_rules(&data, &g_topo, rules, sizeof(rules));
+                    size_t rules_capacity = 0;
+                    char* rules = NULL;
+                    if (calib_rules_buffer_capacity(&data, &rules_capacity)) {
+                        rules = calloc(1, rules_capacity);
+                    }
+                    int n = rules ?
+                        calib_generate_rules(&data, &g_topo, rules, rules_capacity) : 0;
                     if (!calib_write_history(data.pkg, &data)) {
                         printf("[校准] 警告: %s 历史记录写入失败，规则生成继续执行\n", data.pkg);
                     }
                     char st[MAX_PKG_LEN + 64];
-                    if (n > 0) {
+                    if (!rules) {
+                        printf("[校准] 警告: %s 规则缓冲区分配失败\n", data.pkg);
+                        snprintf(st, sizeof(st), "done %s;reason=memory", data.pkg);
+                    } else if (n > 0) {
                         AppConfig* cfg = get_config();
                         const char* cf = cfg ? cfg->config_file : g_config_file;
                         if (calib_write_back(cf, data.pkg, rules)) {
@@ -2165,6 +2386,7 @@ static void* calib_thread(void* arg) {
                         snprintf(st, sizeof(st), "done %s;reason=no_load", data.pkg);
                     }
                     calib_set_state(st);
+                    free(rules);
                     calib_free(&data);
                 }
             }
@@ -2187,13 +2409,21 @@ static void* calib_thread(void* arg) {
                     calib_free(&data);
                     continue;
                 }
-                char rules[4096];
-                int n = calib_generate_rules(&data, &g_topo, rules, sizeof(rules));
+                size_t rules_capacity = 0;
+                char* rules = NULL;
+                if (calib_rules_buffer_capacity(&data, &rules_capacity)) {
+                    rules = calloc(1, rules_capacity);
+                }
+                int n = rules ?
+                    calib_generate_rules(&data, &g_topo, rules, rules_capacity) : 0;
                 if (!calib_write_history(data.pkg, &data)) {
                     printf("[校准] 警告: %s 历史记录写入失败，规则生成继续执行\n", data.pkg);
                 }
                 char st[MAX_PKG_LEN + 64];
-                if (n > 0) {
+                if (!rules) {
+                    printf("[校准] 警告: %s 规则缓冲区分配失败\n", data.pkg);
+                    snprintf(st, sizeof(st), "done %s;reason=memory", data.pkg);
+                } else if (n > 0) {
                     AppConfig* cfg = get_config();
                     const char* cf = cfg ? cfg->config_file : g_config_file;
                     if (calib_write_back(cf, data.pkg, rules)) {
@@ -2210,6 +2440,7 @@ static void* calib_thread(void* arg) {
                     snprintf(st, sizeof(st), "done %s;reason=no_load", data.pkg);
                 }
                 calib_set_state(st);
+                free(rules);
                 calib_free(&data);
             } else if (data.round_count != prev_rounds && data.round_count % 20 == 0) {
                 /* 每 20 轮(约 10s)报一次进度, 避免每 0.5s 刷屏 */

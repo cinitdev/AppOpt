@@ -43,6 +43,10 @@ public final class ForegroundHelper {
     private static final long UID_MAP_RECONCILE_MS = 30000L;
     private static final long UID_MAP_FORCE_REFRESH_MS = 300000L;
     private static final long EVENT_DEBOUNCE_MS = 80L;
+    private static final long DUPLICATE_ERROR_LOG_INTERVAL_MS = 30000L;
+    private static final long DEAD_SERVICE_EXIT_DELAY_MS = 250L;
+    private static final int DEAD_SERVICE_FAILURE_THRESHOLD = 3;
+    private static final int DEAD_SERVICE_EXIT_CODE = 75;
     private static final int MAX_TASKS = 24;
     private static final int MAX_EXIT_RECORDS = 64;
     private static final int MAX_RESTORED_LIFECYCLE_RECORDS = 64;
@@ -74,6 +78,10 @@ public final class ForegroundHelper {
     private static String bootId = "";
     private static long lastBootIdReadAttemptElapsed;
     private static String lastReliableFrontPackage;
+    private static int consecutiveDeadServiceFailures;
+    private static boolean deadServiceExitScheduled;
+    private static String lastTaskError = "";
+    private static long lastTaskErrorLogElapsed;
     private static Set<String> lastInScopePackages = new LinkedHashSet<>();
     private static final TreeMap<String, Long> lastExitElapsed = new TreeMap<>();
     private static final TreeMap<String, LifecycleRecord> lifecyclePackages = new TreeMap<>();
@@ -115,6 +123,9 @@ public final class ForegroundHelper {
     }
 
     private static void connectActivityTaskManager() {
+        if (deadServiceExitScheduled) {
+            return;
+        }
         try {
             Class<?> managerClass = Class.forName("android.app.ActivityTaskManager");
             Method getInstance = managerClass.getMethod("getInstance");
@@ -139,11 +150,15 @@ public final class ForegroundHelper {
             listenerRegistered = false;
             startupError = "connect=" + errorText(error);
             writeErrorState("connect", error);
-            System.err.println("[前台助手] ActivityTaskManager 初始化失败: " + startupError);
+            logTaskError("ActivityTaskManager 初始化失败", error);
+            recordDeadServiceFailure(error);
         }
     }
 
     private static void reconcile() {
+        if (deadServiceExitScheduled) {
+            return;
+        }
         long nowElapsed = SystemClock.elapsedRealtime();
         if (!listenerRegistered
                 && nowElapsed - lastListenerRegisterAttemptElapsed >= LISTENER_REGISTER_RETRY_MS) {
@@ -187,6 +202,7 @@ public final class ForegroundHelper {
                 System.err.println("[前台助手] TaskStackListener 注册失败, 降级轮询: "
                     + startupError);
             }
+            recordDeadServiceFailure(listenerError);
             return false;
         }
     }
@@ -211,6 +227,9 @@ public final class ForegroundHelper {
             long eventElapsed,
             String movedPackage
     ) {
+        if (deadServiceExitScheduled) {
+            return;
+        }
         synchronized (SCHEDULE_LOCK) {
             if (eventElapsed > 0L && (pendingReliableEventElapsed == 0L
                     || eventElapsed < pendingReliableEventElapsed)) {
@@ -275,6 +294,8 @@ public final class ForegroundHelper {
             }
             List<ActivityManager.RunningTaskInfo> tasks =
                 (List<ActivityManager.RunningTaskInfo>) value;
+            consecutiveDeadServiceFailures = 0;
+            lastTaskError = "";
             writeTaskState(tasks, reason, snapshotElapsed, snapshotWall, reliableEventElapsed);
         } catch (Throwable error) {
             writeErrorState(reason, error);
@@ -285,7 +306,58 @@ public final class ForegroundHelper {
             unregisterMethod = null;
             listener = null;
             listenerRegistered = false;
-            System.err.println("[前台助手] 读取任务失败: " + errorText(error));
+            logTaskError("读取任务失败", error);
+            recordDeadServiceFailure(error);
+        }
+    }
+
+    /**
+     * 监听和轮询共用 ActivityTaskManager Binder。Binder 已死亡时，反射重连仍可能取得
+     * framework 缓存的旧代理；连续失败后退出进程，让外层 watchdog 创建全新的 app_process。
+     */
+    private static void recordDeadServiceFailure(Throwable error) {
+        if (!isDeadSystemService(error) || deadServiceExitScheduled) {
+            return;
+        }
+        consecutiveDeadServiceFailures++;
+        if (consecutiveDeadServiceFailures < DEAD_SERVICE_FAILURE_THRESHOLD) {
+            return;
+        }
+        scheduleDeadServiceExit();
+    }
+
+    private static void scheduleDeadServiceExit() {
+        if (deadServiceExitScheduled) {
+            return;
+        }
+        deadServiceExitScheduled = true;
+        System.err.println("[前台助手] 系统服务连接已失效，准备退出并由 watchdog 重启");
+        handler.postDelayed(() -> System.exit(DEAD_SERVICE_EXIT_CODE), DEAD_SERVICE_EXIT_DELAY_MS);
+    }
+
+    private static boolean isDeadSystemService(Throwable error) {
+        Throwable value = error;
+        int depth = 0;
+        while (value != null && depth++ < 12) {
+            String name = value.getClass().getName();
+            if ("android.os.DeadObjectException".equals(name)
+                    || "android.os.DeadSystemException".equals(name)
+                    || "android.os.DeadSystemRuntimeException".equals(name)) {
+                return true;
+            }
+            value = value.getCause();
+        }
+        return false;
+    }
+
+    private static void logTaskError(String action, Throwable error) {
+        String text = action + ": " + errorText(error);
+        long nowElapsed = SystemClock.elapsedRealtime();
+        if (!text.equals(lastTaskError)
+                || nowElapsed - lastTaskErrorLogElapsed >= DUPLICATE_ERROR_LOG_INTERVAL_MS) {
+            System.err.println("[前台助手] " + text);
+            lastTaskError = text;
+            lastTaskErrorLogElapsed = nowElapsed;
         }
     }
 
@@ -451,6 +523,9 @@ public final class ForegroundHelper {
     }
 
     private static void uidMapLoop() {
+        if (deadServiceExitScheduled) {
+            return;
+        }
         syncPackageUidMap("loop");
         handler.postDelayed(ForegroundHelper::uidMapLoop, UID_MAP_RECONCILE_MS);
     }
@@ -494,6 +569,10 @@ public final class ForegroundHelper {
             } catch (Throwable error) {
                 packageManager = null;
                 System.err.println("[前台助手] 生成 package_uid.map 失败: " + errorText(error));
+                if (isDeadSystemService(error)) {
+                    writeErrorState("package_uid_map", error);
+                    scheduleDeadServiceExit();
+                }
                 return;
             }
         }
@@ -524,16 +603,59 @@ public final class ForegroundHelper {
             if (line.isEmpty() || line.startsWith("#")) {
                 continue;
             }
-            int eq = line.indexOf('=');
-            if (eq <= 0) {
-                continue;
-            }
-            String base = extractBasePackage(line.substring(0, eq).trim());
+            String base = extractRulePackage(raw, line);
             if (base.length() > 0) {
                 out.add(base);
             }
         }
         return out;
+    }
+
+    /** 只从规则顶层提取包名，避免把区块成员误认为应用。 */
+    private static String extractRulePackage(String raw, String line) {
+        int comment = line.indexOf("//");
+        if (comment >= 0) {
+            line = line.substring(0, comment).trim();
+        }
+        if (line.isEmpty()) {
+            return "";
+        }
+        boolean topLevel = raw != null && !raw.isEmpty() && !Character.isWhitespace(raw.charAt(0));
+        if (!topLevel) {
+            return "";
+        }
+
+        if (line.startsWith("app ")) {
+            String body = line.substring(4).trim();
+            int space = body.indexOf(' ');
+            String owner = space < 0 ? body : body.substring(0, space);
+            return extractBasePackage(owner);
+        }
+        if (line.startsWith("app(")) {
+            int close = line.indexOf(')', 4);
+            if (close < 0) {
+                return "";
+            }
+            String args = line.substring(4, close);
+            int comma = args.indexOf(',');
+            return extractBasePackage((comma < 0 ? args : args.substring(0, comma)).trim());
+        }
+        if (line.endsWith("{") && line.indexOf('=') < 0) {
+            return extractBasePackage(line.substring(0, line.length() - 1).trim());
+        }
+
+        if (line.endsWith(":") && line.indexOf('=') < 0) {
+            String owner = line.substring(0, line.length() - 1).trim();
+            if (!"threads".equals(owner) && !"processes".equals(owner)) {
+                return extractBasePackage(owner);
+            }
+        }
+
+        int eq = line.indexOf('=');
+        if (eq <= 0) {
+            return "";
+        }
+        return extractBasePackage(line.substring(0, eq).trim());
     }
 
     private static String extractBasePackage(String left) {

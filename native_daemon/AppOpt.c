@@ -48,7 +48,7 @@
 #include "fps_fallback.h"
 #include "foreground_monitor.h"
 
-#define VERSION            "1.7.8"
+#define VERSION            "1.7.9"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -99,6 +99,7 @@
 #define CALIB_MAX_TRACKED_TIDS 4096
 #define CALIB_MAX_CHILD_THREAD_SUMMARIES 1024
 #define CALIB_MAX_SERIES_POINTS 1200
+#define CALIB_RULES_MIN_BUFFER_SIZE 16384
 
 typedef struct {
     char pkg[MAX_PKG_LEN];

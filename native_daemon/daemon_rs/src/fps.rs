@@ -14,7 +14,9 @@ mod imp {
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
 mod imp {
-    pub fn start_fps_thread() {}
+    pub fn start_fps_thread() -> bool {
+        false
+    }
 }
 
 pub use imp::start_fps_thread;

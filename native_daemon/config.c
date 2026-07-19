@@ -53,6 +53,47 @@ static int add_unique_config_name(char*** names, size_t* count, const char* name
     return 0;
 }
 
+static void remove_config_name(char*** names, size_t* count, const char* name) {
+    if (!names || !*names || !count || !name) return;
+    for (size_t i = 0; i < *count; i++) {
+        if (strcmp((*names)[i], name) != 0) continue;
+        free((*names)[i]);
+        if (i + 1 < *count) {
+            memmove(&(*names)[i], &(*names)[i + 1],
+                    (*count - i - 1) * sizeof(**names));
+        }
+        (*count)--;
+        if (*count == 0) {
+            free(*names);
+            *names = NULL;
+        }
+        return;
+    }
+}
+
+/* 覆盖核心数量优先；数量相同时优先更高核心，再优先覆盖更低核心。 */
+static int compare_config_cpu_sets(const cpu_set_t* left, const cpu_set_t* right) {
+    int left_count = CPU_COUNT(left);
+    int right_count = CPU_COUNT(right);
+    if (left_count != right_count) return left_count > right_count ? 1 : -1;
+
+    int left_high = -1, right_high = -1;
+    int left_low = CPU_SETSIZE, right_low = CPU_SETSIZE;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (CPU_ISSET(cpu, left)) {
+            if (left_low == CPU_SETSIZE) left_low = cpu;
+            left_high = cpu;
+        }
+        if (CPU_ISSET(cpu, right)) {
+            if (right_low == CPU_SETSIZE) right_low = cpu;
+            right_high = cpu;
+        }
+    }
+    if (left_high != right_high) return left_high > right_high ? 1 : -1;
+    if (left_low != right_low) return left_low < right_low ? 1 : -1;
+    return 0;
+}
+
 static bool parsed_config_rule_valid(const ParsedConfigRule* rule) {
     if (!rule || !rule->owner || !rule->thread || !rule->cpus ||
         !rule->owner[0] || strlen(rule->owner) >= MAX_PKG_LEN ||
@@ -79,6 +120,12 @@ static int append_config_rule(
     if (!parsed_config_rule_valid(parsed)) return 1;
 
     if (!parsed->thread[0] && strcasecmp(parsed->cpus, "auto") == 0) {
+        for (size_t i = 0; i < *rules_count; i++) {
+            if (strcmp((*rules)[i].pkg, parsed->owner) == 0 &&
+                !(*rules)[i].thread[0]) {
+                return 0;
+            }
+        }
         if (add_unique_config_name(auto_packages, auto_count, parsed->owner) < 0 ||
             add_unique_config_name(packages, package_count, parsed->owner) < 0) {
             return -1;
@@ -89,6 +136,22 @@ static int append_config_rule(
     cpu_set_t set;
     CPU_ZERO(&set);
     if (!parse_cpu_ranges_strict(parsed->cpus, &set, NULL)) return 1;
+    if (!parsed->thread[0]) {
+        remove_config_name(auto_packages, auto_count, parsed->owner);
+    }
+
+    ssize_t duplicate = -1;
+    for (size_t i = 0; i < *rules_count; i++) {
+        if (strcmp((*rules)[i].pkg, parsed->owner) == 0 &&
+            strcmp((*rules)[i].thread, parsed->thread) == 0) {
+            duplicate = (ssize_t)i;
+            break;
+        }
+    }
+    if (duplicate >= 0 &&
+        compare_config_cpu_sets(&set, &(*rules)[duplicate].cpus) <= 0) {
+        return add_unique_config_name(packages, package_count, parsed->owner) < 0 ? -1 : 0;
+    }
 
     cpu_set_t effective_set;
     CPU_AND(&effective_set, &set, &cfg->topo.present_cpus);
@@ -112,11 +175,15 @@ static int append_config_rule(
     rule.cpus = set;
     free(dir_name);
 
-    AffinityRule* resized = realloc(*rules, (*rules_count + 1) * sizeof(**rules));
-    if (!resized) return -1;
-    *rules = resized;
-    memcpy(&resized[*rules_count], &rule, sizeof(rule));
-    (*rules_count)++;
+    if (duplicate >= 0) {
+        memcpy(&(*rules)[duplicate], &rule, sizeof(rule));
+    } else {
+        AffinityRule* resized = realloc(*rules, (*rules_count + 1) * sizeof(**rules));
+        if (!resized) return -1;
+        *rules = resized;
+        memcpy(&resized[*rules_count], &rule, sizeof(rule));
+        (*rules_count)++;
+    }
     return add_unique_config_name(packages, package_count, parsed->owner) < 0 ? -1 : 0;
 }
 
@@ -213,6 +280,237 @@ static int add_config_block_body_rule(
     return add_parsed_config_rule(rules, count, owner, thread, cpus) < 0 ? -1 : 0;
 }
 
+typedef enum {
+    CONFIG_BLOCK_STANDARD = 0,
+    CONFIG_BLOCK_TAGGED,
+    CONFIG_BLOCK_NATURAL,
+    CONFIG_BLOCK_NESTED,
+    CONFIG_BLOCK_FUNCTION,
+    CONFIG_BLOCK_YAML
+} ConfigBlockKind;
+
+/* 返回 1 表示有效自定义头，0 表示不是自定义头，-1 表示自定义头格式错误。 */
+static int config_custom_block_header(
+    char* line,
+    char** owner,
+    char** fallback_cpus,
+    ConfigBlockKind* kind
+) {
+    size_t len = strlen(line);
+    if (len > 1 && line[len - 1] == ':' && !strchr(line, '=') && !strchr(line, ' ')) {
+        line[len - 1] = '\0';
+        *owner = strtrim(line);
+        *fallback_cpus = NULL;
+        *kind = CONFIG_BLOCK_YAML;
+        return (*owner)[0] != '\0' && strcmp(*owner, "threads") != 0 &&
+            strcmp(*owner, "processes") != 0 ? 1 : -1;
+    }
+    if (len < 2 || line[len - 1] != '{') return 0;
+    line[len - 1] = '\0';
+    char* prefix = strtrim(line);
+    if (!prefix[0]) return 0;
+
+    if (strcmp(prefix, "app") == 0 || strncmp(prefix, "app ", 4) == 0) {
+        char* save = NULL;
+        char* value = strcmp(prefix, "app") == 0 ? prefix + 3 : strtrim(prefix + 4);
+        char* pkg = strtok_r(value, " \t", &save);
+        char* keyword = strtok_r(NULL, " \t", &save);
+        char* cpus = strtok_r(NULL, " \t", &save);
+        char* extra = strtok_r(NULL, " \t", &save);
+        *owner = pkg ? pkg : "__invalid__";
+        *fallback_cpus = NULL;
+        *kind = CONFIG_BLOCK_NATURAL;
+        if (!pkg || extra || (keyword && (!cpus || strcmp(keyword, "fallback") != 0))) return -1;
+        *fallback_cpus = cpus;
+        return 1;
+    }
+
+    if (strncmp(prefix, "app(", 4) == 0) {
+        char* close = strrchr(prefix + 4, ')');
+        *owner = "__invalid__";
+        *fallback_cpus = NULL;
+        *kind = CONFIG_BLOCK_FUNCTION;
+        if (!close || strtrim(close + 1)[0]) return -1;
+        *close = '\0';
+        char* args = strtrim(prefix + 4);
+        char* comma = strchr(args, ',');
+        if (comma) {
+            if (strchr(comma + 1, ',')) return -1;
+            *comma++ = '\0';
+            *fallback_cpus = strtrim(comma);
+        }
+        *owner = strtrim(args);
+        return (*owner)[0] && (!*fallback_cpus || (*fallback_cpus)[0]) ? 1 : -1;
+    }
+
+    if (prefix[strlen(prefix) - 1] == '=') {
+        prefix[strlen(prefix) - 1] = '\0';
+        *owner = strtrim(prefix);
+        *fallback_cpus = NULL;
+        *kind = CONFIG_BLOCK_TAGGED;
+        return (*owner)[0] != '\0' && !strchr(*owner, '=') ? 1 : -1;
+    }
+    return 0;
+}
+
+static int add_typed_config_rule(
+    ParsedConfigRule** rules,
+    size_t* count,
+    const char* owner,
+    const char* name,
+    const char* cpus,
+    bool process
+) {
+    if (!name || !name[0] || !cpus || !cpus[0] ||
+        strchr(name, '{') || strchr(name, '}') || strchr(name, '=')) return 1;
+    if (!process) return add_parsed_config_rule(rules, count, owner, name, cpus) < 0 ? -1 : 0;
+
+    char child_owner[MAX_PKG_LEN * 2];
+    size_t owner_len = strlen(owner);
+    if (strncmp(name, owner, owner_len) == 0 && name[owner_len] == ':' && name[owner_len + 1]) {
+        return add_parsed_config_rule(rules, count, name, "", cpus) < 0 ? -1 : 0;
+    }
+    const char* suffix = name[0] == ':' ? name : NULL;
+    int written = suffix ?
+        snprintf(child_owner, sizeof(child_owner), "%s%s", owner, suffix) :
+        snprintf(child_owner, sizeof(child_owner), "%s:%s", owner, name);
+    if (written < 0 || written >= (int)sizeof(child_owner)) return 1;
+    return add_parsed_config_rule(rules, count, child_owner, "", cpus) < 0 ? -1 : 0;
+}
+
+static int config_custom_block_body_rule(
+    ParsedConfigRule** rules,
+    size_t* count,
+    const char* owner,
+    char* line,
+    ConfigBlockKind* kind,
+    int* section,
+    char** fallback,
+    size_t indent
+) {
+    if (*kind == CONFIG_BLOCK_TAGGED &&
+        (strcmp(line, "threads {") == 0 || strcmp(line, "processes {") == 0)) {
+        if (*count > 0) return 1;
+        *kind = CONFIG_BLOCK_NESTED;
+    }
+    if (*kind == CONFIG_BLOCK_NESTED) {
+        if (strcmp(line, "threads {") == 0) {
+            if (*section) return 1;
+            *section = 1;
+            return 0;
+        }
+        if (strcmp(line, "processes {") == 0) {
+            if (*section) return 1;
+            *section = 2;
+            return 0;
+        }
+        if (line[0] == '}' && *section) {
+            *section = 0;
+            return strcmp(line, "}") == 0 ? 0 : 1;
+        }
+    }
+    if (*kind == CONFIG_BLOCK_YAML) {
+        if (strcmp(line, "threads:") == 0) {
+            if (indent != 4) return 1;
+            *section = 1;
+            return 0;
+        }
+        if (strcmp(line, "processes:") == 0) {
+            if (indent != 4) return 1;
+            *section = 2;
+            return 0;
+        }
+    }
+
+    if (*kind == CONFIG_BLOCK_FUNCTION) {
+        bool process = false;
+        char* args = NULL;
+        if (strncmp(line, "thread(", 7) == 0) args = line + 7;
+        else if (strncmp(line, "process(", 8) == 0) {
+            args = line + 8;
+            process = true;
+        } else return 1;
+        char* close = strrchr(args, ')');
+        if (!close || strtrim(close + 1)[0]) return 1;
+        *close = '\0';
+        char* comma = strrchr(args, ',');
+        if (!comma) return 1;
+        *comma++ = '\0';
+        return add_typed_config_rule(rules, count, owner, strtrim(args), strtrim(comma), process);
+    }
+
+    char* separator = *kind == CONFIG_BLOCK_YAML ? strrchr(line, ':') : strchr(line, '=');
+    if (!separator) return 1;
+    *separator++ = '\0';
+    char* name = strtrim(line);
+    char* cpus = strtrim(separator);
+    if (!name[0] || !cpus[0]) return 1;
+    bool outer_fallback =
+        (*kind == CONFIG_BLOCK_TAGGED && strcmp(name, "fallback") == 0) ||
+        (*kind == CONFIG_BLOCK_NESTED && *section == 0 && strcmp(name, "fallback") == 0) ||
+        (*kind == CONFIG_BLOCK_YAML && indent == 4 && strcmp(name, "fallback") == 0);
+    if (outer_fallback) {
+        if (*fallback) return 1;
+        *fallback = strdup(cpus);
+        return *fallback ? 0 : -1;
+    }
+
+    if (*kind == CONFIG_BLOCK_TAGGED) {
+        if (strncmp(name, "thread:", 7) == 0) {
+            return add_typed_config_rule(rules, count, owner, name + 7, cpus, false);
+        }
+        if (strncmp(name, "process:", 8) == 0) {
+            return add_typed_config_rule(rules, count, owner, name + 8, cpus, true);
+        }
+        return 1;
+    }
+    if (*kind == CONFIG_BLOCK_NATURAL) {
+        if (strncmp(name, "thread ", 7) == 0) {
+            return add_typed_config_rule(rules, count, owner, strtrim(name + 7), cpus, false);
+        }
+        if (strncmp(name, "process ", 8) == 0) {
+            return add_typed_config_rule(rules, count, owner, strtrim(name + 8), cpus, true);
+        }
+        return 1;
+    }
+    if (*kind == CONFIG_BLOCK_NESTED || *kind == CONFIG_BLOCK_YAML) {
+        if (*kind == CONFIG_BLOCK_YAML && indent != 8) return 1;
+        if (*section == 1) return add_typed_config_rule(rules, count, owner, name, cpus, false);
+        if (*section == 2) return add_typed_config_rule(rules, count, owner, name, cpus, true);
+        return 1;
+    }
+    return 1;
+}
+
+static int commit_parsed_config_block(
+    AppConfig* cfg,
+    AffinityRule** rules,
+    size_t* rules_count,
+    char*** packages,
+    size_t* package_count,
+    char*** auto_packages,
+    size_t* auto_count,
+    ParsedConfigRule** block_rules,
+    size_t* block_rule_count,
+    const char* owner,
+    const char* fallback,
+    bool valid
+) {
+    if (valid && fallback &&
+        add_parsed_config_rule(block_rules, block_rule_count, owner, "", fallback) < 0) return -1;
+    if (valid) {
+        for (size_t i = 0; i < *block_rule_count; i++) {
+            if (!parsed_config_rule_valid(&(*block_rules)[i])) return 0;
+        }
+        for (size_t i = 0; i < *block_rule_count; i++) {
+            int result = append_config_rule(cfg, rules, rules_count, packages, package_count,
+                                            auto_packages, auto_count, &(*block_rules)[i]);
+            if (result < 0) return -1;
+        }
+    }
+    return 0;
+}
+
 static AppConfig* load_config(const char* config_file, const CpuTopology* topo, struct timespec* last_mtime) {
     struct stat st;
     if (stat(config_file, &st)) return NULL;
@@ -244,8 +542,12 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
     char* block_owner = NULL;
     char* block_fallback = NULL;
     bool block_valid = true;
+    ConfigBlockKind block_kind = CONFIG_BLOCK_STANDARD;
+    int block_section = 0;
 
     while (getline(&line, &line_cap, fp) != -1) {
+        size_t indent = 0;
+        while (line[indent] == ' ' || line[indent] == '\t') indent++;
         char* p = strtrim(line);
         char* comment = strstr(p, "//");
         if (comment) {
@@ -253,32 +555,33 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
             p = strtrim(p);
         }
 
+process_config_line:
         if (block_owner) {
             if (!p[0] || p[0] == '#') continue;
+            bool finish = false;
+            bool reprocess = false;
             char* tail_fallback = NULL;
-            int close_result = config_block_close(p, &tail_fallback);
-            if (close_result != 0) {
-                if (close_result < 0 || (block_fallback && tail_fallback)) block_valid = false;
+            if (block_kind == CONFIG_BLOCK_YAML && indent == 0) {
+                finish = true;
+                reprocess = true;
+            } else if (block_kind == CONFIG_BLOCK_STANDARD) {
+                int close_result = config_block_close(p, &tail_fallback);
+                if (close_result != 0) {
+                    if (close_result < 0 || (block_fallback && tail_fallback)) block_valid = false;
+                    finish = true;
+                }
+            } else if (block_kind != CONFIG_BLOCK_YAML && p[0] == '}' && block_section == 0) {
+                if (strcmp(p, "}") != 0) block_valid = false;
+                finish = true;
+            }
+
+            if (finish) {
                 const char* fallback = block_fallback ? block_fallback : tail_fallback;
-                if (block_valid && fallback &&
-                    add_parsed_config_rule(&block_rules, &block_rule_count,
-                                           block_owner, "", fallback) < 0) goto error;
-                if (block_valid) {
-                    for (size_t i = 0; i < block_rule_count; i++) {
-                        if (!parsed_config_rule_valid(&block_rules[i])) {
-                            block_valid = false;
-                            break;
-                        }
-                    }
-                }
-                if (block_valid) {
-                    for (size_t i = 0; i < block_rule_count; i++) {
-                        int result = append_config_rule(
-                            cfg, &new_rules, &rules_cnt, &new_pkgs, &pkgs_cnt,
-                            &new_auto, &auto_cnt, &block_rules[i]);
-                        if (result < 0) goto error;
-                    }
-                }
+                int commit = commit_parsed_config_block(
+                    cfg, &new_rules, &rules_cnt, &new_pkgs, &pkgs_cnt,
+                    &new_auto, &auto_cnt, &block_rules, &block_rule_count,
+                    block_owner, fallback, block_valid);
+                if (commit < 0) goto error;
                 free_parsed_config_rules(block_rules, block_rule_count);
                 block_rules = NULL;
                 block_rule_count = 0;
@@ -287,11 +590,16 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
                 block_owner = NULL;
                 block_fallback = NULL;
                 block_valid = true;
+                block_kind = CONFIG_BLOCK_STANDARD;
+                block_section = 0;
+                if (reprocess) goto process_config_line;
                 continue;
             }
 
-            int body_result = add_config_block_body_rule(
-                &block_rules, &block_rule_count, block_owner, p);
+            int body_result = block_kind == CONFIG_BLOCK_STANDARD ?
+                add_config_block_body_rule(&block_rules, &block_rule_count, block_owner, p) :
+                config_custom_block_body_rule(&block_rules, &block_rule_count, block_owner, p,
+                                              &block_kind, &block_section, &block_fallback, indent);
             if (body_result < 0) goto error;
             if (body_result > 0) block_valid = false;
             continue;
@@ -300,6 +608,24 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
         if (!p[0] || p[0] == '#') continue;
         char* header_owner = NULL;
         char* header_fallback = NULL;
+        ConfigBlockKind header_kind = CONFIG_BLOCK_STANDARD;
+        char* header_copy = strdup(p);
+        if (!header_copy) goto error;
+        int custom_header = config_custom_block_header(
+            header_copy, &header_owner, &header_fallback, &header_kind);
+        if (custom_header != 0) {
+            block_owner = strdup(header_owner);
+            block_fallback = header_fallback ? strdup(header_fallback) : NULL;
+            free(header_copy);
+            if (!block_owner || (header_fallback && !block_fallback)) goto error;
+            block_valid = custom_header > 0 && block_owner[0] && strlen(block_owner) < MAX_PKG_LEN &&
+                !strchr(block_owner, '=') &&
+                (!block_fallback || (block_fallback[0] && !strchr(block_fallback, '=')));
+            block_kind = header_kind;
+            block_section = 0;
+            continue;
+        }
+        free(header_copy);
         if (config_block_header(p, &header_owner, &header_fallback)) {
             block_owner = strdup(header_owner);
             block_fallback = header_fallback ? strdup(header_fallback) : NULL;
@@ -307,6 +633,8 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
             block_valid = block_owner[0] && strlen(block_owner) < MAX_PKG_LEN &&
                 !strchr(block_owner, '=') &&
                 (!block_fallback || (block_fallback[0] && !strchr(block_fallback, '=')));
+            block_kind = CONFIG_BLOCK_STANDARD;
+            block_section = 0;
             continue;
         }
 
@@ -317,6 +645,14 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
                 &new_auto, &auto_cnt, &parsed);
             if (result < 0) goto error;
         }
+    }
+
+    if (block_owner && block_kind == CONFIG_BLOCK_YAML) {
+        int commit = commit_parsed_config_block(
+            cfg, &new_rules, &rules_cnt, &new_pkgs, &pkgs_cnt,
+            &new_auto, &auto_cnt, &block_rules, &block_rule_count,
+            block_owner, block_fallback, block_valid);
+        if (commit < 0) goto error;
     }
 
     /* 未闭合区块中的内容全部丢弃，不把半块规则带入运行状态。 */

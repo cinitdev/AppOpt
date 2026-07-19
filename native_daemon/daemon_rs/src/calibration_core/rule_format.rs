@@ -4,22 +4,28 @@
 pub(crate) enum RuleOutputFormat {
     Legacy,
     AuthorBlock,
-    CompactHeaderBlock,
-    SeparateFallbackBlock,
-    CompactSeparateFallbackBlock,
-    ExtendedBlock,
     CompactExtendedBlock,
+    TaggedBlock,
+    NaturalBlock,
+    NestedBlock,
+    FunctionBlock,
+    Yaml,
 }
 
 impl RuleOutputFormat {
     pub(crate) fn from_wire(value: &str) -> Self {
         match value.trim() {
             "author_block" => Self::AuthorBlock,
-            "compact_header_block" => Self::CompactHeaderBlock,
-            "separate_fallback_block" => Self::SeparateFallbackBlock,
-            "compact_separate_fallback_block" => Self::CompactSeparateFallbackBlock,
-            "extended_block" => Self::ExtendedBlock,
+            "compact_header_block"
+            | "separate_fallback_block"
+            | "compact_separate_fallback_block"
+            | "extended_block" => Self::AuthorBlock,
             "compact_extended_block" => Self::CompactExtendedBlock,
+            "tagged_block" => Self::TaggedBlock,
+            "natural_block" => Self::NaturalBlock,
+            "nested_block" => Self::NestedBlock,
+            "function_block" => Self::FunctionBlock,
+            "yaml" => Self::Yaml,
             _ => Self::Legacy,
         }
     }
@@ -28,11 +34,12 @@ impl RuleOutputFormat {
         match self {
             Self::Legacy => "legacy",
             Self::AuthorBlock => "author_block",
-            Self::CompactHeaderBlock => "compact_header_block",
-            Self::SeparateFallbackBlock => "separate_fallback_block",
-            Self::CompactSeparateFallbackBlock => "compact_separate_fallback_block",
-            Self::ExtendedBlock => "extended_block",
             Self::CompactExtendedBlock => "compact_extended_block",
+            Self::TaggedBlock => "tagged_block",
+            Self::NaturalBlock => "natural_block",
+            Self::NestedBlock => "nested_block",
+            Self::FunctionBlock => "function_block",
+            Self::Yaml => "yaml",
         }
     }
 }
@@ -88,6 +95,14 @@ pub(crate) fn format_generated_rules(
         .collect::<Vec<_>>();
 
     let mut out = Vec::new();
+    // 只有主进程兜底时保持单行，避免生成没有实际成员的空区块。
+    if threads.is_empty() && children.is_empty() {
+        if let Some(cpus) = fallback.as_ref() {
+            out.push(format!("{pkg}={cpus}"));
+        }
+        out.extend(others);
+        return out;
+    }
     match output_format {
         RuleOutputFormat::Legacy => unreachable!(),
         RuleOutputFormat::AuthorBlock => {
@@ -113,7 +128,7 @@ pub(crate) fn format_generated_rules(
             }
             out.extend(children.into_iter().map(|rule| rule.original.clone()));
         }
-        RuleOutputFormat::CompactHeaderBlock => {
+        RuleOutputFormat::CompactExtendedBlock => {
             if threads.is_empty() && children.is_empty() {
                 fallback
                     .as_ref()
@@ -121,57 +136,114 @@ pub(crate) fn format_generated_rules(
                     .into_iter()
                     .for_each(|line| out.push(line));
             } else {
-                out.push(match fallback.as_ref() {
-                    Some(cpus) => format!("{pkg}={cpus}{{"),
-                    None => format!("{pkg}{{"),
-                });
-                append_block_members(&mut out, pkg, &threads, &children);
-                out.push("}".to_string());
-            }
-        }
-        RuleOutputFormat::SeparateFallbackBlock
-        | RuleOutputFormat::CompactSeparateFallbackBlock => {
-            if threads.is_empty() && children.is_empty() {
-                fallback
-                    .as_ref()
-                    .map(|cpus| format!("{pkg}={cpus}"))
-                    .into_iter()
-                    .for_each(|line| out.push(line));
-            } else {
-                let separator = if output_format == RuleOutputFormat::SeparateFallbackBlock {
-                    " "
-                } else {
-                    ""
-                };
-                out.push(format!("{pkg}{separator}{{"));
-                append_block_members(&mut out, pkg, &threads, &children);
-                out.push("}".to_string());
-                fallback
-                    .as_ref()
-                    .map(|cpus| format!("{pkg}={cpus}"))
-                    .into_iter()
-                    .for_each(|line| out.push(line));
-            }
-        }
-        RuleOutputFormat::ExtendedBlock | RuleOutputFormat::CompactExtendedBlock => {
-            if threads.is_empty() && children.is_empty() {
-                fallback
-                    .as_ref()
-                    .map(|cpus| format!("{pkg}={cpus}"))
-                    .into_iter()
-                    .for_each(|line| out.push(line));
-            } else {
-                let separator = if output_format == RuleOutputFormat::ExtendedBlock {
-                    " "
-                } else {
-                    ""
-                };
-                out.push(format!("{pkg}{separator}{{"));
+                out.push(format!("{pkg}{{"));
                 append_block_members(&mut out, pkg, &threads, &children);
                 out.push(match fallback.as_ref() {
                     Some(cpus) => format!("}}={cpus}"),
                     None => "}".to_string(),
                 });
+            }
+        }
+        RuleOutputFormat::TaggedBlock => {
+            out.push(format!("{pkg}={{"));
+            for rule in &threads {
+                out.push(format!(
+                    "    thread:{}={}",
+                    rule.thread.as_deref().unwrap_or_default(),
+                    rule.cpus
+                ));
+            }
+            for rule in &children {
+                out.push(format!("    process:{}={}", &rule.owner[pkg.len() + 1..], rule.cpus));
+            }
+            if let Some(cpus) = fallback.as_ref() {
+                out.push(format!("    fallback={cpus}"));
+            }
+            out.push("}".to_string());
+        }
+        RuleOutputFormat::NaturalBlock => {
+            out.push(match fallback.as_ref() {
+                Some(cpus) => format!("app {pkg} fallback {cpus} {{"),
+                None => format!("app {pkg} {{"),
+            });
+            for rule in &threads {
+                out.push(format!(
+                    "    thread {}={}",
+                    rule.thread.as_deref().unwrap_or_default(),
+                    rule.cpus
+                ));
+            }
+            for rule in &children {
+                out.push(format!("    process {}={}", &rule.owner[pkg.len() + 1..], rule.cpus));
+            }
+            out.push("}".to_string());
+        }
+        RuleOutputFormat::NestedBlock => {
+            out.push(format!("{pkg}={{"));
+            if !threads.is_empty() {
+                out.push("    threads {".to_string());
+                for rule in &threads {
+                    out.push(format!(
+                        "        {}={}",
+                        rule.thread.as_deref().unwrap_or_default(),
+                        rule.cpus
+                    ));
+                }
+                out.push("    }".to_string());
+            }
+            if !children.is_empty() {
+                out.push("    processes {".to_string());
+                for rule in &children {
+                    out.push(format!("        {}={}", &rule.owner[pkg.len() + 1..], rule.cpus));
+                }
+                out.push("    }".to_string());
+            }
+            if let Some(cpus) = fallback.as_ref() {
+                out.push(format!("    fallback={cpus}"));
+            }
+            out.push("}".to_string());
+        }
+        RuleOutputFormat::FunctionBlock => {
+            out.push(match fallback.as_ref() {
+                Some(cpus) => format!("app({pkg}, {cpus}) {{"),
+                None => format!("app({pkg}) {{"),
+            });
+            for rule in &threads {
+                out.push(format!(
+                    "    thread({}, {})",
+                    rule.thread.as_deref().unwrap_or_default(),
+                    rule.cpus
+                ));
+            }
+            for rule in &children {
+                out.push(format!(
+                    "    process({}, {})",
+                    &rule.owner[pkg.len() + 1..],
+                    rule.cpus
+                ));
+            }
+            out.push("}".to_string());
+        }
+        RuleOutputFormat::Yaml => {
+            out.push(format!("{pkg}:"));
+            if !threads.is_empty() {
+                out.push("    threads:".to_string());
+                for rule in &threads {
+                    out.push(format!(
+                        "        {}: {}",
+                        rule.thread.as_deref().unwrap_or_default(),
+                        rule.cpus
+                    ));
+                }
+            }
+            if !children.is_empty() {
+                out.push("    processes:".to_string());
+                for rule in &children {
+                    out.push(format!("        {}: {}", &rule.owner[pkg.len() + 1..], rule.cpus));
+                }
+            }
+            if let Some(cpus) = fallback.as_ref() {
+                out.push(format!("    fallback: {cpus}"));
             }
         }
     }

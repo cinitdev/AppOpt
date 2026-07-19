@@ -400,6 +400,41 @@ EOF
 		ui_print "- 已生成默认自动校准策略配置"
 	fi
 }
+normalize_calib_rule_output_format() {
+	local POLICY_FILE="$MODPATH/config/calib_policy.conf"
+	local OLD_FORMAT TMP_FILE
+	[ -f "$POLICY_FILE" ] || return
+	OLD_FORMAT="$(sed -n 's/^[[:space:]]*rule_output_format[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*$/\1/p' "$POLICY_FILE" | tail -n 1)"
+	case "$OLD_FORMAT" in
+		compact_header_block|separate_fallback_block|compact_separate_fallback_block|extended_block)
+			TMP_FILE="$POLICY_FILE.format.tmp"
+			if awk -v old_format="$OLD_FORMAT" '
+			BEGIN { migrated = 0 }
+			{
+				trimmed = $0
+				sub(/^[[:space:]]*/, "", trimmed)
+				if (trimmed ~ /^rule_output_format_migration[[:space:]]*=/) next
+				if (trimmed ~ /^rule_output_format[[:space:]]*=/) {
+					comment = ""
+					hash = index($0, "#")
+					if (hash > 0) comment = substr($0, hash)
+					if (!migrated) printf "rule_output_format_migration=%s\n", old_format
+					printf "rule_output_format=author_block"
+					if (comment != "") printf " %s", comment
+					printf "\n"
+					migrated = 1
+					next
+				}
+				print
+			}' "$POLICY_FILE" > "$TMP_FILE" && mv -f "$TMP_FILE" "$POLICY_FILE"; then
+				ui_print "- 校准规则格式：旧区块生成策略已迁移为原作者格式"
+			else
+				rm -f "$TMP_FILE"
+				ui_print "! 校准规则格式迁移失败，守护进程将使用原作者格式兼容处理"
+			fi
+			;;
+	esac
+}
 check_magisk_version
 check_required_files
 extract_bin
@@ -408,6 +443,7 @@ module_instructions
 add_default_rules
 rm -f "$MODPATH/rules.sh"
 prepare_calib_policy
+normalize_calib_rule_output_format
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOpt $MODPATH/config/bin/AppOptRs" 0 2000 0755 0755 u:object_r:magisk_file:s0
 [ -d "$MODPATH/config/app/tools" ] && chmod 0755 "$MODPATH/config/app/tools" "$MODPATH/config/app/tools"/*.sh 2>/dev/null

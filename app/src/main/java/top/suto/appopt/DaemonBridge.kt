@@ -54,8 +54,8 @@ object DaemonBridge {
     private const val FOREGROUND_TASK_MAX_AGE_MS = 12_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 178
-    const val REQUIRED_MODULE_VERSION_NAME = "1.7.8"
+    const val REQUIRED_MODULE_VERSION_CODE = 179
+    const val REQUIRED_MODULE_VERSION_NAME = "1.7.9"
     private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
@@ -392,8 +392,8 @@ object DaemonBridge {
 
     /**
      * 批量判断非 APK 配置项是否对应正在运行的系统进程。
-     * 用于 UI 区分“系统组件”和“未安装/配置残留”。匹配流程是 pidof + pgrep -x
-     * 获取候选 PID，然后反查 /proc/<pid>/comm 与 cmdline 做精确确认。
+     * 用于 UI 区分“系统组件”和“未安装/配置残留”。这里只遍历一次 /proc，
+     * 避免大配置按候选名称反复执行 pidof/pgrep。
      */
     fun findRunningProcessNames(names: Collection<String>): Set<String> {
         val targets = names.map { it.trim().replace("'", "") }
@@ -429,31 +429,18 @@ object DaemonBridge {
                 found="${'$'}found${'$'}name${'$'}nl"
             }
 
-            verify_pid_target() {
-                pid="${'$'}1"
-                target="${'$'}2"
-                case "${'$'}pid" in
-                    ''|*[!0-9]*) return 1 ;;
-                esac
+            for proc in /proc/[0-9]*; do
+                [ -r "${'$'}proc/comm" ] || continue
+                comm=''
+                IFS= read -r comm < "${'$'}proc/comm" 2>/dev/null || true
+                emit_if_target "${'$'}comm"
 
-                comm=${'$'}(cat "/proc/${'$'}pid/comm" 2>/dev/null)
-                first=${'$'}(tr '\000' '\n' < "/proc/${'$'}pid/cmdline" 2>/dev/null | head -n 1)
+                [ -r "${'$'}proc/cmdline" ] || continue
+                first=''
+                IFS= read -r -d '' first < "${'$'}proc/cmdline" 2>/dev/null || true
+                emit_if_target "${'$'}first"
                 base=${'$'}{first##*/}
-
-                if [ "${'$'}comm" = "${'$'}target" ] ||
-                   [ "${'$'}first" = "${'$'}target" ] ||
-                   [ "${'$'}base" = "${'$'}target" ]; then
-                    emit_if_target "${'$'}target"
-                    return 0
-                fi
-                return 1
-            }
-
-            for target in $targetArgs; do
-                pids="${'$'}(pidof "${'$'}target" 2>/dev/null) ${'$'}(pgrep -x "${'$'}target" 2>/dev/null)"
-                for pid in ${'$'}pids; do
-                    verify_pid_target "${'$'}pid" "${'$'}target" && break
-                done
+                [ "${'$'}base" = "${'$'}first" ] || emit_if_target "${'$'}base"
             done
             true
         """.trimIndent()
@@ -796,6 +783,7 @@ object DaemonBridge {
         val groupCount: Int = 0,
         val changed: Boolean = false,
         val mixed: Boolean = false,
+        val migratedDeprecatedFormat: Boolean = false,
         val detail: String? = null
     ) {
         val success: Boolean
@@ -810,6 +798,12 @@ object DaemonBridge {
         format: CalibPolicy.RuleOutputFormat,
         policyContent: String
     ): RuleOutputFormatApplyResult {
+        val outputFormat = format.generationTarget()
+        val normalizedPolicyContent = updatePolicyValuePreservingText(
+            policyContent,
+            "rule_output_format",
+            outputFormat.wire
+        ).let { removePolicyValuePreservingText(it, "rule_output_format_migration") }
         val lockFailure = RuleOutputFormatApplyResult(
             RuleOutputFormatApplyStatus.CONFIG_WRITE_FAILED,
             detail = "无法获取规则配置锁"
@@ -818,7 +812,7 @@ object DaemonBridge {
             val raw = readConfigRawForMutation() ?: return@withConfigMutation lockFailure.copy(
                 detail = "读取 applist.conf 失败"
             )
-            val result = RuleFormatConverter.convert(raw, format)
+            val result = RuleFormatConverter.convert(raw, outputFormat)
             val conversion = result.conversion ?: return@withConfigMutation RuleOutputFormatApplyResult(
                 RuleOutputFormatApplyStatus.INVALID_CONFIG,
                 detail = result.error
@@ -831,10 +825,10 @@ object DaemonBridge {
                 )
             }
 
-            if (writeCalibPolicyRaw(policyContent)) {
+            if (writeCalibPolicyRaw(normalizedPolicyContent)) {
                 return@withConfigMutation RuleOutputFormatApplyResult(
                     status = RuleOutputFormatApplyStatus.SUCCESS,
-                    format = format,
+                    format = outputFormat,
                     ruleCount = conversion.ruleCount,
                     groupCount = conversion.groupCount,
                     changed = conversion.changed
@@ -866,7 +860,7 @@ object DaemonBridge {
             RuleOutputFormatApplyStatus.CONFIG_WRITE_FAILED,
             detail = "无法获取规则配置锁"
         )
-        return withConfigMutation(lockFailure) { _ ->
+        return withConfigMutation(lockFailure) { token ->
             val raw = readConfigRawForMutation() ?: return@withConfigMutation lockFailure.copy(
                 detail = "读取 applist.conf 失败"
             )
@@ -883,44 +877,119 @@ object DaemonBridge {
                 CalibPolicy.DEFAULT
             }
             val detection = RuleFormatConverter.detectFormat(raw)
-                ?: return@withConfigMutation RuleOutputFormatApplyResult(
-                    status = RuleOutputFormatApplyStatus.SUCCESS,
-                    format = currentPolicy.ruleOutputFormat,
-                    ruleCount = RuleSyntax.parse(raw).rules.size
+            val migrationHint = deprecatedRuleOutputMigration(policyFile.content)
+            val requiresMigration = currentPolicy.ruleOutputFormat.requiresAuthorMigration ||
+                detection?.requiresAuthorMigration == true || migrationHint != null
+            if (requiresMigration) {
+                val target = CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK
+                val result = RuleFormatConverter.convert(raw, target)
+                val conversion = result.conversion ?: return@withConfigMutation RuleOutputFormatApplyResult(
+                    RuleOutputFormatApplyStatus.INVALID_CONFIG,
+                    detail = result.error ?: "旧区块格式无法安全转换"
                 )
-            if (detection.format == currentPolicy.ruleOutputFormat) {
+                if (conversion.changed && !writeConfigFileLocked(conversion.content, token)) {
+                    return@withConfigMutation RuleOutputFormatApplyResult(
+                        RuleOutputFormatApplyStatus.CONFIG_WRITE_FAILED,
+                        detail = "旧区块格式转换完成，但写入 applist.conf 失败"
+                    )
+                }
+                val updatedPolicyContent = if (policyFile.exists) {
+                    updatePolicyValuePreservingText(policyFile.content, "rule_output_format", target.wire)
+                        .let { removePolicyValuePreservingText(it, "rule_output_format_migration") }
+                } else {
+                    currentPolicy.copy(ruleOutputFormat = target).toConfigText()
+                }
+                if (writeCalibPolicyRaw(updatedPolicyContent)) {
+                    return@withConfigMutation RuleOutputFormatApplyResult(
+                        status = RuleOutputFormatApplyStatus.SUCCESS,
+                        format = target,
+                        ruleCount = conversion.ruleCount,
+                        groupCount = conversion.groupCount,
+                        changed = true,
+                        mixed = detection?.mixed == true,
+                        migratedDeprecatedFormat = true
+                    )
+                }
+                val rollbackOk = !conversion.changed || writeConfigFileLocked(raw, token)
                 return@withConfigMutation RuleOutputFormatApplyResult(
-                    status = RuleOutputFormatApplyStatus.SUCCESS,
-                    format = detection.format,
-                    ruleCount = detection.ruleCount,
-                    mixed = detection.mixed
+                    status = if (rollbackOk) {
+                        RuleOutputFormatApplyStatus.POLICY_WRITE_FAILED
+                    } else {
+                        RuleOutputFormatApplyStatus.ROLLBACK_FAILED
+                    },
+                    format = currentPolicy.ruleOutputFormat.generationTarget(),
+                    ruleCount = conversion.ruleCount,
+                    groupCount = conversion.groupCount,
+                    detail = if (rollbackOk) {
+                        "旧区块格式迁移失败，原规则已恢复"
+                    } else {
+                        "旧区块格式迁移失败，且原规则恢复失败"
+                    }
                 )
             }
-            val updatedPolicyContent = if (policyFile.exists) {
-                updatePolicyValuePreservingText(
-                    policyFile.content,
-                    "rule_output_format",
-                    detection.format.wire
+            val selectedFormat = currentPolicy.ruleOutputFormat.generationTarget()
+            val detectedFormat = detection?.format?.generationTarget()
+            val targetFormat = detectedFormat ?: selectedFormat
+            val conversion = RuleFormatConverter.convert(raw, targetFormat).conversion
+                ?: return@withConfigMutation RuleOutputFormatApplyResult(
+                    RuleOutputFormatApplyStatus.INVALID_CONFIG,
+                    format = targetFormat,
+                    detail = "现有规则无法规范化"
                 )
-            } else {
-                currentPolicy.copy(ruleOutputFormat = detection.format).toConfigText()
-            }
-            if (writeCalibPolicyRaw(updatedPolicyContent)) {
-                RuleOutputFormatApplyResult(
-                    status = RuleOutputFormatApplyStatus.SUCCESS,
-                    format = detection.format,
-                    ruleCount = detection.ruleCount,
-                    changed = true,
-                    mixed = detection.mixed
-                )
-            } else {
-                RuleOutputFormatApplyResult(
-                    status = RuleOutputFormatApplyStatus.POLICY_WRITE_FAILED,
-                    format = currentPolicy.ruleOutputFormat,
-                    ruleCount = detection.ruleCount,
-                    detail = "识别到现有规则格式，但策略保存失败"
+            if (conversion.changed && !writeConfigFileLocked(conversion.content, token)) {
+                return@withConfigMutation RuleOutputFormatApplyResult(
+                    RuleOutputFormatApplyStatus.CONFIG_WRITE_FAILED,
+                    format = targetFormat,
+                    ruleCount = conversion.ruleCount,
+                    detail = "现有规则格式转换完成，但写入 applist.conf 失败"
                 )
             }
+
+            val policyChanged = detectedFormat != null && detectedFormat != selectedFormat
+            if (policyChanged) {
+                val updatedPolicyContent = if (policyFile.exists) {
+                    updatePolicyValuePreservingText(
+                        policyFile.content,
+                        "rule_output_format",
+                        targetFormat.wire
+                    )
+                } else {
+                    currentPolicy.copy(ruleOutputFormat = targetFormat).toConfigText()
+                }
+                if (writeCalibPolicyRaw(updatedPolicyContent)) {
+                    return@withConfigMutation RuleOutputFormatApplyResult(
+                        status = RuleOutputFormatApplyStatus.SUCCESS,
+                        format = targetFormat,
+                        ruleCount = conversion.ruleCount,
+                        changed = true,
+                        mixed = detection?.mixed == true
+                    )
+                }
+                val rollbackOk = !conversion.changed || writeConfigFileLocked(raw, token)
+                return@withConfigMutation RuleOutputFormatApplyResult(
+                    status = if (rollbackOk) {
+                        RuleOutputFormatApplyStatus.POLICY_WRITE_FAILED
+                    } else {
+                        RuleOutputFormatApplyStatus.ROLLBACK_FAILED
+                    },
+                    format = selectedFormat,
+                    ruleCount = conversion.ruleCount,
+                    changed = conversion.changed,
+                    mixed = detection?.mixed == true,
+                    detail = if (rollbackOk) {
+                        "识别到现有规则格式，但策略保存失败"
+                    } else {
+                        "识别到现有规则格式，且原规则恢复失败"
+                    }
+                )
+            }
+            RuleOutputFormatApplyResult(
+                status = RuleOutputFormatApplyStatus.SUCCESS,
+                format = targetFormat,
+                ruleCount = conversion.ruleCount,
+                changed = conversion.changed,
+                mixed = detection?.mixed == true
+            )
         }
     }
 
@@ -1220,6 +1289,26 @@ object DaemonBridge {
         if (found) return updated
         val separator = if (updated.isEmpty() || updated.endsWith('\n')) "" else "\n"
         return "$updated$separator$key=$value\n"
+    }
+
+    internal fun removePolicyValuePreservingText(raw: String, key: String): String {
+        val pattern = Regex(
+            "(?m)^[ \\t]*${Regex.escape(key)}[ \\t]*=[^\\r\\n]*(?:\\r?\\n|$)"
+        )
+        return pattern.replace(raw, "")
+    }
+
+    internal fun deprecatedRuleOutputMigration(raw: String): CalibPolicy.RuleOutputFormat? {
+        for (rawLine in raw.lineSequence()) {
+            val line = rawLine.substringBefore('#').trim()
+            val index = line.indexOf('=')
+            if (index <= 0 || line.substring(0, index).trim() != "rule_output_format_migration") {
+                continue
+            }
+            return CalibPolicy.RuleOutputFormat.fromWire(line.substring(index + 1))
+                .takeIf(CalibPolicy.RuleOutputFormat::requiresAuthorMigration)
+        }
+        return null
     }
 
     private const val HISTORY_IMPORT_SUFFIX = ".appopt-importing"

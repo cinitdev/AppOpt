@@ -35,7 +35,22 @@ data class CalibPolicy(
         SEPARATE_FALLBACK_BLOCK("separate_fallback_block"),
         COMPACT_SEPARATE_FALLBACK_BLOCK("compact_separate_fallback_block"),
         EXTENDED_BLOCK("extended_block"),
-        COMPACT_EXTENDED_BLOCK("compact_extended_block");
+        COMPACT_EXTENDED_BLOCK("compact_extended_block"),
+        TAGGED_BLOCK("tagged_block"),
+        NATURAL_BLOCK("natural_block"),
+        NESTED_BLOCK("nested_block"),
+        FUNCTION_BLOCK("function_block"),
+        YAML("yaml");
+
+        val requiresAuthorMigration: Boolean
+            get() = this == COMPACT_HEADER_BLOCK ||
+                this == SEPARATE_FALLBACK_BLOCK ||
+                this == COMPACT_SEPARATE_FALLBACK_BLOCK ||
+                this == EXTENDED_BLOCK
+
+        fun generationTarget(): RuleOutputFormat {
+            return if (requiresAuthorMigration) AUTHOR_BLOCK else this
+        }
 
         companion object {
             fun fromWire(value: String): RuleOutputFormat {
@@ -83,7 +98,7 @@ data class CalibPolicy(
             appendLine("group_high=avg:${fmt(p.highAvg)},max:${fmt(p.highMax)},cores:${p.highCores}")
             appendLine("group_mid=avg:${fmt(p.midAvg)},max:${fmt(p.midMax)},cores:${p.midCores}")
             appendLine("wildcard_group=${p.wildcardGroup.wire}")
-            appendLine("rule_output_format=${p.ruleOutputFormat.wire}")
+            appendLine("rule_output_format=${p.ruleOutputFormat.generationTarget().wire}")
             appendLine("max_thread_rules=${p.maxThreadRules}")
             appendLine("fallback=cores:${p.fallbackCores}")
             if (p.detectedTopologyBlock.isNotBlank()) {

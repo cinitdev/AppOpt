@@ -93,51 +93,102 @@ fn generate_rules(pkg: &str, records: &[LoadRecord]) -> Vec<String> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    if let Some(best) = main_threads
-        .iter()
-        .copied()
-        .find(|record| record.avg() >= policy.best_avg && record.max_pct >= policy.best_max)
-    {
+    let best = main_threads.first().copied().and_then(|record| {
+        let base = rule_base_for_thread(&record.name, &main_threads);
+        (record.avg() >= policy.best_avg
+            && record.max_pct >= policy.best_max
+            && !base.contains('*'))
+        .then_some((record, base))
+    });
+    if let Some((_, best_base)) = best.as_ref() {
         // 第一档只挑最重的一个线程，用最高性能核心，避免把一堆线程都推到超大核。
         push_rule(
             &mut rules,
             &mut used,
             format!(
                 "{pkg}{{{}}}={}",
-                rule_base_for_thread(&best.name, &main_threads),
+                best_base,
                 policy.best_cores
             ),
         );
     }
 
+    let mut groups = Vec::<GeneratedThreadGroup>::new();
+    for record in &main_threads {
+        let base = rule_base_for_thread(&record.name, &main_threads);
+        let is_wild = base.contains('*');
+        let index = groups
+            .iter()
+            .position(|group| group.base == base)
+            .unwrap_or_else(|| {
+                groups.push(GeneratedThreadGroup {
+                    base: base.clone(),
+                    avg_pct: 0.0,
+                    max_pct: 0.0,
+                    score: 0.0,
+                    is_wild,
+                });
+                groups.len() - 1
+            });
+        let group = &mut groups[index];
+        let avg = record.avg();
+        if group.is_wild && policy.wildcard_group == WildcardGroup::MaxMember {
+            group.avg_pct = group.avg_pct.max(avg);
+        } else {
+            group.avg_pct += avg;
+        }
+        group.max_pct = group.max_pct.max(record.max_pct);
+    }
+    for group in &mut groups {
+        group.avg_pct = group.avg_pct.min(100.0);
+        group.score = load_score_values(group.avg_pct, group.max_pct);
+    }
+    groups.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut thread_rule_count = rules.len();
     for tier in [RuleTier::High, RuleTier::Mid] {
-        // 第二/第三档继续从主进程线程里挑负载达标项，最多生成 max_thread_rules 条。
-        for record in &main_threads {
-            if rules.len() >= policy.max_thread_rules {
-                break;
+        // 同档位先输出精确线程，再输出通配组，与 C 版保持一致。
+        for wild_pass in [false, true] {
+            for group in groups.iter().filter(|group| group.is_wild == wild_pass) {
+                if thread_rule_count >= policy.max_thread_rules {
+                    break;
+                }
+                let pass = match tier {
+                    RuleTier::High => {
+                        group.avg_pct >= policy.high_avg && group.max_pct >= policy.high_max
+                    }
+                    RuleTier::Mid => {
+                        group.avg_pct >= policy.mid_avg && group.max_pct >= policy.mid_max
+                    }
+                };
+                if !pass {
+                    continue;
+                }
+                if let Some((best, best_base)) = best.as_ref() {
+                    if group.base == *best_base
+                        || (group.is_wild && wildcard_match(&group.base, &best.name))
+                    {
+                        continue;
+                    }
+                }
+                let cpus = match tier {
+                    RuleTier::High => &policy.high_cores,
+                    RuleTier::Mid => &policy.mid_cores,
+                };
+                let previous = rules.len();
+                push_rule(
+                    &mut rules,
+                    &mut used,
+                    format!("{pkg}{{{}}}={}", group.base, cpus),
+                );
+                if rules.len() > previous {
+                    thread_rule_count += 1;
+                }
             }
-            let avg = record.avg();
-            let max = record.max_pct;
-            let pass = match tier {
-                RuleTier::High => avg >= policy.high_avg && max >= policy.high_max,
-                RuleTier::Mid => avg >= policy.mid_avg && max >= policy.mid_max,
-            };
-            if !pass {
-                continue;
-            }
-            let cpus = match tier {
-                RuleTier::High => &policy.high_cores,
-                RuleTier::Mid => &policy.mid_cores,
-            };
-            push_rule(
-                &mut rules,
-                &mut used,
-                format!(
-                    "{pkg}{{{}}}={}",
-                    rule_base_for_thread(&record.name, &main_threads),
-                    cpus
-                ),
-            );
         }
     }
 
@@ -232,7 +283,19 @@ fn push_rule(rules: &mut Vec<String>, used: &mut HashSet<String>, rule: String) 
 }
 
 fn load_score(record: &LoadRecord) -> f64 {
-    record.avg() * 0.7 + record.max_pct * 0.3
+    load_score_values(record.avg(), record.max_pct)
+}
+
+fn load_score_values(avg_pct: f64, max_pct: f64) -> f64 {
+    avg_pct * 0.65 + max_pct * 0.35
+}
+
+struct GeneratedThreadGroup {
+    base: String,
+    avg_pct: f64,
+    max_pct: f64,
+    score: f64,
+    is_wild: bool,
 }
 
 fn rule_name(name: &str) -> String {
@@ -313,17 +376,21 @@ fn wildcard_name_syntax_ok(name: &str) -> bool {
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let text = text.as_bytes();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let mut star = None;
     let mut star_text = 0usize;
 
     while ti < text.len() {
-        if pi < pattern.len() && pattern[pi] == text[ti] {
-            pi += 1;
-            ti += 1;
-        } else if pi < pattern.len() && pattern[pi] == b'*' {
+        if pi < pattern.len() && pattern[pi] != '*' {
+            if let Some(next_pi) = wildcard_atom_matches(&pattern, pi, text[ti]) {
+                pi = next_pi;
+                ti += 1;
+                continue;
+            }
+        }
+        if pi < pattern.len() && pattern[pi] == '*' {
             star = Some(pi);
             pi += 1;
             star_text = ti;
@@ -335,9 +402,52 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
-    while pi < pattern.len() && pattern[pi] == b'*' {
+    while pi < pattern.len() && pattern[pi] == '*' {
         pi += 1;
     }
     pi == pattern.len()
+}
+
+fn wildcard_atom_matches(pattern: &[char], index: usize, ch: char) -> Option<usize> {
+    match pattern[index] {
+        '?' => Some(index + 1),
+        '[' => wildcard_class_matches(pattern, index, ch),
+        literal if literal == ch => Some(index + 1),
+        _ => None,
+    }
+}
+
+fn wildcard_class_matches(pattern: &[char], index: usize, ch: char) -> Option<usize> {
+    let mut cursor = index + 1;
+    let negated = cursor < pattern.len() && matches!(pattern[cursor], '!' | '^');
+    if negated {
+        cursor += 1;
+    }
+    let mut matched = false;
+
+    while cursor < pattern.len() {
+        if pattern[cursor] == ']' {
+            return if matched != negated {
+                Some(cursor + 1)
+            } else {
+                None
+            };
+        }
+        if cursor + 2 < pattern.len()
+            && pattern[cursor + 1] == '-'
+            && pattern[cursor + 2] != ']'
+        {
+            if pattern[cursor] <= ch && ch <= pattern[cursor + 2] {
+                matched = true;
+            }
+            cursor += 3;
+        } else {
+            if pattern[cursor] == ch {
+                matched = true;
+            }
+            cursor += 1;
+        }
+    }
+    None
 }
 

@@ -34,7 +34,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="旧版单行格式默认使用，六种区块格式可分别选择。只改变写入排版，不改变规则效果"
+            android:text="只改变规则写入排版，不改变绑核效果。旧区块格式会自动转换为原作者格式"
             android:textColor="@color/text_secondary"
             android:textSize="12sp" />
 
@@ -64,8 +64,8 @@
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
                 android:layout_below="@id/formatLegacyTitle"
+                android:layout_marginTop="4dp"
                 android:layout_toStartOf="@id/formatLegacySelected"
                 android:fontFamily="monospace"
                 android:text="com.tencent.mm{RenderThread}=6-7&#10;com.tencent.mm:push=0-3&#10;com.tencent.mm=0-3"
@@ -102,7 +102,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginEnd="8dp"
                 android:layout_toStartOf="@id/formatAuthorBlockSelected"
-                android:text="区块格式 1（原作者新增）"
+                android:text="原作者区块格式"
                 android:textColor="@color/text_primary"
                 android:textSize="15sp"
                 android:textStyle="bold" />
@@ -110,8 +110,8 @@
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
                 android:layout_below="@id/formatAuthorBlockTitle"
+                android:layout_marginTop="4dp"
                 android:layout_toStartOf="@id/formatAuthorBlockSelected"
                 android:fontFamily="monospace"
                 android:text="com.tencent.mm=0-3 {&#10;    RenderThread=6-7&#10;}&#10;com.tencent.mm:push=0-3"
@@ -120,190 +120,6 @@
 
             <ImageView
                 android:id="@+id/formatAuthorBlockSelected"
-                android:layout_width="22dp"
-                android:layout_height="22dp"
-                android:layout_alignParentEnd="true"
-                android:layout_centerVertical="true"
-                android:contentDescription="已选择"
-                android:src="@drawable/ic_check_circle"
-                android:visibility="gone"
-                app:tint="@color/brand_primary" />
-        </RelativeLayout>
-
-        <RelativeLayout
-            android:id="@+id/formatCompactHeaderBlock"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:background="@drawable/bg_action_row"
-            android:clickable="true"
-            android:descendantFocusability="blocksDescendants"
-            android:focusable="true"
-            android:foreground="?attr/selectableItemBackground"
-            android:padding="14dp">
-
-            <TextView
-                android:id="@+id/formatCompactHeaderBlockTitle"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginEnd="8dp"
-                android:layout_toStartOf="@id/formatCompactHeaderBlockSelected"
-                android:text="区块格式 2（首行兜底，紧凑）"
-                android:textColor="@color/text_primary"
-                android:textSize="15sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:layout_below="@id/formatCompactHeaderBlockTitle"
-                android:layout_toStartOf="@id/formatCompactHeaderBlockSelected"
-                android:fontFamily="monospace"
-                android:text="com.tencent.mm=0-3{&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}"
-                android:textColor="@color/text_secondary"
-                android:textSize="12sp" />
-
-            <ImageView
-                android:id="@+id/formatCompactHeaderBlockSelected"
-                android:layout_width="22dp"
-                android:layout_height="22dp"
-                android:layout_alignParentEnd="true"
-                android:layout_centerVertical="true"
-                android:contentDescription="已选择"
-                android:src="@drawable/ic_check_circle"
-                android:visibility="gone"
-                app:tint="@color/brand_primary" />
-        </RelativeLayout>
-
-        <RelativeLayout
-            android:id="@+id/formatSeparateFallbackBlock"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:background="@drawable/bg_action_row"
-            android:clickable="true"
-            android:descendantFocusability="blocksDescendants"
-            android:focusable="true"
-            android:foreground="?attr/selectableItemBackground"
-            android:padding="14dp">
-
-            <TextView
-                android:id="@+id/formatSeparateFallbackBlockTitle"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginEnd="8dp"
-                android:layout_toStartOf="@id/formatSeparateFallbackBlockSelected"
-                android:text="区块格式 3（区块外兜底，空格）"
-                android:textColor="@color/text_primary"
-                android:textSize="15sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:layout_below="@id/formatSeparateFallbackBlockTitle"
-                android:layout_toStartOf="@id/formatSeparateFallbackBlockSelected"
-                android:fontFamily="monospace"
-                android:text="com.tencent.mm {&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}&#10;com.tencent.mm=0-3"
-                android:textColor="@color/text_secondary"
-                android:textSize="12sp" />
-
-            <ImageView
-                android:id="@+id/formatSeparateFallbackBlockSelected"
-                android:layout_width="22dp"
-                android:layout_height="22dp"
-                android:layout_alignParentEnd="true"
-                android:layout_centerVertical="true"
-                android:contentDescription="已选择"
-                android:src="@drawable/ic_check_circle"
-                android:visibility="gone"
-                app:tint="@color/brand_primary" />
-        </RelativeLayout>
-
-        <RelativeLayout
-            android:id="@+id/formatCompactSeparateFallbackBlock"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:background="@drawable/bg_action_row"
-            android:clickable="true"
-            android:descendantFocusability="blocksDescendants"
-            android:focusable="true"
-            android:foreground="?attr/selectableItemBackground"
-            android:padding="14dp">
-
-            <TextView
-                android:id="@+id/formatCompactSeparateFallbackBlockTitle"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginEnd="8dp"
-                android:layout_toStartOf="@id/formatCompactSeparateFallbackBlockSelected"
-                android:text="区块格式 4（区块外兜底，紧凑）"
-                android:textColor="@color/text_primary"
-                android:textSize="15sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:layout_below="@id/formatCompactSeparateFallbackBlockTitle"
-                android:layout_toStartOf="@id/formatCompactSeparateFallbackBlockSelected"
-                android:fontFamily="monospace"
-                android:text="com.tencent.mm{&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}&#10;com.tencent.mm=0-3"
-                android:textColor="@color/text_secondary"
-                android:textSize="12sp" />
-
-            <ImageView
-                android:id="@+id/formatCompactSeparateFallbackBlockSelected"
-                android:layout_width="22dp"
-                android:layout_height="22dp"
-                android:layout_alignParentEnd="true"
-                android:layout_centerVertical="true"
-                android:contentDescription="已选择"
-                android:src="@drawable/ic_check_circle"
-                android:visibility="gone"
-                app:tint="@color/brand_primary" />
-        </RelativeLayout>
-
-        <RelativeLayout
-            android:id="@+id/formatExtendedBlock"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:background="@drawable/bg_action_row"
-            android:clickable="true"
-            android:descendantFocusability="blocksDescendants"
-            android:focusable="true"
-            android:foreground="?attr/selectableItemBackground"
-            android:padding="14dp">
-
-            <TextView
-                android:id="@+id/formatExtendedBlockTitle"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginEnd="8dp"
-                android:layout_toStartOf="@id/formatExtendedBlockSelected"
-                android:text="区块格式 5（尾部兜底，空格）"
-                android:textColor="@color/text_primary"
-                android:textSize="15sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:layout_below="@id/formatExtendedBlockTitle"
-                android:layout_toStartOf="@id/formatExtendedBlockSelected"
-                android:fontFamily="monospace"
-                android:text="com.tencent.mm {&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}=0-3"
-                android:textColor="@color/text_secondary"
-                android:textSize="12sp" />
-
-            <ImageView
-                android:id="@+id/formatExtendedBlockSelected"
                 android:layout_width="22dp"
                 android:layout_height="22dp"
                 android:layout_alignParentEnd="true"
@@ -332,7 +148,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginEnd="8dp"
                 android:layout_toStartOf="@id/formatCompactExtendedBlockSelected"
-                android:text="区块格式 6（尾部兜底，紧凑）"
+                android:text="扩展区块格式"
                 android:textColor="@color/text_primary"
                 android:textSize="15sp"
                 android:textStyle="bold" />
@@ -340,8 +156,8 @@
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
                 android:layout_below="@id/formatCompactExtendedBlockTitle"
+                android:layout_marginTop="4dp"
                 android:layout_toStartOf="@id/formatCompactExtendedBlockSelected"
                 android:fontFamily="monospace"
                 android:text="com.tencent.mm{&#10;    RenderThread=6-7&#10;    :push=0-3&#10;}=0-3"
@@ -350,6 +166,236 @@
 
             <ImageView
                 android:id="@+id/formatCompactExtendedBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatTaggedBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatTaggedBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatTaggedBlockSelected"
+                android:text="类型标签区块"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_below="@id/formatTaggedBlockTitle"
+                android:layout_marginTop="4dp"
+                android:layout_toStartOf="@id/formatTaggedBlockSelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm={&#10;    thread:RenderThread=6-7&#10;    process:push=0-3&#10;    fallback=0-6&#10;}"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatTaggedBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatNaturalBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatNaturalBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatNaturalBlockSelected"
+                android:text="自然语句区块"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_below="@id/formatNaturalBlockTitle"
+                android:layout_marginTop="4dp"
+                android:layout_toStartOf="@id/formatNaturalBlockSelected"
+                android:fontFamily="monospace"
+                android:text="app com.tencent.mm fallback 0-6 {&#10;    thread RenderThread=6-7&#10;    process push=0-3&#10;}"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatNaturalBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatNestedBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatNestedBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatNestedBlockSelected"
+                android:text="分类嵌套区块"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_below="@id/formatNestedBlockTitle"
+                android:layout_marginTop="4dp"
+                android:layout_toStartOf="@id/formatNestedBlockSelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm={&#10;    threads {&#10;        RenderThread=6-7&#10;    }&#10;    processes {&#10;        push=0-3&#10;    }&#10;    fallback=0-6&#10;}"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatNestedBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatFunctionBlock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatFunctionBlockTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatFunctionBlockSelected"
+                android:text="函数式格式"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_below="@id/formatFunctionBlockTitle"
+                android:layout_marginTop="4dp"
+                android:layout_toStartOf="@id/formatFunctionBlockSelected"
+                android:fontFamily="monospace"
+                android:text="app(com.tencent.mm, 0-6) {&#10;    thread(RenderThread, 6-7)&#10;    process(push, 0-3)&#10;}"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatFunctionBlockSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/formatYaml"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:descendantFocusability="blocksDescendants"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/formatYamlTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/formatYamlSelected"
+                android:text="YAML 风格"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_below="@id/formatYamlTitle"
+                android:layout_marginTop="4dp"
+                android:layout_toStartOf="@id/formatYamlSelected"
+                android:fontFamily="monospace"
+                android:text="com.tencent.mm:&#10;    threads:&#10;        RenderThread: 6-7&#10;    processes:&#10;        push: 0-3&#10;    fallback: 0-6"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/formatYamlSelected"
                 android:layout_width="22dp"
                 android:layout_height="22dp"
                 android:layout_alignParentEnd="true"

@@ -22,42 +22,47 @@ fn write_rules_back(config_file: &Path, pkg: &str, rules: &[String]) -> bool {
             return false;
         }
     };
-    if !crate::rule_syntax::has_valid_block_structure(&old) {
+    let Some(block_ranges) = crate::rule_syntax::block_ranges(&old) else {
         eprintln!("[校准] 规则配置中存在未闭合或格式错误的区块，已取消写回");
         return false;
-    }
+    };
     let mut out = String::new();
-    let mut block_target: Option<bool> = None;
-    for raw in old.lines() {
-        if let Some(target) = block_target {
+    let lines = old.lines().collect::<Vec<_>>();
+    let mut range_index = 0usize;
+    let mut line_index = 0usize;
+    while line_index < lines.len() {
+        if let Some(range) = block_ranges.get(range_index).filter(|range| range.start_line == line_index) {
+            let target = range.owner == pkg || range.owner.starts_with(&format!("{pkg}:"));
             if !target {
-                out.push_str(raw);
-                out.push('\n');
+                for raw in &lines[range.start_line..range.end_line] {
+                    out.push_str(raw);
+                    out.push('\n');
+                }
+            } else {
+                // YAML 区块范围可能包含下一个顶层规则前的注释；替换目标规则时不能丢掉。
+                for raw in &lines[range.start_line..range.end_line] {
+                    if is_top_level_comment(raw) {
+                        out.push_str(raw);
+                        out.push('\n');
+                    }
+                }
             }
-            if crate::rule_syntax::is_block_close(raw) {
-                block_target = None;
-            }
+            line_index = range.end_line;
+            range_index += 1;
             continue;
         }
-
+        let raw = lines[line_index];
         let line = raw.trim();
-        if let Some(owner) = crate::rule_syntax::block_header_owner(line) {
-            let target = owner == pkg || owner.starts_with(&format!("{pkg}:"));
-            if !target {
-                out.push_str(raw);
-                out.push('\n');
-            }
-            block_target = Some(target);
-            continue;
-        }
         if config_line_owner(line)
             .as_deref()
             .is_some_and(|owner| owner == pkg || owner.starts_with(&format!("{pkg}:")))
         {
+            line_index += 1;
             continue;
         }
         out.push_str(raw);
         out.push('\n');
+        line_index += 1;
     }
     if !out.ends_with("\n\n") {
         out.push('\n');
@@ -72,6 +77,14 @@ fn write_rules_back(config_file: &Path, pkg: &str, rules: &[String]) -> bool {
         return false;
     }
     fs::rename(&tmp, config_file).is_ok()
+}
+
+fn is_top_level_comment(raw: &str) -> bool {
+    if raw.chars().next().is_some_and(char::is_whitespace) {
+        return false;
+    }
+    let trimmed = raw.trim_start();
+    trimmed.starts_with('#') || trimmed.starts_with("//")
 }
 
 fn config_line_owner(line: &str) -> Option<String> {

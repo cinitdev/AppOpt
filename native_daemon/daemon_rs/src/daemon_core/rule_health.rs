@@ -534,20 +534,24 @@ fn finish_rule_health_observation(
     (first_miss, confirmed_miss)
 }
 
-/* 配置应用进入新的可靠前台生命周期时只补一次全量发现扫描。
+/* 待观察规则所属应用进入新的可靠前台生命周期时只补一次全量发现扫描。
  * 这覆盖 sysinfo 进程总数净值不变的进程替换，又不会按 2 秒轮次重复遍历 /proc。 */
 fn foreground_discovery_scan_due(
-    rules: &[Rule],
     scope_pkg: Option<&str>,
     state: &mut DaemonState,
 ) -> bool {
+    let pending_packages = state
+        .rule_health
+        .values()
+        .filter(|entry| entry.status == RuleHealthStatus::Pending)
+        .filter_map(|entry| base_package(&entry.owner))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
     state.foreground_scan_lifecycles.retain(|pkg, _| {
         scope_pkg.is_none_or(|scope| scope == pkg)
-            && rules
-                .iter()
-                .any(|rule| base_package(&rule.owner) == Some(pkg.as_str()))
+            && pending_packages.contains(pkg)
     });
-    if rules.is_empty() {
+    if pending_packages.is_empty() {
         return false;
     }
     let now_elapsed = elapsed_realtime_ms();
@@ -556,7 +560,7 @@ fn foreground_discovery_scan_due(
     if pkg.is_empty()
         || !foreground.can_start(pkg)
         || scope_pkg.is_some_and(|scope| scope != pkg)
-        || !rules.iter().any(|rule| base_package(&rule.owner) == Some(pkg))
+        || !pending_packages.contains(pkg)
     {
         return false;
     }

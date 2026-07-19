@@ -21,8 +21,12 @@ object RuleFormatConverter {
     data class Detection(
         val format: CalibPolicy.RuleOutputFormat,
         val ruleCount: Int,
-        val mixed: Boolean = false
-    )
+        val mixed: Boolean = false,
+        val detectedFormats: Set<CalibPolicy.RuleOutputFormat> = setOf(format)
+    ) {
+        val requiresAuthorMigration: Boolean
+            get() = detectedFormats.any(CalibPolicy.RuleOutputFormat::requiresAuthorMigration)
+    }
 
     private data class RuleGroup(
         val owner: String,
@@ -33,9 +37,10 @@ object RuleFormatConverter {
     /** 根据现有规则的实际写法识别格式；只有兜底或 auto 时无法可靠判断，返回 null。 */
     fun detectFormat(text: String): Detection? {
         val document = RuleSyntax.parse(text)
-        if (document.segments.any { !it.valid } || document.rules.isEmpty()) return null
+        if (document.rules.isEmpty()) return null
 
-        val blocks = document.segments.filter { it.block && it.rules.isNotEmpty() }
+        val validSegments = document.segments.filter(RuleSyntax.Segment::valid)
+        val blocks = validSegments.filter { it.block && it.rules.isNotEmpty() }
         if (blocks.isEmpty()) {
             return if (document.rules.any { it.thread != null }) {
                 Detection(CalibPolicy.RuleOutputFormat.LEGACY, document.rules.size)
@@ -44,7 +49,7 @@ object RuleFormatConverter {
             }
         }
 
-        val separateFallbackOwners = document.segments.asSequence()
+        val separateFallbackOwners = validSegments.asSequence()
             .filterNot { it.block }
             .flatMap { it.rules.asSequence() }
             .filter { it.thread == null && it.owner == groupOwner(it.owner) }
@@ -52,7 +57,15 @@ object RuleFormatConverter {
             .toSet()
         val detected = blocks.mapNotNull { segment ->
             val owner = segment.ownerHint ?: return@mapNotNull null
-            detectBlockFormat(segment.rawLines, owner in separateFallbackOwners)
+            when (segment.format) {
+                RuleSyntax.Format.TAGGED -> CalibPolicy.RuleOutputFormat.TAGGED_BLOCK
+                RuleSyntax.Format.NATURAL -> CalibPolicy.RuleOutputFormat.NATURAL_BLOCK
+                RuleSyntax.Format.NESTED -> CalibPolicy.RuleOutputFormat.NESTED_BLOCK
+                RuleSyntax.Format.FUNCTION -> CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK
+                RuleSyntax.Format.YAML -> CalibPolicy.RuleOutputFormat.YAML
+                RuleSyntax.Format.STANDARD, null ->
+                    detectBlockFormat(segment.rawLines, owner in separateFallbackOwners)
+            }
         }
         if (detected.isEmpty()) return null
 
@@ -62,25 +75,27 @@ object RuleFormatConverter {
         return Detection(
             format = format,
             ruleCount = document.rules.size,
-            mixed = counts.size > 1
+            mixed = counts.size > 1,
+            detectedFormats = counts.keys.toSet()
         )
     }
 
     fun convert(text: String, format: CalibPolicy.RuleOutputFormat): Result {
+        val outputFormat = format.generationTarget()
         if (text.isBlank()) {
             return Result(Conversion(text, 0, 0, changed = false))
         }
 
         val document = RuleSyntax.parse(text)
-        val invalid = document.segments.firstOrNull { !it.valid }
-        if (invalid != null) {
-            val preview = invalid.rawLines.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
-            return Result(error = "存在无法解析的规则${preview.takeIf { it.isNotEmpty() }?.let { "：$it" }.orEmpty()}")
-        }
 
         val groups = LinkedHashMap<String, RuleGroup>()
         val pendingTrivia = mutableListOf<String>()
         for (segment in document.segments) {
+            // 无法识别的原文可能属于其他工具或未来语法，保留原位但不让它阻断有效规则转换。
+            if (!segment.valid) {
+                pendingTrivia.addAll(segment.rawLines)
+                continue
+            }
             if (segment.rules.isEmpty()) {
                 pendingTrivia.addAll(segment.rawLines)
                 continue
@@ -99,15 +114,17 @@ object RuleFormatConverter {
             group.rules.addAll(segment.rules)
         }
 
+        groups.values.forEach { group ->
+            val deduplicated = deduplicateRules(group.rules)
+            group.rules.clear()
+            group.rules.addAll(deduplicated)
+        }
+
         if (groups.isEmpty()) {
             return Result(Conversion(text, 0, 0, changed = false))
         }
 
         for (group in groups.values) {
-            val fallbacks = group.rules.filter { it.owner == group.owner && it.thread == null }
-            if (fallbacks.size > 1) {
-                return Result(error = "${group.owner} 存在多条主进程兜底规则，请先保留一条")
-            }
             val unsupported = group.rules.firstOrNull { rule ->
                 (rule.thread != null && rule.owner != group.owner) ||
                     (rule.thread == null && rule.owner != group.owner &&
@@ -125,7 +142,7 @@ object RuleFormatConverter {
                 output.add("")
             }
             output.addAll(group.trivia)
-            output.addAll(formatGroup(group, format))
+            output.addAll(formatGroup(group, outputFormat))
         }
         if (pendingTrivia.isNotEmpty()) {
             if (output.lastOrNull()?.isNotEmpty() == true && pendingTrivia.firstOrNull()?.isNotEmpty() != false) {
@@ -158,6 +175,11 @@ object RuleFormatConverter {
         val children = group.rules.filter { it.owner != group.owner && it.thread == null }
         val members = threads.size + children.size
 
+        // 只有主进程兜底时保持单行，避免生成没有实际成员的空区块。
+        if (members == 0) {
+            return fallback?.let { listOf(it.canonicalLine) }.orEmpty()
+        }
+
         if (format == CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK) {
             val output = mutableListOf<String>()
             if (threads.isEmpty()) {
@@ -171,35 +193,102 @@ object RuleFormatConverter {
             return output
         }
 
-        if (members == 0) return fallback?.let { listOf(it.canonicalLine) }.orEmpty()
-
         val output = mutableListOf<String>()
         when (format) {
-            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK -> {
-                output.add(fallback?.let { "${group.owner}=${it.cpus}{" } ?: "${group.owner}{")
-            }
-            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
-            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> output.add("${group.owner} {")
-            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
             CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> output.add("${group.owner}{")
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> output.add("${group.owner}={")
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK -> output.add(
+                fallback?.let { "app ${group.owner} fallback ${it.cpus} {" } ?: "app ${group.owner} {"
+            )
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> output.add("${group.owner}={")
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> output.add(
+                fallback?.let { "app(${group.owner}, ${it.cpus}) {" } ?: "app(${group.owner}) {"
+            )
+            CalibPolicy.RuleOutputFormat.YAML -> output.add("${group.owner}:")
             CalibPolicy.RuleOutputFormat.LEGACY,
             CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> error("已在前面处理")
-        }
-        threads.forEach { output.add("    ${it.thread}=${it.cpus}") }
-        children.forEach { output.add("    ${it.owner.removePrefix(group.owner)}=${it.cpus}") }
-        when (format) {
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
             CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
-            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK -> {
-                output.add("}")
-                fallback?.let { output.add(it.canonicalLine) }
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> error("旧区块格式只能转换为原作者格式")
+        }
+        when (format) {
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> {
+                threads.forEach { output.add("    ${it.thread}=${it.cpus}") }
+                children.forEach { output.add("    ${it.owner.removePrefix(group.owner)}=${it.cpus}") }
             }
-            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK,
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> {
+                threads.forEach { output.add("    thread:${it.thread}=${it.cpus}") }
+                children.forEach {
+                    output.add("    process:${it.owner.removePrefix("${group.owner}:")}=${it.cpus}")
+                }
+            }
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK -> {
+                threads.forEach { output.add("    thread ${it.thread}=${it.cpus}") }
+                children.forEach {
+                    output.add("    process ${it.owner.removePrefix("${group.owner}:")}=${it.cpus}")
+                }
+            }
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> {
+                if (threads.isNotEmpty()) {
+                    output.add("    threads {")
+                    threads.forEach { output.add("        ${it.thread}=${it.cpus}") }
+                    output.add("    }")
+                }
+                if (children.isNotEmpty()) {
+                    output.add("    processes {")
+                    children.forEach {
+                        output.add("        ${it.owner.removePrefix("${group.owner}:")}=${it.cpus}")
+                    }
+                    output.add("    }")
+                }
+            }
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> {
+                threads.forEach { output.add("    thread(${it.thread}, ${it.cpus})") }
+                children.forEach {
+                    output.add("    process(${it.owner.removePrefix("${group.owner}:")}, ${it.cpus})")
+                }
+            }
+            CalibPolicy.RuleOutputFormat.YAML -> {
+                if (threads.isNotEmpty()) {
+                    output.add("    threads:")
+                    threads.forEach { output.add("        ${it.thread}: ${it.cpus}") }
+                }
+                if (children.isNotEmpty()) {
+                    output.add("    processes:")
+                    children.forEach {
+                        output.add("        ${it.owner.removePrefix("${group.owner}:")}: ${it.cpus}")
+                    }
+                }
+            }
+            CalibPolicy.RuleOutputFormat.LEGACY,
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK,
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> error("已在前面处理")
+        }
+        when (format) {
             CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> {
                 output.add(fallback?.let { "}=${it.cpus}" } ?: "}")
             }
-            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK -> output.add("}")
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> {
+                fallback?.let { output.add("    fallback=${it.cpus}") }
+                output.add("}")
+            }
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK,
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> output.add("}")
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> {
+                fallback?.let { output.add("    fallback=${it.cpus}") }
+                output.add("}")
+            }
+            CalibPolicy.RuleOutputFormat.YAML -> fallback?.let { output.add("    fallback: ${it.cpus}") }
             CalibPolicy.RuleOutputFormat.LEGACY,
             CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> error("已在前面处理")
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> error("旧区块格式只能转换为原作者格式")
         }
         return output
     }
@@ -222,6 +311,54 @@ object RuleFormatConverter {
         return if (base != owner && base.contains('.')) base else owner
     }
 
+    /** 同一线程、子进程或主进程兜底只保留覆盖核心最多的一条。 */
+    private fun deduplicateRules(rules: List<RuleSyntax.Rule>): List<RuleSyntax.Rule> {
+        val selected = LinkedHashMap<Pair<String, String?>, RuleSyntax.Rule>()
+        for (rule in rules) {
+            val key = rule.owner to rule.thread
+            val current = selected[key]
+            if (current == null || cpuPreference(rule.cpus) > cpuPreference(current.cpus)) {
+                selected[key] = rule
+            }
+        }
+        return selected.values.toList()
+    }
+
+    private data class CpuPreference(
+        val validity: Int,
+        val count: Int,
+        val highest: Int,
+        val lowerCoverage: Int
+    ) : Comparable<CpuPreference> {
+        override fun compareTo(other: CpuPreference): Int {
+            return compareValuesBy(
+                this,
+                other,
+                CpuPreference::validity,
+                CpuPreference::count,
+                CpuPreference::highest,
+                CpuPreference::lowerCoverage
+            )
+        }
+    }
+
+    private fun cpuPreference(cpus: String): CpuPreference {
+        val parsed = RuleConfigLogic.parseCpuRangeList(cpus)
+        if (parsed != null && parsed.isNotEmpty()) {
+            return CpuPreference(
+                validity = 2,
+                count = parsed.size,
+                highest = parsed.maxOrNull() ?: -1,
+                lowerCoverage = -(parsed.minOrNull() ?: 0)
+            )
+        }
+        return if (cpus.equals("auto", ignoreCase = true)) {
+            CpuPreference(1, 0, -1, 0)
+        } else {
+            CpuPreference(0, 0, -1, 0)
+        }
+    }
+
     private fun detectBlockFormat(
         rawLines: List<String>,
         hasSeparateFallback: Boolean
@@ -242,7 +379,8 @@ object RuleFormatConverter {
             headerFallback -> CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK
             hasSeparateFallback && spaced -> CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK
             hasSeparateFallback -> CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK
-            else -> null
+            spaced -> CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK
+            else -> CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK
         }
     }
 }

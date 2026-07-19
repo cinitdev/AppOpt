@@ -226,23 +226,6 @@ class MainActivity : AppCompatActivity() {
             val running = runtime.running
             val helperStatus = if (r && compatible && !pendingUpdate) queryForegroundHelperStatus() else ForegroundHelperStatus()
             val enabled = r && compatible && running
-            val startupFormatResult = if (r && compatible && !pendingUpdate) {
-                DaemonBridge.detectAndApplyRuleOutputFormat()
-            } else {
-                null
-            }
-            val config = if (enabled) {
-                ConfigReader.readPackagesOrNull()
-            } else {
-                ConfigReader.ConfigPackages(emptyList(), emptyList())
-            }
-            val health = if (enabled) DaemonBridge.readRuleHealthOrNull().orEmpty() else emptyMap()
-            val resolvedNames = config?.let { resolveProcessComponentNames(it, enabled) }.orEmpty()
-            val visibleLists = when {
-                !enabled -> AppLists()
-                config != null -> buildConfiguredLists(config, resolvedNames, health)
-                else -> null
-            }
 
             runOnUiThreadIfEnvironmentCurrent(startupEnvironmentGeneration) {
                 runAfterEnvironmentLoadingMinimum {
@@ -264,52 +247,108 @@ class MainActivity : AppCompatActivity() {
                         addableAppsLoading = false
                         processNames = emptySet()
                         appLists = AppLists()
-                    } else if (config != null && visibleLists != null &&
-                        appListRequests.isCurrent(startupAppListGeneration)) {
-                        updateRuleHealthSnapshot(health)
-                        appListsLoading = false
-                        processNames = resolvedNames
-                        appLists = if (addableAppsLoading) {
-                            visibleLists
-                        } else {
-                            appLists.copy(
-                                pending = visibleLists.pending,
-                                configured = visibleLists.configured
-                            )
-                        }
-                    } else {
-                        refreshAppList(scrollAddableToTop = false)
                     }
                     refresh()
                     buildAppList()
-                    if (startupFormatResult?.success == true && startupFormatResult.changed) {
-                        val formatName = startupRuleOutputFormatName(startupFormatResult.format)
-                        val mixedHint = if (startupFormatResult.mixed) "（按主要写法识别）" else ""
-                        toast("已识别现有规则为$formatName$mixedHint")
-                    } else if (startupFormatResult != null && !startupFormatResult.success) {
-                        val message = startupFormatResult.detail ?: "现有规则自动转换失败"
-                        android.util.Log.w("AppOpt", "startup rule format conversion failed: $message")
-                        toast(message)
-                    }
                     showModuleWarningIfNeeded()
                     maybeCheckStartupUpdate()
                 }
             }
 
+            val config = if (enabled) {
+                ConfigReader.readPackagesOrNull()
+            } else {
+                ConfigReader.ConfigPackages(emptyList(), emptyList())
+            }
+            val health = if (enabled) DaemonBridge.readRuleHealthOrNull().orEmpty() else emptyMap()
+            val visibleLists = when {
+                !enabled -> AppLists()
+                config != null -> buildConfiguredLists(config, emptySet(), health)
+                else -> null
+            }
+            if (visibleLists != null) {
+                runOnUiThreadIfAppListCurrent(startupAppListGeneration) {
+                    updateRuleHealthSnapshot(health)
+                    appListsLoading = false
+                    processNames = emptySet()
+                    appLists = if (addableAppsLoading) {
+                        visibleLists
+                    } else {
+                        appLists.copy(
+                            pending = visibleLists.pending,
+                            configured = visibleLists.configured
+                        )
+                    }
+                    buildAppList()
+                }
+            } else if (enabled) {
+                runOnUiThreadIfEnvironmentCurrent(startupEnvironmentGeneration) {
+                    runAfterEnvironmentLoadingMinimum {
+                        if (environmentRequests.isCurrent(startupEnvironmentGeneration) &&
+                            appListRequests.isCurrent(startupAppListGeneration)) {
+                            refreshAppList(scrollAddableToTop = false)
+                        }
+                    }
+                }
+            }
+
+            // 格式整理和进程名识别可能随配置规模增长，不应阻塞运行环境检测页面。
+            val startupFormatResult = if (r && compatible && !pendingUpdate) {
+                DaemonBridge.detectAndApplyRuleOutputFormat()
+            } else {
+                null
+            }
+            val configAfterFormat = if (enabled && startupFormatResult?.success == true &&
+                startupFormatResult.changed) {
+                ConfigReader.readPackagesOrNull() ?: config
+            } else {
+                config
+            }
+            val healthAfterFormat = if (enabled && startupFormatResult?.success == true &&
+                startupFormatResult.changed) {
+                DaemonBridge.readRuleHealthOrNull() ?: health
+            } else {
+                health
+            }
+            val resolvedNames = configAfterFormat
+                ?.let { resolveProcessComponentNames(it, enabled) }
+                .orEmpty()
             val fullLists = when {
                 !enabled -> AppLists()
-                config != null -> buildAppLists(config, resolvedNames, health)
+                configAfterFormat != null -> buildAppLists(
+                    configAfterFormat,
+                    resolvedNames,
+                    healthAfterFormat
+                )
                 else -> null
             }
             if (fullLists != null) {
                 runOnUiThreadIfAppListCurrent(startupAppListGeneration) {
+                    updateRuleHealthSnapshot(healthAfterFormat)
                     addableAppsLoading = false
                     appLists = fullLists
                     buildAppList()
                 }
             }
+            if (startupFormatResult != null) {
+                runOnUiThreadIfEnvironmentCurrent(startupEnvironmentGeneration) {
+                    if (startupFormatResult.success && startupFormatResult.changed) {
+                        if (startupFormatResult.migratedDeprecatedFormat) {
+                            toast("已将旧区块规则转换为原作者区块格式")
+                        } else {
+                            val formatName = startupRuleOutputFormatName(startupFormatResult.format)
+                            val mixedHint = if (startupFormatResult.mixed) "（按主要写法识别）" else ""
+                            toast("已识别现有规则为$formatName$mixedHint")
+                        }
+                    } else if (!startupFormatResult.success) {
+                        val message = startupFormatResult.detail ?: "现有规则自动转换失败"
+                        android.util.Log.w("AppOpt", "startup rule format conversion failed: $message")
+                        toast(message)
+                    }
+                }
+            }
 
-            config?.let { migrateLogsLater(enabled, it) }
+            configAfterFormat?.let { migrateLogsLater(enabled, it) }
         }
     }
 
@@ -2279,12 +2318,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun startupRuleOutputFormatName(format: CalibPolicy.RuleOutputFormat?): String {
         return when (format) {
-            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> "区块格式 1"
-            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK -> "区块格式 2"
-            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK -> "区块格式 3"
-            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK -> "区块格式 4"
-            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> "区块格式 5"
-            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> "区块格式 6"
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> "原作者区块格式"
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> "扩展区块格式"
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> "类型标签区块"
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK -> "自然语句区块"
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> "分类嵌套区块"
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> "函数式格式"
+            CalibPolicy.RuleOutputFormat.YAML -> "YAML 风格"
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> "原作者区块格式"
             CalibPolicy.RuleOutputFormat.LEGACY,
             null -> "旧版单行格式"
         }

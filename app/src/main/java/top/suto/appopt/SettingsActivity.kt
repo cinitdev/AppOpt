@@ -168,7 +168,7 @@ class SettingsActivity : AppCompatActivity() {
             clearPolicyInputErrors()
             currentDetectedTopologyBlock = policy.detectedTopologyBlock
             currentWildcardGroup = policy.wildcardGroup
-            currentRuleOutputFormat = policy.ruleOutputFormat
+            currentRuleOutputFormat = policy.ruleOutputFormat.generationTarget()
 
             val topology = parseDetectedTopology(currentDetectedTopologyBlock)
             availableCpus = availableCpuList(policy, topology)
@@ -558,25 +558,36 @@ class SettingsActivity : AppCompatActivity() {
                 binding.ruleOutputFormatValue.text = "原作者区块"
                 binding.ruleOutputFormatDesc.text = "线程写入原作者新增区块，子进程仍单独一行"
             }
-            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK -> {
-                binding.ruleOutputFormatValue.text = "首行兜底紧凑区块"
-                binding.ruleOutputFormatDesc.text = "主进程兜底写在紧贴左花括号的区块首行"
-            }
-            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK -> {
-                binding.ruleOutputFormatValue.text = "区块外兜底（空格）"
-                binding.ruleOutputFormatDesc.text = "线程和子进程写入区块，主进程兜底单独写在区块后"
-            }
-            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK -> {
-                binding.ruleOutputFormatValue.text = "区块外兜底（紧凑）"
-                binding.ruleOutputFormatDesc.text = "紧凑区块写线程和子进程，主进程兜底单独写在区块后"
-            }
-            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> {
-                binding.ruleOutputFormatValue.text = "区块尾部兜底（空格）"
-                binding.ruleOutputFormatDesc.text = "线程和子进程写入同一区块，兜底核心放在区块尾部"
-            }
             CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> {
-                binding.ruleOutputFormatValue.text = "区块尾部兜底（紧凑）"
+                binding.ruleOutputFormatValue.text = "扩展区块格式"
                 binding.ruleOutputFormatDesc.text = "紧凑区块写线程和子进程，兜底核心放在区块尾部"
+            }
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "类型标签区块"
+                binding.ruleOutputFormatDesc.text = "用 thread、process 和 fallback 明确标记规则类型"
+            }
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "自然语句区块"
+                binding.ruleOutputFormatDesc.text = "使用接近自然语言的 thread 和 process 写法"
+            }
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "分类嵌套区块"
+                binding.ruleOutputFormatDesc.text = "线程与子进程分别写入独立子区块"
+            }
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "函数式格式"
+                binding.ruleOutputFormatDesc.text = "使用 app、thread 和 process 函数表达规则"
+            }
+            CalibPolicy.RuleOutputFormat.YAML -> {
+                binding.ruleOutputFormatValue.text = "YAML 风格"
+                binding.ruleOutputFormatDesc.text = "使用缩进分组展示线程、子进程和兜底核心"
+            }
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "原作者区块"
+                binding.ruleOutputFormatDesc.text = "旧区块格式将在启动时转换为原作者格式"
             }
         }
     }
@@ -597,42 +608,49 @@ class SettingsActivity : AppCompatActivity() {
             view.formatAuthorBlockSelected,
             current,
             CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK,
-            "区块格式 1（原作者新增）"
-        )
-        setRuleOutputFormatTitle(
-            view.formatCompactHeaderBlockTitle,
-            view.formatCompactHeaderBlockSelected,
-            current,
-            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
-            "区块格式 2（首行兜底，紧凑）"
-        )
-        setRuleOutputFormatTitle(
-            view.formatSeparateFallbackBlockTitle,
-            view.formatSeparateFallbackBlockSelected,
-            current,
-            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
-            "区块格式 3（区块外兜底，空格）"
-        )
-        setRuleOutputFormatTitle(
-            view.formatCompactSeparateFallbackBlockTitle,
-            view.formatCompactSeparateFallbackBlockSelected,
-            current,
-            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
-            "区块格式 4（区块外兜底，紧凑）"
-        )
-        setRuleOutputFormatTitle(
-            view.formatExtendedBlockTitle,
-            view.formatExtendedBlockSelected,
-            current,
-            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK,
-            "区块格式 5（尾部兜底，空格）"
+            "原作者区块格式"
         )
         setRuleOutputFormatTitle(
             view.formatCompactExtendedBlockTitle,
             view.formatCompactExtendedBlockSelected,
             current,
             CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK,
-            "区块格式 6（尾部兜底，紧凑）"
+            "扩展区块格式"
+        )
+        setRuleOutputFormatTitle(
+            view.formatTaggedBlockTitle,
+            view.formatTaggedBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK,
+            "类型标签区块"
+        )
+        setRuleOutputFormatTitle(
+            view.formatNaturalBlockTitle,
+            view.formatNaturalBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK,
+            "自然语句区块"
+        )
+        setRuleOutputFormatTitle(
+            view.formatNestedBlockTitle,
+            view.formatNestedBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK,
+            "分类嵌套区块"
+        )
+        setRuleOutputFormatTitle(
+            view.formatFunctionBlockTitle,
+            view.formatFunctionBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK,
+            "函数式格式"
+        )
+        setRuleOutputFormatTitle(
+            view.formatYamlTitle,
+            view.formatYamlSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.YAML,
+            "YAML 风格"
         )
         view.formatLegacy.setOnClickListener {
             dialog.dismiss()
@@ -642,32 +660,33 @@ class SettingsActivity : AppCompatActivity() {
             dialog.dismiss()
             setRuleOutputFormat(CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK)
         }
-        view.formatCompactHeaderBlock.setOnClickListener {
-            dialog.dismiss()
-            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK)
-        }
-        view.formatSeparateFallbackBlock.setOnClickListener {
-            dialog.dismiss()
-            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK)
-        }
-        view.formatCompactSeparateFallbackBlock.setOnClickListener {
-            dialog.dismiss()
-            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK)
-        }
-        view.formatExtendedBlock.setOnClickListener {
-            dialog.dismiss()
-            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK)
-        }
         view.formatCompactExtendedBlock.setOnClickListener {
             dialog.dismiss()
             setRuleOutputFormat(CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK)
         }
+        view.formatTaggedBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.TAGGED_BLOCK)
+        }
+        view.formatNaturalBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.NATURAL_BLOCK)
+        }
+        view.formatNestedBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.NESTED_BLOCK)
+        }
+        view.formatFunctionBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK)
+        }
+        view.formatYaml.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.YAML)
+        }
         view.formatCancel.setOnClickListener { dialog.dismiss() }
         dialog.setContentView(view.root)
         dialog.setOnShowListener {
-            val maxHeight = (resources.displayMetrics.heightPixels * 0.9f).toInt()
-            view.root.layoutParams = view.root.layoutParams.apply { height = maxHeight }
-            dialog.behavior.peekHeight = maxHeight
             dialog.behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
             dialog.behavior.skipCollapsed = true
         }
@@ -687,9 +706,10 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun setRuleOutputFormat(format: CalibPolicy.RuleOutputFormat) {
         if (formatConversionBusy) return
+        val outputFormat = format.generationTarget()
         cancelAutoSave()
         val previous = currentRuleOutputFormat
-        currentRuleOutputFormat = format
+        currentRuleOutputFormat = outputFormat
         updateRuleOutputFormatText()
         val policy = readPolicyFromInputs()
         if (policy == null) {
@@ -701,11 +721,11 @@ class SettingsActivity : AppCompatActivity() {
 
         formatConversionBusy = true
         setPolicyInputsEnabled(false)
-        val formatName = ruleOutputFormatName(format)
+        val formatName = ruleOutputFormatName(outputFormat)
         setPolicyStatus("正在把现有规则转换为$formatName")
         ++saveSeq
         POLICY_IO_EXECUTOR.execute {
-            val result = DaemonBridge.applyRuleOutputFormat(format, policy.toConfigText())
+            val result = DaemonBridge.applyRuleOutputFormat(outputFormat, policy.toConfigText())
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 formatConversionBusy = false
@@ -744,12 +764,17 @@ class SettingsActivity : AppCompatActivity() {
     private fun ruleOutputFormatName(format: CalibPolicy.RuleOutputFormat): String {
         return when (format) {
             CalibPolicy.RuleOutputFormat.LEGACY -> "旧版单行格式"
-            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> "区块格式 1"
-            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK -> "区块格式 2"
-            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK -> "区块格式 3"
-            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK -> "区块格式 4"
-            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> "区块格式 5"
-            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> "区块格式 6"
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> "原作者区块格式"
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> "扩展区块格式"
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> "类型标签区块"
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK -> "自然语句区块"
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> "分类嵌套区块"
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> "函数式格式"
+            CalibPolicy.RuleOutputFormat.YAML -> "YAML 风格"
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> "原作者区块格式"
         }
     }
 

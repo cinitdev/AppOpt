@@ -127,19 +127,6 @@ fn cpu_max_freq(cpu: usize) -> u64 {
     .unwrap_or(0)
 }
 
-fn log_detected_topology(topo: &CpuTiers) {
-    println!(
-        "[RS] CPU 拓扑识别: {} 个性能簇, 全部=[{}] 低性能=[{}] 主性能=[{}] 高性能=[{}] 最高性能=[{}] 非最高=[{}]",
-        topo.clusters,
-        topo.all,
-        topo.low,
-        topo.mid,
-        topo.high,
-        topo.highest,
-        topo.fallback
-    );
-}
-
 fn sync_policy_topology(topo: &CpuTiers) {
     // 设置页读取 detected_* 作为默认核心建议；这里用锁和整块替换避免半写入。
     let _lock = match PolicyLock::acquire() {

@@ -8,6 +8,7 @@
 // affinity.rs 中实现。
 fn daemon_loop(args: &Args) -> io::Result<()> {
     println!("[RS] 启动 AppOpt Rust 守护 v{VERSION}");
+    println!("[RS] 作者: suto & 一只小柒夏");
     println!("[RS] 配置文件: {}", args.config.display());
     println!("[RS] 包名 UID 映射: {}", args.uid_map.display());
     println!("[RS] 检查间隔: {} 秒", args.interval_secs);
@@ -15,10 +16,19 @@ fn daemon_loop(args: &Args) -> io::Result<()> {
         "[RS] 目标范围: {}",
         args.target_pkg.as_deref().unwrap_or("全部配置应用")
     );
+    print_startup_device_info();
+    calibration::print_version_diagnostics(VERSION);
 
-    start_daemon_socket_thread();
-    calibration::start_calibration_thread(args.config.clone());
-    fps::start_fps_thread();
+    println!("[RS] 配置文件监控模式: 守护主循环轮询");
+    if start_daemon_socket_thread() {
+        println!("[RS] 启用守护进程验证 socket");
+    }
+    if calibration::start_calibration_thread(args.config.clone()) {
+        println!("[RS] 启用自动校准线程");
+    }
+    if fps::start_fps_thread() {
+        println!("[RS] 启用真实帧率监测线程 (eBPF/SF fallback)");
+    }
     let mut state = DaemonState::default();
 
     loop {
@@ -27,6 +37,111 @@ fn daemon_loop(args: &Args) -> io::Result<()> {
         }
         thread::sleep(Duration::from_secs(args.interval_secs));
     }
+}
+
+// 启动时输出与 C 版一致的设备诊断，便于用户反馈日志时确认运行环境。
+fn print_startup_device_info() {
+    let properties = read_android_properties();
+    let android_version = first_property(
+        &properties,
+        &[
+            "ro.build.version.release",
+            "ro.system.build.version.release",
+        ],
+    );
+    let api_level = first_property(
+        &properties,
+        &["ro.build.version.sdk", "ro.system.build.version.sdk"],
+    );
+    if let Some(version) = android_version {
+        if let Some(api) = api_level {
+            println!("Android 版本: {version} (API {api})");
+        } else {
+            println!("Android 版本: {version}");
+        }
+    }
+
+    let brand = first_property(
+        &properties,
+        &[
+            "ro.product.brand",
+            "ro.product.system.brand",
+            "ro.product.vendor.brand",
+            "ro.product.odm.brand",
+            "ro.product.product.brand",
+        ],
+    );
+    let market_model = first_property(
+        &properties,
+        &[
+            "ro.product.marketname",
+            "ro.product.vendor.marketname",
+            "ro.product.odm.marketname",
+            "ro.product.system.marketname",
+            "ro.product.product.marketname",
+            "ro.vendor.product.marketname",
+            "ro.config.marketing_name",
+            "ro.vendor.oplus.market.name",
+            "ro.oplus.market.name",
+        ],
+    );
+    let certified_model = first_property(
+        &properties,
+        &[
+            "ro.product.model",
+            "ro.product.vendor.model",
+            "ro.product.odm.model",
+            "ro.product.system.model",
+            "ro.product.product.model",
+        ],
+    );
+    if let Some(brand) = brand {
+        if let Some(model) = market_model.or(certified_model) {
+            println!("设备品牌: {brand} {model}");
+        } else {
+            println!("设备品牌: {brand}");
+        }
+    } else if let Some(model) = market_model.or(certified_model) {
+        println!("设备型号: {model}");
+    }
+
+    if let Ok(release) = fs::read_to_string("/proc/sys/kernel/osrelease") {
+        let release = release.trim();
+        if !release.is_empty() {
+            println!("内核版本: Linux {release}");
+        }
+    }
+}
+
+fn read_android_properties() -> HashMap<String, String> {
+    let output = Command::new("/system/bin/getprop")
+        .output()
+        .or_else(|_| Command::new("getprop").output());
+    let Ok(output) = output else {
+        return HashMap::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut properties = HashMap::new();
+    for line in text.lines() {
+        let Some(separator) = line.find("]: [") else {
+            continue;
+        };
+        if !line.starts_with('[') {
+            continue;
+        }
+        let key = &line[1..separator];
+        let value = line[separator + 4..].strip_suffix(']').unwrap_or(&line[separator + 4..]);
+        if !key.is_empty() && !value.is_empty() {
+            properties.insert(key.to_string(), value.to_string());
+        }
+    }
+    properties
+}
+
+fn first_property<'a>(properties: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| properties.get(*key).map(String::as_str))
+        .filter(|value| !value.is_empty())
 }
 
 fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
@@ -73,11 +188,8 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
                 && scan_clock.saturating_sub(last) >= RULE_HEALTH_FULL_SCAN_RETRY_MS
         });
     let health_due = rule_health_full_scan_due(state);
-    let foreground_discovery_due = foreground_discovery_scan_due(
-        &runtime_rules,
-        args.target_pkg.as_deref(),
-        state,
-    );
+    let foreground_discovery_due =
+        foreground_discovery_scan_due(args.target_pkg.as_deref(), state);
 
     // Rust 版的核心优化点：
     // - 配置刚变化时必须全量扫，因为规则目标可能完全变了。

@@ -6,21 +6,26 @@
 //
 // 这么设计是为了兼容 App 被系统回收、Activity 重建、悬浮窗关闭等场景。daemon 只认命令文件
 // 和状态文件，不依赖 App 进程一直活着。
-pub fn start_calibration_thread(config_file: PathBuf) {
-    thread::spawn(move || {
+pub fn start_calibration_thread(config_file: PathBuf) -> bool {
+    match thread::Builder::new()
+        .name("AppOptRsCalibration".to_string())
+        .spawn(move || {
         if let Err(err) = calibration_loop(config_file) {
             eprintln!("[CALIB] 校准线程已停止: {err}");
         }
-    });
+        }) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("[CALIB] 校准线程创建失败: {err}");
+            false
+        }
+    }
 }
 
 fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
     fs::create_dir_all(CONFIG_DIR)?;
     fs::create_dir_all(HISTORY_DIR)?;
     write_state("idle")?;
-    let startup_topo = CpuTiers::detect();
-    log_detected_topology(&startup_topo);
-    sync_policy_topology(&startup_topo);
 
     let mut session: Option<CalibSession> = None;
     loop {
