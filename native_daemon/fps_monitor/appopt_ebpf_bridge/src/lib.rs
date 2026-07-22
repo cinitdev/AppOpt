@@ -21,6 +21,12 @@ use aya::{
     util::online_cpus,
 };
 
+mod adaptive_boost;
+pub use adaptive_boost::{
+    AppOptFrameMetrics, AppOptJankCtx, appopt_jank_create, appopt_jank_last_event,
+    appopt_jank_recover, appopt_jank_stop, appopt_jank_update,
+};
+
 // Rust daemon 通过 C ABI 调用这个 bridge。
 // 这里负责加载 aya eBPF 对象、附加 libgui uprobe、读取 RingBuf/PerfEvent 帧事件，
 // 并把当前 FPS、后端名称、命中的符号和错误信息暴露给 daemon 日志。
@@ -686,6 +692,50 @@ pub extern "C" fn appopt_ebpf_get(ctx: *const AppOptEbpfCtx) -> c_double {
     }
     let ctx = unsafe { &*ctx };
     ctx.cur_fps
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn appopt_ebpf_metrics(
+    ctx: *const AppOptEbpfCtx,
+    out: *mut AppOptFrameMetrics,
+) -> c_int {
+    if ctx.is_null() || out.is_null() {
+        return 0;
+    }
+    let ctx = unsafe { &*ctx };
+    let Some(stream) = ctx.streams.values().max_by(|left, right| {
+        left.cur_fps
+            .partial_cmp(&right.cur_fps)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return 0;
+    };
+    if stream.frame_times.is_empty() {
+        return 0;
+    }
+    let mut intervals = stream.frame_times.iter().copied().collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let percentile = |percent: usize| -> u64 {
+        let index = ((intervals.len() - 1) * percent + 99) / 100;
+        intervals[index.min(intervals.len() - 1)]
+    };
+    unsafe {
+        *out = AppOptFrameMetrics {
+            fps: stream.cur_fps,
+            median_interval_ns: percentile(50),
+            p95_interval_ns: percentile(95),
+            max_interval_ns: intervals.last().copied().unwrap_or(0),
+            frame_count: intervals.len().min(u32::MAX as usize) as u32,
+            flags: if matches!(&ctx.backend, EventBackend::PerfEvent(_))
+                && ctx.frame_stats.is_some()
+            {
+                1
+            } else {
+                0
+            },
+        };
+    }
+    1
 }
 
 #[unsafe(no_mangle)]

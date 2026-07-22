@@ -46,6 +46,7 @@ extern AppOptEbpfCtx *appopt_ebpf_start(int pid, const char *bpf_obj_path);
 extern AppOptEbpfCtx *appopt_ebpf_start_for_package(int pid, const char *bpf_obj_path, const char *target_pkg);
 extern int appopt_ebpf_poll(AppOptEbpfCtx *ctx);
 extern double appopt_ebpf_get(const AppOptEbpfCtx *ctx);
+extern int appopt_ebpf_metrics(const AppOptEbpfCtx *ctx, AppOptFrameMetrics *out);
 extern int appopt_ebpf_pid(const AppOptEbpfCtx *ctx);
 extern const char *appopt_ebpf_symbol(const AppOptEbpfCtx *ctx);
 extern const char *appopt_ebpf_backend(const AppOptEbpfCtx *ctx);
@@ -152,6 +153,14 @@ double ebpf_fps_get(ebpf_fps_ctx *ctx) {
         return 0.0;
     }
     return appopt_ebpf_get(ctx->inner);
+}
+
+bool ebpf_fps_metrics(ebpf_fps_ctx *ctx, AppOptFrameMetrics *out) {
+    if (!ctx || !ctx->inner || !out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    return appopt_ebpf_metrics(ctx->inner, out) > 0;
 }
 
 pid_t ebpf_fps_pid(ebpf_fps_ctx *ctx) {

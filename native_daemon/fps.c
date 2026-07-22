@@ -270,6 +270,137 @@ static ebpf_fps_ctx* fps_start_ebpf_ctx(const char* pkg, pid_t target_pid,
     return NULL;
 }
 
+static char* fps_jank_normalize_pkg(char* line) {
+    if (!line) return NULL;
+    char* value = strtrim(line);
+    char* comment = strchr(value, '#');
+    if (comment) *comment = '\0';
+    value = strtrim(value);
+    char* process = strchr(value, ':');
+    if (process) *process = '\0';
+    value = strtrim(value);
+    if (!value[0] || !strchr(value, '.')) return NULL;
+    for (const unsigned char* cursor = (const unsigned char*)value; *cursor; cursor++) {
+        if (!isalnum(*cursor) && *cursor != '_' && *cursor != '.') return NULL;
+    }
+    return value;
+}
+
+static unsigned long long fps_jank_config_snapshot(
+    char* preview,
+    size_t preview_size,
+    size_t* package_count,
+    const char* match_pkg,
+    bool* match_found
+) {
+    if (preview && preview_size > 0) preview[0] = '\0';
+    if (package_count) *package_count = 0;
+    if (match_found) *match_found = false;
+    struct stat info;
+    if (stat(JANK_BOOST_FILE, &info) != 0) return 0;
+    unsigned long long signature =
+        (unsigned long long)info.st_mtime * 1000003ULL + (unsigned long long)info.st_size;
+    FILE* fp = fopen(JANK_BOOST_FILE, "r");
+    if (!fp) return signature;
+    char* line = NULL;
+    size_t cap = 0;
+    size_t count = 0;
+    size_t shown = 0;
+    while (getline(&line, &cap, fp) != -1) {
+        char* value = fps_jank_normalize_pkg(line);
+        if (!value) continue;
+        count++;
+        if (match_found && match_pkg && strcmp(value, match_pkg) == 0) {
+            *match_found = true;
+        }
+        if (preview && shown < 5) {
+            size_t used = strlen(preview);
+            if (used < preview_size) {
+                snprintf(
+                    preview + used,
+                    preview_size - used,
+                    "%s%s",
+                    shown > 0 ? ", " : "",
+                    value);
+            }
+            shown++;
+        }
+    }
+    free(line);
+    fclose(fp);
+    if (package_count) *package_count = count;
+    return signature ^ ((unsigned long long)count << 32);
+}
+
+static bool fps_jank_cgroup_foreground_pkg(char* out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    FILE* fp = fopen(JANK_BOOST_FILE, "r");
+    if (!fp) return false;
+    bool found = false;
+    char* line = NULL;
+    size_t cap = 0;
+    while (!found && getline(&line, &cap, fp) != -1) {
+        char* pkg = fps_jank_normalize_pkg(line);
+        if (!pkg) continue;
+        app_top_state_result state;
+        if (app_top_state_check(pkg, &state) && state.target_top_app) {
+            build_str(out, out_size, pkg, NULL);
+            found = true;
+        }
+    }
+    free(line);
+    fclose(fp);
+    return found;
+}
+
+static bool fps_jank_foreground_pkg(char* out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    FILE* fp = fopen(FOREGROUND_TASK_STATE_FILE, "r");
+    if (!fp) return false;
+    char status[32] = {0};
+    char focused[MAX_PKG_LEN] = {0};
+    unsigned long long updated_wall_ms = 0;
+    char* line = NULL;
+    size_t cap = 0;
+    while (getline(&line, &cap, fp) != -1) {
+        char* equal = strchr(line, '=');
+        if (!equal) continue;
+        *equal = '\0';
+        char* key = strtrim(line);
+        char* value = strtrim(equal + 1);
+        if (strcmp(key, "status") == 0) build_str(status, sizeof(status), value, NULL);
+        else if (strcmp(key, "focused_package") == 0) build_str(focused, sizeof(focused), value, NULL);
+        else if (strcmp(key, "updated_wall_ms") == 0) updated_wall_ms = strtoull(value, NULL, 10);
+    }
+    free(line);
+    fclose(fp);
+    struct timespec wall;
+    unsigned long long now_wall_ms = 0;
+    if (clock_gettime(CLOCK_REALTIME, &wall) == 0) {
+        now_wall_ms = (unsigned long long)wall.tv_sec * 1000ULL +
+            (unsigned long long)wall.tv_nsec / 1000000ULL;
+    }
+    char* normalized = fps_jank_normalize_pkg(focused);
+    if (strcmp(status, "ok") != 0 || !normalized || updated_wall_ms == 0 ||
+        now_wall_ms < updated_wall_ms || now_wall_ms - updated_wall_ms > 12000ULL) return false;
+    build_str(out, out_size, normalized, NULL);
+    return true;
+}
+
+static void fps_jank_log_update(AppOptJankCtx* ctx, pid_t pid, double fps,
+                                ebpf_fps_ctx* ebpf_ctx) {
+    if (!ctx) return;
+    AppOptFrameMetrics metrics = {0};
+    const AppOptFrameMetrics* metrics_ptr = NULL;
+    if (ebpf_ctx && ebpf_fps_metrics(ebpf_ctx, &metrics)) metrics_ptr = &metrics;
+    int event = appopt_jank_update(ctx, (int)pid, fps, metrics_ptr);
+    if (event > 0) {
+        const char* message = appopt_jank_last_event(ctx);
+        printf("[boost] %s\n", (message && message[0]) ? message : "状态已更新");
+    }
+}
+
 /*
  * FPS 监测线程。控制协议仍走纯文本文件:
  *   App -> 守护: 写 FPS_CMD_FILE, 内容 "start <pkg> [socket token]" / "stop"
@@ -288,8 +419,17 @@ static void* fps_thread(void* arg) {
     pthread_setname_np(pthread_self(), "AppOptFps");
 
     bool monitoring = false;
+    bool manual_monitoring = false;
+    bool adaptive_monitoring = false;
     char pkg[MAX_PKG_LEN] = "";
     char cmd[384];
+    char auto_pkg[MAX_PKG_LEN] = "";
+    long long last_auto_check_ms = 0;
+    unsigned long long last_jank_config_signature = ~0ULL;
+    size_t last_selected_count = 0;
+    AppOptJankCtx* jank_ctx = NULL;
+    pid_t monitor_pid = (pid_t)-1;
+    bool publish_fps = false;
 
     /* eBPF 状态 */
     ebpf_fps_ctx *ebpf_ctx = NULL;
@@ -307,9 +447,69 @@ static void* fps_thread(void* arg) {
     bool fallback_first_fps = true;
     long long last_fps_output_ms = 0;
 
-    for (;;) {
+    for (; !shutdown_requested;) {
         /* 轮询命令 */
-        if (fps_read_cmd(cmd, sizeof(cmd))) {
+        bool internal_command = false;
+        bool has_command = fps_read_cmd(cmd, sizeof(cmd));
+        long long command_now_ms = monotonic_ms();
+        long long auto_check_interval_ms = last_selected_count > 0 ? 1000 : 10000;
+        if (command_now_ms - last_auto_check_ms >= auto_check_interval_ms) {
+            last_auto_check_ms = command_now_ms;
+            char next_auto_pkg[MAX_PKG_LEN] = "";
+            bool has_foreground = last_selected_count > 0 && fps_jank_foreground_pkg(
+                next_auto_pkg, sizeof(next_auto_pkg));
+            char selected_preview[512] = "";
+            size_t selected_count = 0;
+            bool selected_foreground = false;
+            unsigned long long selected_signature = fps_jank_config_snapshot(
+                selected_preview, sizeof(selected_preview), &selected_count,
+                has_foreground ? next_auto_pkg : NULL, &selected_foreground);
+            if (selected_count > 0 && !selected_foreground &&
+                fps_jank_cgroup_foreground_pkg(next_auto_pkg, sizeof(next_auto_pkg))) {
+                has_foreground = true;
+                selected_foreground = true;
+            }
+            last_selected_count = selected_count;
+            if (selected_signature != last_jank_config_signature) {
+                if (selected_count == 0) {
+                    printf("[boost] 卡顿时临时提速未配置应用\n");
+                } else {
+                    printf(
+                        "[boost] 已配置临时提速: %s%s；等待所选应用进入前台\n",
+                        selected_preview,
+                        selected_count > 5 ? " ..." : "");
+                }
+                last_jank_config_signature = selected_signature;
+            }
+            bool has_auto = has_foreground && selected_foreground;
+            bool should_adapt = has_auto && monitoring && strcmp(next_auto_pkg, pkg) == 0;
+            if (should_adapt != adaptive_monitoring) {
+                if (jank_ctx) {
+                    appopt_jank_stop(jank_ctx);
+                    jank_ctx = NULL;
+                }
+                adaptive_monitoring = should_adapt;
+                if (should_adapt) {
+                    jank_ctx = appopt_jank_create(pkg);
+                    printf("[boost] 已为 %s 开启卡顿时临时提速\n", pkg);
+                } else if (monitoring) {
+                    printf("[boost] 已为 %s 停止卡顿时临时提速并恢复参数\n", pkg);
+                }
+            }
+            if (!manual_monitoring && !has_command) {
+                if (has_auto && (!monitoring || strcmp(next_auto_pkg, pkg) != 0)) {
+                    snprintf(cmd, sizeof(cmd), "start %s", next_auto_pkg);
+                    has_command = true;
+                    internal_command = true;
+                } else if (!has_auto && monitoring) {
+                    build_str(cmd, sizeof(cmd), "stop", NULL);
+                    has_command = true;
+                    internal_command = true;
+                }
+            }
+            build_str(auto_pkg, sizeof(auto_pkg), has_auto ? next_auto_pkg : "", NULL);
+        }
+        if (has_command) {
             if (is_start_command(cmd)) {
                 const char* p = strtrim(cmd + 6);
                 char start_pkg[MAX_PKG_LEN] = "";
@@ -323,6 +523,8 @@ static void* fps_thread(void* arg) {
                     fps_socket_reset();
 
                     build_str(pkg, sizeof(pkg), start_pkg, NULL);
+                    manual_monitoring = !internal_command;
+                    publish_fps = manual_monitoring;
                     if (parsed >= 3) fps_socket_configure(socket_name, socket_token);
                     monitoring = true;
                     ebpf_first_fps = true;
@@ -335,6 +537,16 @@ static void* fps_thread(void* arg) {
                     ebpf_last_restart_ms = ebpf_last_frame_ms;
                     fallback_first_fps = true;
                     last_fps_output_ms = 0;
+                    monitor_pid = (pid_t)-1;
+                    if (jank_ctx) {
+                        appopt_jank_stop(jank_ctx);
+                        jank_ctx = NULL;
+                    }
+                    adaptive_monitoring = auto_pkg[0] && strcmp(auto_pkg, pkg) == 0;
+                    if (adaptive_monitoring) {
+                        jank_ctx = appopt_jank_create(pkg);
+                        printf("[boost] 已为 %s 开启卡顿时临时提速\n", pkg);
+                    }
 
                     /* 1. eBPF 预检查。真正加载/attach 是否成功由 ebpf_fps_start 决定。 */
                     ebpf_cap_t cap = ebpf_fps_probe_capability(FPS_BPF_OBJ);
@@ -344,6 +556,7 @@ static void* fps_thread(void* arg) {
                         /* 2. 找目标进程 PID。游戏刚启动时 /proc/cmdline 可能短暂不可见, 等一小段时间。 */
                         const char* pid_source = "未找到";
                         pid_t start_pid = fps_wait_pkg_pid(pkg, 30, 100 * 1000, &pid_source);
+                        monitor_pid = start_pid;
                         if (start_pid < 0) {
                             printf("[FPS] 等待约 3 秒仍未找到 %s 的进程, 跳过全局 eBPF 探测\n", pkg);
                         }
@@ -372,6 +585,10 @@ static void* fps_thread(void* arg) {
 
                     /* 4. eBPF 不可用 -> 启用 SF fallback (含 latency + timestats) */
                     if (!ebpf_ctx) {
+                        if (monitor_pid <= 0) {
+                            const char* fallback_pid_source = NULL;
+                            monitor_pid = fps_find_preferred_pkg_pid(pkg, true, &fallback_pid_source);
+                        }
                         fallback_ctx = fps_fallback_start(pkg);
                         if (!fallback_ctx) {
                             printf("[FPS] 警告: fallback 启动失败\n");
@@ -379,14 +596,26 @@ static void* fps_thread(void* arg) {
                     }
                 }
             } else if (is_stop_command(cmd)) {
+                if (!internal_command) manual_monitoring = false;
+                if (!internal_command && auto_pkg[0] && monitoring && strcmp(auto_pkg, pkg) == 0) {
+                    if (publish_fps) fps_write_out_windowed(0, &last_fps_output_ms, true);
+                    publish_fps = false;
+                    fps_socket_reset();
+                    continue;
+                }
                 if (monitoring) {
+                    bool was_publishing = publish_fps;
                     monitoring = false;
+                    manual_monitoring = false;
+                    adaptive_monitoring = false;
+                    if (jank_ctx) { appopt_jank_stop(jank_ctx); jank_ctx = NULL; }
                     if (ebpf_ctx) { ebpf_fps_stop(ebpf_ctx); ebpf_ctx = NULL; }
                     if (fallback_ctx) { fps_fallback_stop(fallback_ctx); fallback_ctx = NULL; }
                     ebpf_seen_frames = false;
                     ebpf_stale_zero_sent = false;
                     printf("[FPS] 停止监测 %s\n", pkg);
-                    fps_write_out_windowed(0, &last_fps_output_ms, true);
+                    if (was_publishing) fps_write_out_windowed(0, &last_fps_output_ms, true);
+                    publish_fps = false;
                     fps_socket_reset();
                     last_fps_output_ms = 0;
                 }
@@ -441,11 +670,17 @@ static void* fps_thread(void* arg) {
                 now_ms - ebpf_last_frame_ms >= FPS_EBPF_STALE_MS;
             bool fps_has_no_valid_value = ebpf_first_fps && now_ms > 0 &&
                 now_ms - ebpf_last_restart_ms >= FPS_EBPF_STALE_MS;
+            fps_jank_log_update(
+                jank_ctx,
+                active_pid,
+                (fps_is_stale || fps_has_no_valid_value) ? 0.0 : fps,
+                ebpf_ctx
+            );
             if (fps_is_stale) {
                 if (!ebpf_stale_zero_sent) {
                     printf("[FPS] eBPF 目标暂无新帧 %.1f 秒, 输出 0 FPS\n",
                            (double)(now_ms - ebpf_last_frame_ms) / 1000.0);
-                    fps_write_out_windowed(0, &last_fps_output_ms, true);
+                    if (publish_fps) fps_write_out_windowed(0, &last_fps_output_ms, true);
                     ebpf_stale_zero_sent = true;
                 }
 
@@ -462,6 +697,7 @@ static void* fps_thread(void* arg) {
                            active_pid, next_pid, next_pid_source);
                     ebpf_fps_stop(ebpf_ctx);
                     ebpf_ctx = fps_start_ebpf_ctx(pkg, next_pid, next_pid_source);
+                    monitor_pid = next_pid;
                     ebpf_first_fps = true;
                     ebpf_pid_reported = false;
                     ebpf_poll_failures = 0;
@@ -494,7 +730,7 @@ static void* fps_thread(void* arg) {
             }
 
             if (!fps_is_stale) {
-                fps_write_out_windowed(fps, &last_fps_output_ms, false);
+                    if (publish_fps) fps_write_out_windowed(fps, &last_fps_output_ms, false);
             }
             usleep(100 * 1000);  /* 100ms 轮询 */
             continue;
@@ -503,19 +739,24 @@ static void* fps_thread(void* arg) {
         /* === Fallback 模式: --latency 或 timestats === */
         if (fallback_ctx) {
             double fps = fps_fallback_poll(fallback_ctx);
+            fps_jank_log_update(jank_ctx, monitor_pid, fps, NULL);
             if (fallback_first_fps && fps > 0) {
                 printf("[FPS] Fallback 首次捕获到帧率: %.1f fps\n", fps);
                 fallback_first_fps = false;
             }
-            fps_write_out_windowed(fps, &last_fps_output_ms, false);
+            if (publish_fps) fps_write_out_windowed(fps, &last_fps_output_ms, false);
             usleep((useconds_t)FPS_WINDOW_MS * 1000);  /* 按 FPS_WINDOW_MS 更新悬浮胶囊 */
             continue;
         }
 
         /* 无可用数据源 */
         usleep(500 * 1000);
-        fps_write_out_windowed(0, &last_fps_output_ms, false);
+            if (publish_fps) fps_write_out_windowed(0, &last_fps_output_ms, false);
     }
+    if (jank_ctx) appopt_jank_stop(jank_ctx);
+    if (ebpf_ctx) ebpf_fps_stop(ebpf_ctx);
+    if (fallback_ctx) fps_fallback_stop(fallback_ctx);
+    fps_socket_reset();
     return NULL;
 }
 

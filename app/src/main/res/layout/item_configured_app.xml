@@ -72,11 +72,28 @@
                 android:id="@+id/configPkg"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
                 android:ellipsize="middle"
                 android:maxLines="1"
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
         </LinearLayout>
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switchJankBoost"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:layout_marginStart="12dp"
+            android:layout_gravity="center_vertical"
+            android:button="@null"
+            android:gravity="center"
+            android:minHeight="48dp"
+            android:minWidth="0dp"
+            android:padding="0dp"
+            android:text="卡顿时提速"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp"
+            android:visibility="gone" />
 
         <ImageButton
             android:id="@+id/btnView"

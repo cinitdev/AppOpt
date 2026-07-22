@@ -22,8 +22,8 @@ use std::os::unix::fs::MetadataExt;
 //
 // 设计目标不是把 C 版简单翻译成 Rust，而是减少长期运行时对 /proc 的全量遍历：
 // 1. App/前台 helper 写入 package_uid.map，daemon 用 appId 缩小包名候选并以 cmdline 最终确认。
-// 2. 第一次启动、配置变化、缓存失效时才全量扫描 /proc。
-// 3. 找到目标进程后缓存 PID，后续优先只扫描这些 PID 的 task 目录。
+// 2. 第一次启动、配置变化和周期校验时才全量扫描 /proc。
+// 3. 日常只比较数字 PID 目录快照，并复查新增 PID；命中后缓存 PID 和线程结果。
 // 4. 写 affinity 前先读当前 Cpus_allowed_list，相同则跳过，避免重复抢系统调度配置。
 // 5. 写入后再读回一次，用于发现移植系统/厂商服务把线程绑核抢写回去的情况。
 const VERSION: &str = "1.7.9";
@@ -31,6 +31,8 @@ const DEFAULT_CONFIG: &str = "/data/adb/modules/AppOpt/config/applist.conf";
 const DEFAULT_UID_MAP: &str = "/data/adb/modules/AppOpt/config/package_uid.map";
 const RULE_HEALTH_FILE: &str = "/data/adb/modules/AppOpt/config/rule_health.tsv";
 const FOREGROUND_TASK_STATE_FILE: &str = "/data/adb/modules/AppOpt/config/foreground_task.state";
+const PROCESS_CACHE_FILE: &str = "/data/adb/modules/AppOpt/config/pid_cache.tsv";
+const PROCESS_INDEX_MAGIC: &str = "APPOPT_PROCESS_INDEX_V1";
 const BOOT_ID_FILE: &str = "/proc/sys/kernel/random/boot_id";
 const FOREGROUND_TASK_MAX_AGE_MS: u64 = 12_000;
 const RULE_HEALTH_OBSERVE_SECS: u64 = 30;
@@ -38,7 +40,10 @@ const ANDROID_UID_USER_RANGE: u32 = 100_000;
 const BASE_CPUSET: &str = "/dev/cpuset/AppOptRs";
 const DEFAULT_INTERVAL_SECS: u64 = 2;
 const FULL_RESCAN_MAX_MS: u64 = 60_000;
-const PROC_GROWTH_RESCAN_COOLDOWN_MS: u64 = 10_000;
+const PID_SNAPSHOT_ACTIVE_MS: u64 = 2_000;
+const PID_SNAPSHOT_IDLE_MS: u64 = 10_000;
+const PID_DISCOVERY_RETRY_MS: u64 = 6_000;
+const PID_SNAPSHOT_LOG_INTERVAL_MS: u64 = 30_000;
 const RULE_HEALTH_FULL_SCAN_RETRY_MS: u64 = 5_000;
 const FOREGROUND_DISCOVERY_DELAY_MS: u64 = 2_000;
 const FOREGROUND_DISCOVERY_COOLDOWN_MS: u64 = 10_000;
@@ -149,6 +154,8 @@ struct Args {
     version: bool,
     ping_daemon: Option<(String, String)>,
     app_state_pkg: Option<String>,
+    find_pid_name: Option<String>,
+    find_process_names: Vec<String>,
     target_pkg: Option<String>,
     interval_secs: u64,
 }
@@ -172,22 +179,28 @@ struct ApplyStats {
 #[derive(Debug, Default)]
 struct DaemonState {
     // 已确认属于规则目标的 PID 缓存。
-    // 只在配置变化、PID 缓存失效或周期到达时全量扫 /proc；平时优先复用已知 PID。
+    // 只在配置变化、健康观察或周期到达时全量扫 /proc；平时优先复用已知 PID。
     known_pids: BTreeSet<i32>,
+    // 进程发现状态保存在共享 TSV，内存只记录调度节奏，不长期保存全量 PID 快照。
+    process_index_initialized: bool,
+    process_index_has_candidates: bool,
+    last_pid_snapshot_elapsed_ms: Option<u64>,
+    last_pid_snapshot_log_elapsed_ms: Option<u64>,
+    stable_pid_snapshot_rounds: u32,
     // 区分“尚未做过初始全扫”和“已经全扫但当前没有目标进程”。
     // known_pids 为空并不代表缓存未初始化，否则无目标进程时会每轮全扫 /proc。
     proc_scan_initialized: bool,
     // 使用同一次文件读取所得的内容指纹判断配置是否变化。
     last_config_key: Option<FileKey>,
     last_uid_map_key: Option<FileKey>,
-    // 即使缓存一直有效，也每 60 秒至多补一次全量扫，处理 App 新拉起子进程但
-    // sysinfo 进程数净值未增长的情况，同时避免恢复成每轮遍历 /proc。
+    // 即使快照和缓存一直有效，也每 60 秒至多补一次全量扫，校验极端竞态或
+    // PID 快照读取缺口，同时避免恢复成每轮完整读取 /proc。
     last_full_scan_elapsed_ms: Option<u64>,
     // 不完整全扫只保留正向结果，并在冷却后重试；不能把缺口当作完整缓存等待 60 秒。
     last_full_scan_attempt_elapsed_ms: Option<u64>,
     // 健康观察到期后的不完整全扫需要限频，避免按 2 秒主循环反复遍历 /proc。
     last_health_full_scan_attempt_elapsed_ms: Option<u64>,
-    // sysinfo 增长只设置待扫描门闩，并受全扫冷却限制，避免进程频繁起落时连续遍历 /proc。
+    // sysinfo 增长只要求尽快刷新数字 PID 快照，不再触发 cmdline 全量扫描。
     proc_growth_scan_pending: bool,
     last_proc_total: Option<u64>,
     // 每个配置应用的可靠前台生命周期只触发一次进程发现全扫。

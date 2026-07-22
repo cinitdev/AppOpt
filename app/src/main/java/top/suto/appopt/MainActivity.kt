@@ -60,6 +60,7 @@ import java.util.Collections
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 引导授予悬浮窗权限，并列出配置文件中的待校准、可添加和已配置应用。
@@ -72,6 +73,7 @@ class MainActivity : AppCompatActivity() {
     private var daemonRunning = false
     private var daemonRuntime = DaemonBridge.DaemonRuntime(running = false)
     private var ruleHealth: Map<String, DaemonBridge.RuleHealth> = emptyMap()
+    private var jankBoostPackages: Set<String> = emptySet()
     private var foregroundHelperStatus = ForegroundHelperStatus()
     private var moduleVersion: DaemonBridge.ModuleVersion? = null
     private var moduleCompatible = false
@@ -106,6 +108,9 @@ class MainActivity : AppCompatActivity() {
     private var resumedAt = 0L
     private var settledHealthRefresh: Runnable? = null
     private var activeRuleHealthObserver: ((Map<String, DaemonBridge.RuleHealth>) -> Unit)? = null
+    @Volatile private var startupLoadInFlight = false
+    private val foregroundRefreshesInFlight = AtomicInteger(0)
+    private val appListRefreshesInFlight = AtomicInteger(0)
     @Volatile private var activityDestroyed = false
     private var firstResume = true
     private lateinit var appAdapter: AppAdapter
@@ -213,7 +218,9 @@ class MainActivity : AppCompatActivity() {
         // root 检测 + 读配置 + 批量导入旧 .log 放后台线程，避免 su 弹窗阻塞 UI
         val startupEnvironmentGeneration = environmentRequests.next()
         val startupAppListGeneration = appListRequests.next()
+        startupLoadInFlight = true
         thread {
+            try {
             val r = DaemonBridge.hasRoot()
             val pendingUpdate = if (r) DaemonBridge.hasPendingModuleUpdate() else false
             val version = if (r && !pendingUpdate) DaemonBridge.readModuleVersion() else null
@@ -261,6 +268,7 @@ class MainActivity : AppCompatActivity() {
                 ConfigReader.ConfigPackages(emptyList(), emptyList())
             }
             val health = if (enabled) DaemonBridge.readRuleHealthOrNull().orEmpty() else emptyMap()
+            val jankPackages = if (enabled) DaemonBridge.readJankBoostPackages().orEmpty() else emptySet()
             val visibleLists = when {
                 !enabled -> AppLists()
                 config != null -> buildConfiguredLists(config, emptySet(), health)
@@ -269,6 +277,7 @@ class MainActivity : AppCompatActivity() {
             if (visibleLists != null) {
                 runOnUiThreadIfAppListCurrent(startupAppListGeneration) {
                     updateRuleHealthSnapshot(health)
+                    jankBoostPackages = jankPackages
                     appListsLoading = false
                     processNames = emptySet()
                     appLists = if (addableAppsLoading) {
@@ -325,6 +334,7 @@ class MainActivity : AppCompatActivity() {
             if (fullLists != null) {
                 runOnUiThreadIfAppListCurrent(startupAppListGeneration) {
                     updateRuleHealthSnapshot(healthAfterFormat)
+                    jankBoostPackages = jankPackages
                     addableAppsLoading = false
                     appLists = fullLists
                     buildAppList()
@@ -349,6 +359,9 @@ class MainActivity : AppCompatActivity() {
             }
 
             configAfterFormat?.let { migrateLogsLater(enabled, it) }
+            } finally {
+                startupLoadInFlight = false
+            }
         }
     }
 
@@ -399,6 +412,7 @@ class MainActivity : AppCompatActivity() {
         if (configMutationInFlight > 0) {
             return
         }
+        foregroundRefreshesInFlight.incrementAndGet()
         val environmentGeneration = environmentRequests.next()
         val appListGeneration = if (refreshConfig) {
             appListRequests.next()
@@ -410,6 +424,7 @@ class MainActivity : AppCompatActivity() {
         val previousProcessNames = processNames
         val completeInitialAppLists = environmentLoading && addableAppsLoading
         thread {
+            try {
             val root = DaemonBridge.hasRoot()
             val pendingUpdate = if (root) DaemonBridge.hasPendingModuleUpdate() else false
             val version = if (root && !pendingUpdate) DaemonBridge.readModuleVersion() else null
@@ -427,6 +442,11 @@ class MainActivity : AppCompatActivity() {
                 DaemonBridge.readRuleHealthOrNull() ?: previousHealth
             } else {
                 previousHealth
+            }
+            val jankPackages = if (enabled && refreshConfig) {
+                DaemonBridge.readJankBoostPackages() ?: jankBoostPackages
+            } else {
+                jankBoostPackages
             }
             val resolvedNames = config?.let { resolveProcessComponentNames(it, enabled) } ?: previousProcessNames
             val visibleLists = when {
@@ -455,6 +475,7 @@ class MainActivity : AppCompatActivity() {
                     buildAppList()
                 } else if (refreshConfig && appListCurrent && visibleLists != null) {
                     updateRuleHealthSnapshot(health)
+                    jankBoostPackages = jankPackages
                     appListsLoading = false
                     processNames = resolvedNames
                     appLists = visibleLists
@@ -478,6 +499,9 @@ class MainActivity : AppCompatActivity() {
                 }
                 showModuleWarningIfNeeded()
                 maybeCheckStartupUpdate()
+            }
+            } finally {
+                foregroundRefreshesInFlight.decrementAndGet()
             }
         }
     }
@@ -570,6 +594,11 @@ class MainActivity : AppCompatActivity() {
             if (!activityResumed || activityDestroyed) return@Runnable
             if (!lifecycleRequests.isCurrent(lifecycleGeneration)) return@Runnable
             if (configMutationInFlight > 0) {
+                return@Runnable
+            }
+            if (startupLoadInFlight || foregroundRefreshesInFlight.get() > 0 ||
+                appListRefreshesInFlight.get() > 0) {
+                scheduleSettledHealthRefresh()
                 return@Runnable
             }
             if (environmentLoading) {
@@ -880,7 +909,9 @@ class MainActivity : AppCompatActivity() {
         if (appTab == AppTab.ADD && previousAddable.isEmpty()) {
             buildAppList()
         }
+        appListRefreshesInFlight.incrementAndGet()
         thread {
+            try {
             val config = if (rootAvailable) {
                 ConfigReader.readPackagesOrNull()
             } else {
@@ -899,11 +930,17 @@ class MainActivity : AppCompatActivity() {
             } else {
                 emptyMap()
             }
+            val jankPackages = if (rootAvailable) {
+                DaemonBridge.readJankBoostPackages() ?: jankBoostPackages
+            } else {
+                emptySet()
+            }
             val resolvedNames = resolveProcessComponentNames(config, rootAvailable)
             val visibleLists = buildConfiguredLists(config, resolvedNames, health).copy(addable = previousAddable)
             runOnUiThreadIfAppListCurrent(generation, lifecycleGeneration) {
                 appListsLoading = false
                 updateRuleHealthSnapshot(health)
+                jankBoostPackages = jankPackages
                 processNames = resolvedNames
                 appLists = visibleLists
                 buildAppList()
@@ -921,6 +958,9 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 binding.appRefresh.isRefreshing = false
+            }
+            } finally {
+                appListRefreshesInFlight.decrementAndGet()
             }
         }
     }
@@ -1054,6 +1094,38 @@ class MainActivity : AppCompatActivity() {
         bindHealthHint(item.configHealth, appHealthLabel, appHealthDescription)
         bindEntryIcon(item.configIcon, entry)
         val usable = canUseModuleFeatures()
+        val basePkg = entry.pkg.substringBefore(':')
+        item.root.tag = "jank:$basePkg"
+        item.switchJankBoost.setOnCheckedChangeListener(null)
+        item.switchJankBoost.isChecked = basePkg in jankBoostPackages
+        item.switchJankBoost.isEnabled = usable && entry.installed
+        item.switchJankBoost.alpha = if (usable && entry.installed) 1f else 0.45f
+        item.switchJankBoost.setOnCheckedChangeListener { _, checked ->
+            if (!canUseModuleFeatures()) {
+                item.switchJankBoost.isChecked = !checked
+                return@setOnCheckedChangeListener
+            }
+            val next = jankBoostPackages.toMutableSet().apply {
+                if (checked) add(basePkg) else remove(basePkg)
+            }.toSet()
+            jankBoostPackages = next
+            item.switchJankBoost.isEnabled = false
+            thread {
+                val ok = DaemonBridge.setJankBoostEnabled(basePkg, checked)
+                runOnUiThread {
+                    if (activityDestroyed) return@runOnUiThread
+                    if (!ok) {
+                        jankBoostPackages = jankBoostPackages.toMutableSet().apply {
+                            if (checked) remove(basePkg) else add(basePkg)
+                        }.toSet()
+                        toast("卡顿提速设置保存失败")
+                    } else {
+                        toast(if (checked) "已开启卡顿时临时提速" else "已关闭卡顿时临时提速")
+                    }
+                    appAdapter.notifyDataSetChanged()
+                }
+            }
+        }
         item.btnView.isEnabled = usable
         item.btnRemove.isEnabled = usable
         item.btnView.setOnClickListener { showConfiguredRules(entry) }
@@ -2000,6 +2072,16 @@ class MainActivity : AppCompatActivity() {
         thread {
             try {
                 val ok = DaemonBridge.deleteConfigPackages(pkgs)
+                val removedJankPackages = if (ok) {
+                    pkgs.map(::configOwnerName).map { it.substringBefore(':') }.distinct()
+                } else {
+                    emptyList()
+                }
+                for (pkg in removedJankPackages) {
+                    if (!DaemonBridge.setJankBoostEnabled(pkg, false)) {
+                        android.util.Log.w("AppOpt", "remove stale jank boost setting failed: $pkg")
+                    }
+                }
                 val config = if (ok) ConfigReader.readPackagesOrNull() else null
                 val resolvedNames = config?.let {
                     resolveProcessComponentNames(it, rootAvailable)
@@ -2018,6 +2100,7 @@ class MainActivity : AppCompatActivity() {
                 finishConfigMutation(generation) {
                     addableAppsLoading = false
                     if (ok) {
+                        jankBoostPackages = jankBoostPackages - removedJankPackages.toSet()
                         updateRuleHealthSnapshot(updatedHealth)
                         processNames = resolvedNames
                         appLists = visibleLists

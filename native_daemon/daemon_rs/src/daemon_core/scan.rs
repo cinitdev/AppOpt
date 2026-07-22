@@ -13,6 +13,49 @@ enum ProcessScanOutcome {
     Unreadable,
 }
 
+#[derive(Debug, Default)]
+struct CandidateScanResult {
+    hits: Vec<ProcHit>,
+    gone_pids: BTreeSet<i32>,
+}
+
+fn enumerate_proc_pids() -> io::Result<BTreeSet<i32>> {
+    let mut pids = BTreeSet::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        if let Some(pid) = parse_pid(&entry.file_name()) {
+            pids.insert(pid);
+        }
+    }
+    Ok(pids)
+}
+
+fn scan_candidate_pids(
+    rules: &[Rule],
+    plan: &ScanPlan,
+    candidates: &BTreeSet<i32>,
+) -> CandidateScanResult {
+    if plan.is_empty() || candidates.is_empty() {
+        return CandidateScanResult::default();
+    }
+
+    let rules_by_owner = build_rules_by_owner(rules);
+    let mut result = CandidateScanResult::default();
+    for pid in candidates.iter().copied() {
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        match scan_process_path(pid, &proc_path, &rules_by_owner, plan) {
+            ProcessScanOutcome::Hit(hit) => result.hits.push(hit),
+            ProcessScanOutcome::Gone => {
+                result.gone_pids.insert(pid);
+            }
+            // Zygote fork 后 cmdline 可能稍晚才改成应用进程名；未命中和瞬时读取失败
+            // 都交给主循环在短时间窗口内复查，不立即判定为无关进程。
+            ProcessScanOutcome::NotTarget | ProcessScanOutcome::Unreadable => {}
+        }
+    }
+    result
+}
+
 fn scan_proc(
     rules: &[Rule],
     plan: &ScanPlan,

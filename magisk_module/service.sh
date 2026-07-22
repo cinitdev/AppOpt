@@ -139,7 +139,14 @@ start_foreground_helper || echo "- 前台助手启动失败：App 使用 UsageSt
 
 # Check only the daemon started from this module path.
 is_our_daemon_running() {
-    for PID in $(pidof "$DAEMON_PROC_NAME" 2>/dev/null) $(pgrep -x "$DAEMON_PROC_NAME" 2>/dev/null); do
+    INDEX_PIDS=""
+    if [ -x "$BIN" ]; then
+        INDEX_PIDS="$("$BIN" --find-pid "$DAEMON_PROC_NAME" 2>/dev/null)" || INDEX_PIDS=""
+    fi
+    if [ -z "$INDEX_PIDS" ]; then
+        INDEX_PIDS="$(pidof "$DAEMON_PROC_NAME" 2>/dev/null) $(pgrep -x "$DAEMON_PROC_NAME" 2>/dev/null)"
+    fi
+    for PID in $INDEX_PIDS; do
         [ -n "$PID" ] || continue
         EXE="$(readlink "/proc/$PID/exe" 2>/dev/null)"
         [ "$EXE" = "$BIN" ] && return 0

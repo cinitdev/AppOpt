@@ -400,6 +400,25 @@ EOF
 		ui_print "- 已生成默认自动校准策略配置"
 	fi
 }
+
+# 模块升级时保留用户在 App 中选择的卡顿自动增强应用。
+prepare_jank_boost_config() {
+	mkdir -p "$MODPATH/config"
+	local ACTIVE_JANK_BOOST="/data/adb/modules/AppOpt/config/jank_boost.conf"
+	local PENDING_JANK_BOOST="$MODPATH/config/jank_boost.conf"
+	if [ -f "$ACTIVE_JANK_BOOST" ]; then
+		cp -f "$ACTIVE_JANK_BOOST" "$PENDING_JANK_BOOST"
+		ui_print "- 卡顿提速应用：已保留"
+	else
+		: > "$PENDING_JANK_BOOST"
+	fi
+	# 恢复清单只属于当前开机周期，不带入待刷入模块。
+	rm -f "$MODPATH/config/jank_boost.restore" "$MODPATH/config/jank_boost.restore.tmp"
+	# PID 缓存只在运行时生成，旧名称和新名称都不迁移。
+	rm -f "$MODPATH/config/process_index.tsv" "$MODPATH/config/process_index.tsv."*.tmp \
+		"$MODPATH/config/pid_cache.tsv" "$MODPATH/config/pid_cache.tsv."*.tmp
+}
+
 normalize_calib_rule_output_format() {
 	local POLICY_FILE="$MODPATH/config/calib_policy.conf"
 	local OLD_FORMAT TMP_FILE
@@ -443,6 +462,7 @@ module_instructions
 add_default_rules
 rm -f "$MODPATH/rules.sh"
 prepare_calib_policy
+prepare_jank_boost_config
 normalize_calib_rule_output_format
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOpt $MODPATH/config/bin/AppOptRs" 0 2000 0755 0755 u:object_r:magisk_file:s0

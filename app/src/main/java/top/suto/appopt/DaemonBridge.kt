@@ -42,6 +42,8 @@ object DaemonBridge {
     private const val STATE_FILE = "$CONFIG_DIR/calibrate.state"
     private const val CONFIG_FILE = "$CONFIG_DIR/applist.conf"
     private const val RULE_HEALTH_FILE = "$CONFIG_DIR/rule_health.tsv"
+    private const val JANK_BOOST_FILE = "$CONFIG_DIR/jank_boost.conf"
+    private const val JANK_BOOST_LOCK_DIR = "$CONFIG_DIR/jank_boost.conf.lock"
     private const val CONFIG_LOCK_DIR = "$CONFIG_DIR/applist.conf.lock"
     private const val POLICY_FILE = "$CONFIG_DIR/calib_policy.conf"
     private const val POLICY_LOCK_DIR = "$CONFIG_DIR/calib_policy.conf.lock"
@@ -140,6 +142,91 @@ object DaemonBridge {
     }
 
     fun readRuleHealth(): Map<String, RuleHealth> = readRuleHealthOrNull().orEmpty()
+
+    /** 读取已开启卡顿自动增强的基础包名；文件不存在等同于全部关闭。 */
+    fun readJankBoostPackages(): Set<String>? {
+        val marker = "__APPOPT_JANK_BOOST_MISSING_${UUID.randomUUID()}__"
+        val result = readRootCommandResult(
+            "if [ -f '$JANK_BOOST_FILE' ]; then cat '$JANK_BOOST_FILE' || exit 1; " +
+                "elif [ ! -e '$JANK_BOOST_FILE' ]; then printf '$marker'; else exit 1; fi"
+        )
+        if (!result.success) return null
+        if (result.output.trimEnd('\r', '\n') == marker) return emptySet()
+        return result.output.lineSequence()
+            .map { it.substringBefore('#').trim().substringBefore(':').trim() }
+            .filter(::isValidBasePackage)
+            .toCollection(LinkedHashSet())
+    }
+
+    /** 原子更新单个应用的卡顿增强开关，不改动线程规则文件。 */
+    fun setJankBoostEnabled(pkg: String, enabled: Boolean): Boolean =
+        synchronized(configMutationLock) {
+            setJankBoostEnabledLocked(pkg, enabled)
+        }
+
+    private fun setJankBoostEnabledLocked(pkg: String, enabled: Boolean): Boolean {
+        val basePkg = pkg.trim().substringBefore(':').trim()
+        if (!isValidBasePackage(basePkg)) return false
+        val token = UUID.randomUUID().toString()
+        val marker = "__APPOPT_JANK_BOOST_MISSING_${UUID.randomUUID()}__"
+        val readResult = readRootCommandResult(
+            "if [ -f '$JANK_BOOST_FILE' ]; then cat '$JANK_BOOST_FILE' || exit 1; " +
+                "elif [ ! -e '$JANK_BOOST_FILE' ]; then printf '$marker'; else exit 1; fi"
+        )
+        if (!readResult.success) return false
+        val packages = if (readResult.output.trimEnd('\r', '\n') == marker) {
+            linkedSetOf()
+        } else {
+            readResult.output.lineSequence()
+                .map { it.substringBefore('#').trim().substringBefore(':').trim() }
+                .filter(::isValidBasePackage)
+                .toCollection(LinkedHashSet())
+        }
+        if (enabled) packages.add(basePkg) else packages.remove(basePkg)
+        val content = packages.sorted().joinToString(separator = "\n", postfix = if (packages.isEmpty()) "" else "\n")
+        val b64 = android.util.Base64.encodeToString(
+            content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
+        )
+        val tmp = "$JANK_BOOST_FILE.app-$token.tmp"
+        val cmd = """
+            lock='$JANK_BOOST_LOCK_DIR'
+            target='$JANK_BOOST_FILE'
+            tmp='$tmp'
+            mkdir -p '$CONFIG_DIR'
+            waited=0
+            while ! mkdir "${'$'}lock" 2>/dev/null; do
+                now=${'$'}(date +%s)
+                mtime=${'$'}(stat -c %Y "${'$'}lock" 2>/dev/null || printf 0)
+                if [ "${'$'}mtime" -gt 0 ] && [ "${'$'}now" -gt "${'$'}((mtime + 30))" ]; then
+                    rm -f "${'$'}lock/owner"
+                    rmdir "${'$'}lock" 2>/dev/null || true
+                    continue
+                fi
+                waited=${'$'}((waited + 1))
+                [ "${'$'}waited" -ge 5 ] && exit 1
+                sleep 1
+            done
+            trap 'rm -f "${'$'}tmp"; rm -f "${'$'}lock/owner"; rmdir "${'$'}lock" 2>/dev/null' EXIT
+            printf '%s' '$token' > "${'$'}lock/owner" || exit 1
+            if ! base64 -d > "${'$'}tmp" << 'EOF_BASE64'
+            $b64
+            EOF_BASE64
+            then
+                exit 1
+            fi
+            chmod 0644 "${'$'}tmp" 2>/dev/null || true
+            chown 0:0 "${'$'}tmp" 2>/dev/null || true
+            mv -f "${'$'}tmp" "${'$'}target" || exit 1
+        """.trimIndent()
+        return runAsRoot(cmd).isNotErrored()
+    }
+
+    private fun isValidBasePackage(value: String): Boolean {
+        if (value.isBlank() || value.length >= 128 || '.' !in value) return false
+        return value.all {
+            it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '_' || it == '.'
+        }
+    }
 
     fun readRuleHealthOrNull(): Map<String, RuleHealth>? {
         val result = readRootCommandResult(
@@ -392,55 +479,37 @@ object DaemonBridge {
 
     /**
      * 批量判断非 APK 配置项是否对应正在运行的系统进程。
-     * 用于 UI 区分“系统组件”和“未安装/配置残留”。这里只遍历一次 /proc，
-     * 避免大配置按候选名称反复执行 pidof/pgrep。
+     * 用于 UI 区分“系统组件”和“未安装/配置残留”。优先查询 AppOpt 文件索引；
+     * 旧模块或索引不可用时才回退一次 /proc 遍历。
      */
     fun findRunningProcessNames(names: Collection<String>): Set<String> {
         val targets = names.map { it.trim().replace("'", "") }
             .filter { it.isNotEmpty() }
             .distinct()
         if (targets.isEmpty()) return emptySet()
+        val targetSet = targets.toHashSet()
 
         val targetArgs = targets.joinToString(" ") { "'$it'" }
+        val binSelect = daemonBinarySelectShell()
         val cmd = """
-            nl='
-            '
-            targets="${'$'}nl"
-            for target in $targetArgs; do
-                targets="${'$'}targets${'$'}target${'$'}nl"
-            done
-            found="${'$'}nl"
-
-            contains_line() {
-                haystack="${'$'}1"
-                needle="${'$'}2"
-                case "${'$'}haystack" in
-                    *"${'$'}nl${'$'}needle${'$'}nl"*) return 0 ;;
-                    *) return 1 ;;
-                esac
-            }
-
-            emit_if_target() {
-                name="${'$'}1"
-                [ -z "${'$'}name" ] && return
-                contains_line "${'$'}targets" "${'$'}name" || return
-                contains_line "${'$'}found" "${'$'}name" && return
-                printf '%s\n' "${'$'}name"
-                found="${'$'}found${'$'}name${'$'}nl"
-            }
+            daemon_bin=${'$'}($binSelect)
+            if [ -x "${'$'}daemon_bin" ] &&
+                "${'$'}daemon_bin" --find-processes $targetArgs 2>/dev/null; then
+                exit 0
+            fi
 
             for proc in /proc/[0-9]*; do
                 [ -r "${'$'}proc/comm" ] || continue
                 comm=''
                 IFS= read -r comm < "${'$'}proc/comm" 2>/dev/null || true
-                emit_if_target "${'$'}comm"
+                [ -n "${'$'}comm" ] && printf '%s\n' "${'$'}comm"
 
                 [ -r "${'$'}proc/cmdline" ] || continue
                 first=''
                 IFS= read -r -d '' first < "${'$'}proc/cmdline" 2>/dev/null || true
-                emit_if_target "${'$'}first"
+                [ -n "${'$'}first" ] && printf '%s\n' "${'$'}first"
                 base=${'$'}{first##*/}
-                [ "${'$'}base" = "${'$'}first" ] || emit_if_target "${'$'}base"
+                [ "${'$'}base" = "${'$'}first" ] || printf '%s\n' "${'$'}base"
             done
             true
         """.trimIndent()
@@ -448,7 +517,7 @@ object DaemonBridge {
         val clean = out.substringBefore(ERR_MARK)
         return clean.lineSequence()
             .map { it.trim() }
-            .filter { it.isNotEmpty() }
+            .filter { it in targetSet }
             .toSet()
     }
 
@@ -1549,23 +1618,56 @@ object DaemonBridge {
     /** 等待 root 子进程结束，并读取 stdout；超时或非零退出会附加错误标记。 */
     private fun waitAndRead(process: Process, timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS): String {
         val outRef = AtomicReference("")
+        val readFailed = AtomicReference(false)
         val reader = Thread {
-            outRef.set(process.inputStream.bufferedReader().readText())
+            try {
+                process.inputStream.bufferedReader().use { input ->
+                    outRef.set(input.readText())
+                }
+            } catch (_: Exception) {
+                readFailed.set(true)
+            }
         }.apply {
             isDaemon = true
             start()
         }
 
-        val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        val finished = try {
+            process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
         if (!finished) {
-            process.destroyForcibly()
-            reader.join(1000)
+            stopRootProcess(process, reader)
             return ERR_MARK
         }
 
-        reader.join(1000)
+        joinRootReader(reader)
         val out = outRef.get()
-        return if (process.exitValue() != 0) "$out$ERR_MARK" else out
+        return if (process.exitValue() != 0 || readFailed.get()) "$out$ERR_MARK" else out
+    }
+
+    /** Root 进程超时后主动关闭读取端，并等待读取线程退出，避免关闭流异常逃逸到主进程。 */
+    private fun stopRootProcess(process: Process, reader: Thread) {
+        try {
+            process.destroyForcibly()
+        } catch (_: Exception) {
+        }
+        try {
+            process.inputStream.close()
+        } catch (_: Exception) {
+        }
+        reader.interrupt()
+        joinRootReader(reader)
+    }
+
+    private fun joinRootReader(reader: Thread) {
+        try {
+            reader.join(1000)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     private fun waitAndStream(
@@ -1593,17 +1695,21 @@ object DaemonBridge {
             start()
         }
 
-        val finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        val finished = try {
+            process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
         if (!finished) {
-            process.destroyForcibly()
-            reader.join(1000)
+            stopRootProcess(process, reader)
             return RootCommandResult(
                 output = synchronized(out) { out.toString() },
                 success = false
             )
         }
 
-        reader.join(1000)
+        joinRootReader(reader)
         return RootCommandResult(
             output = synchronized(out) { out.toString() },
             success = process.exitValue() == 0

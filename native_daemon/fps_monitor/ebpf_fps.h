@@ -24,6 +24,16 @@
 
 /* 不透明句柄: 内部实际持有 Rust/aya bridge 的上下文。 */
 typedef struct ebpf_fps_ctx ebpf_fps_ctx;
+typedef struct AppOptJankCtx AppOptJankCtx;
+
+typedef struct {
+    double fps;
+    uint64_t median_interval_ns;
+    uint64_t p95_interval_ns;
+    uint64_t max_interval_ns;
+    uint32_t frame_count;
+    uint32_t flags;
+} AppOptFrameMetrics;
 
 /* eBPF 预检查或初始化状态，用于日志/UI 展示。 */
 typedef enum {
@@ -67,6 +77,9 @@ int ebpf_fps_poll(ebpf_fps_ctx *ctx);
  */
 double ebpf_fps_get(ebpf_fps_ctx *ctx);
 
+/* 读取当前活跃 Surface 的帧间隔统计；无有效逐帧数据时返回 false。 */
+bool ebpf_fps_metrics(ebpf_fps_ctx *ctx, AppOptFrameMetrics *out);
+
 /* 获取当前 eBPF 实际锁定的 PID。
  * 指定 PID 启动时返回该 PID。
  * 未锁定或 ctx 无效时返回 -1。
@@ -91,5 +104,13 @@ const char *ebpf_fps_last_error(ebpf_fps_ctx *ctx);
 
 /* 停止采集并释放资源。调用后 ctx 失效。 */
 void ebpf_fps_stop(ebpf_fps_ctx *ctx);
+
+/* 卡顿增强执行器由 C/Rust 共用；不会修改线程亲和性或 applist.conf。 */
+AppOptJankCtx *appopt_jank_create(const char *pkg);
+int appopt_jank_recover(void);
+int appopt_jank_update(AppOptJankCtx *ctx, int pid, double fps,
+                       const AppOptFrameMetrics *metrics);
+const char *appopt_jank_last_event(const AppOptJankCtx *ctx);
+void appopt_jank_stop(AppOptJankCtx *ctx);
 
 #endif /* APPOPT_EBPF_FPS_H */

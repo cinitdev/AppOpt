@@ -58,6 +58,10 @@
                 fallback: None,
                 socket: FpsSocket::new(socket_name, socket_token),
                 last_output: None,
+                target_pid: initial_pid,
+                adaptive_enabled: false,
+                jank: ptr::null_mut(),
+                output_enabled: true,
             }
         }
 
@@ -131,6 +135,7 @@
                 self.ebpf_seen_frames && now.duration_since(self.ebpf_last_frame) >= FPS_EBPF_STALE;
             let fps_has_no_valid_value = !self.ebpf_seen_frames
                 && now.duration_since(self.ebpf_last_restart) >= FPS_EBPF_STALE;
+            self.poll_jank(if fps_is_stale || fps_has_no_valid_value { 0.0 } else { fps });
 
             // 目标仍有帧也要偶尔核对前台 cgroup PID。部分游戏启动后主进程仍会提交少量 UI 帧，
             // 但真实 90/120Hz 渲染已经切到另一个目标进程；只靠“停帧后重锁”会漏掉这种情况。
@@ -276,6 +281,7 @@
                 .as_mut()
                 .map(|fallback| fallback.poll())
                 .unwrap_or(0.0);
+            self.poll_jank(fps);
             let now = Instant::now();
             let should_output = self
                 .last_output
@@ -299,6 +305,7 @@
             self.ebpf_pid_reported = false;
             self.ebpf_first_fps = true;
             self.ebpf_stale_checks = 0;
+            self.target_pid = pid;
             if self.ctx.is_null() {
                 self.start_fallback();
             } else {
@@ -307,6 +314,7 @@
         }
 
         fn stop(&mut self) {
+            self.set_adaptive(false);
             if !self.ctx.is_null() {
                 appopt_ebpf_stop(self.ctx);
                 self.ctx = std::ptr::null_mut();
@@ -318,10 +326,63 @@
         }
 
         fn write_fps(&mut self, fps: f64) {
+            if !self.output_enabled {
+                return;
+            }
             if self.socket.send_fps(fps).is_ok() {
                 return;
             }
             write_fps_file(fps);
+        }
+
+        fn set_output_enabled(&mut self, enabled: bool) {
+            if self.output_enabled == enabled {
+                return;
+            }
+            if !enabled {
+                self.write_fps(0.0);
+                self.socket.close();
+            }
+            self.output_enabled = enabled;
+        }
+
+        fn set_adaptive(&mut self, enabled: bool) {
+            if self.adaptive_enabled == enabled {
+                return;
+            }
+            self.adaptive_enabled = enabled;
+            if enabled {
+                if let Ok(pkg) = CString::new(self.pkg.as_str()) {
+                    self.jank = appopt_jank_create(pkg.as_ptr());
+                }
+                println!("[boost] 已为 {} 开启卡顿时临时提速", self.pkg);
+            } else if !self.jank.is_null() {
+                appopt_jank_stop(self.jank);
+                self.jank = ptr::null_mut();
+                println!("[boost] 已为 {} 停止卡顿时临时提速并恢复参数", self.pkg);
+            }
+        }
+
+        fn poll_jank(&mut self, fps: f64) {
+            if !self.adaptive_enabled || self.jank.is_null() {
+                return;
+            }
+            let mut metrics = AppOptFrameMetrics::default();
+            let metrics_ptr = if !self.ctx.is_null()
+                && appopt_ebpf_metrics(self.ctx, &mut metrics) > 0
+            {
+                &metrics as *const AppOptFrameMetrics
+            } else {
+                ptr::null()
+            };
+            let pid = if self.ctx.is_null() {
+                self.target_pid
+            } else {
+                appopt_ebpf_pid(self.ctx)
+            };
+            if appopt_jank_update(self.jank, pid, fps, metrics_ptr) > 0 {
+                println!("[boost] {}", cstr_lossy(appopt_jank_last_event(self.jank)));
+            }
         }
     }
 
@@ -362,6 +423,7 @@
 
     impl Drop for FpsMonitor {
         fn drop(&mut self) {
+            self.set_adaptive(false);
             if !self.ctx.is_null() {
                 appopt_ebpf_stop(self.ctx);
                 self.ctx = std::ptr::null_mut();

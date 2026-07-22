@@ -48,7 +48,10 @@ object DiagnosticExporter {
                         zip.addRootFile("module/pending_module.prop", "/data/adb/modules_update/AppOpt/module.prop")
                         zip.addRootFile("config/applist.conf", "/data/adb/modules/AppOpt/config/applist.conf")
                         zip.addRootFile("config/rule_health.tsv", "/data/adb/modules/AppOpt/config/rule_health.tsv")
+                        zip.addRootFile("config/pid_cache.tsv", "/data/adb/modules/AppOpt/config/pid_cache.tsv")
                         zip.addRootFile("config/calib_policy.conf", "/data/adb/modules/AppOpt/config/calib_policy.conf")
+                        zip.addRootFile("config/jank_boost.conf", "/data/adb/modules/AppOpt/config/jank_boost.conf")
+                        zip.addRootFile("config/jank_boost.restore", "/data/adb/modules/AppOpt/config/jank_boost.restore")
                         zip.addRootFile("config/foreground_task.state", "/data/adb/modules/AppOpt/config/foreground_task.state")
                         zip.addRootFile("config/foreground_helper.pid", "/data/adb/modules/AppOpt/config/foreground_helper.pid")
                         zip.addText("system/cpu_topology.txt", runRoot(CPU_TOPOLOGY_CMD, timeoutSeconds = 10L))
@@ -224,11 +227,21 @@ object DiagnosticExporter {
         ps -A 2>/dev/null | grep -i -E 'AppOpt|top.suto.appopt|appopt_foreground_helper' || true
         echo
         echo '# module daemon pid'
-        pidof AppOptRs 2>/dev/null || true
-        pidof AppOpt 2>/dev/null || true
+        daemon_bin=/data/adb/modules/AppOpt/config/bin/AppOptRs
+        [ -x "${'$'}daemon_bin" ] || daemon_bin=/data/adb/modules/AppOpt/config/bin/AppOpt
+        find_pid() {
+            name="${'$'}1"
+            found=$("${'$'}daemon_bin" --find-pid "${'$'}name" 2>/dev/null) || found=''
+            if [ -z "${'$'}found" ]; then
+                found="${'$'}(pidof "${'$'}name" 2>/dev/null) ${'$'}(pgrep -x "${'$'}name" 2>/dev/null)"
+            fi
+            printf '%s\n' "${'$'}found"
+        }
+        find_pid AppOptRs
+        find_pid AppOpt
         echo
         echo '# app pid'
-        pidof top.suto.appopt 2>/dev/null || true
+        find_pid top.suto.appopt
     """
 
     private val FPS_CMD = """

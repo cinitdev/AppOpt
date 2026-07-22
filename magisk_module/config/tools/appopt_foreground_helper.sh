@@ -14,6 +14,9 @@ STATE="$MODDIR/config/foreground_task.state"
 PID_FILE="$MODDIR/config/foreground_helper.pid"
 LOG="$MODDIR/logs/ForegroundHelper.log"
 NICE_NAME="appopt_foreground_helper"
+BIN_C="$MODDIR/config/bin/AppOpt"
+BIN_RS="$MODDIR/config/bin/AppOptRs"
+RS_FALLBACK_FILE="$MODDIR/config/.appopt_use_c_daemon"
 RESTART_COOLDOWN_SECONDS=20
 
 find_app_process() {
@@ -49,6 +52,20 @@ is_helper_pid() {
 }
 
 helper_pids() {
+    query_bin="$BIN_C"
+    [ -x "$BIN_RS" ] && [ ! -f "$RS_FALLBACK_FILE" ] && query_bin="$BIN_RS"
+    if [ -x "$query_bin" ]; then
+        found=0
+        for pid in $("$query_bin" --find-pid "$NICE_NAME" 2>/dev/null); do
+            if is_helper_pid "$pid"; then
+                echo "$pid"
+                found=1
+            fi
+        done
+        [ "$found" -eq 1 ] && return 0
+    fi
+
+    # 兼容旧模块或索引尚未建立的启动窗口，系统工具仅作为降级。
     if command -v pidof >/dev/null 2>&1; then
         found=0
         for pid in $(pidof "$NICE_NAME" 2>/dev/null); do

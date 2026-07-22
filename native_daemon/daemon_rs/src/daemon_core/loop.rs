@@ -1,8 +1,8 @@
 // 常驻守护主循环。
 //
 // 这里负责把“规则文件 -> 扫描计划 -> 进程/线程命中 -> sched_setaffinity”串起来。
-// Rust 版和 C 版最大的结构差异就在这里：不是每一轮都全量扫 /proc，而是优先使用
-// DaemonState.known_pids 缓存；只有配置变化、缓存失效、周期到达时才全量枚举 /proc/<pid>。
+// 日常轮次优先使用 DaemonState.known_pids，并以数字 PID 快照发现新进程；只有配置变化、
+// 健康观察或周期校验到达时才完整读取 /proc/<pid>。
 //
 // 这个文件只关心调度节奏和日志摘要，具体规则解析/扫描/绑核分别在 config.rs、scan.rs、
 // affinity.rs 中实现。
@@ -144,6 +144,112 @@ fn first_property<'a>(properties: &'a HashMap<String, String>, keys: &[&str]) ->
         .filter(|value| !value.is_empty())
 }
 
+#[derive(Debug, Default)]
+struct ProcessIndexRound {
+    view: ProcessIndexView,
+    entered_idle_backoff: bool,
+}
+
+fn pid_snapshot_interval_ms(state: &DaemonState) -> u64 {
+    if state.process_index_has_candidates
+        || state.stable_pid_snapshot_rounds < 3
+    {
+        PID_SNAPSHOT_ACTIVE_MS
+    } else {
+        PID_SNAPSHOT_IDLE_MS
+    }
+}
+
+fn pid_snapshot_log_due(state: &mut DaemonState, now_elapsed: u64) -> bool {
+    let due = state.last_pid_snapshot_log_elapsed_ms.is_none_or(|last| {
+        now_elapsed >= last
+            && now_elapsed.saturating_sub(last) >= PID_SNAPSHOT_LOG_INTERVAL_MS
+    });
+    if due {
+        state.last_pid_snapshot_log_elapsed_ms = Some(now_elapsed);
+    }
+    due
+}
+
+fn prepare_process_index_round(
+    state: &mut DaemonState,
+    now_elapsed: u64,
+    force: bool,
+    rebuild_all: bool,
+) -> io::Result<ProcessIndexRound> {
+    let interval = pid_snapshot_interval_ms(state);
+    let due = force
+        || !state.process_index_initialized
+        || state.last_pid_snapshot_elapsed_ms.is_none_or(|last| {
+            now_elapsed >= last && now_elapsed.saturating_sub(last) >= interval
+        });
+    let view = if due {
+        refresh_process_index(
+            now_elapsed,
+            rebuild_all || !state.process_index_initialized,
+        )?
+    } else if state.process_index_has_candidates {
+        load_process_index_view(now_elapsed)
+            .or_else(|_| refresh_process_index(now_elapsed, true))?
+    } else {
+        ProcessIndexView::default()
+    };
+    let mut round = ProcessIndexRound {
+        view,
+        ..ProcessIndexRound::default()
+    };
+    if round.view.refreshed {
+        if state.process_index_initialized {
+            if round.view.added == 0 && round.view.exited == 0 {
+                let previous = state.stable_pid_snapshot_rounds;
+                state.stable_pid_snapshot_rounds = previous.saturating_add(1);
+                round.entered_idle_backoff = previous < 3
+                    && state.stable_pid_snapshot_rounds >= 3
+                    && round.view.candidate_pids.is_empty();
+            } else {
+                state.stable_pid_snapshot_rounds = 0;
+            }
+        } else {
+            state.process_index_initialized = true;
+            state.stable_pid_snapshot_rounds = 0;
+        }
+        state.last_pid_snapshot_elapsed_ms = Some(now_elapsed);
+    }
+    if round.view.loaded {
+        state.process_index_has_candidates = !round.view.candidate_pids.is_empty();
+        state
+            .known_pids
+            .retain(|pid| round.view.current_pids.contains(pid));
+    }
+    Ok(round)
+}
+
+fn merge_candidate_hits(
+    scan_result: &mut ProcScanResult,
+    candidate_result: CandidateScanResult,
+    state: &mut DaemonState,
+) {
+    for pid in candidate_result.gone_pids {
+        state.known_pids.remove(&pid);
+    }
+    for hit in candidate_result.hits {
+        let pid = hit.pid;
+        state.known_pids.insert(pid);
+        if !hit.health_scan_complete {
+            if let Some(pkg) = base_package(&hit.cmdline) {
+                scan_result
+                    .health_incomplete_packages
+                    .insert(pkg.to_string());
+            }
+        }
+        if let Some(existing) = scan_result.hits.iter_mut().find(|item| item.pid == pid) {
+            *existing = hit;
+        } else {
+            scan_result.hits.push(hit);
+        }
+    }
+}
+
 fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     let round_start = Instant::now();
     let (rules, config_key) = parse_config_with_key(&args.config)?;
@@ -176,10 +282,6 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     let periodic_rescan = state.last_full_scan_elapsed_ms.is_some_and(|last| {
         scan_clock >= last && scan_clock.saturating_sub(last) >= FULL_RESCAN_MAX_MS
     });
-    let proc_growth_cooldown_elapsed = state.last_full_scan_elapsed_ms.is_none_or(|last| {
-        scan_clock >= last && scan_clock.saturating_sub(last) >= PROC_GROWTH_RESCAN_COOLDOWN_MS
-    });
-    let proc_growth_rescan = state.proc_growth_scan_pending && proc_growth_cooldown_elapsed;
     let full_scan_retry_pending = state.last_full_scan_attempt_elapsed_ms.is_some();
     let full_scan_retry_allowed = state
         .last_full_scan_attempt_elapsed_ms
@@ -194,25 +296,22 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     // Rust 版的核心优化点：
     // - 配置刚变化时必须全量扫，因为规则目标可能完全变了。
     // - 第一次启动时必须全量扫；全扫结果为空后也视为缓存已经初始化。
-    // - 系统进程数增长会设置门闩，冷却到期后全量扫，避免进程起落导致连续扫描。
+    // - 系统进程数增长只要求立即刷新轻量 PID 快照，不再因此全量读取 cmdline。
     // - 缓存连续跑一段时间后周期性全量扫，补捉极端情况下漏掉的子进程。
-    // - 只有原本持有 PID 的缓存整体失效时才立刻全量扫；已确认空结果不会每轮重扫。
+    // - 已确认空结果不会每轮重扫；新进程由 PID 快照差集和短期复查发现。
     let full_scan_requested = config_changed
         || cache_uninitialized
         || full_scan_retry_pending
-        || proc_growth_rescan
         || periodic_rescan
         || health_due
         || foreground_discovery_due;
-    let mut full_scan = full_scan_requested && full_scan_retry_allowed;
+    let full_scan = full_scan_requested && full_scan_retry_allowed;
     let mut scan_reason = if config_changed {
         "配置变更"
     } else if cache_uninitialized {
         "初始扫描"
     } else if full_scan_retry_pending {
         "不完整全扫重试"
-    } else if proc_growth_rescan {
-        "进程数增长冷却到期"
     } else if periodic_rescan {
         "周期校验"
     } else if health_due {
@@ -224,7 +323,41 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     };
     let scan_started = Instant::now();
     let previous_known_pids = state.known_pids.clone();
-    let had_cached_pids = !state.known_pids.is_empty();
+    let mut process_index_round = match prepare_process_index_round(
+        state,
+        scan_clock,
+        full_scan_requested || state.proc_growth_scan_pending,
+        full_scan_requested,
+    ) {
+        Ok(update) => {
+            if update.view.refreshed {
+                state.proc_growth_scan_pending = false;
+            }
+            update
+        }
+        Err(err) => {
+            if pid_snapshot_log_due(state, scan_clock) {
+                eprintln!("[RS] PID快照刷新失败，保留现有缓存并等待下轮重试: {err}");
+            }
+            ProcessIndexRound::default()
+        }
+    };
+    if (process_index_round.view.added > 0 || process_index_round.view.exited > 0)
+        && pid_snapshot_log_due(state, scan_clock)
+    {
+        println!(
+            "[RS] 进程索引变化: 新增={} 退出={} 待确认={}",
+            process_index_round.view.added,
+            process_index_round.view.exited,
+            process_index_round.view.candidate_pids.len()
+        );
+    } else if process_index_round.entered_idle_backoff {
+        println!("[RS] 进程索引长时间无变化，空闲时退避到 10 秒");
+        state.last_pid_snapshot_log_elapsed_ms = Some(scan_clock);
+    }
+    if !full_scan && process_index_round.view.added > 0 {
+        scan_reason = "进程索引发现";
+    }
     let mut scan_result = if full_scan {
         match scan_proc(&runtime_rules, &plan, &state.known_pids) {
             Ok(result) => result,
@@ -237,27 +370,39 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
         scan_known_pids(&runtime_rules, &plan, &mut state.known_pids)
     };
 
-    if !full_scan
-        && full_scan_retry_allowed
-        && had_cached_pids
-        && scan_result.hits.is_empty()
-        && !plan.is_empty()
-    {
-        full_scan = true;
-        println!(
-            "[RS] PID缓存未命中，触发全量扫描: 已知PID={} 目标包={}",
-            state.known_pids.len(),
-            plan.package_count()
-        );
-        scan_reason = "缓存未命中";
-        scan_result = match scan_proc(&runtime_rules, &plan, &state.known_pids) {
-            Ok(result) => result,
-            Err(err) => {
-                eprintln!("[RS] 缓存失效后的全量扫描失败，将在冷却后重试: {err}");
-                ProcScanResult::default()
+    if !full_scan {
+        let dropped_pids = previous_known_pids
+            .difference(&state.known_pids)
+            .copied()
+            .collect::<Vec<_>>();
+        for pid in dropped_pids {
+            if process_index_round.view.current_pids.contains(&pid) {
+                if let Err(err) = process_index_mark_candidate(pid, scan_clock) {
+                    if pid_snapshot_log_due(state, scan_clock) {
+                        eprintln!("[RS] 进程索引复查标记写入失败: {err}");
+                    }
+                }
+                process_index_round.view.candidate_pids.insert(pid);
+                state.process_index_has_candidates = true;
             }
-        };
+        }
     }
+
+    let already_scanned = scan_result
+        .hits
+        .iter()
+        .map(|hit| hit.pid)
+        .collect::<BTreeSet<_>>();
+    process_index_round.view.candidate_pids.retain(|pid| {
+        !state.known_pids.contains(pid) && !already_scanned.contains(pid)
+    });
+
+    let candidate_result = scan_candidate_pids(
+        &runtime_rules,
+        &plan,
+        &process_index_round.view.candidate_pids,
+    );
+    merge_candidate_hits(&mut scan_result, candidate_result, state);
     let scan_finished_at = elapsed_realtime_ms();
     let ProcScanResult {
         hits,

@@ -1381,7 +1381,6 @@ static bool proc_collect(
     const AppConfig* cfg,
     ProcCache* cache,
     size_t* count,
-    bool full_scan,
     ProcScanQuality* quality
 ) {
     DIR* proc_dir = opendir("/proc");
@@ -1394,7 +1393,6 @@ static bool proc_collect(
     *count = 0;
 
     struct dirent* ent;
-    time_t current_time = time(NULL);
     while (true) {
         errno = 0;
         ent = readdir(proc_dir);
@@ -1411,13 +1409,6 @@ static bool proc_collect(
         }
         pid_t pid = (pid_t)value;
         bool is_tracked = tracked_process_index(cache, pid) >= 0;
-        if (!full_scan) {
-            if (!is_tracked) {
-                struct stat statbuf;
-                if (fstatat(proc_fd, ent->d_name, &statbuf, AT_SYMLINK_NOFOLLOW) != 0) continue;
-                if (current_time - statbuf.st_mtime > 60) continue;
-            }
-        }
 
         int pid_fd = openat(proc_fd, ent->d_name,O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (pid_fd == -1) {
@@ -1468,6 +1459,77 @@ static bool proc_collect(
     return quality->global_complete;
 }
 
+static ProcessRefreshResult discover_candidate_process(
+    const AppConfig* cfg,
+    ProcCache* cache,
+    pid_t pid
+) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d", pid);
+    int pid_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (pid_fd == -1) {
+        return identity_errno(errno) ?
+            PROCESS_REFRESH_IDENTITY_LOST : PROCESS_REFRESH_READ_GAP;
+    }
+
+    char cmdline[MAX_PKG_LEN] = {0};
+    ProcFileResult cmd_result = read_proc_file_at(
+        pid_fd, "cmdline", cmdline, sizeof(cmdline));
+    if (cmd_result != PROC_FILE_OK || cmdline[0] == '\0') {
+        int error = errno;
+        close(pid_fd);
+        return cmd_result == PROC_FILE_ERROR && identity_errno(error) ?
+            PROCESS_REFRESH_IDENTITY_LOST : PROCESS_REFRESH_READ_GAP;
+    }
+    char* name = strrchr(cmdline, '/');
+    name = name ? name + 1 : cmdline;
+
+    char base_pkg[MAX_PKG_LEN];
+    bool is_child = false;
+    bool has_exact_process_rule = false;
+    if (!process_rule_scope(
+            cfg, name, base_pkg, sizeof(base_pkg),
+            &is_child, &has_exact_process_rule)) {
+        close(pid_fd);
+        return PROCESS_REFRESH_NOT_RELEVANT;
+    }
+
+    unsigned long long starttime = 0;
+    if (read_proc_stat_at(pid_fd, NULL, 0, &starttime) != PROC_FILE_OK) {
+        int error = errno;
+        close(pid_fd);
+        return identity_errno(error) ?
+            PROCESS_REFRESH_IDENTITY_LOST : PROCESS_REFRESH_READ_GAP;
+    }
+    if (!ensure_process_capacity(cache, cache->num_procs + 1)) {
+        close(pid_fd);
+        return PROCESS_REFRESH_READ_GAP;
+    }
+
+    ProcessInfo* proc = &cache->procs[cache->num_procs];
+    populate_process(cfg, proc, pid, starttime, name, pid_fd);
+    close(pid_fd);
+    cache->num_procs++;
+    return PROCESS_REFRESH_INCLUDED;
+}
+
+static size_t scan_candidate_processes(
+    ProcCache* cache,
+    const AppConfig* cfg,
+    const pid_t* candidates,
+    size_t candidate_count
+) {
+    size_t discovered = 0;
+    for (size_t index = 0; index < candidate_count; index++) {
+        pid_t pid = candidates[index];
+        if (tracked_process_index(cache, pid) >= 0) continue;
+        ProcessRefreshResult result = discover_candidate_process(
+            cfg, cache, pid);
+        if (result == PROCESS_REFRESH_INCLUDED) discovered++;
+    }
+    return discovered;
+}
+
 static void refresh_tracked_processes(
     ProcCache* cache,
     const AppConfig* cfg,
@@ -1510,7 +1572,12 @@ static void refresh_tracked_processes(
         if (result == PROCESS_REFRESH_IDENTITY_LOST) {
             proc->pid = 0;
             proc->num_threads = 0;
-            cache->scan_all_proc = true;
+            if (!process_index_mark_candidate(
+                    tracked.pid, rule_health_boottime_ms())) {
+                cache->scan_all_proc = true;
+            } else {
+                cache->process_index_has_candidates = true;
+            }
             continue;
         }
         if (result == PROCESS_REFRESH_NOT_RELEVANT) {
@@ -1562,10 +1629,7 @@ static void update_cache(
     bool force_full_scan
 ) {
     unsigned long long now_elapsed = rule_health_boottime_ms();
-    if (!config_has_runtime_rules(cfg)) {
-        clear_empty_runtime_cache(cache, affinity_counter, now_elapsed);
-        return;
-    }
+    bool has_runtime_rules = config_has_runtime_rules(cfg);
     bool periodic_full_scan = cache->initialized && now_elapsed > 0 &&
         (cache->last_full_scan_elapsed_ms == 0 ||
          now_elapsed - cache->last_full_scan_elapsed_ms >= PROC_FULL_RESCAN_MS);
@@ -1573,8 +1637,9 @@ static void update_cache(
         cache->last_full_scan_attempt_elapsed_ms == 0 ||
         now_elapsed - cache->last_full_scan_attempt_elapsed_ms >=
             RULE_HEALTH_FULL_SCAN_RETRY_MS;
-    bool full_scan_requested = !cache->initialized || cache->scan_all_proc ||
-        periodic_full_scan || force_full_scan;
+    bool full_scan_requested = has_runtime_rules &&
+        (!cache->initialized || cache->scan_all_proc ||
+         periodic_full_scan || force_full_scan);
     bool full_scan = full_scan_requested && full_retry_allowed;
     struct sysinfo info;
     if (sysinfo(&info) == 0) {
@@ -1586,12 +1651,68 @@ static void update_cache(
         }
         cache->last_proc_count = current_proc_count;
     }
-    bool growth_scan_due = cache->proc_growth_pending &&
-        (now_elapsed == 0 || cache->last_proc_growth_scan_elapsed_ms == 0 ||
-         now_elapsed - cache->last_proc_growth_scan_elapsed_ms >=
-            PROC_GROWTH_SCAN_COOLDOWN_MS);
-    bool incremental_scan = growth_scan_due && !full_scan_requested;
-    if (full_scan || incremental_scan) {
+
+    bool entered_idle_backoff = false;
+    bool snapshot_log_due = cache->last_pid_snapshot_log_elapsed_ms == 0 ||
+        now_elapsed == 0 || now_elapsed < cache->last_pid_snapshot_log_elapsed_ms ||
+        now_elapsed - cache->last_pid_snapshot_log_elapsed_ms >=
+            PID_SNAPSHOT_LOG_INTERVAL_MS;
+    unsigned long long index_interval =
+        cache->process_index_has_candidates || cache->stable_pid_snapshot_rounds < 3 ?
+            PID_SNAPSHOT_ACTIVE_MS : PID_SNAPSHOT_IDLE_MS;
+    bool index_refresh_due = full_scan_requested || cache->proc_growth_pending ||
+        !cache->process_index_initialized ||
+        cache->last_pid_snapshot_elapsed_ms == 0 || now_elapsed == 0 ||
+        now_elapsed < cache->last_pid_snapshot_elapsed_ms ||
+        now_elapsed - cache->last_pid_snapshot_elapsed_ms >= index_interval;
+    ProcessIndexView process_index;
+    memset(&process_index, 0, sizeof(process_index));
+    bool need_index_read = index_refresh_due || cache->process_index_has_candidates;
+    if (need_index_read && !process_index_prepare(
+            now_elapsed, index_refresh_due, full_scan_requested, &process_index)) {
+        memset(&process_index, 0, sizeof(process_index));
+        if (snapshot_log_due) {
+            fprintf(stderr, "进程索引刷新失败，保留现有缓存并等待下轮重试\n");
+            cache->last_pid_snapshot_log_elapsed_ms = now_elapsed;
+        }
+    } else if (process_index.loaded) {
+        cache->process_index_has_candidates = process_index.num_candidate_pids > 0;
+        if (process_index.refreshed) {
+            bool was_initialized = cache->process_index_initialized;
+            cache->process_index_initialized = true;
+            cache->last_pid_snapshot_elapsed_ms = now_elapsed;
+            cache->proc_growth_pending = false;
+            if (was_initialized && process_index.added == 0 && process_index.exited == 0) {
+                unsigned int previous = cache->stable_pid_snapshot_rounds;
+                if (cache->stable_pid_snapshot_rounds < UINT_MAX) {
+                    cache->stable_pid_snapshot_rounds++;
+                }
+                entered_idle_backoff = previous < 3 &&
+                    cache->stable_pid_snapshot_rounds >= 3 &&
+                    process_index.num_candidate_pids == 0;
+            } else if (was_initialized) {
+                cache->stable_pid_snapshot_rounds = 0;
+            }
+        }
+        if ((process_index.added > 0 || process_index.exited > 0) && snapshot_log_due) {
+            printf(
+                "进程索引变化: 新增=%zu 退出=%zu 待确认=%zu\n",
+                process_index.added, process_index.exited,
+                process_index.num_candidate_pids);
+            cache->last_pid_snapshot_log_elapsed_ms = now_elapsed;
+        } else if (entered_idle_backoff) {
+            printf("进程索引长时间无变化，空闲时退避到 10 秒\n");
+            cache->last_pid_snapshot_log_elapsed_ms = now_elapsed;
+        }
+    }
+
+    if (!has_runtime_rules) {
+        clear_empty_runtime_cache(cache, affinity_counter, now_elapsed);
+        process_index_view_release(&process_index);
+        return;
+    }
+
+    if (full_scan) {
         if (full_scan && now_elapsed > 0) {
             cache->last_full_scan_attempt_elapsed_ms = now_elapsed;
             cache->last_health_full_scan_attempt_elapsed_ms = now_elapsed;
@@ -1600,7 +1721,7 @@ static void update_cache(
         ProcScanQuality quality;
         proc_scan_quality_init(&quality);
         bool scan_complete = proc_collect(
-            cfg, cache, &new_count, full_scan, &quality);
+            cfg, cache, &new_count, &quality);
         cache->num_procs = new_count;
         bool full_cache_complete = scan_complete &&
             quality.num_incomplete_pkgs == 0;
@@ -1609,33 +1730,49 @@ static void update_cache(
             replace_tracked_processes(cache) :
             merge_tracked_processes(cache, &identity_changed);
         cache->initialized = true;
-        if (full_scan) {
-            cache->scan_all_proc = identity_changed ||
-                !scan_complete || !tracked_cache_complete;
-        } else {
-            cache->scan_all_proc = cache->scan_all_proc ||
-                identity_changed || !scan_complete || !tracked_cache_complete;
-        }
+        cache->scan_all_proc = identity_changed ||
+            !scan_complete || !tracked_cache_complete;
         unsigned long long completed_at = rule_health_boottime_ms();
         cache->last_refresh_elapsed_ms = completed_at;
-        if (incremental_scan) {
-            cache->last_proc_growth_scan_elapsed_ms = completed_at;
-            if (scan_complete) cache->proc_growth_pending = false;
-        }
-        if (full_scan && scan_complete) {
+        if (scan_complete) {
             proc_cache_commit_full_scan_quality(cache, &quality);
             cache->last_full_scan_elapsed_ms = completed_at;
             if (tracked_cache_complete) {
                 cache->last_full_scan_attempt_elapsed_ms = 0;
-                cache->last_proc_growth_scan_elapsed_ms = completed_at;
                 cache->proc_growth_pending = false;
             }
         }
         proc_scan_quality_release(&quality);
+        size_t discovered = scan_candidate_processes(
+            cache, cfg, process_index.candidate_pids,
+            process_index.num_candidate_pids);
+        if (discovered > 0) {
+            if (!merge_tracked_processes(cache, NULL)) {
+                cache->scan_all_proc = true;
+            }
+            printf(
+                "进程索引发现目标进程: %zu 个，待确认=%zu\n",
+                discovered, process_index.num_candidate_pids);
+        }
         *affinity_counter = 0;
+        process_index_view_release(&process_index);
         return;
     }
     refresh_tracked_processes(cache, cfg, affinity_counter);
+    size_t discovered = scan_candidate_processes(
+        cache, cfg, process_index.candidate_pids,
+        process_index.num_candidate_pids);
+    if (discovered > 0) {
+        if (!merge_tracked_processes(cache, NULL)) {
+            cache->scan_all_proc = true;
+        }
+        cache->last_refresh_elapsed_ms = rule_health_boottime_ms();
+        *affinity_counter = 0;
+        printf(
+            "进程索引发现目标进程: %zu 个，待确认=%zu\n",
+            discovered, process_index.num_candidate_pids);
+    }
+    process_index_view_release(&process_index);
 }
 
 static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
@@ -1648,7 +1785,12 @@ static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
         if (proc_fd == -1 || !read_starttime_at(proc_fd, &process_starttime) ||
             process_starttime != proc->starttime) {
             if (proc_fd != -1) close(proc_fd);
-            cache->scan_all_proc = true;
+            if (!process_index_mark_candidate(
+                    proc->pid, rule_health_boottime_ms())) {
+                cache->scan_all_proc = true;
+            } else {
+                cache->process_index_has_candidates = true;
+            }
             continue;
         }
         int task_fd = openat(proc_fd, "task", O_RDONLY | O_DIRECTORY | O_CLOEXEC);

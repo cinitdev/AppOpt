@@ -6,6 +6,8 @@ static void print_help(const char* prog_name) {
     printf("  -v                 显示程序版本\n");
     printf("  -P, --ping-daemon <socket> <token>  请求守护进程反向验证 App\n");
     printf("  --app-state <pkg>                   读取 top-app/foreground_window 并检查目标包是否前台\n");
+    printf("  --find-pid <name>                   从 AppOpt 进程索引查询 PID\n");
+    printf("  --find-processes <name...>          输出当前存在的进程名\n");
     printf("  -h                 显示帮助信息\n");
     printf("\n示例:\n");
     printf("  %s -c /data/adb/modules/AppOpt/config/applist.conf -s 3\n", prog_name);
@@ -37,6 +39,20 @@ int main(int argc, char **argv) {
                 return 2;
             }
             return app_state_print_cli(argv[i + 1], NULL);
+        }
+        if (strcmp(argv[i], "--find-pid") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--find-pid 需要 <name>\n");
+                return 2;
+            }
+            return process_index_print_pids(argv[i + 1]);
+        }
+        if (strcmp(argv[i], "--find-processes") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--find-processes 至少需要一个进程名\n");
+                return 2;
+            }
+            return process_index_print_names(argc - i - 1, &argv[i + 1]);
         }
     }
 
@@ -142,6 +158,12 @@ int main(int argc, char **argv) {
     }
 
     /* 启动真实帧率监测线程 (eBPF 优先, SurfaceFlinger 兜底) */
+    int recovered_jank_overrides = appopt_jank_recover();
+    if (recovered_jank_overrides > 0) {
+        printf(
+            "[boost] 已恢复上次异常退出遗留的 %d 项临时参数\n",
+            recovered_jank_overrides);
+    }
     pthread_t fps_tid;
     if (pthread_create(&fps_tid, NULL, fps_thread, NULL) == 0) {
         pthread_detach(fps_tid);

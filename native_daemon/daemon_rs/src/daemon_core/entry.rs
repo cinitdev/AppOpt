@@ -25,6 +25,10 @@ fn main() {
         daemon_socket_ping_client(socket_name, token)
     } else if let Some(pkg) = &args.app_state_pkg {
         app_state_print_cli(pkg)
+    } else if let Some(name) = &args.find_pid_name {
+        process_index_print_pids(name)
+    } else if !args.find_process_names.is_empty() {
+        process_index_print_names(&args.find_process_names)
     } else if args.scan_once {
         run_once(&args, false)
     } else if args.apply_once {
@@ -51,6 +55,8 @@ where
         version: false,
         ping_daemon: None,
         app_state_pkg: None,
+        find_pid_name: None,
+        find_process_names: Vec::new(),
         target_pkg: None,
         interval_secs: DEFAULT_INTERVAL_SECS,
     };
@@ -76,6 +82,18 @@ where
                     .next()
                     .ok_or_else(|| format!("{arg} 需要包名"))?;
                 parsed.app_state_pkg = Some(value);
+            }
+            "--find-pid" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} 需要进程名"))?;
+                parsed.find_pid_name = Some(value);
+            }
+            "--find-processes" => {
+                parsed.find_process_names.extend(args.by_ref());
+                if parsed.find_process_names.is_empty() {
+                    return Err(format!("{arg} 至少需要一个进程名"));
+                }
             }
             "--scan-once" => parsed.scan_once = true,
             "--apply-once" => parsed.apply_once = true,
@@ -115,13 +133,15 @@ where
         parsed.apply_once,
         parsed.ping_daemon.is_some(),
         parsed.app_state_pkg.is_some(),
+        parsed.find_pid_name.is_some(),
+        !parsed.find_process_names.is_empty(),
     ]
     .into_iter()
     .filter(|enabled| *enabled)
     .count();
     if exclusive_modes > 1 {
         return Err(
-            "--scan-once、--apply-once、--ping-daemon 和 --app-state 不能同时使用".to_string(),
+            "扫描、应用、守护验证、前台状态和进程查询模式不能同时使用".to_string(),
         );
     }
 
@@ -137,6 +157,8 @@ fn print_help() {
            --apply-once  执行一次绑核后退出\n\
            --scan-once   只打印命中的进程/线程规则, 不修改绑核\n\
            --app-state <包名>  打印 cgroup 前台包状态\n\
+           --find-pid <进程名>  从 AppOpt 进程索引查询 PID\n\
+           --find-processes <名称...>  输出当前存在的进程名\n\
            -P, --ping-daemon <socket> <token>  请求守护进程回连 App 验证 socket\n\
            -v            打印版本和启动诊断\n"
     );

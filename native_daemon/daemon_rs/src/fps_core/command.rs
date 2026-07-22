@@ -8,7 +8,56 @@
     // 这里不解析更多复杂参数，避免命令文件变成半套 IPC 协议。
     fn fps_loop() -> io::Result<()> {
         let mut monitor: Option<FpsMonitor> = None;
-        loop {
+        let mut manual_pkg: Option<String> = None;
+        let mut auto_pkg: Option<String> = None;
+        let mut last_selected: Option<Vec<String>> = None;
+        let mut selected = Vec::new();
+        let mut last_auto_check = Instant::now() - Duration::from_secs(10);
+        while !FPS_SHUTDOWN.load(Ordering::Relaxed) {
+            let auto_check_interval = if selected.is_empty() {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(1)
+            };
+            if last_auto_check.elapsed() >= auto_check_interval {
+                last_auto_check = Instant::now();
+                selected = read_jank_packages();
+                if last_selected.as_ref() != Some(&selected) {
+                    if selected.is_empty() {
+                        println!("[boost] 卡顿时临时提速未配置应用");
+                    } else {
+                        let preview = selected.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                        let remaining = selected.len().saturating_sub(5);
+                        println!(
+                            "[boost] 已配置临时提速: {}{}；等待所选应用进入前台",
+                            preview,
+                            if remaining > 0 {
+                                format!(" ... +{remaining}")
+                            } else {
+                                String::new()
+                            }
+                        );
+                    }
+                    last_selected = Some(selected.clone());
+                }
+                let target = selected_jank_foreground(&selected);
+                if manual_pkg.is_none() && target != auto_pkg {
+                    if let Some(old) = monitor.as_mut() {
+                        old.set_adaptive(false);
+                    }
+                    monitor = target.clone().map(|pkg| {
+                        let mut active = FpsMonitor::start(pkg, None, None);
+                        active.set_output_enabled(false);
+                        active.set_adaptive(true);
+                        active
+                    });
+                    auto_pkg = target;
+                } else if let (Some(manual), Some(active)) =
+                    (manual_pkg.as_deref(), monitor.as_mut())
+                {
+                    active.set_adaptive(target.as_deref() == Some(manual));
+                }
+            }
             // fps.cmd 是简单命令文件，App 每次启动/停止 FPS 都会写入。
             // 读取后立即删除，和 C 版消费语义保持一致，避免 daemon 重启后重复执行旧命令。
             if let Some(cmd) = read_command()? {
@@ -34,9 +83,32 @@
                             socket_name,
                             socket_token,
                         ));
+                        manual_pkg = Some(pkg.to_string());
+                        auto_pkg = None;
+                        selected = read_jank_packages();
+                        if selected_jank_foreground(&selected).as_deref() == Some(pkg) {
+                            if let Some(active) = monitor.as_mut() {
+                                active.set_adaptive(true);
+                            }
+                        }
                     }
                 } else if cmd == "stop" || cmd.starts_with("stop ") {
-                    if let Some(mut old) = monitor.take() {
+                    manual_pkg = None;
+                    selected = read_jank_packages();
+                    let target = selected_jank_foreground(&selected);
+                    if let Some(pkg) = target {
+                        if monitor.as_ref().is_none_or(|active| active.pkg != pkg) {
+                            if let Some(mut old) = monitor.take() {
+                                old.stop();
+                            }
+                            monitor = Some(FpsMonitor::start(pkg.clone(), None, None));
+                        }
+                        if let Some(active) = monitor.as_mut() {
+                            active.set_output_enabled(false);
+                            active.set_adaptive(true);
+                        }
+                        auto_pkg = Some(pkg);
+                    } else if let Some(mut old) = monitor.take() {
                         old.stop();
                     }
                 }
@@ -48,28 +120,122 @@
                 thread::sleep(Duration::from_millis(300));
             }
         }
+        if let Some(mut active) = monitor.take() {
+            active.stop();
+        }
+        Ok(())
+    }
+
+    fn read_jank_packages() -> Vec<String> {
+        fs::read_to_string(JANK_BOOST_FILE)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(normalize_jank_package)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn normalize_jank_package(line: &str) -> Option<String> {
+        let value = line.split('#').next()?.trim();
+        let base = value.split(':').next()?.trim();
+        if base.is_empty()
+            || !base.contains('.')
+            || !base
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+        {
+            return None;
+        }
+        Some(base.to_string())
+    }
+
+    fn selected_jank_foreground(selected: &[String]) -> Option<String> {
+        if selected.is_empty() {
+            return None;
+        }
+        read_jank_foreground()
+            .filter(|pkg| selected.iter().any(|item| item == pkg))
+            .or_else(|| {
+                selected
+                    .iter()
+                    .find(|pkg| app_top_state_check(pkg).target_top_app)
+                    .cloned()
+            })
+    }
+
+    fn read_jank_foreground() -> Option<String> {
+        let raw = fs::read_to_string(FOREGROUND_TASK_STATE_FILE).ok()?;
+        let mut status = "";
+        let mut focused = "";
+        let mut updated = 0u64;
+        for line in raw.lines() {
+            let Some((key, value)) = line.split_once('=') else { continue; };
+            match key.trim() {
+                "status" => status = value.trim(),
+                "focused_package" => focused = value.trim(),
+                "updated_wall_ms" => updated = value.trim().parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64;
+        if status != "ok"
+            || focused.is_empty()
+            || updated == 0
+            || now < updated
+            || now - updated > 12_000
+        {
+            return None;
+        }
+        normalize_jank_package(focused)
     }
 
     fn read_command() -> io::Result<Option<String>> {
+        let before = match fs::metadata(FPS_CMD_FILE) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
         let text = match fs::read_to_string(FPS_CMD_FILE) {
             Ok(text) => text.trim().to_string(),
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
-        if text.is_empty() {
+        let after = match fs::metadata(FPS_CMD_FILE) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let stable = before.len() == after.len()
+            && before.modified().ok() == after.modified().ok();
+        if !stable {
             return Ok(None);
         }
         let valid = text.starts_with("start ") || text == "stop" || text.starts_with("stop ");
+        if text.is_empty() || !valid {
+            let stale = after
+                .modified()
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age >= Duration::from_secs(2));
+            if stale {
+                match fs::remove_file(FPS_CMD_FILE) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            return Ok(None);
+        }
         match fs::remove_file(FPS_CMD_FILE) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        if valid {
-            Ok(Some(text))
-        } else {
-            Ok(None)
-        }
+        Ok(Some(text))
     }
 
     #[derive(Clone, Debug)]

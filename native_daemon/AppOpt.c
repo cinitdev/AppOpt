@@ -65,12 +65,17 @@
 #define HISTORY_DIR        MODULE_DIR "/history"
 #define RULE_HEALTH_FILE    CONFIG_DIR "/rule_health.tsv"
 #define FOREGROUND_TASK_STATE_FILE CONFIG_DIR "/foreground_task.state"
+#define PROCESS_CACHE_FILE CONFIG_DIR "/pid_cache.tsv"
+#define PROCESS_INDEX_MAGIC "APPOPT_PROCESS_INDEX_V1"
 #define FOREGROUND_TASK_MAX_AGE_MS 12000ULL
 #define RULE_HEALTH_OBSERVE_SECS 30
 #define RULE_HEALTH_EXIT_BUFFER_SIZE 32768
 #define RULE_HEALTH_LIFECYCLE_BUFFER_SIZE 32768
 #define PROC_FULL_RESCAN_MS 60000ULL
-#define PROC_GROWTH_SCAN_COOLDOWN_MS 10000ULL
+#define PID_SNAPSHOT_ACTIVE_MS 2000ULL
+#define PID_SNAPSHOT_IDLE_MS 10000ULL
+#define PID_DISCOVERY_RETRY_MS 6000ULL
+#define PID_SNAPSHOT_LOG_INTERVAL_MS 30000ULL
 #define RULE_HEALTH_FULL_SCAN_RETRY_MS 5000ULL
 #define FOREGROUND_DISCOVERY_DELAY_MS 2000ULL
 #define FOREGROUND_DISCOVERY_COOLDOWN_MS 10000ULL
@@ -83,6 +88,7 @@
  * 守护优先把每秒算出的 FPS 推到 App 创建的 Android 本地 socket;
  * socket 不可用时再覆盖写 app 私有目录(下方), 由 App 侧 FileObserver 兜底读取。 */
 #define FPS_CMD_FILE       CONFIG_DIR "/fps.cmd"
+#define JANK_BOOST_FILE    CONFIG_DIR "/jank_boost.conf"
 #define FPS_OUT_DIR        "/data/data/top.suto.appopt/files"
 #define FPS_OUT_FILE       FPS_OUT_DIR "/fps"
 #define FPS_BPF_OBJ        EBPF_DIR "/queuebuffer_probe.bpf.o"  /* eBPF 字节码 */
@@ -185,15 +191,30 @@ typedef struct {
     TrackedProcess* tracked_procs;
     size_t num_tracked_procs;
     size_t tracked_procs_cap;
+    bool process_index_initialized;
+    bool process_index_has_candidates;
+    unsigned int stable_pid_snapshot_rounds;
+    unsigned long long last_pid_snapshot_elapsed_ms;
+    unsigned long long last_pid_snapshot_log_elapsed_ms;
     bool initialized;
     unsigned long long last_refresh_elapsed_ms;
-    unsigned long long last_proc_growth_scan_elapsed_ms;
     unsigned long long last_full_scan_elapsed_ms;
     unsigned long long last_full_scan_attempt_elapsed_ms;
     unsigned long long last_health_full_scan_attempt_elapsed_ms;
     char (*last_full_incomplete_pkgs)[MAX_PKG_LEN];
     size_t num_last_full_incomplete_pkgs;
 } ProcCache;
+
+typedef struct {
+    pid_t* current_pids;
+    size_t num_current_pids;
+    pid_t* candidate_pids;
+    size_t num_candidate_pids;
+    size_t added;
+    size_t exited;
+    bool refreshed;
+    bool loaded;
+} ProcessIndexView;
 
 static atomic_int config_updated = ATOMIC_VAR_INIT(0);
 static int inotify_fd = -1;
@@ -212,9 +233,19 @@ static volatile sig_atomic_t shutdown_requested = 0;
 static unsigned long long rule_health_boottime_ms(void);
 static bool rule_health_sync_config(const AppConfig* cfg, bool* changed);
 static bool rule_health_rule_disabled(const AffinityRule* rule);
+static bool process_index_prepare(
+    unsigned long long now_elapsed,
+    bool refresh_due,
+    bool rebuild_all,
+    ProcessIndexView* view);
+static void process_index_view_release(ProcessIndexView* view);
+static bool process_index_mark_candidate(pid_t pid, unsigned long long now_elapsed);
+static int process_index_print_pids(const char* name);
+static int process_index_print_names(int count, char* const names[]);
 
 #include "core.c"
 #include "config.c"
+#include "process_tracker.c"
 #include "rule_health.c"
 #include "calibration.c"
 #include "surfaceflinger.c"
