@@ -54,6 +54,8 @@
                 ebpf_pid_reported: false,
                 ebpf_first_fps: true,
                 ebpf_stale_checks: 0,
+                pending_foreground_pid: -1,
+                pending_foreground_pid_hits: 0,
                 ebpf_alternate_pid_attempted: false,
                 fallback: None,
                 socket: FpsSocket::new(socket_name, socket_token),
@@ -150,15 +152,48 @@
                 self.ebpf_last_pid_check = Some(now);
                 if let Some(choice) = find_foreground_pkg_pid(&self.pkg) {
                     if choice.pid > 0 && choice.pid != active_pid {
+                        if !pid_ready_for_ebpf(choice.pid, &self.pkg) {
+                            self.pending_foreground_pid = -1;
+                            self.pending_foreground_pid_hits = 0;
+                            println!(
+                                "[FPS] 忽略尚未就绪的前台候选PID: pkg={} pid={} 来源={}",
+                                self.pkg, choice.pid, choice.source
+                            );
+                            thread::sleep(Duration::from_millis(120));
+                            return;
+                        }
+                        if self.pending_foreground_pid == choice.pid {
+                            self.pending_foreground_pid_hits =
+                                self.pending_foreground_pid_hits.saturating_add(1);
+                        } else {
+                            self.pending_foreground_pid = choice.pid;
+                            self.pending_foreground_pid_hits = 1;
+                        }
+                        if self.pending_foreground_pid_hits < 2 {
+                            println!(
+                                "[FPS] 前台候选PID等待复核: pkg={} current={} candidate={} 来源={}",
+                                self.pkg, active_pid, choice.pid, choice.source
+                            );
+                            thread::sleep(Duration::from_millis(120));
+                            return;
+                        }
                         println!(
                             "[FPS] 前台目标进程已切换: pkg={} old={} new={} 来源={}, 重启 eBPF 监测",
                             self.pkg, active_pid, choice.pid, choice.source
                         );
+                        self.pending_foreground_pid = -1;
+                        self.pending_foreground_pid_hits = 0;
                         self.ebpf_alternate_pid_attempted = false;
                         self.restart_ebpf(choice.pid, &choice.source, now);
                         thread::sleep(Duration::from_millis(120));
                         return;
+                    } else {
+                        self.pending_foreground_pid = -1;
+                        self.pending_foreground_pid_hits = 0;
                     }
+                } else {
+                    self.pending_foreground_pid = -1;
+                    self.pending_foreground_pid_hits = 0;
                 }
             }
 
@@ -295,8 +330,34 @@
         }
 
         fn restart_ebpf(&mut self, pid: i32, source: &str, now: Instant) {
-            appopt_ebpf_stop(self.ctx);
-            self.ctx = start_ebpf_for_pkg(&self.pkg, pid, source);
+            if !pid_ready_for_ebpf(pid, &self.pkg) {
+                println!(
+                    "[FPS] 候选PID已退出或尚未加载libgui，取消eBPF切换: pkg={} pid={} 来源={}",
+                    self.pkg, pid, source
+                );
+                if self.ctx.is_null() {
+                    self.start_fallback();
+                }
+                return;
+            }
+            let next_ctx = start_ebpf_for_pkg(&self.pkg, pid, source);
+            if next_ctx.is_null() {
+                if self.ctx.is_null() {
+                    self.start_fallback();
+                } else {
+                    println!(
+                        "[FPS] 候选PID附加失败，继续保留当前eBPF: pkg={} current={} candidate={}",
+                        self.pkg,
+                        appopt_ebpf_pid(self.ctx),
+                        pid
+                    );
+                }
+                return;
+            }
+            if !self.ctx.is_null() {
+                appopt_ebpf_stop(self.ctx);
+            }
+            self.ctx = next_ctx;
             self.ebpf_failures = 0;
             self.ebpf_seen_frames = false;
             self.ebpf_stale_zero_sent = false;
@@ -305,6 +366,8 @@
             self.ebpf_pid_reported = false;
             self.ebpf_first_fps = true;
             self.ebpf_stale_checks = 0;
+            self.pending_foreground_pid = -1;
+            self.pending_foreground_pid_hits = 0;
             self.target_pid = pid;
             if self.ctx.is_null() {
                 self.start_fallback();

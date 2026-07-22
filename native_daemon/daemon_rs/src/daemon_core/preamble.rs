@@ -284,6 +284,7 @@ struct AppTopState {
     ok: bool,
     target_top_app: bool,
     target_pid: i32,
+    target_pid_is_main: bool,
     scanned: usize,
     packages: Vec<String>,
 }

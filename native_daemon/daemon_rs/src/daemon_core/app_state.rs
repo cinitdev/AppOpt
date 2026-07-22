@@ -74,8 +74,14 @@ fn scan_top_app_path(
         }
 
         if proc_matches_target(&proc_name, target_pkg) {
+            let is_main = proc_name == target_pkg;
             state.target_top_app = true;
-            if state.target_pid <= 0 {
+            if is_main {
+                if !state.target_pid_is_main {
+                    state.target_pid = pid;
+                    state.target_pid_is_main = true;
+                }
+            } else if state.target_pid <= 0 {
                 state.target_pid = pid;
             }
         }

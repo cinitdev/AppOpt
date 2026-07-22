@@ -7,6 +7,7 @@
 typedef struct {
     bool target_top_app;
     pid_t target_pid;
+    bool target_pid_is_main;
     int scanned;
     int package_count;
     char packages[1024];

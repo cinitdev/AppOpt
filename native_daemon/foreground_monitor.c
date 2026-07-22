@@ -162,8 +162,16 @@ static void scan_top_app_path(const char *path, const char *target_pkg, app_top_
         if (!read_process_first_arg(pid, proc_name, sizeof(proc_name))) continue;
 
         if (target_pkg && *target_pkg && proc_matches_target(proc_name, target_pkg)) {
+            bool is_main = strcmp(proc_name, target_pkg) == 0;
             out->target_top_app = true;
-            if (out->target_pid <= 0) out->target_pid = pid;
+            if (is_main) {
+                if (!out->target_pid_is_main) {
+                    out->target_pid = pid;
+                    out->target_pid_is_main = true;
+                }
+            } else if (out->target_pid <= 0) {
+                out->target_pid = pid;
+            }
         }
 
         char pkg[APPOPT_CMDLINE_MAX];

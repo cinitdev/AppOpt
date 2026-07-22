@@ -241,6 +241,7 @@
     #[derive(Clone, Debug)]
     struct PidChoice {
         pid: i32,
+        is_main: bool,
         source: String,
     }
 
@@ -256,13 +257,16 @@
         // 前几轮不允许子进程兜底，避免刚启动就锁到 push/MSF 等非渲染进程。
         for _ in 0..attempts {
             if let Some(choice) = find_preferred_pkg_pid(pkg, false) {
-                return Some(choice);
+                if pid_ready_for_ebpf(choice.pid, pkg) {
+                    return Some(choice);
+                }
             }
             if !delay.is_zero() {
                 thread::sleep(delay);
             }
         }
         find_preferred_pkg_pid(pkg, true)
+            .filter(|choice| pid_ready_for_ebpf(choice.pid, pkg))
     }
 
     fn find_top_app_pid(pkg: &str) -> Option<PidChoice> {
@@ -270,7 +274,12 @@
         if state.target_top_app && state.target_pid > 0 {
             return Some(PidChoice {
                 pid: state.target_pid,
-                source: "cgroup 前台组".to_string(),
+                is_main: state.target_pid_is_main,
+                source: if state.target_pid_is_main {
+                    "cgroup 前台组主进程".to_string()
+                } else {
+                    "cgroup 前台组子进程".to_string()
+                },
             });
         }
         None
@@ -283,8 +292,10 @@
         match foreground_helper_state(pkg) {
             ForegroundHelperState::Target => {
                 if let Some(mut choice) = find_top_app_pid(pkg) {
-                    choice.source = format!("前台助手+{}", choice.source);
-                    return Some(choice);
+                    if allow_child || choice.is_main {
+                        choice.source = format!("前台助手+{}", choice.source);
+                        return Some(choice);
+                    }
                 }
                 if let Some(choice) = find_pkg_cmdline_pid(pkg, allow_child, "前台助手+") {
                     return Some(choice);
@@ -296,7 +307,9 @@
         }
 
         if let Some(choice) = find_top_app_pid(pkg) {
-            return Some(choice);
+            if allow_child || choice.is_main {
+                return Some(choice);
+            }
         }
 
         find_pkg_cmdline_pid(pkg, allow_child, "")
@@ -315,6 +328,25 @@
         }
     }
 
+    fn pid_ready_for_ebpf(pid: i32, pkg: &str) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        let Ok(cmdline) = read_cmdline(pid) else {
+            return false;
+        };
+        if cmdline != pkg
+            && !cmdline
+                .strip_prefix(pkg)
+                .is_some_and(|rest| rest.starts_with(':'))
+        {
+            return false;
+        }
+        fs::read_to_string(format!("/proc/{pid}/maps"))
+            .ok()
+            .is_some_and(|maps| maps.lines().any(|line| line.contains("libgui.so")))
+    }
+
     fn find_alternate_pkg_pid(pkg: &str, current_pid: i32) -> Option<PidChoice> {
         // eBPF 已经锁定一个 PID 但连续没有新帧时，尝试同包其它进程。
         // 这里仍然只返回具体 PID，避免 Android 上不可靠的全进程 uprobe。
@@ -324,6 +356,7 @@
                     if choice.pid > 0 && choice.pid != current_pid {
                         return Some(PidChoice {
                             pid: choice.pid,
+                            is_main: choice.is_main,
                             source: format!("前台助手+{}", choice.source),
                         });
                     }
@@ -368,6 +401,7 @@
             if cmdline == pkg {
                 return Some(PidChoice {
                     pid,
+                    is_main: true,
                     source: format!("{source_prefix}包名主进程重锁定"),
                 });
             }
@@ -378,6 +412,7 @@
             {
                 child_fallback = Some(PidChoice {
                     pid,
+                    is_main: false,
                     source: format!("{source_prefix}包名子进程重锁定"),
                 });
             }
@@ -402,6 +437,7 @@
             if cmdline == pkg {
                 return Some(PidChoice {
                     pid,
+                    is_main: true,
                     source: format!("{source_prefix}包名主进程"),
                 });
             }
@@ -412,6 +448,7 @@
             {
                 child_fallback = Some(PidChoice {
                     pid,
+                    is_main: false,
                     source: format!("{source_prefix}包名子进程回退"),
                 });
             }

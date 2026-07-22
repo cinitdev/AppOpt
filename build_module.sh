@@ -567,7 +567,7 @@ load_gitee_token() {
 }
 
 publish_gitee_release() {
-    local tag title changelog release_id response zip_upload changelog_upload
+    local tag title changelog release_id response zip_upload changelog_upload target_commitish
     command -v curl >/dev/null 2>&1 || {
         echo "! 找不到 curl，无法发布 Gitee Release"
         exit 1
@@ -582,6 +582,8 @@ publish_gitee_release() {
     tag="$(read_release_tag)"
     title="AppOpt $tag"
     changelog="$ROOT/modules_update/changelog.md"
+    # Gitee 仓库只维护 modules-update 分支，不能使用不存在的 master 创建标签。
+    target_commitish="$UPDATE_BRANCH"
 
     [ -s "$ZIP" ] || { echo "! 找不到模块 zip: $ZIP"; exit 1; }
     [ -s "$changelog" ] || { echo "! 找不到更新日志: $changelog"; exit 1; }
@@ -594,7 +596,7 @@ publish_gitee_release() {
         if release_id="$(gitee_release_id "$tag")" && [ -n "$release_id" ]; then
             echo "- [预演] 将更新 Gitee Release: $tag"
         else
-            echo "- [预演] 将创建 Gitee Release: $tag"
+            echo "- [预演] 将创建 Gitee Release: $tag（基于 $target_commitish）"
         fi
         echo "- [预演] 将上传: $ZIP 和 $changelog"
         publish_update_json "$tag" 1
@@ -615,14 +617,14 @@ publish_gitee_release() {
             --data-urlencode "name=$title" \
             --data-urlencode "body@$changelog_upload" >/dev/null
     else
-        echo "- 创建 Gitee Release: $tag"
+        echo "- 创建 Gitee Release: $tag（基于 $target_commitish）"
         response="$(mktemp "$ROOT/build/gitee-release.XXXXXX")"
         if ! curl --fail-with-body -sS -o "$response" -X POST "$GITEE_API_BASE/releases" \
             --data-urlencode "access_token=$GITEE_TOKEN" \
             --data-urlencode "tag_name=$tag" \
             --data-urlencode "name=$title" \
             --data-urlencode "body@$changelog_upload" \
-            --data-urlencode "target_commitish=master"; then
+            --data-urlencode "target_commitish=$target_commitish"; then
             echo "! Gitee 创建 Release 失败，接口返回：" >&2
             cat "$response" >&2
             rm -f "$response"

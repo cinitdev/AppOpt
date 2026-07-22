@@ -97,6 +97,9 @@
         ebpf_pid_reported: bool,
         ebpf_first_fps: bool,
         ebpf_stale_checks: u32,
+        // 正常出帧时发现不同前台 PID，连续两次一致才切换，过滤短命子进程。
+        pending_foreground_pid: i32,
+        pending_foreground_pid_hits: u8,
         // 固定 PID 连续无帧时，尝试一次同包其它 PID。
         // Android 上 aya 的全进程 uprobe 会走桌面 Linux 的 ld.so.cache 路径，不可靠。
         ebpf_alternate_pid_attempted: bool,
