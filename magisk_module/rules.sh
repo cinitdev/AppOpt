@@ -68,55 +68,7 @@ com.android.systemui {
 	ndroid.systemui=$(format_cpu_ranges "$p_core $hp_core")
 }
 "
-game_rules="
-# 将 '王者荣耀' Unity引擎线程绑定到中大核
-com.tencent.tmgp.sgame=$(format_cpu_ranges "$e_core $p_core") {
-	UnityMain=$(format_cpu_ranges "$hp_core")
-	UnityGfxDeviceW=$(format_cpu_ranges "$p_core $hp_core")
-}
-
-# 将 '和平精英' 主线程绑定到中大核
-com.tencent.tmgp.pubgmhd=$(format_cpu_ranges "$e_core $p_core") {
-	Thread-[0-9]?=$(format_cpu_ranges "$hp_core")
-	Thread-?=$(format_cpu_ranges "$hp_core")
-	RenderThread*=$(format_cpu_ranges "$p_core $hp_core")
-	RHIThread=$(format_cpu_ranges "$e_core $p_core")
-}
-
-# 将 '蛋仔派对' 主线程绑定到大核
-com.netease.party=$(format_cpu_ranges "$e_core $p_core") {
-	MainThread=$(format_cpu_ranges "$hp_core")
-	Compute*=$(format_cpu_ranges "$p_core $hp_core")
-}
-
-# 将 '原神' Unity引擎线程绑定到中大核
-com.miHoYo.Yuanshen=$(format_cpu_ranges "$e_core $p_core") {
-	UnityMain=$(format_cpu_ranges "$hp_core")
-	UnityGfx*=$(format_cpu_ranges "$p_core $hp_core")
-}
-
-# '三角洲行动' 主线程绑定到大核
-com.tencent.tmgp.dfm=$(format_cpu_ranges "$e_core $p_core") {
-	GameThread=$(format_cpu_ranges "$hp_core")
-	Thread*=$(format_cpu_ranges "$p_core $hp_core")
-	TaskGraphNP*=$(format_cpu_ranges "$p_core $hp_core")
-	AudioTrack=$(format_cpu_ranges "$e_core")
-}
-
-# '金铲铲' Unity线程绑定到大核
-com.tencent.jkchess=$(format_cpu_ranges "$e_core $p_core") {
-	UnityMain=$(format_cpu_ranges "$hp_core")
-	UnityGfx*=$(format_cpu_ranges "$p_core $hp_core")
-}
-
-# '第五人格' 主线程绑定到大核
-com.netease.dwrg=$(format_cpu_ranges "$e_core $p_core") {
-	Thread-*=$(format_cpu_ranges "$p_core $hp_core")
-	NativeThread=$(format_cpu_ranges "$p_core $hp_core")
-}
-"
 
 RULES_CONFIG_FILE="${APPOPT_RULES_FILE:-$MODPATH/applist.conf}"
 echo "$common_rules" >> "$RULES_CONFIG_FILE"
-echo "$game_rules" >> "$RULES_CONFIG_FILE"
-unset common_rules game_rules RULES_CONFIG_FILE
+unset common_rules RULES_CONFIG_FILE
