@@ -26,7 +26,7 @@ use std::os::unix::fs::MetadataExt;
 // 3. 日常只比较数字 PID 目录快照，并复查新增 PID；命中后缓存 PID 和线程结果。
 // 4. 写 affinity 前先读当前 Cpus_allowed_list，相同则跳过，避免重复抢系统调度配置。
 // 5. 写入后再读回一次，用于发现移植系统/厂商服务把线程绑核抢写回去的情况。
-const VERSION: &str = "1.7.9";
+const VERSION: &str = "1.8.0";
 const DEFAULT_CONFIG: &str = "/data/adb/modules/AppOpt/config/applist.conf";
 const DEFAULT_UID_MAP: &str = "/data/adb/modules/AppOpt/config/package_uid.map";
 const RULE_HEALTH_FILE: &str = "/data/adb/modules/AppOpt/config/rule_health.tsv";

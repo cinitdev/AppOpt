@@ -56,8 +56,8 @@ object DaemonBridge {
     private const val FOREGROUND_TASK_MAX_AGE_MS = 12_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 179
-    const val REQUIRED_MODULE_VERSION_NAME = "1.7.9"
+    const val REQUIRED_MODULE_VERSION_CODE = 180
+    const val REQUIRED_MODULE_VERSION_NAME = "1.8.0"
     private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
