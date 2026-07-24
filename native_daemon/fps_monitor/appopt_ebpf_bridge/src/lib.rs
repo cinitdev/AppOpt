@@ -22,6 +22,7 @@ use aya::{
 };
 
 mod adaptive_boost;
+mod adaptive_governor;
 pub use adaptive_boost::{
     AppOptFrameMetrics, AppOptJankCtx, appopt_jank_create, appopt_jank_last_event,
     appopt_jank_recover, appopt_jank_stop, appopt_jank_update,

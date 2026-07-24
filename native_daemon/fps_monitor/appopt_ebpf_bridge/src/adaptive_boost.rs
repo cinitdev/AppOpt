@@ -78,31 +78,33 @@ pub extern "C" fn appopt_jank_stop(ctx: *mut AppOptJankCtx) {
         return;
     }
     unsafe {
-        let mut ctx = Box::from_raw(ctx);
-        ctx.inner.restore();
+        drop(Box::from_raw(ctx));
     }
 }
 
 /// 守护启动时恢复上一次异常退出留下的临时调度参数。
 #[unsafe(no_mangle)]
 pub extern "C" fn appopt_jank_recover() -> c_int {
-    platform::recover_stale_overrides()
+    platform::recover_stale_overrides() + crate::adaptive_governor::recover_stale_overrides()
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 mod platform {
     use super::AppOptFrameMetrics;
+    use crate::adaptive_governor::AdaptiveGovernor;
     use std::cmp::Ordering;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
     use std::fs;
     use std::io::Write;
     use std::mem;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     const SAMPLE_INTERVAL: Duration = Duration::from_millis(900);
-    const PULSE_DURATION: Duration = Duration::from_millis(1400);
-    const RECOVERY_FILE: &str = "/data/adb/modules/AppOpt/config/jank_boost.restore";
+    const MAX_BOOSTED_THREADS: usize = 16;
+    const RECOVERY_FILE: &str = "/data/adb/modules/AppOpt/config/boost.restore";
     const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
     const SCHED_FLAG_LATENCY_NICE: u64 = 0x80;
 
@@ -130,14 +132,18 @@ mod platform {
         nice_written: bool,
         original_attr: Option<SchedAttr>,
         written_attr: Option<SchedAttr>,
-        restore_attr: Option<SchedAttr>,
     }
 
     struct FileOverride {
         path: PathBuf,
         original: String,
         written: String,
-        pulse: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ThreadCpuSample {
+        total_ticks: u64,
+        starttime: u64,
     }
 
     pub struct JankController {
@@ -145,35 +151,45 @@ mod platform {
         pid: i32,
         baseline_samples: Vec<f64>,
         baseline_fps: f64,
-        low_count: u32,
-        severe_count: u32,
+        moderate_count: u32,
         smooth_count: u32,
         stopped_count: u32,
         stable_low_count: u32,
         previous_fps: f64,
+        jank_level: i32,
         boosted: bool,
+        restore_pending: bool,
+        thread_boost_attempted: bool,
+        thread_sample: Option<BTreeMap<i32, ThreadCpuSample>>,
+        governor: AdaptiveGovernor,
+        startup_message: Option<String>,
         last_sample: Option<Instant>,
-        pulse_until: Option<Instant>,
         threads: Vec<ThreadOverride>,
         files: Vec<FileOverride>,
     }
 
     impl JankController {
         pub fn new(pkg: String) -> Self {
+            let mut governor = AdaptiveGovernor::new();
+            let startup_message = governor.take_startup_message();
             Self {
                 pkg,
                 pid: -1,
                 baseline_samples: Vec::with_capacity(8),
                 baseline_fps: 0.0,
-                low_count: 0,
-                severe_count: 0,
+                moderate_count: 0,
                 smooth_count: 0,
                 stopped_count: 0,
                 stable_low_count: 0,
                 previous_fps: 0.0,
+                jank_level: 0,
                 boosted: false,
+                restore_pending: false,
+                thread_boost_attempted: false,
+                thread_sample: None,
+                governor,
+                startup_message,
                 last_sample: None,
-                pulse_until: None,
                 threads: Vec::new(),
                 files: Vec::new(),
             }
@@ -186,7 +202,6 @@ mod platform {
             metrics: Option<&AppOptFrameMetrics>,
         ) -> Option<(i32, String)> {
             let now = Instant::now();
-            self.restore_expired_pulses(now);
             if self
                 .last_sample
                 .is_some_and(|last| now.duration_since(last) < SAMPLE_INTERVAL)
@@ -195,7 +210,18 @@ mod platform {
             }
             self.last_sample = Some(now);
 
-            if pid <= 0 || (self.pid > 0 && self.pid != pid) {
+            if let Some(message) = self.startup_message.take() {
+                return Some((4, message));
+            }
+
+            if pid <= 0 {
+                if self.pid > 0 || self.jank_level > 0 || self.boosted || self.restore_pending {
+                    self.restore();
+                    self.reset_learning();
+                }
+                self.pid = pid;
+                return None;
+            } else if self.pid > 0 && self.pid != pid {
                 self.restore();
                 self.reset_learning();
                 self.pid = pid;
@@ -205,7 +231,9 @@ mod platform {
 
             if !fps.is_finite() || fps <= 1.0 {
                 self.stopped_count = self.stopped_count.saturating_add(1);
-                if self.stopped_count >= 2 && self.boosted {
+                if self.stopped_count >= 2
+                    && (self.jank_level > 0 || self.boosted || self.restore_pending)
+                {
                     return Some(if self.restore() {
                         (3, "目标停帧，已恢复增强参数".to_string())
                     } else {
@@ -215,6 +243,12 @@ mod platform {
                 return None;
             }
             self.stopped_count = 0;
+            let mild_irregular = metrics.is_some_and(|value| {
+                value.frame_count >= 6
+                    && value.median_interval_ns > 0
+                    && (value.p95_interval_ns > value.median_interval_ns.saturating_mul(15) / 10
+                        || value.max_interval_ns > value.median_interval_ns.saturating_mul(22) / 10)
+            });
             let irregular = metrics.is_some_and(|value| {
                 value.frame_count >= 6
                     && value.median_interval_ns > 0
@@ -234,13 +268,14 @@ mod platform {
                 return Some((4, format!("已学习帧率基线 {:.1} FPS", self.baseline_fps)));
             }
 
-            let low = fps < self.baseline_fps * 0.75 && (irregular || fallback_like);
+            let ordinary = fps < self.baseline_fps * 0.85 && (mild_irregular || fallback_like);
+            let moderate = fps < self.baseline_fps * 0.75 && (irregular || fallback_like);
             let severe = fps < self.baseline_fps * 0.55
                 || metrics.is_some_and(|value| {
                     value.median_interval_ns > 0
                         && value.max_interval_ns > value.median_interval_ns.saturating_mul(4)
                 });
-            if low
+            if ordinary
                 && fallback_like
                 && self.previous_fps > 0.0
                 && (fps - self.previous_fps).abs() <= (self.previous_fps * 0.05).max(1.0)
@@ -251,13 +286,13 @@ mod platform {
             }
             self.previous_fps = fps;
             if self.stable_low_count >= 5 {
-                let was_boosted = self.boosted;
-                self.restore();
+                let was_active = self.jank_level > 0 || self.boosted || self.restore_pending;
+                let restored = self.restore();
                 self.baseline_fps = fps;
-                self.low_count = 0;
+                self.moderate_count = 0;
                 self.stable_low_count = 0;
-                if was_boosted {
-                    return Some(if !self.boosted {
+                if was_active {
+                    return Some(if restored {
                         (3, "检测到稳定帧率档位变化，已恢复增强参数".to_string())
                     } else {
                         (
@@ -268,60 +303,104 @@ mod platform {
                 }
                 return Some((4, format!("已更新帧率基线为 {:.1} FPS", fps)));
             }
-            if low {
-                self.low_count = self.low_count.saturating_add(1);
-                self.smooth_count = 0;
-                self.severe_count = if severe {
-                    self.severe_count.saturating_add(1)
-                } else {
-                    0
-                };
-            } else {
-                self.low_count = 0;
-                self.severe_count = 0;
-                self.smooth_count = if irregular {
-                    0
-                } else {
-                    self.smooth_count.saturating_add(1)
-                };
-                if !self.boosted && !irregular {
-                    self.baseline_fps = self.baseline_fps.max(fps * 0.98).min(fps * 1.05);
-                }
-            }
 
-            if !self.boosted && self.low_count >= 2 {
-                let (detail, applied) = self.apply_base_boost(pid);
-                if !applied {
-                    self.low_count = 0;
-                    return Some((
-                        4,
-                        format!("{} 检测到卡顿，但未调整性能参数：{detail}", self.pkg),
-                    ));
-                }
-                self.boosted = true;
-                if severe {
-                    let _ = self.apply_frequency_pulse(now);
-                }
-                return Some((1, format!("{} 连续卡顿，已临时增强：{detail}", self.pkg)));
-            }
-            if self.boosted && self.severe_count >= 2 {
-                let frequency_count = self.apply_frequency_pulse(now);
-                self.severe_count = 0;
-                if frequency_count > 0 {
+            if severe {
+                let entering = self.jank_level < 3;
+                self.moderate_count = 0;
+                self.smooth_count = 0;
+                self.jank_level = 3;
+                self.restore_pending = false;
+                self.governor.set_level(3);
+                let (detail, applied) = if let Some(first) = self.thread_sample.take() {
+                    self.thread_boost_attempted = true;
+                    self.apply_thread_boost(pid, Some(first))
+                } else if !self.thread_boost_attempted {
+                    self.thread_sample = Some(snapshot_thread_cpu(pid));
+                    self.apply_thread_boost(pid, None)
+                } else if self.boosted {
+                    ("沿用已增强线程".to_string(), true)
+                } else {
+                    ("线程增强接口不可用".to_string(), false)
+                };
+                self.boosted |= applied;
+                if entering {
                     return Some((
                         2,
                         format!(
-                            "持续严重卡顿，已短时提升 {} 个频率接口响应",
-                            frequency_count
+                            "{} 严重卡顿，已立即进入重度调速；线程增强：{detail}",
+                            self.pkg
                         ),
                     ));
                 }
-                return Some((
-                    4,
-                    "持续严重卡顿，但当前设备没有可写的 CPU/GPU 频率接口".to_string(),
-                ));
+                return None;
             }
-            if self.boosted && self.smooth_count >= 3 {
+
+            if ordinary {
+                self.smooth_count = 0;
+                self.moderate_count = if moderate {
+                    self.moderate_count.saturating_add(1)
+                } else {
+                    if self.jank_level < 2 {
+                        self.thread_sample = None;
+                    }
+                    0
+                };
+                if self.moderate_count == 1
+                    && !self.thread_boost_attempted
+                    && self.thread_sample.is_none()
+                {
+                    self.thread_sample = Some(snapshot_thread_cpu(pid));
+                }
+                if self.moderate_count >= 2 {
+                    let entering = self.jank_level < 2;
+                    self.jank_level = 2;
+                    self.restore_pending = false;
+                    self.governor.set_level(2);
+                    let (detail, applied) = if let Some(first) = self.thread_sample.take() {
+                        self.thread_boost_attempted = true;
+                        self.apply_thread_boost(pid, Some(first))
+                    } else if self.boosted {
+                        ("沿用已增强线程".to_string(), true)
+                    } else if self.thread_boost_attempted {
+                        ("线程增强接口不可用".to_string(), false)
+                    } else {
+                        self.thread_boost_attempted = true;
+                        self.apply_thread_boost(pid, None)
+                    };
+                    self.boosted |= applied;
+                    if entering {
+                        return Some((
+                            1,
+                            format!("{} 连续卡顿升级为中度档；线程增强：{detail}", self.pkg),
+                        ));
+                    }
+                } else if self.jank_level == 0 {
+                    self.jank_level = 1;
+                    self.restore_pending = false;
+                    self.governor.set_level(1);
+                    return Some((
+                        1,
+                        format!("{} 检测到普通卡顿，已启用轻量 CPU 调速", self.pkg),
+                    ));
+                }
+                return None;
+            }
+
+            self.moderate_count = 0;
+            if self.jank_level == 0 {
+                self.thread_sample = None;
+            }
+            self.smooth_count = if mild_irregular {
+                0
+            } else {
+                self.smooth_count.saturating_add(1)
+            };
+            if self.jank_level == 0 && !mild_irregular {
+                self.baseline_fps = self.baseline_fps.max(fps * 0.98).min(fps * 1.05);
+            }
+            if (self.jank_level > 0 || self.boosted || self.restore_pending)
+                && self.smooth_count >= 3
+            {
                 return Some(if self.restore() {
                     (3, "帧率恢复稳定，已恢复增强参数".to_string())
                 } else {
@@ -337,64 +416,129 @@ mod platform {
         fn reset_learning(&mut self) {
             self.baseline_samples.clear();
             self.baseline_fps = 0.0;
-            self.low_count = 0;
-            self.severe_count = 0;
+            self.moderate_count = 0;
             self.smooth_count = 0;
             self.stopped_count = 0;
             self.stable_low_count = 0;
             self.previous_fps = 0.0;
+            self.jank_level = 0;
+            self.thread_boost_attempted = false;
+            self.thread_sample = None;
         }
 
-        fn apply_base_boost(&mut self, pid: i32) -> (String, bool) {
-            self.restore();
-            if !self.threads.is_empty() || !self.files.is_empty() {
-                return ("上一次增强参数仍在恢复中".to_string(), false);
-            }
-            let mut uclamp_ok = 0usize;
-            let mut latency_ok = 0usize;
+        fn apply_thread_boost(
+            &mut self,
+            pid: i32,
+            first: Option<BTreeMap<i32, ThreadCpuSample>>,
+        ) -> (String, bool) {
+            let mut uclamp_ok =
+                self.threads
+                    .iter()
+                    .filter(|item| {
+                        item.original_attr.zip(item.written_attr).is_some_and(
+                            |(original, written)| original.sched_util_min != written.sched_util_min,
+                        )
+                    })
+                    .count();
+            let mut latency_ok = self
+                .threads
+                .iter()
+                .filter(|item| {
+                    item.original_attr
+                        .zip(item.written_attr)
+                        .is_some_and(|(original, written)| {
+                            original.sched_latency_nice != written.sched_latency_nice
+                        })
+                })
+                .count();
             let mut nice_ok = 0usize;
             let mut uclamp_changed = 0usize;
             let mut latency_changed = 0usize;
-            for tid in selected_tids(pid) {
+            let selected = selected_tids_by_load(pid, first.as_ref());
+            let selected_count = selected.len();
+            let existing = self
+                .threads
+                .iter()
+                .map(|item| item.tid)
+                .collect::<BTreeSet<_>>();
+            let original_thread_count = self.threads.len();
+            for tid in selected {
+                if existing.contains(&tid) {
+                    continue;
+                }
                 let Some(starttime) = thread_starttime(tid) else {
                     continue;
                 };
-                // 必须在修改 nice 之前保存调度属性，否则恢复 uclamp 时会把 -5 再写回去。
                 let original_attr = sched_getattr(tid);
                 let original_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid as u32) };
                 let written_nice = original_nice.min(-5);
-                let mut written_attr = None;
-                let mut restore_attr = None;
-                if let Some(original) = original_attr {
+                let planned_attr = original_attr.map(|original| {
                     let mut attr = original;
                     attr.sched_flags |= SCHED_FLAG_UTIL_CLAMP_MIN | SCHED_FLAG_LATENCY_NICE;
                     attr.sched_util_min = attr.sched_util_min.max(512);
                     attr.sched_latency_nice = attr.sched_latency_nice.min(-10);
+                    attr
+                });
+                let attr_planned =
+                    original_attr
+                        .zip(planned_attr)
+                        .is_some_and(|(original, planned)| {
+                            original.sched_util_min != planned.sched_util_min
+                                || original.sched_latency_nice != planned.sched_latency_nice
+                        });
+                if original_nice == written_nice && !attr_planned {
+                    continue;
+                }
+
+                // 恢复记录必须先于系统参数写入，进程即使在 syscall 后立刻退出也能恢复。
+                self.threads.push(ThreadOverride {
+                    tid,
+                    starttime,
+                    original_nice,
+                    written_nice,
+                    nice_written: original_nice != written_nice,
+                    original_attr,
+                    written_attr: planned_attr,
+                });
+            }
+            if self.threads.len() > original_thread_count
+                && !sync_recovery_file(&self.files, &self.threads)
+            {
+                self.threads.truncate(original_thread_count);
+                return ("无法在增强前保存异常恢复状态".to_string(), false);
+            }
+            let had_pending_threads = self.threads.len() > original_thread_count;
+
+            for index in original_thread_count..self.threads.len() {
+                let tid = self.threads[index].tid;
+                let original_attr = self.threads[index].original_attr;
+                let original_nice = self.threads[index].original_nice;
+                let written_nice = self.threads[index].written_nice;
+                let planned_attr = self.threads[index].written_attr;
+                let mut written_attr = None;
+                if let Some(original) = original_attr {
+                    let attr = planned_attr.unwrap_or(original);
                     if sched_setattr_verified(tid, &attr, true, true) {
                         uclamp_ok += 1;
                         latency_ok += 1;
                         written_attr = Some(sched_getattr(tid).unwrap_or(attr));
-                        restore_attr = Some(restore_attr_for(&attr, original));
                     } else {
-                        let _ = sched_setattr(tid, &restore_attr_for(&attr, original));
+                        let _ = restore_sched_fields(tid, original, attr);
                         let mut latency_only = attr;
                         latency_only.sched_flags &= !SCHED_FLAG_UTIL_CLAMP_MIN;
                         if sched_setattr_verified(tid, &latency_only, false, true) {
                             latency_ok += 1;
                             written_attr = Some(sched_getattr(tid).unwrap_or(latency_only));
-                            restore_attr = Some(restore_attr_for(&latency_only, original));
                         } else {
-                            let _ = sched_setattr(tid, &restore_attr_for(&latency_only, original));
+                            let _ = restore_sched_fields(tid, original, latency_only);
                             let mut uclamp_only = attr;
                             uclamp_only.sched_flags &= !SCHED_FLAG_LATENCY_NICE;
                             if sched_setattr_verified(tid, &uclamp_only, true, false) {
                                 uclamp_ok += 1;
                                 written_attr = Some(sched_getattr(tid).unwrap_or(uclamp_only));
-                                restore_attr = Some(restore_attr_for(&uclamp_only, original));
                             } else {
                                 // 某些内核会接受调用但不应用字段，失败时主动撤销可能的部分写入。
-                                let _ =
-                                    sched_setattr(tid, &restore_attr_for(&uclamp_only, original));
+                                let _ = restore_sched_fields(tid, original, uclamp_only);
                             }
                         }
                     }
@@ -407,6 +551,8 @@ mod platform {
                 if nice_written {
                     nice_ok += 1;
                 }
+                self.threads[index].nice_written = nice_written;
+                self.threads[index].written_attr = written_attr;
                 let mut attr_changed = false;
                 if let (Some(original), Some(written)) = (original_attr, written_attr) {
                     if original.sched_util_min != written.sched_util_min {
@@ -419,22 +565,21 @@ mod platform {
                     }
                 }
                 if !nice_written && !attr_changed {
-                    continue;
+                    self.threads[index].written_attr = None;
                 }
-                self.threads.push(ThreadOverride {
-                    tid,
-                    starttime,
-                    original_nice,
-                    written_nice,
-                    nice_written,
-                    original_attr,
-                    written_attr,
-                    restore_attr,
-                });
-                if !sync_recovery_file(&self.files, &self.threads) {
-                    let _ = self.restore();
-                    return ("无法保存异常恢复状态".to_string(), false);
-                }
+            }
+            self.threads.retain(|item| {
+                item.nice_written
+                    || item.original_attr.zip(item.written_attr).is_some_and(
+                        |(original, written)| {
+                            original.sched_util_min != written.sched_util_min
+                                || original.sched_latency_nice != written.sched_latency_nice
+                        },
+                    )
+            });
+            if had_pending_threads && !sync_recovery_file(&self.files, &self.threads) {
+                let _ = self.restore();
+                return ("无法保存异常恢复状态".to_string(), false);
             }
             let cgroup_uclamp = uclamp_ok == 0
                 && [
@@ -443,7 +588,7 @@ mod platform {
                     "/sys/fs/cgroup/cpu/top-app/cpu.uclamp.min",
                 ]
                 .iter()
-                .any(|path| self.apply_file_override(Path::new(path), "50", false));
+                .any(|path| self.apply_file_override(Path::new(path), "50"));
             let latency_sensitive = latency_ok == 0
                 && [
                     "/dev/cpuctl/top-app/cpu.uclamp.latency_sensitive",
@@ -451,18 +596,15 @@ mod platform {
                     "/sys/fs/cgroup/cpu/top-app/cpu.uclamp.latency_sensitive",
                 ]
                 .iter()
-                .any(|path| self.apply_file_override(Path::new(path), "1", false));
+                .any(|path| self.apply_file_override(Path::new(path), "1"));
             let schedtune = uclamp_ok == 0
                 && !cgroup_uclamp
-                && (self.apply_file_override(
-                    Path::new("/dev/stune/top-app/schedtune.boost"),
-                    "20",
-                    false,
-                ) || self.apply_file_override(
-                    Path::new("/sys/fs/cgroup/stune/top-app/schedtune.boost"),
-                    "20",
-                    false,
-                ));
+                && (self
+                    .apply_file_override(Path::new("/dev/stune/top-app/schedtune.boost"), "20")
+                    || self.apply_file_override(
+                        Path::new("/sys/fs/cgroup/stune/top-app/schedtune.boost"),
+                        "20",
+                    ));
             let applied = nice_ok > 0
                 || uclamp_changed > 0
                 || latency_changed > 0
@@ -471,7 +613,8 @@ mod platform {
                 || schedtune;
             let detail = if applied {
                 format!(
-                    "nice={} uclamp={} cgroup_uclamp={} latency_nice={} latency_sensitive={} schedtune={}",
+                    "采样线程={} nice={} uclamp={} cgroup_uclamp={} latency_nice={} latency_sensitive={} schedtune={}",
+                    selected_count,
                     nice_ok,
                     uclamp_changed,
                     if cgroup_uclamp { "50" } else { "未启用" },
@@ -487,26 +630,7 @@ mod platform {
             (detail, applied)
         }
 
-        fn apply_frequency_pulse(&mut self, now: Instant) -> usize {
-            self.restore_pulses();
-            let mut applied = 0usize;
-            for (path, value) in cpu_policy_targets() {
-                if self.apply_file_override(&path, &value, true) {
-                    applied += 1;
-                }
-            }
-            for (path, value) in gpu_targets() {
-                if self.apply_file_override(&path, &value, true) {
-                    applied += 1;
-                }
-            }
-            if applied > 0 {
-                self.pulse_until = Some(now + PULSE_DURATION);
-            }
-            applied
-        }
-
-        fn apply_file_override(&mut self, path: &Path, value: &str, pulse: bool) -> bool {
+        fn apply_file_override(&mut self, path: &Path, value: &str) -> bool {
             let Ok(original) = fs::read_to_string(path) else {
                 return false;
             };
@@ -521,14 +645,25 @@ mod platform {
                 path: path.to_path_buf(),
                 original: original.clone(),
                 written: value.to_string(),
-                pulse,
             });
             if !sync_recovery_file(&self.files, &self.threads) {
                 self.files.pop();
                 return false;
             }
             if !write_value(path, value) {
-                self.files.pop();
+                let keep_record = match fs::read_to_string(path) {
+                    Ok(current) if value_matches(&current, value) => {
+                        !write_value(path, &original)
+                            || fs::read_to_string(path)
+                                .ok()
+                                .is_none_or(|current| !value_matches(&current, &original))
+                    }
+                    Ok(_) => false,
+                    Err(_) => true,
+                };
+                if !keep_record {
+                    self.files.pop();
+                }
                 let _ = sync_recovery_file(&self.files, &self.threads);
                 return false;
             }
@@ -536,29 +671,28 @@ mod platform {
                 .ok()
                 .is_none_or(|current| !value_matches(&current, value))
             {
-                let _ = write_value(path, &original);
-                self.files.pop();
+                let restored = match fs::read_to_string(path) {
+                    Ok(current) if value_matches(&current, value) => {
+                        write_value(path, &original)
+                            && fs::read_to_string(path)
+                                .ok()
+                                .is_some_and(|current| value_matches(&current, &original))
+                    }
+                    Ok(_) => true,
+                    Err(_) => false,
+                };
+                if restored {
+                    self.files.pop();
+                }
                 let _ = sync_recovery_file(&self.files, &self.threads);
                 return false;
             }
             true
         }
 
-        fn restore_expired_pulses(&mut self, now: Instant) {
-            if self.pulse_until.is_some_and(|deadline| now >= deadline) {
-                self.restore_pulses();
-            }
-        }
-
-        fn restore_pulses(&mut self) {
-            restore_files(&mut self.files, true);
-            let _ = sync_recovery_file(&self.files, &self.threads);
-            self.pulse_until = None;
-        }
-
         pub fn restore(&mut self) -> bool {
-            self.restore_pulses();
-            restore_files(&mut self.files, false);
+            let governor_restored = self.governor.restore();
+            restore_files(&mut self.files);
             let mut retained_threads = Vec::new();
             for item in self.threads.drain(..) {
                 let proc_path = PathBuf::from(format!("/proc/{}", item.tid));
@@ -587,32 +721,25 @@ mod platform {
                         restored = false;
                     }
                 }
-                if let (Some(written), Some(restore_attr)) = (item.written_attr, item.restore_attr)
+                if let (Some(original), Some(written)) = (item.original_attr, item.written_attr)
+                    && !restore_sched_fields(item.tid, original, written)
                 {
-                    if sched_getattr(item.tid)
-                        .is_some_and(|current| sched_attr_matches(&current, &written))
-                    {
-                        if !sched_setattr(item.tid, &restore_attr)
-                            || item.original_attr.is_some_and(|original| {
-                                sched_getattr(item.tid)
-                                    .is_none_or(|current| !sched_attr_matches(&current, &original))
-                            })
-                        {
-                            restored = false;
-                        }
-                    }
+                    restored = false;
                 }
                 if !restored {
                     retained_threads.push(item);
                 }
             }
             self.threads = retained_threads;
-            let _ = sync_recovery_file(&self.files, &self.threads);
+            let recovery_synced = sync_recovery_file(&self.files, &self.threads);
             self.boosted = !self.threads.is_empty() || !self.files.is_empty();
-            self.low_count = 0;
-            self.severe_count = 0;
+            self.restore_pending = !governor_restored || !recovery_synced;
+            self.jank_level = 0;
+            self.thread_boost_attempted = self.boosted;
+            self.thread_sample = None;
+            self.moderate_count = 0;
             self.smooth_count = 0;
-            !self.boosted
+            !self.restore_pending && !self.boosted
         }
     }
 
@@ -622,11 +749,42 @@ mod platform {
         }
     }
 
-    fn selected_tids(pid: i32) -> Vec<i32> {
-        let mut preferred = Vec::new();
-        let mut ordinary = Vec::new();
+    fn selected_tids_by_load(pid: i32, first: Option<&BTreeMap<i32, ThreadCpuSample>>) -> Vec<i32> {
+        let second = snapshot_thread_cpu(pid);
+
+        let mut ranked = second
+            .iter()
+            .filter_map(|(tid, current)| {
+                let previous = first?.get(tid)?;
+                (current.starttime == previous.starttime).then_some((
+                    *tid,
+                    current.total_ticks.saturating_sub(previous.total_ticks),
+                ))
+            })
+            .filter(|(_, delta)| *delta > 0)
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+        let mut selected = Vec::with_capacity(MAX_BOOSTED_THREADS);
+        if pid > 0 {
+            selected.push(pid);
+        }
+        for (tid, _) in ranked {
+            if selected.len() >= MAX_BOOSTED_THREADS {
+                break;
+            }
+            if tid == pid {
+                continue;
+            }
+            selected.push(tid);
+        }
+        selected
+    }
+
+    fn snapshot_thread_cpu(pid: i32) -> BTreeMap<i32, ThreadCpuSample> {
+        let mut snapshot = BTreeMap::new();
         let Ok(entries) = fs::read_dir(format!("/proc/{pid}/task")) else {
-            return vec![pid];
+            return snapshot;
         };
         for entry in entries.flatten() {
             let Some(tid) = entry
@@ -636,56 +794,31 @@ mod platform {
             else {
                 continue;
             };
-            let name = fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase();
-            if is_maintenance_thread(&name) {
-                continue;
-            }
-            if tid == pid || is_render_thread(&name) {
-                preferred.push(tid);
-            } else {
-                ordinary.push(tid);
+            if let Some(sample) = read_thread_cpu_sample(pid, tid) {
+                snapshot.insert(tid, sample);
             }
         }
-        preferred.truncate(64);
-        let remaining = 64usize.saturating_sub(preferred.len());
-        preferred.extend(ordinary.into_iter().take(remaining));
-        if preferred.is_empty() {
-            preferred.push(pid);
-        }
-        preferred
+        snapshot
     }
 
-    fn is_render_thread(name: &str) -> bool {
-        [
-            "render",
-            "unity",
-            "gfx",
-            "glthread",
-            "vulkan",
-            "rhi",
-            "game",
-            "ue4",
-            "thread-shared",
-        ]
-        .iter()
-        .any(|key| name.contains(key))
+    fn read_thread_cpu_sample(pid: i32, tid: i32) -> Option<ThreadCpuSample> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")).ok()?;
+        parse_thread_cpu_sample(&stat)
     }
 
-    fn is_maintenance_thread(name: &str) -> bool {
-        [
-            "signal catcher",
-            "heaptask",
-            "gc",
-            "finalizer",
-            "referencequeue",
-            "jit thread",
-            "binder:",
-        ]
-        .iter()
-        .any(|key| name.contains(key))
+    fn parse_thread_cpu_sample(stat: &str) -> Option<ThreadCpuSample> {
+        let close = stat.rfind(')')?;
+        let fields = stat
+            .get(close + 1..)?
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let utime = fields.get(11)?.parse::<u64>().ok()?;
+        let stime = fields.get(12)?.parse::<u64>().ok()?;
+        let starttime = fields.get(19)?.parse::<u64>().ok()?;
+        Some(ThreadCpuSample {
+            total_ticks: utime.saturating_add(stime),
+            starttime,
+        })
     }
 
     fn sched_getattr(tid: i32) -> Option<SchedAttr> {
@@ -732,28 +865,109 @@ mod platform {
             && (!expect_latency || current.sched_latency_nice == attr.sched_latency_nice)
     }
 
-    fn restore_attr_for(written: &SchedAttr, original: SchedAttr) -> SchedAttr {
-        let mut restore = original;
-        // sched_setattr 只有在对应 flag 置位时才会写入 uclamp/latency_nice，
-        // 因此恢复时必须带回实际修改过的 flag，不能直接复用原始属性。
-        restore.sched_flags |=
-            written.sched_flags & (SCHED_FLAG_UTIL_CLAMP_MIN | SCHED_FLAG_LATENCY_NICE);
-        restore.sched_util_min = original.sched_util_min;
-        restore.sched_latency_nice = original.sched_latency_nice;
-        restore
-    }
-
-    fn sched_attr_matches(left: &SchedAttr, right: &SchedAttr) -> bool {
-        left.sched_util_min == right.sched_util_min
-            && left.sched_latency_nice == right.sched_latency_nice
+    fn restore_sched_fields(tid: i32, original: SchedAttr, written: SchedAttr) -> bool {
+        let Some(current) = sched_getattr(tid) else {
+            return false;
+        };
+        let mut restore = current;
+        let mut restore_uclamp = false;
+        let mut restore_latency = false;
+        if written.sched_util_min != original.sched_util_min
+            && current.sched_util_min == written.sched_util_min
+        {
+            restore.sched_flags |= SCHED_FLAG_UTIL_CLAMP_MIN;
+            restore.sched_util_min = original.sched_util_min;
+            restore_uclamp = true;
+        }
+        if written.sched_latency_nice != original.sched_latency_nice
+            && current.sched_latency_nice == written.sched_latency_nice
+        {
+            restore.sched_flags |= SCHED_FLAG_LATENCY_NICE;
+            restore.sched_latency_nice = original.sched_latency_nice;
+            restore_latency = true;
+        }
+        if !restore_uclamp && !restore_latency {
+            return true;
+        }
+        if !sched_setattr(tid, &restore) {
+            return false;
+        }
+        let Some(after) = sched_getattr(tid) else {
+            return false;
+        };
+        (!restore_uclamp || after.sched_util_min == original.sched_util_min)
+            && (!restore_latency || after.sched_latency_nice == original.sched_latency_nice)
     }
 
     fn write_value(path: &Path, value: &str) -> bool {
-        fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .and_then(|mut file| file.write_all(value.as_bytes()))
-            .is_ok()
+        // msm_performance 参数是“逐个 CPU:频率”命令节点，整行写回只会处理第一个参数。
+        // 因此目标值和恢复值都必须逐项写入。
+        if path
+            .to_string_lossy()
+            .contains("/msm_performance/parameters/cpu_")
+            && value.split_whitespace().count() > 1
+        {
+            let mut wrote = false;
+            for pair in ordered_cpu_pairs(value) {
+                if !write_single_value(path, pair) {
+                    return false;
+                }
+                wrote = true;
+            }
+            return wrote;
+        }
+        write_single_value(path, value)
+    }
+
+    fn ordered_cpu_pairs(value: &str) -> Vec<&str> {
+        let mut by_cpu = BTreeMap::new();
+        let mut remaining = Vec::new();
+        for pair in value.split_whitespace() {
+            let Some((cpu, _)) = pair.split_once(':') else {
+                remaining.push(pair);
+                continue;
+            };
+            let Ok(cpu) = cpu.parse::<usize>() else {
+                remaining.push(pair);
+                continue;
+            };
+            by_cpu.insert(cpu, pair);
+        }
+        let mut ordered = Vec::with_capacity(by_cpu.len() + remaining.len());
+        for pair in by_cpu.values().rev() {
+            ordered.push(*pair);
+        }
+        ordered.extend(remaining);
+        ordered
+    }
+
+    fn write_single_value(path: &Path, value: &str) -> bool {
+        let write = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(value.as_bytes()))
+                .is_ok()
+        };
+        if write() {
+            return true;
+        }
+
+        // 部分厂商把频率节点暴露成 0444，Scene daemon 会临时放开权限后再恢复。
+        // 这里也只在普通写入失败时尝试，避免改变节点的长期权限。
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        let original_mode = metadata.permissions().mode();
+        let writable_mode = original_mode | 0o600;
+        if writable_mode == original_mode
+            || fs::set_permissions(path, fs::Permissions::from_mode(writable_mode)).is_err()
+        {
+            return false;
+        }
+        let written = write();
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(original_mode));
+        written
     }
 
     fn value_matches(current: &str, expected: &str) -> bool {
@@ -767,24 +981,36 @@ mod platform {
                 .is_some_and(|(left, right)| (left - right).abs() < 0.001)
     }
 
-    fn restore_files(files: &mut Vec<FileOverride>, pulse_only: bool) {
+    fn cpu_pairs_match(current: &str, expected: &str) -> bool {
+        let current = current.split_whitespace().collect::<BTreeSet<_>>();
+        let expected = expected.split_whitespace().collect::<Vec<_>>();
+        !expected.is_empty() && expected.into_iter().all(|pair| current.contains(pair))
+    }
+
+    fn override_matches(current: &str, expected: &str, cpu_pairs: bool) -> bool {
+        if cpu_pairs {
+            cpu_pairs_match(current, expected)
+        } else {
+            value_matches(current, expected)
+        }
+    }
+
+    fn restore_files(files: &mut Vec<FileOverride>) {
         let mut retained = Vec::new();
         for item in files.drain(..).rev() {
-            if pulse_only && !item.pulse {
+            let Ok(current) = fs::read_to_string(&item.path) else {
                 retained.push(item);
                 continue;
+            };
+            if !value_matches(&current, &item.written) {
+                continue;
             }
-            if fs::read_to_string(&item.path)
-                .ok()
-                .is_some_and(|value| value_matches(&value, &item.written))
+            if !write_value(&item.path, &item.original)
+                || fs::read_to_string(&item.path)
+                    .ok()
+                    .is_none_or(|value| !value_matches(&value, &item.original))
             {
-                if !write_value(&item.path, &item.original)
-                    || fs::read_to_string(&item.path)
-                        .ok()
-                        .is_none_or(|value| !value_matches(&value, &item.original))
-                {
-                    retained.push(item);
-                }
+                retained.push(item);
             }
         }
         retained.reverse();
@@ -833,13 +1059,31 @@ mod platform {
     }
 
     fn write_recovery_content(content: &str) -> bool {
-        let path = Path::new(RECOVERY_FILE);
+        write_recovery_content_at(Path::new(RECOVERY_FILE), content)
+    }
+
+    fn write_recovery_content_at(path: &Path, content: &str) -> bool {
         if content.is_empty() {
-            let _ = fs::remove_file(path);
-            return true;
+            let removed = match fs::remove_file(path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            let _ = fs::remove_file(path.with_extension("restore.tmp"));
+            return removed;
         }
         let tmp = path.with_extension("restore.tmp");
-        if fs::write(&tmp, content).is_ok() && fs::rename(&tmp, path).is_ok() {
+        let written = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .and_then(|mut file| {
+                file.write_all(content.as_bytes())?;
+                file.sync_all()
+            })
+            .is_ok();
+        if written && fs::rename(&tmp, path).is_ok() {
             true
         } else {
             let _ = fs::remove_file(tmp);
@@ -875,18 +1119,18 @@ mod platform {
         write_recovery_content(&content)
     }
 
-    fn recover_file_override(target: &str, original: &str, written: &str) -> bool {
+    fn recover_file_override(target: &str, original: &str, written: &str, cpu_pairs: bool) -> bool {
         let target = Path::new(target);
         let Ok(current) = fs::read_to_string(target) else {
             return false;
         };
-        if !value_matches(&current, written) {
+        if !override_matches(&current, written, cpu_pairs) {
             return true;
         }
         write_value(target, original)
             && fs::read_to_string(target)
                 .ok()
-                .is_some_and(|value| value_matches(&value, original))
+                .is_some_and(|value| override_matches(&value, original, cpu_pairs))
     }
 
     fn recover_thread_override(fields: &[&str]) -> bool {
@@ -927,22 +1171,15 @@ mod platform {
                     && unsafe { libc::getpriority(libc::PRIO_PROCESS, tid as u32) }
                         == original_nice;
         }
-        if let (Some(original), Some(written)) = (original_attr, written_attr) {
-            if sched_getattr(tid).is_some_and(|current| sched_attr_matches(&current, &written)) {
-                let restore = restore_attr_for(&written, original);
-                if !sched_setattr(tid, &restore)
-                    || sched_getattr(tid)
-                        .is_none_or(|current| !sched_attr_matches(&current, &original))
-                {
-                    restored = false;
-                }
-            }
+        if let (Some(original), Some(written)) = (original_attr, written_attr)
+            && !restore_sched_fields(tid, original, written)
+        {
+            restored = false;
         }
         restored
     }
 
-    pub fn recover_stale_overrides() -> i32 {
-        let path = Path::new(RECOVERY_FILE);
+    fn recover_stale_file(path: &Path) -> i32 {
         let Ok(content) = fs::read_to_string(path) else {
             return 0;
         };
@@ -951,12 +1188,14 @@ mod platform {
         for line in content.lines() {
             let fields = line.split('\t').collect::<Vec<_>>();
             let done = if fields.first() == Some(&"F") && fields.len() == 4 {
-                recover_file_override(fields[1], fields[2], fields[3])
+                recover_file_override(fields[1], fields[2], fields[3], false)
+            } else if fields.first() == Some(&"P") && fields.len() == 4 {
+                recover_file_override(fields[1], fields[2], fields[3], true)
             } else if fields.first() == Some(&"T") {
                 recover_thread_override(&fields)
             } else if fields.len() == 3 {
                 // 兼容旧版仅保存文件覆盖的三列恢复记录。
-                recover_file_override(fields[0], fields[1], fields[2])
+                recover_file_override(fields[0], fields[1], fields[2], false)
             } else {
                 true
             };
@@ -967,92 +1206,17 @@ mod platform {
                 retained.push('\n');
             }
         }
-        let _ = write_recovery_content(&retained);
+        let _ = write_recovery_content_at(path, &retained);
         recovered
+    }
+
+    pub fn recover_stale_overrides() -> i32 {
+        recover_stale_file(Path::new(RECOVERY_FILE))
     }
 
     fn thread_starttime(tid: i32) -> Option<u64> {
         let stat = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
-        let close = stat.rfind(')')?;
-        stat.get(close + 1..)?
-            .split_whitespace()
-            .nth(19)?
-            .parse()
-            .ok()
-    }
-
-    fn cpu_policy_targets() -> Vec<(PathBuf, String)> {
-        let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") else {
-            return Vec::new();
-        };
-        let mut policies = entries
-            .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("policy"))
-            .filter_map(|entry| {
-                let dir = entry.path();
-                let max = fs::read_to_string(dir.join("scaling_max_freq"))
-                    .ok()?
-                    .trim()
-                    .parse::<u64>()
-                    .ok()?;
-                Some((max, dir.join("scaling_min_freq"), max.to_string()))
-            })
-            .collect::<Vec<_>>();
-        policies.sort_by_key(|(max, _, _)| *max);
-        policies
-            .into_iter()
-            .rev()
-            .take(2)
-            .map(|(_, path, value)| (path, value))
-            .collect()
-    }
-
-    fn gpu_targets() -> Vec<(PathBuf, String)> {
-        let mut targets = fs::read_dir("/sys/class/devfreq")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|entry| {
-                let dir = entry.path();
-                let identity = format!(
-                    "{} {}",
-                    entry.file_name().to_string_lossy(),
-                    fs::read_to_string(dir.join("name")).unwrap_or_default()
-                )
-                .to_ascii_lowercase();
-                if !["gpu", "kgsl", "mali"]
-                    .iter()
-                    .any(|key| identity.contains(key))
-                {
-                    return None;
-                }
-                let max = fs::read_to_string(dir.join("max_freq"))
-                    .ok()?
-                    .trim()
-                    .parse::<u64>()
-                    .ok()?;
-                Some((dir.join("min_freq"), max.to_string()))
-            })
-            .collect::<Vec<_>>();
-        for (min_path, max_path) in [
-            (
-                "/sys/class/kgsl/kgsl-3d0/devfreq/min_freq",
-                "/sys/class/kgsl/kgsl-3d0/devfreq/max_freq",
-            ),
-            (
-                "/sys/class/kgsl/kgsl-3d0/min_gpuclk",
-                "/sys/class/kgsl/kgsl-3d0/max_gpuclk",
-            ),
-        ] {
-            let min_path = PathBuf::from(min_path);
-            let Ok(max) = fs::read_to_string(max_path) else {
-                continue;
-            };
-            if !targets.iter().any(|(path, _)| path == &min_path) {
-                targets.push((min_path, max.trim().to_string()));
-            }
-        }
-        targets
+        parse_thread_cpu_sample(&stat).map(|sample| sample.starttime)
     }
 }
 

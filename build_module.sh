@@ -834,11 +834,12 @@ build_and_embed_app
 
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"
 BPF_PERF_SRC="$FPS_MON/bpf/queuebuffer_probe_perf.bpf.c"
+BPF_CPU_UTIL_SRC="$FPS_MON/bpf/cpu_util_monitor.bpf.c"
 mkdir -p "$WORK/config/ebpf"
-BPF_OBJ="$WORK/config/ebpf/queuebuffer_probe.bpf.o"
-BPF_PERF_OBJ="$WORK/config/ebpf/queuebuffer_probe_perf.bpf.o"
+BPF_CPU_UTIL_OBJ="$WORK/config/ebpf/cpu_util_monitor.bpf.o"
 [ -f "$BPF_SRC" ] || { echo "! 找不到 BPF 源码: $BPF_SRC"; exit 1; }
 [ -f "$BPF_PERF_SRC" ] || { echo "! 找不到 PerfEvent BPF 源码: $BPF_PERF_SRC"; exit 1; }
+[ -f "$BPF_CPU_UTIL_SRC" ] || { echo "! 找不到 CPU 利用率 BPF 源码: $BPF_CPU_UTIL_SRC"; exit 1; }
 
 CLANG="$BIN/clang"
 [ ! -f "$CLANG" ] && CLANG="$BIN/clang.exe"
@@ -868,6 +869,19 @@ build_bpf_obj() {
     [ -s "$obj" ] || { echo "! BPF 对象构建失败: $label"; exit 1; }
 }
 
+build_common_bpf_obj() {
+    local src="$1" obj="$2" label="$3"
+    echo "- 构建通用 BPF 对象: $label"
+    (
+        cd "$(dirname "$src")"
+        "$CLANG" -target bpf -g -O2 -c "$(basename "$src")" -o "$obj" \
+            -fdebug-compilation-dir=. \
+            -ffile-prefix-map="$ROOT=." \
+            -Wno-unused-value
+    )
+    [ -s "$obj" ] || { echo "! BPF 对象构建失败: $label"; exit 1; }
+}
+
 build_bpf_pair_for_abi() {
     local abidir="$1" target_arch="$2" include_arch="$3" abi_define="$4"
     local ebpf_dir="$WORK/config/ebpf/$abidir"
@@ -880,10 +894,7 @@ build_bpf_pair_for_abi arm64-v8a   __TARGET_ARCH_arm64 aarch64-linux-android  AP
 build_bpf_pair_for_abi armeabi-v7a __TARGET_ARCH_arm   arm-linux-androideabi  APPOPT_BPF_ARM
 build_bpf_pair_for_abi x86_64      __TARGET_ARCH_x86   x86_64-linux-android   APPOPT_BPF_X86_64
 build_bpf_pair_for_abi x86         __TARGET_ARCH_x86   i686-linux-android      APPOPT_BPF_I386
-
-# 保留根目录默认对象，兼容手动解包测试；正式刷入时 customize.sh 会按设备 ABI 覆盖。
-cp "$WORK/config/ebpf/arm64-v8a/queuebuffer_probe.bpf.o" "$BPF_OBJ"
-cp "$WORK/config/ebpf/arm64-v8a/queuebuffer_probe_perf.bpf.o" "$BPF_PERF_OBJ"
+build_common_bpf_obj "$BPF_CPU_UTIL_SRC" "$BPF_CPU_UTIL_OBJ" "cpu_util_monitor.bpf.c"
 
 build_abi() {
     local triple="$1" abidir="$2" rust_target="$3"

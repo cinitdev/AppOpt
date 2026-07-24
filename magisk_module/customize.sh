@@ -47,10 +47,13 @@ extract_bin() {
 	fi
 	cp $MODPATH/config/bin/$BIN_ABI_DIR/AppOpt $MODPATH/config/bin/AppOpt
 	[ -f $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs ] && cp $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs $MODPATH/config/bin/AppOptRs
-	if [ -d "$MODPATH/config/ebpf/$BIN_ABI_DIR" ]; then
-		cp "$MODPATH/config/ebpf/$BIN_ABI_DIR/queuebuffer_probe.bpf.o" "$MODPATH/config/ebpf/queuebuffer_probe.bpf.o" 2>/dev/null || true
-		cp "$MODPATH/config/ebpf/$BIN_ABI_DIR/queuebuffer_probe_perf.bpf.o" "$MODPATH/config/ebpf/queuebuffer_probe_perf.bpf.o" 2>/dev/null || true
-	fi
+	[ -d "$MODPATH/config/ebpf/$BIN_ABI_DIR" ] || abort "! 缺少 eBPF ABI 目录: $BIN_ABI_DIR"
+	cp "$MODPATH/config/ebpf/$BIN_ABI_DIR/queuebuffer_probe.bpf.o" "$MODPATH/config/ebpf/queuebuffer_probe.bpf.o" 2>/dev/null \
+		|| abort "! 安装 queueBuffer RingBuf eBPF 对象失败"
+	cp "$MODPATH/config/ebpf/$BIN_ABI_DIR/queuebuffer_probe_perf.bpf.o" "$MODPATH/config/ebpf/queuebuffer_probe_perf.bpf.o" 2>/dev/null \
+		|| abort "! 安装 queueBuffer PerfEvent eBPF 对象失败"
+	[ -f "$MODPATH/config/ebpf/cpu_util_monitor.bpf.o" ] \
+		|| abort "! 缺少 CPU 利用率 eBPF 对象"
 	ui_print "- Device platform: $ARCH"
 	rm -rf $MODPATH/config/bin/armeabi-v7a $MODPATH/config/bin/arm64-v8a $MODPATH/config/bin/x86 $MODPATH/config/bin/x86_64
 	rm -rf $MODPATH/config/ebpf/armeabi-v7a $MODPATH/config/ebpf/arm64-v8a $MODPATH/config/ebpf/x86 $MODPATH/config/ebpf/x86_64
@@ -413,7 +416,10 @@ prepare_jank_boost_config() {
 		: > "$PENDING_JANK_BOOST"
 	fi
 	# 恢复清单只属于当前开机周期，不带入待刷入模块。
-	rm -f "$MODPATH/config/jank_boost.restore" "$MODPATH/config/jank_boost.restore.tmp"
+	rm -f "$MODPATH/config/jank_boost.restore" "$MODPATH/config/jank_boost.restore.tmp" \
+		"$MODPATH/config/boost.restore" "$MODPATH/config/boost.restore.tmp" \
+		"$MODPATH/config/adaptive_governor.restore" \
+		"$MODPATH/config/adaptive_governor.restore.tmp"
 	# PID 缓存只在运行时生成，旧名称和新名称都不迁移。
 	rm -f "$MODPATH/config/process_index.tsv" "$MODPATH/config/process_index.tsv."*.tmp \
 		"$MODPATH/config/pid_cache.tsv" "$MODPATH/config/pid_cache.tsv."*.tmp
