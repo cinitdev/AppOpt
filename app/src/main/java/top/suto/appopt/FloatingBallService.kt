@@ -67,6 +67,7 @@ class FloatingBallService : Service() {
     private var foregroundCheckGeneration = -1L
     private var monitorGeneration = 0L
     private var pendingStopRunnable: Runnable? = null
+    private var expectedStopReason: String? = null
 
     private data class ForegroundCheckSnapshot(
         val generation: Long,
@@ -110,12 +111,17 @@ class FloatingBallService : Service() {
         private val FPS_COMMAND_EXECUTOR = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "AppOptFpsCommand").apply { isDaemon = true }
         }
+
+        @Volatile private var runningInProcess = false
+
+        fun isRunningInProcess(): Boolean = runningInProcess
     }
 
     override fun onCreate() {
         super.onCreate()
         android.util.Log.d("AppOpt", "FloatingBallService onCreate")
         serviceDestroyed = false
+        runningInProcess = true
         startForeground(NOTIF_ID, buildNotification())
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         // fpsMonitor 和悬浮窗延迟到 onStartCommand 初始化, 需要明确的 targetPkg。
@@ -152,11 +158,22 @@ class FloatingBallService : Service() {
         pendingStopRunnable = null
     }
 
-    private fun scheduleStopSelf(delayMs: Long, generation: Long = monitorGeneration) {
+    private fun stopNormally(reason: String) {
+        if (expectedStopReason == null) expectedStopReason = reason
+        FloatingBallSessionState.markExpectedStop(this, reason)
+        android.util.Log.d("AppOpt", "FloatingBallService stopSelf: reason=$reason")
+        stopSelf()
+    }
+
+    private fun scheduleStopSelf(
+        delayMs: Long,
+        generation: Long = monitorGeneration,
+        reason: String
+    ) {
         cancelPendingStop()
         val stop = Runnable {
             pendingStopRunnable = null
-            if (!serviceDestroyed && generation == monitorGeneration) stopSelf()
+            if (!serviceDestroyed && generation == monitorGeneration) stopNormally(reason)
         }
         pendingStopRunnable = stop
         mainHandler.postDelayed(stop, delayMs)
@@ -237,7 +254,7 @@ class FloatingBallService : Service() {
             android.util.Log.d("AppOpt", "FloatingBallService capsule added")
         } catch (e: Exception) {
             android.util.Log.e("AppOpt", "FloatingBallService add capsule failed: ${e.message}")
-            stopSelf()
+            stopNormally("add_capsule_failed")
         }
     }
 
@@ -270,8 +287,13 @@ class FloatingBallService : Service() {
                     layoutParams.y = initialY + dy.toInt()
                     try {
                         windowManager.updateViewLayout(capsuleContainer, layoutParams)
-                    } catch (_: Exception) {
-                        stopSelf()
+                    } catch (error: Exception) {
+                        android.util.Log.e(
+                            "AppOpt",
+                            "FloatingBallService update capsule failed: ${error.message}",
+                            error
+                        )
+                        stopNormally("update_capsule_failed")
                     }
                 }
                 return true
@@ -302,6 +324,7 @@ class FloatingBallService : Service() {
             }
             android.util.Log.d("AppOpt", "calibration start: pkg=$pkg")
             calibrating = true
+            FloatingBallSessionState.setCalibrating(this, true)
             capsuleContainer.contentDescription = "AppOpt 正在校准，点击停止校准，拖动可移动"
             // 用户能点击悬浮球开始校准, 说明目标 App 会话已经成立。
             // 部分 ROM 的 UsageStats 会漏掉目标进入前台事件; 这里避免后续一直卡在"等待目标出现"阶段。
@@ -328,6 +351,7 @@ class FloatingBallService : Service() {
                 "FloatingBallService manual stop: reason=manual_stop target=$pkg launch=${launchPkg.orEmpty()} appeared=$hasAppearedForeground calibrating=$calibrating absent=$absentCount"
             )
             calibrating = false
+            FloatingBallSessionState.setCalibrating(this, false)
             // 用户主动停止: 关闭前台监测, 避免查看结果卡片时被自动关闭打断
             foregroundClosing = true
             mainHandler.removeCallbacks(foregroundWatcher)
@@ -344,7 +368,7 @@ class FloatingBallService : Service() {
                     if (generation != monitorGeneration) return@Runnable
                     showBanner("校准收尾时间过长\n可稍后在历史记录或日志里查看结果", durationMs = 3200)
                     val stop = Runnable {
-                        if (generation == monitorGeneration) stopSelf()
+                        if (generation == monitorGeneration) stopNormally("manual_stop_timeout")
                     }
                     timeoutStopSelf = stop
                     mainHandler.postDelayed(stop, 3200)
@@ -368,7 +392,7 @@ class FloatingBallService : Service() {
                     timeoutStopSelf?.let { mainHandler.removeCallbacks(it) }
                     if (ok && status == null && !stopTimedOut) {
                         showBanner("等待守护进程响应超时\n规则可能未生成，请重试或检查日志", durationMs = 3200)
-                        scheduleStopSelf(3000, generation)
+                        scheduleStopSelf(3000, generation, "manual_stop_response_timeout")
                     } else {
                         showResult(pkg, ok, status, rules)
                     }
@@ -441,7 +465,7 @@ class FloatingBallService : Service() {
                 mainHandler.removeCallbacks(this)  // 取消未触发的自动关闭
                 try { windowManager.removeView(view.root) } catch (_: Exception) {}
                 if (resultView === view.root) resultView = null
-                if (generation == monitorGeneration) stopSelf()
+                if (generation == monitorGeneration) stopNormally("result_closed")
             }
         }
         view.resultOk.setOnClickListener { close.run() }
@@ -454,13 +478,14 @@ class FloatingBallService : Service() {
         } catch (e: Exception) {
             if (resultView === view.root) resultView = null
             // addView 失败(权限撤销/窗口异常), 停止服务避免空跑
-            if (generation == monitorGeneration) stopSelf()
+            if (generation == monitorGeneration) stopNormally("result_window_failed")
         }
     }
 
     private fun revertToYellow() {
         if (serviceDestroyed) return
         calibrating = false
+        FloatingBallSessionState.setCalibrating(this, false)
         capsuleContainer.contentDescription = "AppOpt 悬浮球，点击开始校准，拖动可移动"
         capsule.setBackgroundResource(R.drawable.capsule_yellow)
         updateCapsuleText()
@@ -770,6 +795,7 @@ class FloatingBallService : Service() {
 
         val wasCalibrating = calibrating
         calibrating = false
+        FloatingBallSessionState.setCalibrating(this, false)
 
         if (wasCalibrating && appeared && pkg.isNotBlank()) {
             showBanner("正在结束校准…", durationMs = 3500)
@@ -801,15 +827,28 @@ class FloatingBallService : Service() {
                 else     -> "未检测到目标应用启动\n悬浮球已自动关闭"
             }
             showBanner(msg, durationMs = 2600)
-            scheduleStopSelf(2200, generation)
+            scheduleStopSelf(2200, generation, "foreground_close:$reason")
         }
     }
 
     override fun onDestroy() {
-        android.util.Log.d("AppOpt", "FloatingBallService onDestroy target=$targetPkg calibrating=$calibrating")
-        val pkgToStop = targetPkg?.takeIf { it.isNotBlank() && calibrating }
+        val wasCalibrating = calibrating
+        val wasSessionActive = FloatingBallSessionState.isActive(this)
+        val unexpectedStop = expectedStopReason == null && wasSessionActive
+        android.util.Log.d(
+            "AppOpt",
+            "FloatingBallService onDestroy target=$targetPkg calibrating=$wasCalibrating " +
+                "expected=${expectedStopReason.orEmpty()} unexpected=$unexpectedStop"
+        )
+        val pkgToStop = targetPkg?.takeIf { it.isNotBlank() && wasCalibrating }
         calibrating = false
         serviceDestroyed = true
+        runningInProcess = false
+        if (unexpectedStop) {
+            FloatingBallSessionState.reportUnexpectedStop(this, targetPkg, wasCalibrating)
+        } else if (wasSessionActive) {
+            FloatingBallSessionState.markExpectedStop(this, expectedStopReason ?: "service_destroyed")
+        }
         monitorGeneration++
         cancelPendingStop()
         mainHandler.removeCallbacksAndMessages(null)
@@ -844,7 +883,7 @@ class FloatingBallService : Service() {
             ?.takeIf { it.isNotBlank() } ?: targetPkg
         if (requestedTarget.isNullOrBlank()) {
             android.util.Log.d("AppOpt", "FloatingBallService stop: missing target package")
-            stopSelf()
+            stopNormally("missing_target_package")
             return START_NOT_STICKY
         }
         val requestedLaunch = intent?.getStringExtra(EXTRA_LAUNCH_PKG)
@@ -878,6 +917,8 @@ class FloatingBallService : Service() {
         foregroundClosing = false
         targetPkg = requestedTarget
         launchPkg = requestedLaunch
+        expectedStopReason = null
+        FloatingBallSessionState.begin(this, requestedTarget, calibrating)
         hasAppearedForeground = false
         absentCount = 0
         launchProcessMissingCount = 0

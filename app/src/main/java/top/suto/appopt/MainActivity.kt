@@ -1,5 +1,6 @@
 package top.suto.appopt
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -14,6 +15,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -32,6 +34,7 @@ import android.widget.GridLayout
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -47,6 +50,7 @@ import top.suto.appopt.databinding.DialogConfigRuleEditBinding
 import top.suto.appopt.databinding.DialogConfigRulesBinding
 import top.suto.appopt.databinding.DialogDeleteConfigBinding
 import top.suto.appopt.databinding.DialogDiscardRulesBinding
+import top.suto.appopt.databinding.DialogFloatingInterruptionBinding
 import top.suto.appopt.databinding.DialogRuleHistoryPickerBinding
 import top.suto.appopt.databinding.DialogThreadWildcardBinding
 import top.suto.appopt.databinding.ItemAddAppBinding
@@ -81,6 +85,15 @@ class MainActivity : AppCompatActivity() {
     private var moduleWarningShown = false
     private var startupUpdateCheckStarted = false
     private var startupUpdateDialogShowing = false
+    private var floatingInterruptionDialogShowing = false
+    private var pendingFloatingLaunchPkg: String? = null
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        val pkg = pendingFloatingLaunchPkg
+        pendingFloatingLaunchPkg = null
+        if (pkg != null && !activityDestroyed) launchAppWithBall(pkg)
+    }
     private var appTab = AppTab.PENDING
     private var appSearchQuery = ""
     private var appLists = AppLists()
@@ -395,6 +408,66 @@ class MainActivity : AppCompatActivity() {
             )
         }
         scheduleSettledHealthRefresh(resumedAt)
+        showFloatingInterruptionIfNeeded()
+    }
+
+    private fun showFloatingInterruptionIfNeeded() {
+        if (floatingInterruptionDialogShowing || activityDestroyed) return
+        val incident = FloatingBallSessionState.consumeIncident(
+            this,
+            FloatingBallService.isRunningInProcess()
+        ) ?: return
+        android.util.Log.d(
+            "AppOpt",
+            "FloatingBall interruption prompt: target=${incident.targetPkg} " +
+                "calibrating=${incident.calibrating} restart=${incident.detectedAfterRestart}"
+        )
+        cleanupInterruptedFloatingSession(incident)
+        floatingInterruptionDialogShowing = true
+        val view = DialogFloatingInterruptionBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(this)
+        dialog.setCanceledOnTouchOutside(false)
+        dialog.setContentView(view.root)
+        view.interruptionSubtitle.text = if (incident.calibrating) {
+            "本次校准已中断"
+        } else {
+            "上次悬浮球会话未正常结束"
+        }
+        view.interruptionMessage.text =
+            "可能被系统省电或 Thanox、NoActive 等后台管控工具停止。" +
+                "请允许 AppOpt 后台运行、自启动，并关闭省电限制后重试。"
+        view.interruptionSettings.setOnClickListener {
+            dialog.dismiss()
+            try {
+                startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                )
+            } catch (_: Exception) {
+                toast("请在系统设置中允许 AppOpt 后台运行")
+            }
+        }
+        view.interruptionDone.setOnClickListener { dialog.dismiss() }
+        dialog.setOnDismissListener { floatingInterruptionDialogShowing = false }
+        dialog.show()
+    }
+
+    private fun cleanupInterruptedFloatingSession(incident: FloatingBallSessionState.Incident) {
+        thread(name = "AppOptFloatingCleanup") {
+            val calibrationStopped = if (incident.calibrating && incident.targetPkg.isNotBlank()) {
+                DaemonBridge.stopCalibration(incident.targetPkg)
+            } else {
+                true
+            }
+            val fpsStopped = DaemonBridge.stopFpsMonitor()
+            android.util.Log.d(
+                "AppOpt",
+                "FloatingBall interruption cleanup: target=${incident.targetPkg} " +
+                    "calibrating=${incident.calibrating} calibrationStopped=$calibrationStopped " +
+                    "fpsStopped=$fpsStopped"
+            )
+        }
     }
 
     override fun onPause() {
@@ -1886,6 +1959,19 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingFloatingLaunchPkg = pkg
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+
+        launchAppWithBall(pkg)
+    }
+
+    private fun launchAppWithBall(pkg: String) {
         val launchPkg = packageLookupName(pkg)
         val launch = packageManager.getLaunchIntentForPackage(launchPkg)
         if (launch != null) {
@@ -1900,6 +1986,7 @@ class MainActivity : AppCompatActivity() {
                 startActivity(launch)
             } catch (e: Exception) {
                 android.util.Log.e("AppOpt", "startAppWithBall launch failed: $launchPkg ${e.message}")
+                FloatingBallSessionState.markExpectedStop(this, "launch_failed")
                 stopService(Intent(this, FloatingBallService::class.java))
                 toast("启动 $launchPkg 失败")
             }
