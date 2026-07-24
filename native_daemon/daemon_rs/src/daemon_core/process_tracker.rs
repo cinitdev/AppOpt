@@ -233,24 +233,38 @@ fn process_index_mark_candidate(pid: i32, now_elapsed: u64) -> io::Result<()> {
 
 fn process_index_find_names(names: &[String]) -> io::Result<Vec<String>> {
     let entries = load_process_index()?;
-    let current_pids = enumerate_proc_pids()?;
-    let cached_pids = entries.keys().copied().collect::<BTreeSet<_>>();
-    if current_pids != cached_pids {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "进程索引落后于当前 PID 快照",
-        ));
-    }
-    let mut found = Vec::new();
-    for name in names {
-        if entries.values().any(|entry| {
+    let mut matched = vec![false; names.len()];
+    for (index, name) in names.iter().enumerate() {
+        matched[index] = entries.values().any(|entry| {
             process_index_name_matches(entry, name)
                 && process_index_current_name_matches(entry, name)
-        }) {
-            found.push(name.clone());
+        });
+    }
+
+    if matched.iter().any(|value| !value) {
+        let current_pids = enumerate_proc_pids()?;
+        let cached_pids = entries.keys().copied().collect::<BTreeSet<_>>();
+        for pid in current_pids.difference(&cached_pids).copied() {
+            let Ok(entry) = read_process_index_entry(pid, 0, None) else {
+                continue;
+            };
+            for (index, name) in names.iter().enumerate() {
+                if !matched[index] && process_index_name_matches(&entry, name) {
+                    matched[index] = true;
+                }
+            }
+            if matched.iter().all(|value| *value) {
+                break;
+            }
         }
     }
-    Ok(found)
+
+    Ok(names
+        .iter()
+        .zip(matched)
+        .filter(|(_, matched)| *matched)
+        .map(|(name, _)| name.clone())
+        .collect())
 }
 
 fn process_index_print_pids(name: &str) -> io::Result<()> {

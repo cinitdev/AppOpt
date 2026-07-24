@@ -505,40 +505,59 @@ static int process_index_print_pids(const char* name) {
     return found ? 0 : 1;
 }
 
-static bool process_index_snapshot_current(
-    const ProcessIndexEntry* entries,
-    size_t count
-) {
-    pid_t* current_pids = NULL;
-    size_t current_count = 0;
-    if (!process_index_enumerate_pids(&current_pids, &current_count)) return false;
-    bool current = current_count == count;
-    for (size_t i = 0; current && i < count; i++) {
-        current = current_pids[i] == entries[i].pid;
-    }
-    free(current_pids);
-    return current;
-}
-
 static int process_index_print_names(int name_count, char* const names[]) {
     ProcessIndexEntry* entries = NULL;
     size_t count = 0;
     if (name_count <= 0 || !process_index_load(&entries, &count)) return 1;
-    if (!process_index_snapshot_current(entries, count)) {
+    bool* found = calloc((size_t)name_count, sizeof(*found));
+    if (!found) {
         process_index_entries_release(entries);
         return 1;
     }
     for (int name_index = 0; name_index < name_count; name_index++) {
         const char* name = names[name_index];
-        bool found = false;
-        for (size_t i = 0; i < count && !found; i++) {
-            found = process_index_name_matches(&entries[i], name) &&
+        for (size_t i = 0; i < count && !found[name_index]; i++) {
+            found[name_index] = process_index_name_matches(&entries[i], name) &&
                 process_index_current_name_matches(&entries[i], name);
         }
-        if (found) {
-            printf("%s\n", name);
+    }
+
+    bool all_found = true;
+    for (int name_index = 0; name_index < name_count; name_index++) {
+        if (!found[name_index]) {
+            all_found = false;
+            break;
         }
     }
+    if (!all_found) {
+        pid_t* current_pids = NULL;
+        size_t current_count = 0;
+        if (!process_index_enumerate_pids(&current_pids, &current_count)) {
+            free(found);
+            process_index_entries_release(entries);
+            return 1;
+        }
+        for (size_t pid_index = 0; pid_index < current_count && !all_found; pid_index++) {
+            pid_t pid = current_pids[pid_index];
+            if (process_index_entry_index(entries, count, pid) >= 0) continue;
+            ProcessIndexEntry current;
+            if (!process_index_read_entry(pid, 0, NULL, &current)) continue;
+            all_found = true;
+            for (int name_index = 0; name_index < name_count; name_index++) {
+                if (!found[name_index] &&
+                    process_index_name_matches(&current, names[name_index])) {
+                    found[name_index] = true;
+                }
+                if (!found[name_index]) all_found = false;
+            }
+        }
+        free(current_pids);
+    }
+
+    for (int name_index = 0; name_index < name_count; name_index++) {
+        if (found[name_index]) printf("%s\n", names[name_index]);
+    }
+    free(found);
     process_index_entries_release(entries);
     /* 缓存读取成功时，未命中表示名称当前不存在，不再触发 App 全量遍历 /proc。 */
     return 0;
