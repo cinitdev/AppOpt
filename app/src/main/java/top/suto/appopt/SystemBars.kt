@@ -8,13 +8,19 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 
 object SystemBars {
-    fun applyEdgeToEdge(activity: Activity, root: View, header: View) {
+    fun applyEdgeToEdge(
+        activity: Activity,
+        root: View,
+        header: View,
+        lightStatusBar: Boolean = false,
+        bottomOverlay: View? = null
+    ) {
         WindowCompat.setDecorFitsSystemWindows(activity.window, false)
         activity.window.statusBarColor = Color.TRANSPARENT
         activity.window.navigationBarColor = activity.getColor(R.color.surface_app)
 
         val controller = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
-        controller.isAppearanceLightStatusBars = false
+        controller.isAppearanceLightStatusBars = lightStatusBar
         controller.isAppearanceLightNavigationBars = true
 
         val rootLeft = root.paddingLeft
@@ -23,7 +29,12 @@ object SystemBars {
         val rootBottom = root.paddingBottom
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
             val nav = insets.getInsets(WindowInsetsCompat.Type.navigationBars())
-            view.setPadding(rootLeft, rootTop, rootRight, rootBottom + nav.bottom)
+            if (bottomOverlay == null) {
+                view.setPadding(rootLeft, rootTop, rootRight, rootBottom + nav.bottom)
+            } else {
+                view.setPadding(rootLeft, rootTop, rootRight, rootBottom)
+                bottomOverlay.translationY = -nav.bottom.toFloat()
+            }
             insets
         }
 

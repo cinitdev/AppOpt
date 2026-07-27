@@ -5,35 +5,40 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.Editable
 import android.text.TextWatcher
+import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.checkbox.MaterialCheckBox
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputLayout
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
-import top.suto.appopt.databinding.ActivitySettingsBinding
+import top.suto.appopt.databinding.FragmentSettingsBinding
 import top.suto.appopt.databinding.DialogPolicyModeBinding
 import top.suto.appopt.databinding.DialogRuleOutputFormatBinding
 
-class SettingsActivity : AppCompatActivity() {
+class SettingsFragment : TopLevelFragment() {
 
-    private lateinit var binding: ActivitySettingsBinding
+    private var _binding: FragmentSettingsBinding? = null
+    private val binding: FragmentSettingsBinding
+        get() = checkNotNull(_binding)
+    private var viewGeneration = 0
+    private var policyLoadGeneration = 0
+    private var policyLoadInFlight = false
+    private var policyLoaded = false
+    private var lastPolicyLoadFinishedAt = 0L
     private var lockedByPendingUpdate = false
     private var hasRoot = false
     private var moduleVersion: DaemonBridge.ModuleVersion? = null
-    private var firstResume = true
-    private var updateBusy = false
     private var diagnosticBusy = false
-    private var cachedUpdateInfo: ModuleUpdater.UpdateInfo? = null
     private var policyEditable = false
     private var suppressPolicyChange = false
     private var currentWildcardGroup = CalibPolicy.WildcardGroup.MAX_MEMBER
@@ -54,28 +59,32 @@ class SettingsActivity : AppCompatActivity() {
     private companion object {
         const val MIN_MODULE_VERSION_CODE = DaemonBridge.REQUIRED_MODULE_VERSION_CODE
         const val MIN_MODULE_VERSION_NAME = DaemonBridge.REQUIRED_MODULE_VERSION_NAME
+        const val POLICY_REFRESH_INTERVAL_MS = 3_000L
         val POLICY_IO_EXECUTOR = Executors.newSingleThreadExecutor()
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        binding = ActivitySettingsBinding.inflate(layoutInflater)
-        setContentView(binding.root)
-        SystemBars.applyEdgeToEdge(this, binding.root, binding.settingsHeader)
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentSettingsBinding.inflate(inflater, container, false)
+        viewGeneration++
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        prepareTopLevelPage(binding.settingsHeader)
 
         binding.settingsHistoryRow.setOnClickListener {
-            startActivity(Intent(this, HistoryListActivity::class.java))
+            (activity as? MainActivity)?.selectTopLevelPage(R.id.navHistory)
         }
         binding.settingsLogRow.setOnClickListener {
-            startActivity(Intent(this, LogActivity::class.java))
+            startActivity(Intent(requireContext(), LogActivity::class.java))
         }
         binding.settingsDiagnosticRow.setOnClickListener {
             exportDiagnosticPackage()
-        }
-        binding.settingsUpdateButton.setOnClickListener {
-            cachedUpdateInfo?.let { update ->
-                showModuleUpdateDialog(update)
-            } ?: checkModuleUpdate(manual = true)
         }
         binding.settingsHelpRow.setOnClickListener { showHelp() }
         binding.wildcardModeRow.setOnClickListener {
@@ -92,72 +101,84 @@ class SettingsActivity : AppCompatActivity() {
 
         setPolicyInputsEnabled(false)
         setPolicyStatus("正在读取策略")
-        setUpdateStatus("正在获取远程更新信息")
-        binding.root.post {
-            if (!isFinishing && !isDestroyed) {
-                loadPolicy()
-                checkModuleUpdate(manual = false)
-            }
-        }
     }
 
-    override fun onResume() {
-        super.onResume()
-        if (firstResume) {
-            firstResume = false
-        } else {
+    override fun onTopLevelPageSelected() {
+        if (_binding == null) return
+        if (!policyLoaded ||
+            SystemClock.elapsedRealtime() - lastPolicyLoadFinishedAt >= POLICY_REFRESH_INTERVAL_MS) {
             loadPolicy()
         }
     }
 
     private fun loadPolicy() {
+        if (_binding == null) return
+        if (policyLoadInFlight) return
         cancelAutoSave()
+        policyLoadInFlight = true
+        val generation = ++policyLoadGeneration
+        val currentViewGeneration = viewGeneration
         policyEditable = false
         setPolicyStatus("正在读取策略")
         setPolicyInputsEnabled(false)
         POLICY_IO_EXECUTOR.execute {
-            val root = DaemonBridge.hasRoot()
-            val version = if (root) DaemonBridge.readModuleVersion() else null
-            val file = if (root) DaemonBridge.readCalibPolicyRaw() else null
-            val rawPolicy = file?.takeIf { it.readSuccess }?.content?.takeIf { it.isNotBlank() }
-            val policy = rawPolicy
-                ?.takeIf { it.isNotBlank() }
-                ?.let { CalibPolicy.parse(it) }
-                ?: CalibPolicy.DEFAULT
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                hasRoot = root
-                moduleVersion = version
-                binding.updateLocalVersion.text = version?.let {
-                    versionLabel(it.versionName, it.versionCode)
-                } ?: "未知"
-                lockedByPendingUpdate = file?.lockedByPendingUpdate == true
-                val moduleOk = version?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
-                val moduleLabel = version?.let { "${it.versionName} (${it.versionCode})" }
-                bindPolicy(policy)
-                binding.policyLockedNotice.visibility =
-                    if (lockedByPendingUpdate || (root && !moduleOk)) View.VISIBLE else View.GONE
-                binding.policyLockedNotice.text = when {
-                    lockedByPendingUpdate ->
-                        "模块更新待重启，当前刷入的模块尚未生效，重启后才能修改自动校准策略"
-                    root && version == null ->
-                        "未检测到兼容的 AppOpt 模块，请刷入 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE) 或更高版本模块"
-                    root && !moduleOk ->
-                        "当前模块版本 $moduleLabel 低于 App 要求，请刷入 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE) 或更高版本模块"
-                    else -> binding.policyLockedNotice.text
+            try {
+                val root = DaemonBridge.hasRoot()
+                val version = if (root) DaemonBridge.readModuleVersion() else null
+                val file = if (root) DaemonBridge.readCalibPolicyRaw() else null
+                val rawPolicy = file?.takeIf { it.readSuccess }?.content?.takeIf { it.isNotBlank() }
+                val policy = rawPolicy
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { CalibPolicy.parse(it) }
+                    ?: CalibPolicy.DEFAULT
+                runOnUiThread {
+                    if (currentViewGeneration != viewGeneration || generation != policyLoadGeneration ||
+                        isFinishing || isDestroyed) return@runOnUiThread
+                    policyLoadInFlight = false
+                    policyLoaded = true
+                    lastPolicyLoadFinishedAt = SystemClock.elapsedRealtime()
+                    hasRoot = root
+                    moduleVersion = version
+                    lockedByPendingUpdate = file?.lockedByPendingUpdate == true
+                    val moduleOk = version?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
+                    val moduleLabel = version?.let { "${it.versionName} (${it.versionCode})" }
+                    bindPolicy(policy)
+                    binding.policyLockedNotice.visibility =
+                        if (lockedByPendingUpdate || (root && !moduleOk)) View.VISIBLE else View.GONE
+                    binding.policyLockedNotice.text = when {
+                        lockedByPendingUpdate ->
+                            "模块更新待重启，当前刷入的模块尚未生效，重启后才能修改自动校准策略"
+                        root && version == null ->
+                            "未检测到兼容的 AppOpt 模块，请刷入 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE) 或更高版本模块"
+                        root && !moduleOk ->
+                            "当前模块版本 $moduleLabel 低于 App 要求，请刷入 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE) 或更高版本模块"
+                        else -> binding.policyLockedNotice.text
+                    }
+                    setPolicyStatus(when {
+                        !root -> "需要 Root 权限读取和保存策略"
+                        version == null -> "未检测到模块版本，策略已锁定"
+                        !moduleOk -> "当前模块版本 $moduleLabel，低于要求 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE)，策略已锁定"
+                        file?.readSuccess == false -> "策略文件读取失败，请检查 Root 权限后重试"
+                        lockedByPendingUpdate -> "读取待生效更新配置：${file?.path.orEmpty()}"
+                        file?.exists == false -> "策略文件不存在，可点击恢复默认重新生成；修改任意设置也会重新创建"
+                        file?.content.isNullOrBlank() -> "策略文件为空，修改后会自动保存当前策略"
+                        else -> "当前配置：${file?.path.orEmpty()}，修改后自动保存"
+                    })
+                    policyEditable = root && moduleOk && !lockedByPendingUpdate && file?.readSuccess == true
+                    setPolicyInputsEnabled(policyEditable)
                 }
-                setPolicyStatus(when {
-                    !root -> "需要 Root 权限读取和保存策略"
-                    version == null -> "未检测到模块版本，策略已锁定"
-                    !moduleOk -> "当前模块版本 $moduleLabel，低于要求 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE)，策略已锁定"
-                    file?.readSuccess == false -> "策略文件读取失败，请检查 Root 权限后重试"
-                    lockedByPendingUpdate -> "读取待生效更新配置：${file?.path.orEmpty()}"
-                    file?.exists == false -> "策略文件不存在，可点击恢复默认重新生成；修改任意设置也会重新创建"
-                    file?.content.isNullOrBlank() -> "策略文件为空，修改后会自动保存当前策略"
-                    else -> "当前配置：${file?.path.orEmpty()}，修改后自动保存"
-                })
-                policyEditable = root && moduleOk && !lockedByPendingUpdate && file?.readSuccess == true
-                setPolicyInputsEnabled(policyEditable)
+            } catch (error: Exception) {
+                android.util.Log.e("AppOpt", "读取校准策略失败", error)
+                runOnUiThread {
+                    if (currentViewGeneration != viewGeneration || generation != policyLoadGeneration ||
+                        isFinishing || isDestroyed) return@runOnUiThread
+                    policyLoadInFlight = false
+                    policyLoaded = true
+                    lastPolicyLoadFinishedAt = SystemClock.elapsedRealtime()
+                    policyEditable = false
+                    setPolicyInputsEnabled(false)
+                    setPolicyStatus("策略文件读取失败，请检查 Root 权限后重试")
+                }
             }
         }
     }
@@ -308,7 +329,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun showResetPolicyConfirm() {
         if (!policyEditable) return
-        MaterialAlertDialogBuilder(this)
+        MaterialAlertDialogBuilder(requireContext())
             .setTitle("恢复默认策略")
             .setMessage("会把自动校准策略恢复为默认阈值和默认核心分配，并立即写入配置文件。")
             .setNegativeButton("取消", null)
@@ -351,10 +372,12 @@ class SettingsActivity : AppCompatActivity() {
             toast("模块更新待重启，当前不能修改策略")
             return
         }
+        val currentViewGeneration = viewGeneration
         POLICY_IO_EXECUTOR.execute {
             val ok = DaemonBridge.writeCalibPolicyRaw(policy.toConfigText())
             runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (currentViewGeneration != viewGeneration || _binding == null ||
+                    isFinishing || isDestroyed) return@runOnUiThread
                 if (seq != saveSeq) return@runOnUiThread
                 if (ok) {
                     successMessage?.let {
@@ -377,10 +400,12 @@ class SettingsActivity : AppCompatActivity() {
         binding.settingsDiagnosticRow.isEnabled = false
         binding.settingsDiagnosticRow.alpha = 0.55f
         toast("正在导出诊断包")
+        val currentViewGeneration = viewGeneration
         thread {
-            val result = DiagnosticExporter.export(this)
+            val result = DiagnosticExporter.export(appContext)
             runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (currentViewGeneration != viewGeneration || _binding == null ||
+                    isFinishing || isDestroyed) return@runOnUiThread
                 diagnosticBusy = false
                 binding.settingsDiagnosticRow.isEnabled = true
                 binding.settingsDiagnosticRow.alpha = 1f
@@ -389,97 +414,6 @@ class SettingsActivity : AppCompatActivity() {
                     onFailure = { toast("导出失败: ${it.message ?: "无法写入 Download"}") }
                 )
             }
-        }
-    }
-
-    private fun checkModuleUpdate(manual: Boolean) {
-        if (updateBusy) {
-            if (manual) toast("正在处理更新")
-            return
-        }
-        setUpdateBusy(true)
-        setUpdateStatus("正在获取远程更新信息")
-        binding.updateRemoteVersion.text = "获取中"
-        if (manual) toast("正在检查更新")
-        thread {
-            val result = ModuleUpdater.checkForUpdate()
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                bindUpdateResult(result)
-                when (result) {
-                    is ModuleUpdater.CheckResult.UpdateAvailable -> {
-                        if (manual) {
-                            showModuleUpdateDialog(result.update)
-                        } else {
-                            setUpdateBusy(false)
-                        }
-                    }
-                    is ModuleUpdater.CheckResult.NoUpdate -> {
-                        setUpdateBusy(false)
-                        if (manual) toast(result.message)
-                    }
-                    is ModuleUpdater.CheckResult.Failed -> {
-                        setUpdateBusy(false)
-                        if (manual) toast(result.message)
-                    }
-                }
-            }
-        }
-    }
-
-    private fun setUpdateBusy(busy: Boolean) {
-        updateBusy = busy
-        binding.settingsUpdateRow.isEnabled = !busy
-        binding.settingsUpdateButton.isEnabled = !busy
-        binding.settingsUpdateRow.alpha = if (busy) 0.55f else 1f
-    }
-
-    private fun bindUpdateResult(result: ModuleUpdater.CheckResult) {
-        when (result) {
-            is ModuleUpdater.CheckResult.UpdateAvailable -> {
-                cachedUpdateInfo = result.update
-                binding.updateLocalVersion.text = versionLabel(
-                    result.update.localVersion,
-                    result.update.localVersionCode
-                )
-                binding.updateRemoteVersion.text = versionLabel(
-                    result.update.remoteVersion,
-                    result.update.remoteVersionCode
-                )
-                setUpdateStatus("发现新版本，可查看更新日志并刷入")
-                binding.settingsUpdateButton.text = "查看更新"
-            }
-            is ModuleUpdater.CheckResult.NoUpdate -> {
-                cachedUpdateInfo = null
-                binding.updateLocalVersion.text = versionLabel(result.localVersion, result.localVersionCode)
-                binding.updateRemoteVersion.text = versionLabel(result.remoteVersion, result.remoteVersionCode)
-                setUpdateStatus(result.message)
-                binding.settingsUpdateButton.text = "检查更新"
-            }
-            is ModuleUpdater.CheckResult.Failed -> {
-                cachedUpdateInfo = null
-                binding.updateLocalVersion.text = versionLabel(result.localVersion, result.localVersionCode)
-                binding.updateRemoteVersion.text = versionLabel(result.remoteVersion, result.remoteVersionCode)
-                setUpdateStatus(result.message)
-                binding.settingsUpdateButton.text = "重试"
-            }
-        }
-    }
-
-    private fun versionLabel(version: String?, code: Int?): String {
-        val name = version?.takeIf { it.isNotBlank() }
-        return when {
-            name != null && code != null -> "$name ($code)"
-            name != null -> name
-            code != null -> code.toString()
-            else -> "未知"
-        }
-    }
-
-    private fun showModuleUpdateDialog(update: ModuleUpdater.UpdateInfo) {
-        setUpdateBusy(true)
-        ModuleUpdateDialog.show(this, update) {
-            setUpdateBusy(false)
         }
     }
 
@@ -524,7 +458,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun showWildcardModeDialog() {
         val view = DialogPolicyModeBinding.inflate(layoutInflater)
-        val dialog = BottomSheetDialog(this)
+        val dialog = BottomSheetDialog(requireContext())
         val maxCurrent = currentWildcardGroup == CalibPolicy.WildcardGroup.MAX_MEMBER
         view.modeMaxMemberTitle.text = if (maxCurrent) "平均负载取最高（当前）" else "平均负载取最高"
         view.modeSumTitle.text = if (!maxCurrent) "平均负载相加（当前）" else "平均负载相加"
@@ -594,7 +528,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun showRuleOutputFormatDialog() {
         val view = DialogRuleOutputFormatBinding.inflate(layoutInflater)
-        val dialog = BottomSheetDialog(this)
+        val dialog = BottomSheetDialog(requireContext())
         val current = currentRuleOutputFormat
         setRuleOutputFormatTitle(
             view.formatLegacyTitle,
@@ -724,10 +658,12 @@ class SettingsActivity : AppCompatActivity() {
         val formatName = ruleOutputFormatName(outputFormat)
         setPolicyStatus("正在把现有规则转换为$formatName")
         ++saveSeq
+        val currentViewGeneration = viewGeneration
         POLICY_IO_EXECUTOR.execute {
             val result = DaemonBridge.applyRuleOutputFormat(outputFormat, policy.toConfigText())
             runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (currentViewGeneration != viewGeneration || _binding == null ||
+                    isFinishing || isDestroyed) return@runOnUiThread
                 formatConversionBusy = false
                 if (result.success) {
                     val message = if (result.ruleCount == 0) {
@@ -816,17 +752,17 @@ class SettingsActivity : AppCompatActivity() {
         binding.topologySummaryGrid.columnCount = 2
 
         for ((label, cores) in entries) {
-            val item = LinearLayout(this).apply {
+            val item = LinearLayout(requireContext()).apply {
                 orientation = LinearLayout.VERTICAL
                 setBackgroundResource(R.drawable.bg_topology_chip)
                 setPadding(10.dp, 8.dp, 10.dp, 8.dp)
-                addView(TextView(this@SettingsActivity).apply {
+                addView(TextView(requireContext()).apply {
                     text = label
                     setTextColor(getColor(R.color.text_secondary))
                     textSize = 11.5f
                     includeFontPadding = false
                 })
-                addView(TextView(this@SettingsActivity).apply {
+                addView(TextView(requireContext()).apply {
                     text = "CPU ${cores.orEmpty()}"
                     setTextColor(getColor(R.color.text_primary))
                     textSize = 13.5f
@@ -849,7 +785,7 @@ class SettingsActivity : AppCompatActivity() {
         warning.visibility = View.GONE
         grid.columnCount = minOf(4, availableCpus.size.coerceAtLeast(1))
         for (cpu in availableCpus) {
-            val box = MaterialCheckBox(this).apply {
+            val box = MaterialCheckBox(requireContext()).apply {
                 text = "CPU$cpu"
                 textSize = 15f
                 isChecked = selected.contains(cpu)
@@ -1002,7 +938,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun showHelp() {
         val view = layoutInflater.inflate(R.layout.section_help, binding.root, false)
-        val dialog = BottomSheetDialog(this)
+        val dialog = BottomSheetDialog(requireContext())
         dialog.setContentView(view)
         dialog.show()
     }
@@ -1018,11 +954,6 @@ class SettingsActivity : AppCompatActivity() {
     private fun setPolicyStatus(text: String) {
         binding.policyStatus.setTextColor(getColor(R.color.text_secondary))
         binding.policyStatus.text = text
-    }
-
-    private fun setUpdateStatus(text: String) {
-        binding.updateStatus.setTextColor(getColor(R.color.text_secondary))
-        binding.updateStatus.text = text
     }
 
     private fun showCoreWarning(view: TextView, message: String) {
@@ -1044,7 +975,7 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun toast(msg: String) {
-        AppToast.show(this, msg)
+        AppToast.show(requireContext(), msg)
     }
 
     override fun onStop() {
@@ -1052,11 +983,18 @@ class SettingsActivity : AppCompatActivity() {
         super.onStop()
     }
 
-    override fun onDestroy() {
+    override fun onDestroyView() {
         cancelAutoSave()
+        policyLoadGeneration++
+        policyLoadInFlight = false
+        policyLoaded = false
+        ++saveSeq
         coreWarningRunnable?.let { mainHandler.removeCallbacks(it) }
         coreWarningRunnable = null
         coreWarningView = null
-        super.onDestroy()
+        diagnosticBusy = false
+        formatConversionBusy = false
+        _binding = null
+        super.onDestroyView()
     }
 }

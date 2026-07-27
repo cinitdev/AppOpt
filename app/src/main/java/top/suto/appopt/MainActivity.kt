@@ -27,6 +27,7 @@ import android.text.TextWatcher
 import android.text.style.ReplacementSpan
 import android.util.LruCache
 import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.LinearInterpolator
@@ -35,7 +36,9 @@ import android.widget.ImageView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.OnBackPressedCallback
 import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.ListAdapter
@@ -43,11 +46,13 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.checkbox.MaterialCheckBox
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.google.android.material.tabs.TabLayout
 import kotlin.concurrent.thread
 import top.suto.appopt.databinding.ActivityMainBinding
 import top.suto.appopt.databinding.DialogConfigRuleEditBinding
 import top.suto.appopt.databinding.DialogConfigRulesBinding
+import top.suto.appopt.databinding.DialogConfiguredAppManageBinding
 import top.suto.appopt.databinding.DialogDeleteConfigBinding
 import top.suto.appopt.databinding.DialogDiscardRulesBinding
 import top.suto.appopt.databinding.DialogFloatingInterruptionBinding
@@ -127,6 +132,11 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var activityDestroyed = false
     private var firstResume = true
     private lateinit var appAdapter: AppAdapter
+    private lateinit var bottomNavigation: BottomNavigationView
+    private lateinit var bottomNavigationBlur: BackdropBlurLayout
+    private var selectedTopLevelPage = R.id.navApps
+    private var lastAppsPageRefreshAt = SystemClock.elapsedRealtime()
+    private var appsPageRefreshRunnable: Runnable? = null
 
     private data class ForegroundHelperStatus(
         val state: DaemonBridge.TaskForegroundState? = null,
@@ -139,7 +149,15 @@ class MainActivity : AppCompatActivity() {
         const val MIN_ENV_LOADING_MS = 1800L
         const val RULE_TOOLS_THRESHOLD = 9
         const val RULE_HEALTH_SETTLE_MS = 2600L
+        const val TOP_LEVEL_REFRESH_INTERVAL_MS = 5_000L
         const val MAX_EDITOR_CPU_COUNT = 128
+        const val STATE_TOP_LEVEL_PAGE = "top_level_page"
+        val TOP_LEVEL_PAGE_IDS = setOf(
+            R.id.navApps,
+            R.id.navEnvironment,
+            R.id.navHistory,
+            R.id.navSettings
+        )
     }
 
     private enum class AppTab(val title: String) {
@@ -160,6 +178,11 @@ class MainActivity : AppCompatActivity() {
         val pendingReviewRuleCount: Int = 0,
         val missedRuleKinds: Set<RuleHealthKind> = emptySet(),
         val pendingReviewRuleKinds: Set<RuleHealthKind> = emptySet()
+    )
+
+    private data class ConfiguredAppHealthUi(
+        val label: String?,
+        val description: String?
     )
 
     private enum class ComponentKind {
@@ -208,15 +231,25 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        SystemBars.applyEdgeToEdge(this, binding.root, binding.mainHeader)
+        bottomNavigation = findViewById(R.id.bottomNavigation)
+        bottomNavigationBlur = findViewById(R.id.bottomNavigationBlur)
+        val bottomNavigationHost = findViewById<View>(R.id.bottomNavigationHost)
+        SystemBars.applyEdgeToEdge(
+            this,
+            binding.root,
+            binding.mainHeader,
+            bottomOverlay = bottomNavigationHost
+        )
+        bottomNavigationBlur.setupWith(binding.mainContent)
+        centerFloatingBottomNavigation()
+        setupTopLevelNavigation(savedInstanceState)
+        setupTopLevelBackNavigation()
         environmentLoadingShownAt = SystemClock.uptimeMillis()
         hideMissingConfigured = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getBoolean(PREF_HIDE_MISSING_CONFIGURED, false)
 
-        binding.statusSection.btnOverlay.setOnClickListener { requestOverlay() }
-        binding.statusSection.btnUsage.setOnClickListener { requestUsageAccess() }
-        binding.statusSection.btnSettings.setOnClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
+        binding.statusSection.root.setOnClickListener {
+            selectTopLevelPage(R.id.navEnvironment)
         }
         binding.appRefresh.setOnRefreshListener {
             refreshAppList()
@@ -225,8 +258,9 @@ class MainActivity : AppCompatActivity() {
         setupAppSearch()
         setupConfiguredFilter()
         setupAppRecycler()
-        refresh()
+        renderEnvironmentOverview()
         buildAppList()
+        scheduleTopLevelPrewarm()
 
         // root 检测 + 读配置 + 批量导入旧 .log 放后台线程，避免 su 弹窗阻塞 UI
         val startupEnvironmentGeneration = environmentRequests.next()
@@ -268,7 +302,7 @@ class MainActivity : AppCompatActivity() {
                         processNames = emptySet()
                         appLists = AppLists()
                     }
-                    refresh()
+                    renderEnvironmentOverview()
                     buildAppList()
                     showModuleWarningIfNeeded()
                     maybeCheckStartupUpdate()
@@ -397,8 +431,9 @@ class MainActivity : AppCompatActivity() {
         activityResumed = true
         val lifecycleGeneration = lifecycleRequests.next()
         resumedAt = SystemClock.uptimeMillis()
-        refresh()
-        val shouldRefreshConfig = firstResume.not()
+        renderEnvironmentOverview()
+        val appsVisible = selectedTopLevelPage == R.id.navApps
+        val shouldRefreshConfig = firstResume.not() && appsVisible
         firstResume = false
         // 守护进程、Root 授权和配置可能在后台变化，回到前台时后台重查一次。
         if (shouldRefreshConfig) {
@@ -407,8 +442,208 @@ class MainActivity : AppCompatActivity() {
                 lifecycleGeneration = lifecycleGeneration
             )
         }
-        scheduleSettledHealthRefresh(resumedAt)
+        if (appsVisible) {
+            scheduleSettledHealthRefresh(resumedAt)
+        } else {
+            mainHandler.post {
+                if (activityResumed && selectedTopLevelPage != R.id.navApps) {
+                    notifyTopLevelPageSelected(selectedTopLevelPage)
+                }
+            }
+        }
         showFloatingInterruptionIfNeeded()
+    }
+
+    private fun setupTopLevelNavigation(savedInstanceState: Bundle?) {
+        selectedTopLevelPage = savedInstanceState?.getInt(STATE_TOP_LEVEL_PAGE, R.id.navApps)
+            ?: R.id.navApps
+        bottomNavigation.setOnItemSelectedListener { item ->
+            showTopLevelPage(item.itemId)
+        }
+        bottomNavigation.setOnItemReselectedListener { }
+        bottomNavigation.menu.findItem(selectedTopLevelPage)?.isChecked = true
+        showTopLevelPage(selectedTopLevelPage, force = true)
+    }
+
+    private fun centerFloatingBottomNavigation() {
+        val horizontalPadding = dp(36f)
+        val availableWidth = (resources.displayMetrics.widthPixels - horizontalPadding).coerceAtLeast(dp(280f))
+        val targetWidth = minOf(availableWidth, dp(560f))
+        (bottomNavigationBlur.layoutParams as? android.widget.FrameLayout.LayoutParams)?.let { params ->
+            params.width = targetWidth
+            params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            bottomNavigationBlur.layoutParams = params
+        }
+    }
+
+    private fun setupTopLevelBackNavigation() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (selectedTopLevelPage != R.id.navApps) {
+                    selectTopLevelPage(R.id.navApps)
+                    return
+                }
+                isEnabled = false
+                onBackPressedDispatcher.onBackPressed()
+                isEnabled = true
+            }
+        })
+    }
+
+    /**
+     * 历史与设置页面首次创建的视图较多，在主界面空闲后提前创建，避免用户点击时才同步膨胀。
+     * 两个页面错开执行，防止启动阶段连续占用主线程。
+     */
+    private fun scheduleTopLevelPrewarm() {
+        mainHandler.postDelayed(
+            { prewarmTopLevelPageWhenIdle(R.id.navHistory) },
+            450L
+        )
+        mainHandler.postDelayed(
+            { prewarmTopLevelPageWhenIdle(R.id.navSettings) },
+            950L
+        )
+    }
+
+    private fun prewarmTopLevelPageWhenIdle(itemId: Int) {
+        if (activityDestroyed || isFinishing || isDestroyed) return
+        if (startupLoadInFlight) {
+            mainHandler.postDelayed({ prewarmTopLevelPageWhenIdle(itemId) }, 300L)
+            return
+        }
+        Looper.myQueue().addIdleHandler {
+            prewarmTopLevelPage(itemId)
+            false
+        }
+    }
+
+    private fun prewarmTopLevelPage(itemId: Int) {
+        if (activityDestroyed || isFinishing || isDestroyed ||
+            supportFragmentManager.isStateSaved || selectedTopLevelPage == itemId ||
+            supportFragmentManager.findFragmentByTag(topLevelFragmentTag(itemId)) != null
+        ) {
+            return
+        }
+        val fragment = createTopLevelFragment(itemId)
+        supportFragmentManager.beginTransaction()
+            .setReorderingAllowed(true)
+            .add(R.id.topLevelPageContainer, fragment, topLevelFragmentTag(itemId))
+            .hide(fragment)
+            .commitNow()
+    }
+
+    fun selectTopLevelPage(itemId: Int) {
+        if (bottomNavigation.selectedItemId == itemId) {
+            showTopLevelPage(itemId)
+        } else {
+            bottomNavigation.selectedItemId = itemId
+        }
+    }
+
+    private fun showTopLevelPage(itemId: Int, force: Boolean = false): Boolean {
+        if (itemId !in TOP_LEVEL_PAGE_IDS) return false
+        if (!force && selectedTopLevelPage == itemId) return true
+
+        selectedTopLevelPage = itemId
+        if (itemId == R.id.navApps) {
+            hideTopLevelFragments()
+            binding.appsPage.visibility = View.VISIBLE
+            binding.topLevelPageContainer.visibility = View.GONE
+            onAppsPageSelected()
+            return true
+        }
+
+        binding.appsPage.visibility = View.GONE
+        binding.topLevelPageContainer.visibility = View.VISIBLE
+        val tag = topLevelFragmentTag(itemId)
+        val fragment = supportFragmentManager.findFragmentByTag(tag)
+            ?: createTopLevelFragment(itemId)
+        val transaction = supportFragmentManager.beginTransaction().setReorderingAllowed(true)
+        TOP_LEVEL_PAGE_IDS.asSequence()
+            .filter { it != R.id.navApps }
+            .mapNotNull { supportFragmentManager.findFragmentByTag(topLevelFragmentTag(it)) }
+            .filter { it !== fragment }
+            .forEach(transaction::hide)
+        val addingFragment = !fragment.isAdded
+        if (!addingFragment) {
+            transaction.show(fragment)
+        } else {
+            transaction.add(R.id.topLevelPageContainer, fragment, tag)
+        }
+        if (supportFragmentManager.isStateSaved) {
+            transaction.commitAllowingStateLoss()
+        } else if (addingFragment) {
+            transaction.commitNow()
+        } else {
+            transaction.commit()
+        }
+        notifyTopLevelPageSelected(itemId, fragment)
+        return true
+    }
+
+    private fun notifyTopLevelPageSelected(itemId: Int, knownFragment: Fragment? = null) {
+        val fragment = knownFragment
+            ?: supportFragmentManager.findFragmentByTag(topLevelFragmentTag(itemId))
+        (fragment as? TopLevelFragment)?.onTopLevelPageSelected()
+    }
+
+    private fun onAppsPageSelected() {
+        appsPageRefreshRunnable?.let(mainHandler::removeCallbacks)
+        if (environmentLoading || startupLoadInFlight || !activityResumed) return
+        val runnable = object : Runnable {
+            override fun run() {
+                if (activityDestroyed || isFinishing || isDestroyed ||
+                    selectedTopLevelPage != R.id.navApps || !activityResumed) {
+                    appsPageRefreshRunnable = null
+                    return
+                }
+                if (startupLoadInFlight || configMutationInFlight > 0 ||
+                    foregroundRefreshesInFlight.get() > 0 || appListRefreshesInFlight.get() > 0) {
+                    mainHandler.postDelayed(this, 250L)
+                    return
+                }
+                val elapsed = SystemClock.elapsedRealtime() - lastAppsPageRefreshAt
+                if (elapsed < TOP_LEVEL_REFRESH_INTERVAL_MS) {
+                    mainHandler.postDelayed(this, TOP_LEVEL_REFRESH_INTERVAL_MS - elapsed)
+                    return
+                }
+                appsPageRefreshRunnable = null
+                lastAppsPageRefreshAt = SystemClock.elapsedRealtime()
+                refreshForegroundState(refreshConfig = true)
+            }
+        }
+        appsPageRefreshRunnable = runnable
+        mainHandler.post(runnable)
+    }
+
+    private fun hideTopLevelFragments() {
+        val fragments = TOP_LEVEL_PAGE_IDS.asSequence()
+            .filter { it != R.id.navApps }
+            .mapNotNull { supportFragmentManager.findFragmentByTag(topLevelFragmentTag(it)) }
+            .filter(Fragment::isVisible)
+            .toList()
+        if (fragments.isEmpty()) return
+        val transaction = supportFragmentManager.beginTransaction().setReorderingAllowed(true)
+        fragments.forEach(transaction::hide)
+        if (supportFragmentManager.isStateSaved) {
+            transaction.commitAllowingStateLoss()
+        } else {
+            transaction.commit()
+        }
+    }
+
+    private fun createTopLevelFragment(itemId: Int): Fragment = when (itemId) {
+        R.id.navEnvironment -> EnvironmentFragment()
+        R.id.navHistory -> HistoryListFragment()
+        R.id.navSettings -> SettingsFragment()
+        else -> error("未知顶级页面: $itemId")
+    }
+
+    private fun topLevelFragmentTag(itemId: Int) = "top_level_$itemId"
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt(STATE_TOP_LEVEL_PAGE, selectedTopLevelPage)
+        super.onSaveInstanceState(outState)
     }
 
     private fun showFloatingInterruptionIfNeeded() {
@@ -474,6 +709,8 @@ class MainActivity : AppCompatActivity() {
         activityResumed = false
         lifecycleRequests.next()
         cancelSettledHealthRefresh()
+        appsPageRefreshRunnable?.let(mainHandler::removeCallbacks)
+        appsPageRefreshRunnable = null
         super.onPause()
     }
 
@@ -537,6 +774,7 @@ class MainActivity : AppCompatActivity() {
                 daemonRuntime = runtime
                 foregroundHelperStatus = helperStatus
                 environmentLoading = false
+                renderEnvironmentOverview()
                 var needsAppListRefresh = false
                 if (!enabled) {
                     appListRequests.next()
@@ -547,6 +785,7 @@ class MainActivity : AppCompatActivity() {
                     appLists = AppLists()
                     buildAppList()
                 } else if (refreshConfig && appListCurrent && visibleLists != null) {
+                    lastAppsPageRefreshAt = SystemClock.elapsedRealtime()
                     updateRuleHealthSnapshot(health)
                     jankBoostPackages = jankPackages
                     appListsLoading = false
@@ -561,7 +800,6 @@ class MainActivity : AppCompatActivity() {
                 } else if (refreshConfig && config == null) {
                     binding.appRefresh.isRefreshing = false
                 }
-                refresh()
                 if (needsAppListRefresh) {
                     refreshAppList(
                         scrollAddableToTop = false,
@@ -582,6 +820,8 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         activityDestroyed = true
         cancelSettledHealthRefresh()
+        appsPageRefreshRunnable?.let(mainHandler::removeCallbacks)
+        appsPageRefreshRunnable = null
         activeRuleHealthObserver = null
         appSearchRender?.let { binding.appSection.appRecycler.removeCallbacks(it) }
         updateEmptyAnimation(false)
@@ -775,107 +1015,119 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun refresh() {
+    private fun renderEnvironmentOverview() {
+        val status = binding.statusSection
         val overlay = hasOverlay()
-        val s = binding.statusSection
-        s.btnSettings.visibility = if (!environmentLoading && hasRoot && (pendingModuleUpdate || !moduleCompatible)) {
-            View.GONE
-        } else {
-            View.VISIBLE
-        }
-        s.btnOverlay.visibility = if (overlay) View.GONE else View.VISIBLE
-        s.overlayState.text = if (overlay) "已授予" else "未授予"
-        setDot(s.dotOverlay, if (overlay) R.color.status_ok else R.color.status_warn)
-
         val usage = ForegroundDetector.hasUsageAccess(this)
-        s.btnUsage.visibility = if (usage) View.GONE else View.VISIBLE
-        s.usageState.text = if (usage) "已授予" else "未授予"
-        setDot(s.dotUsage, if (usage) R.color.status_ok else R.color.status_warn)
+
+        status.overlayState.text = if (overlay) "已授予" else "未授予"
+        setStatusDot(status.dotOverlay, if (overlay) R.color.status_ok else R.color.status_warn)
+        status.usageState.text = if (usage) "已授予" else "未授予"
+        setStatusDot(status.dotUsage, if (usage) R.color.status_ok else R.color.status_warn)
 
         if (environmentLoading) {
-            s.rootState.text = "检查中"
-            setDot(s.dotRoot, R.color.status_warn)
-            s.daemonState.text = "检查中"
-            setDot(s.dotDaemon, R.color.status_warn)
-            s.foregroundHelperState.text = "检查中"
-            setDot(s.dotForegroundHelper, R.color.status_warn)
+            status.overviewState.text = "正在检测"
+            setStatusDot(status.dotOverview, R.color.status_warn)
+            status.overviewState.setTextColor(ContextCompat.getColor(this, R.color.status_warn))
+            status.rootState.text = "检查中"
+            status.daemonState.text = "检查中"
+            status.foregroundHelperState.text = "检查中"
+            setStatusDot(status.dotRoot, R.color.status_warn)
+            setStatusDot(status.dotDaemon, R.color.status_warn)
+            setStatusDot(status.dotForegroundHelper, R.color.status_warn)
             return
         }
 
-        s.rootState.text = if (hasRoot) "可用" else "不可用"
-        setDot(s.dotRoot, if (hasRoot) R.color.status_ok else R.color.status_off)
+        status.rootState.text = if (hasRoot) "可用" else "不可用"
+        setStatusDot(status.dotRoot, if (hasRoot) R.color.status_ok else R.color.status_off)
 
-        // 守护进程：无 root 时无从判断，显示“未知”；有 root 时按当前模块验证结果显示
+        val daemonReady = hasRoot && !pendingModuleUpdate && moduleCompatible && daemonRunning
         when {
             !hasRoot -> {
-                s.daemonState.text = "未知"
-                setDot(s.dotDaemon, R.color.status_off)
+                status.daemonState.text = "未知"
+                setStatusDot(status.dotDaemon, R.color.status_off)
             }
             pendingModuleUpdate -> {
-                s.daemonState.text = "待重启"
-                setDot(s.dotDaemon, R.color.status_warn)
+                status.daemonState.text = "待重启"
+                setStatusDot(status.dotDaemon, R.color.status_warn)
             }
             !moduleCompatible -> {
-                s.daemonState.text = "模块需更新"
-                setDot(s.dotDaemon, R.color.status_warn)
+                status.daemonState.text = "模块需更新"
+                setStatusDot(status.dotDaemon, R.color.status_warn)
             }
             daemonRunning -> {
-                s.daemonState.text = daemonRuntimeLabel()
-                setDot(s.dotDaemon, R.color.status_ok)
+                status.daemonState.text = daemonRuntimeLabel()
+                setStatusDot(status.dotDaemon, R.color.status_ok)
             }
             else -> {
-                s.daemonState.text = "未运行"
-                setDot(s.dotDaemon, R.color.status_warn)
+                status.daemonState.text = "未运行"
+                setStatusDot(status.dotDaemon, R.color.status_warn)
             }
         }
 
         val helper = foregroundHelperStatus.state
+        val helperReady = daemonReady && helper?.available == true && helper.mode != "poll"
         when {
             !hasRoot -> {
-                s.foregroundHelperState.text = "未知"
-                setDot(s.dotForegroundHelper, R.color.status_off)
+                status.foregroundHelperState.text = "未知"
+                setStatusDot(status.dotForegroundHelper, R.color.status_off)
             }
             pendingModuleUpdate -> {
-                s.foregroundHelperState.text = "待重启"
-                setDot(s.dotForegroundHelper, R.color.status_warn)
+                status.foregroundHelperState.text = "待重启"
+                setStatusDot(status.dotForegroundHelper, R.color.status_warn)
             }
             !moduleCompatible -> {
-                s.foregroundHelperState.text = "模块需更新"
-                setDot(s.dotForegroundHelper, R.color.status_warn)
+                status.foregroundHelperState.text = "模块需更新"
+                setStatusDot(status.dotForegroundHelper, R.color.status_warn)
             }
             helper?.available == true && helper.mode == "poll" -> {
-                s.foregroundHelperState.text = "轮询中"
-                setDot(s.dotForegroundHelper, R.color.status_warn)
+                status.foregroundHelperState.text = "轮询中"
+                setStatusDot(status.dotForegroundHelper, R.color.status_warn)
             }
             helper?.available == true -> {
-                s.foregroundHelperState.text = "运行中"
-                setDot(s.dotForegroundHelper, R.color.status_ok)
+                status.foregroundHelperState.text = "运行中"
+                setStatusDot(status.dotForegroundHelper, R.color.status_ok)
             }
             helper?.status == "error" -> {
-                s.foregroundHelperState.text = "错误"
-                setDot(s.dotForegroundHelper, R.color.status_warn)
+                status.foregroundHelperState.text = "错误"
+                setStatusDot(status.dotForegroundHelper, R.color.status_warn)
             }
             helper?.status == "empty" -> {
-                s.foregroundHelperState.text = "无任务"
-                setDot(s.dotForegroundHelper, R.color.status_warn)
+                status.foregroundHelperState.text = "无任务"
+                setStatusDot(status.dotForegroundHelper, R.color.status_warn)
             }
             helper?.ageMs != null -> {
-                s.foregroundHelperState.text = "状态过期"
-                setDot(s.dotForegroundHelper, R.color.status_warn)
+                status.foregroundHelperState.text = "状态过期"
+                setStatusDot(status.dotForegroundHelper, R.color.status_warn)
             }
             foregroundHelperStatus.startRequested -> {
-                s.foregroundHelperState.text = "启动中"
-                setDot(s.dotForegroundHelper, R.color.status_warn)
+                status.foregroundHelperState.text = "启动中"
+                setStatusDot(status.dotForegroundHelper, R.color.status_warn)
             }
             else -> {
-                s.foregroundHelperState.text = "不可用"
-                setDot(s.dotForegroundHelper, R.color.status_off)
+                status.foregroundHelperState.text = "不可用"
+                setStatusDot(status.dotForegroundHelper, R.color.status_off)
             }
         }
+
+        val readyCount = listOf(overlay, usage, hasRoot, daemonReady, helperReady).count { it }
+        status.overviewState.text = if (readyCount == 5) "全部正常" else "${5 - readyCount} 项需要处理"
+        val overviewColor = when {
+            readyCount == 5 -> R.color.status_ok
+            !hasRoot -> R.color.status_off
+            else -> R.color.status_warn
+        }
+        setStatusDot(status.dotOverview, overviewColor)
+        status.overviewState.setTextColor(ContextCompat.getColor(this, overviewColor))
     }
 
-    private fun setDot(dot: View, colorRes: Int) {
-        dot.background?.mutate()?.setTint(ContextCompat.getColor(this, colorRes))
+    private fun setStatusDot(dot: View, colorRes: Int) {
+        val color = ContextCompat.getColor(this, colorRes)
+        if (dot is android.widget.ImageView) {
+            dot.imageTintList = android.content.res.ColorStateList.valueOf(color)
+        } else {
+            dot.background?.mutate()?.setTint(color)
+        }
     }
 
     private fun setupAppTabs() {
@@ -945,10 +1197,6 @@ class MainActivity : AppCompatActivity() {
     private fun setupAppRecycler() {
         appAdapter = AppAdapter()
         binding.appSection.appRecycler.apply {
-            layoutParams = layoutParams.apply {
-                height = (resources.displayMetrics.heightPixels * 0.55f).toInt()
-                    .coerceIn(dp(360f), dp(620f))
-            }
             layoutManager = LinearLayoutManager(this@MainActivity)
             adapter = appAdapter
             setHasFixedSize(true)
@@ -1011,6 +1259,7 @@ class MainActivity : AppCompatActivity() {
             val resolvedNames = resolveProcessComponentNames(config, rootAvailable)
             val visibleLists = buildConfiguredLists(config, resolvedNames, health).copy(addable = previousAddable)
             runOnUiThreadIfAppListCurrent(generation, lifecycleGeneration) {
+                lastAppsPageRefreshAt = SystemClock.elapsedRealtime()
                 appListsLoading = false
                 updateRuleHealthSnapshot(health)
                 jankBoostPackages = jankPackages
@@ -1043,6 +1292,7 @@ class MainActivity : AppCompatActivity() {
         val blocked = blockedState()
         if (blocked != null) {
             a.appTitle.text = "应用功能不可用"
+            a.appTitle.visibility = View.VISIBLE
             a.appCount.text = ""
             a.appTabs.visibility = View.GONE
             a.appSearchBox.visibility = View.GONE
@@ -1058,11 +1308,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         val entries = entriesForCurrentTab()
-        a.appTitle.text = appTab.title
+        a.appTitle.visibility = View.GONE
         a.appTabs.visibility = View.VISIBLE
         a.appSearchBox.visibility = if (supportsAppSearch()) View.VISIBLE else View.GONE
         a.configuredFilterRow.visibility = if (appTab == AppTab.CONFIGURED) View.VISIBLE else View.GONE
-        a.appCount.text = if (entries.isEmpty()) "" else "${entries.size} 个"
+        a.appCount.text = ""
         a.appRecycler.visibility = if (entries.isEmpty()) View.GONE else View.VISIBLE
         if (entries.isEmpty()) {
             a.emptyState.visibility = View.VISIBLE
@@ -1136,11 +1386,24 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindConfiguredAppItem(item: ItemConfiguredAppBinding, entry: AppEntry) {
         item.configName.text = if (entry.installed) entry.label else entry.pkg
-        item.configPkg.text = when (entry.component) {
+        item.configPkg.text = configuredAppMeta(entry)
+        val healthUi = configuredAppHealth(entry)
+        bindHealthHint(item.configHealth, healthUi.label, healthUi.description)
+        bindEntryIcon(item.configIcon, entry)
+        item.root.contentDescription = "管理 ${item.configName.text}"
+        item.root.setOnClickListener { showConfiguredAppManageSheet(entry) }
+        item.configManage.setOnClickListener { showConfiguredAppManageSheet(entry) }
+    }
+
+    private fun configuredAppMeta(entry: AppEntry): String {
+        return when (entry.component) {
             ComponentKind.APP -> "${entry.pkg} · ${entry.ruleCount} 条规则"
             ComponentKind.SYSTEM_COMPONENT -> "系统组件 · ${entry.ruleCount} 条规则"
             ComponentKind.MISSING_APP -> "未安装/配置残留 · ${entry.ruleCount} 条规则"
         }
+    }
+
+    private fun configuredAppHealth(entry: AppEntry): ConfiguredAppHealthUi {
         val hasMissedRules = entry.missedRuleCount > 0
         val hasPendingReviewRules = entry.pendingReviewRuleCount > 0
         val missedKindLabel = ruleHealthKindLabel(entry.missedRuleKinds)
@@ -1164,45 +1427,124 @@ class MainActivity : AppCompatActivity() {
                 "${entry.pendingReviewRuleCount} 条${pendingKindLabel}规则首次未检测到目标，下次启动时再次检查"
             else -> null
         }
-        bindHealthHint(item.configHealth, appHealthLabel, appHealthDescription)
-        bindEntryIcon(item.configIcon, entry)
+        return ConfiguredAppHealthUi(appHealthLabel, appHealthDescription)
+    }
+
+    private fun showConfiguredAppManageSheet(entry: AppEntry) {
+        val view = DialogConfiguredAppManageBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(this)
+        dialog.setContentView(view.root)
+
+        val displayName = if (entry.installed) entry.label else entry.pkg
+        view.configuredManageName.text = displayName
+        view.configuredManagePkg.text = configuredAppMeta(entry)
+        view.configuredManageRulesDescription.text = "当前共 ${entry.ruleCount} 条规则"
+        bindEntryIcon(view.configuredManageIcon, entry)
+        val healthUi = configuredAppHealth(entry)
+        bindHealthHint(view.configuredManageHealth, healthUi.label, healthUi.description)
+
         val usable = canUseModuleFeatures()
         val basePkg = entry.pkg.substringBefore(':')
-        item.root.tag = "jank:$basePkg"
-        item.switchJankBoost.setOnCheckedChangeListener(null)
-        item.switchJankBoost.isChecked = basePkg in jankBoostPackages
-        item.switchJankBoost.isEnabled = usable && entry.installed
-        item.switchJankBoost.alpha = if (usable && entry.installed) 1f else 0.45f
-        item.switchJankBoost.setOnCheckedChangeListener { _, checked ->
-            if (!canUseModuleFeatures()) {
-                item.switchJankBoost.isChecked = !checked
-                return@setOnCheckedChangeListener
+        val canBoost = usable && entry.installed
+        var boostEnabled = basePkg in jankBoostPackages
+        var boostSaving = false
+        var suppressBoostListener = false
+
+        fun setActionEnabled(action: View, enabled: Boolean) {
+            action.isEnabled = enabled
+            action.alpha = if (enabled) 1f else 0.48f
+        }
+
+        fun renderBoostState() {
+            suppressBoostListener = true
+            view.configuredManageBoostSwitch.isChecked = boostEnabled
+            suppressBoostListener = false
+            view.configuredManageBoostSwitch.isEnabled = canBoost && !boostSaving
+            view.configuredManageBoostSwitch.visibility = if (boostSaving) View.INVISIBLE else View.VISIBLE
+            view.configuredManageBoostProgress.visibility = if (boostSaving) View.VISIBLE else View.GONE
+            view.configuredManageBoost.isEnabled = canBoost && !boostSaving
+            view.configuredManageBoost.alpha = if (canBoost || boostSaving) 1f else 0.48f
+            view.configuredManageBoostDescription.text = when {
+                !entry.installed -> "应用未安装，暂不可用"
+                !usable -> "模块不可用，暂时无法修改"
+                else -> "按掉帧程度接管 CPU 调速，必要时提升活跃线程优先级，流畅后恢复"
             }
+            view.configuredManageBoostDescription.setTextColor(
+                ContextCompat.getColor(this, R.color.text_secondary)
+            )
+            setActionEnabled(view.configuredManageRules, usable && !boostSaving)
+            setActionEnabled(view.configuredManageDelete, usable && !boostSaving)
+            view.configuredManageClose.isEnabled = !boostSaving
+            view.configuredManageClose.alpha = if (boostSaving) 0.48f else 1f
+            dialog.setCancelable(!boostSaving)
+        }
+
+        fun saveBoostState(checked: Boolean) {
+            if (!canBoost || boostSaving) return
+            boostEnabled = checked
             val next = jankBoostPackages.toMutableSet().apply {
                 if (checked) add(basePkg) else remove(basePkg)
             }.toSet()
             jankBoostPackages = next
-            item.switchJankBoost.isEnabled = false
+            boostSaving = true
+            renderBoostState()
             thread {
                 val ok = DaemonBridge.setJankBoostEnabled(basePkg, checked)
-                runOnUiThread {
-                    if (activityDestroyed) return@runOnUiThread
+                runOnUiThreadIfAlive {
                     if (!ok) {
+                        boostEnabled = !checked
                         jankBoostPackages = jankBoostPackages.toMutableSet().apply {
                             if (checked) remove(basePkg) else add(basePkg)
                         }.toSet()
-                        toast("卡顿提速设置保存失败")
-                    } else {
-                        toast(if (checked) "已开启卡顿时临时提速" else "已关闭卡顿时临时提速")
                     }
-                    appAdapter.notifyDataSetChanged()
+                    boostSaving = false
+                    if (dialog.isShowing) {
+                        renderBoostState()
+                        toast(
+                            when {
+                                !ok -> "保存失败，请稍后重试"
+                                checked -> "已开启，返回应用后自动生效"
+                                else -> "已关闭，临时增强参数将自动恢复"
+                            }
+                        )
+                    }
                 }
             }
         }
-        item.btnView.isEnabled = usable
-        item.btnRemove.isEnabled = usable
-        item.btnView.setOnClickListener { showConfiguredRules(entry) }
-        item.btnRemove.setOnClickListener { confirmDeleteConfig(entry) }
+
+        renderBoostState()
+        view.configuredManageBoostSwitch.setOnCheckedChangeListener { _, checked ->
+            if (!suppressBoostListener) saveBoostState(checked)
+        }
+        view.configuredManageBoost.setOnClickListener {
+            if (view.configuredManageBoostSwitch.isEnabled) {
+                view.configuredManageBoostSwitch.toggle()
+            }
+        }
+        view.configuredManageRules.setOnClickListener {
+            if (!usable) return@setOnClickListener
+            dialog.dismiss()
+            binding.root.post { showConfiguredRules(entry) }
+        }
+        view.configuredManageDelete.setOnClickListener {
+            if (!usable) return@setOnClickListener
+            dialog.dismiss()
+            binding.root.post { confirmDeleteConfig(entry) }
+        }
+        view.configuredManageClose.setOnClickListener { dialog.dismiss() }
+        dialog.setOnShowListener {
+            if (resources.configuration.smallestScreenWidthDp >= 600) {
+                dialog.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)?.let { sheet ->
+                    val params = sheet.layoutParams
+                    params.width = minOf(dp(560f), resources.displayMetrics.widthPixels - dp(32f))
+                    if (params is androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams) {
+                        params.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                    }
+                    sheet.layoutParams = params
+                }
+            }
+        }
+        dialog.show()
     }
 
     private fun migrateLogsLater(rootAvailable: Boolean, config: ConfigReader.ConfigPackages) {
@@ -1861,6 +2203,9 @@ class MainActivity : AppCompatActivity() {
             .distinct()
             .filterNot { isInstalled(it) }
         return DaemonBridge.findRunningProcessNames(candidates)
+            .flatMapTo(LinkedHashSet()) { name ->
+                listOf(name, configOwnerName(name))
+            }
     }
 
     private fun List<AppEntry>.sortedByInstallTime(): List<AppEntry> {
@@ -1912,31 +2257,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestOverlay() {
-        startActivity(
-            Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-        )
-    }
-
-    /** 跳转系统「使用情况访问」设置页，让用户为本应用授予 PACKAGE_USAGE_STATS */
-    private fun requestUsageAccess() {
-        val intent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
-        // 部分 ROM 支持直接定位到本应用条目；失败则回退到列表页
-        try {
-            intent.data = Uri.parse("package:$packageName")
-            startActivity(intent)
-        } catch (_: Exception) {
-            try {
-                startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-            } catch (_: Exception) {
-                toast("请在系统设置 > 使用情况访问 中授予本应用权限")
-            }
-        }
-    }
-
     /** 启动目标应用并显示悬浮球，把目标包名传给服务用于校准 */
     private fun startAppWithBall(pkg: String) {
         android.util.Log.d("AppOpt", "startAppWithBall: pkg=$pkg")
@@ -1949,13 +2269,11 @@ class MainActivity : AppCompatActivity() {
         if (!hasOverlay()) {
             android.util.Log.d("AppOpt", "startAppWithBall blocked: overlay permission missing")
             toast("请先授予悬浮窗权限")
-            refresh()
             return
         }
         if (!ForegroundDetector.hasUsageAccess(this)) {
             android.util.Log.d("AppOpt", "startAppWithBall blocked: usage access missing")
             toast("请先授予使用情况访问权限")
-            refresh()
             return
         }
 

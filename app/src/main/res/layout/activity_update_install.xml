@@ -10,13 +10,24 @@
         android:id="@+id/updateInstallHeader"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:background="@drawable/bg_header_gradient"
+        android:background="@drawable/bg_top_bar"
         android:gravity="center_vertical"
         android:orientation="horizontal"
-        android:paddingStart="24dp"
-        android:paddingTop="32dp"
+        android:minHeight="72dp"
+        android:paddingStart="8dp"
+        android:paddingTop="12dp"
         android:paddingEnd="16dp"
-        android:paddingBottom="22dp">
+        android:paddingBottom="12dp">
+
+        <ImageButton
+            android:id="@+id/updateInstallBack"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="返回"
+            android:padding="12dp"
+            android:src="@drawable/ic_arrow_back"
+            app:tint="@color/brand_on_primary" />
 
         <LinearLayout
             android:layout_width="0dp"
@@ -28,7 +39,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="模块刷入"
-                android:textColor="#FFFFFF"
+                android:textColor="@color/brand_on_primary"
                 android:textSize="22sp"
                 android:textStyle="bold" />
 
@@ -37,8 +48,8 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:textColor="#E8E8FF"
-                android:textSize="13sp" />
+                android:textColor="#ECECFF"
+                android:textSize="12sp" />
         </LinearLayout>
     </LinearLayout>
 

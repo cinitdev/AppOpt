@@ -18,5 +18,14 @@
     <color name="text_primary">#1A1A2E</color>
     <color name="text_secondary">#6B6B80</color>
     <color name="surface_app">#F4F4FB</color>
+    <color name="surface_header">#FFFFFF</color>
+    <color name="surface_subtle">#F7F7FF</color>
+    <color name="surface_selected">#ECECFF</color>
+    <color name="surface_teal">#E5F8F4</color>
     <color name="card_bg">#FFFFFF</color>
+    <color name="environment_card_bg">#FBFBFF</color>
+    <color name="divider">#E6E6F4</color>
+    <color name="outline_soft">#E6E6F4</color>
+    <color name="nav_inactive">#77798B</color>
+    <color name="nav_divider">#B8BAC8</color>
 </resources>

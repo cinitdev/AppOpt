@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/bottomNavigationHost"
+    android:layout_width="match_parent"
+    android:layout_height="104dp"
+    android:background="@android:color/transparent"
+    android:clipChildren="false"
+    android:clipToPadding="false"
+    android:paddingStart="18dp"
+    android:paddingEnd="18dp">
+
+    <top.suto.appopt.BackdropBlurLayout
+        android:id="@+id/bottomNavigationBlur"
+        android:layout_width="match_parent"
+        android:layout_height="72dp"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="6dp"
+        android:background="@drawable/bg_bottom_navigation_clip"
+        android:clipToOutline="true"
+        android:elevation="10dp"
+        android:outlineAmbientShadowColor="#245B5BD6"
+        android:outlineSpotShadowColor="#2B5B5BD6"
+        android:translationZ="2dp">
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@drawable/bg_bottom_navigation_floating"
+            android:importantForAccessibility="no" />
+
+        <com.google.android.material.bottomnavigation.BottomNavigationView
+            android:id="@+id/bottomNavigation"
+            android:layout_width="match_parent"
+            android:layout_height="64dp"
+            android:layout_gravity="center"
+            android:background="@android:color/transparent"
+            android:elevation="0dp"
+            android:translationY="6dp"
+            app:itemIconSize="22dp"
+            app:itemIconTint="@color/bottom_nav_item_color"
+            app:itemPaddingBottom="6dp"
+            app:itemPaddingTop="6dp"
+            app:itemRippleColor="@color/surface_selected"
+            app:itemTextAppearanceActive="@style/AppBottomNavigationText"
+            app:itemTextAppearanceInactive="@style/AppBottomNavigationText"
+            app:itemTextColor="@color/bottom_nav_item_color"
+            app:labelVisibilityMode="labeled"
+            app:menu="@menu/bottom_navigation" />
+
+    </top.suto.appopt.BackdropBlurLayout>
+
+</FrameLayout>

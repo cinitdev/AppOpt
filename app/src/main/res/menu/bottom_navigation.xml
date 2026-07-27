@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:id="@+id/navApps"
+        android:icon="@drawable/ic_apps"
+        android:title="应用" />
+    <item
+        android:id="@+id/navEnvironment"
+        android:icon="@drawable/ic_environment"
+        android:title="运行环境" />
+    <item
+        android:id="@+id/navHistory"
+        android:icon="@drawable/ic_history"
+        android:title="历史记录" />
+    <item
+        android:id="@+id/navSettings"
+        android:icon="@drawable/ic_settings"
+        android:title="设置" />
+</menu>

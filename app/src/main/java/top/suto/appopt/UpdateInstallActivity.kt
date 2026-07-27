@@ -31,6 +31,9 @@ class UpdateInstallActivity : AppCompatActivity() {
                 }
             }
         })
+        binding.updateInstallBack.setOnClickListener {
+            onBackPressedDispatcher.onBackPressed()
+        }
 
         val update = readUpdateInfo()
         val zipPath = intent.getStringExtra(EXTRA_ZIP_PATH)

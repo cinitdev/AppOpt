@@ -2,10 +2,12 @@ package top.suto.appopt
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.Dialog
 import android.content.Context
 import android.content.ContextWrapper
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
@@ -13,15 +15,16 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import android.view.WindowManager
 
 object AppToast {
     private var currentToast: Toast? = null
+    private var currentDialog: Dialog? = null
+    private var currentDialogHide: Runnable? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private const val ACTIVITY_TOAST_TAG = "appopt_activity_toast"
 
     @SuppressLint("ShowToast")
     @Suppress("DEPRECATION")
@@ -33,8 +36,7 @@ object AppToast {
 
         val activity = context.findActivity()
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
-            showInActivity(activity, message, duration)
-            return
+            if (showOverActivity(activity, message, duration)) return
         }
 
         val appContext = context.applicationContext
@@ -66,14 +68,17 @@ object AppToast {
         }
     }
 
-    private fun showInActivity(activity: Activity, message: String, duration: Int) {
-        val root = activity.findViewById<ViewGroup>(android.R.id.content) ?: return
+    /** 使用独立、不可交互的应用窗口，确保提示显示在 BottomSheet 和普通 Dialog 上方。 */
+    private fun showOverActivity(activity: Activity, message: String, duration: Int): Boolean {
         val density = activity.resources.displayMetrics.density
         fun dp(value: Float): Int = (value * density + 0.5f).toInt()
 
-        root.findViewWithTag<View>(ACTIVITY_TOAST_TAG)?.let { old ->
-            (old.parent as? ViewGroup)?.removeView(old)
-        }
+        currentToast?.cancel()
+        currentToast = null
+        currentDialogHide?.let(mainHandler::removeCallbacks)
+        currentDialogHide = null
+        currentDialog?.dismiss()
+        currentDialog = null
 
         val container = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -84,7 +89,6 @@ object AppToast {
             elevation = dp(12f).toFloat()
             alpha = 0f
             translationY = dp(10f).toFloat()
-            tag = ACTIVITY_TOAST_TAG
         }
 
         container.addView(View(activity).apply {
@@ -103,36 +107,75 @@ object AppToast {
             typeface = Typeface.DEFAULT_BOLD
             includeFontPadding = false
             maxLines = 4
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            maxWidth = (activity.resources.displayMetrics.widthPixels - dp(88f))
+                .coerceAtLeast(dp(180f))
+                .coerceAtMost(dp(420f))
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
 
-        val params = FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        ).apply {
-            leftMargin = dp(20f)
-            rightMargin = dp(20f)
-            bottomMargin = dp(74f)
+        val dialog = Dialog(activity, android.R.style.Theme_Translucent_NoTitleBar).apply {
+            setCancelable(false)
+            setCanceledOnTouchOutside(false)
+            setContentView(container)
         }
-        root.addView(container, params)
-        container.animate()
-            .alpha(1f)
-            .translationY(0f)
-            .setDuration(110L)
-            .start()
+        dialog.window?.apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            addFlags(
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+            )
+            setGravity(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+            attributes = attributes.apply {
+                width = WindowManager.LayoutParams.WRAP_CONTENT
+                height = WindowManager.LayoutParams.WRAP_CONTENT
+                y = dp(86f)
+                dimAmount = 0f
+            }
+        }
+        dialog.setOnDismissListener {
+            if (currentDialog === dialog) {
+                currentDialogHide?.let(mainHandler::removeCallbacks)
+                currentDialogHide = null
+                currentDialog = null
+            }
+        }
+        try {
+            dialog.show()
+        } catch (_: WindowManager.BadTokenException) {
+            return false
+        } catch (_: IllegalStateException) {
+            return false
+        }
+        currentDialog = dialog
+        container.post {
+            if (dialog.isShowing) {
+                container.animate()
+                    .alpha(1f)
+                    .translationY(0f)
+                    .setDuration(110L)
+                    .start()
+            }
+        }
 
         val showMs = if (duration == Toast.LENGTH_LONG) 3200L else 1900L
         val hide = Runnable {
+            if (currentDialog !== dialog || !dialog.isShowing) return@Runnable
             container.animate()
                 .alpha(0f)
                 .translationY(dp(8f).toFloat())
                 .setDuration(140L)
                 .withEndAction {
-                    (container.parent as? ViewGroup)?.removeView(container)
+                    if (currentDialog === dialog) dialog.dismiss()
                 }
                 .start()
         }
-        container.postDelayed(hide, showMs)
+        currentDialogHide = hide
+        mainHandler.postDelayed(hide, showMs)
+        return true
     }
 
     private fun toastBackground(radius: Float): GradientDrawable {

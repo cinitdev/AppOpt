@@ -41,15 +41,7 @@
             android:exported="false" />
 
         <activity
-            android:name=".HistoryListActivity"
-            android:exported="false" />
-
-        <activity
             android:name=".LogActivity"
-            android:exported="false" />
-
-        <activity
-            android:name=".SettingsActivity"
             android:exported="false" />
 
         <activity

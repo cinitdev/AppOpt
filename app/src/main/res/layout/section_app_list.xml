@@ -1,51 +1,69 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
-    android:layout_height="wrap_content"
-    android:orientation="vertical">
+    android:layout_height="match_parent"
+    android:background="@color/surface_app"
+    android:orientation="vertical"
+    android:paddingStart="16dp"
+    android:paddingTop="4dp"
+    android:paddingEnd="16dp">
 
-    <LinearLayout
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="2dp"
+        android:layout_marginBottom="8dp"
+        android:background="@color/divider" />
+
+    <TextView
+        android:id="@+id/appTitle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:paddingStart="4dp"
-        android:paddingEnd="4dp"
-        android:layout_marginBottom="8dp">
+        android:layout_marginBottom="10dp"
+        android:paddingStart="2dp"
+        android:text="应用功能不可用"
+        android:textColor="@color/text_primary"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
 
-        <TextView
-            android:id="@+id/appTitle"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="待校准"
-            android:textColor="@color/text_primary"
-            android:textSize="17sp"
-            android:textStyle="bold" />
-
-        <TextView
-            android:id="@+id/appCount"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text=""
-            android:textColor="@color/text_secondary"
-            android:textSize="13sp" />
-    </LinearLayout>
+    <TextView
+        android:id="@+id/appCount"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:visibility="gone" />
 
     <com.google.android.material.tabs.TabLayout
         android:id="@+id/appTabs"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="44dp"
         android:layout_marginBottom="10dp"
-        android:background="@android:color/transparent" />
+        android:background="@android:color/transparent"
+        app:tabIndicator="@drawable/bg_app_tab_indicator"
+        app:tabIndicatorColor="@color/brand_primary"
+        app:tabIndicatorFullWidth="false"
+        app:tabIndicatorGravity="bottom"
+        app:tabRippleColor="@color/surface_selected"
+        app:tabSelectedTextColor="@color/brand_primary"
+        app:tabTextColor="@color/text_secondary" />
 
     <com.google.android.material.textfield.TextInputLayout
         android:id="@+id/appSearchBox"
-        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+        style="@style/Widget.Material3.TextInputLayout.OutlinedBox.Dense"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="10dp"
-        android:hint="搜索应用名称或包名">
+        android:layout_marginBottom="8dp"
+        android:hint="搜索应用名称或包名"
+        app:boxBackgroundColor="@color/surface_subtle"
+        app:boxCornerRadiusBottomEnd="8dp"
+        app:boxCornerRadiusBottomStart="8dp"
+        app:boxCornerRadiusTopEnd="8dp"
+        app:boxCornerRadiusTopStart="8dp"
+        app:boxStrokeColor="@color/app_text_field_stroke"
+        app:boxStrokeWidth="1dp"
+        app:boxStrokeWidthFocused="1dp"
+        app:startIconDrawable="@drawable/ic_search">
 
         <com.google.android.material.textfield.TextInputEditText
             android:id="@+id/appSearchInput"
@@ -60,13 +78,16 @@
     <LinearLayout
         android:id="@+id/configuredFilterRow"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="-2dp"
-        android:layout_marginBottom="10dp"
+        android:layout_height="48dp"
+        android:layout_marginBottom="8dp"
+        android:background="@drawable/bg_action_row"
+        android:clickable="true"
+        android:focusable="true"
+        android:foreground="?attr/selectableItemBackground"
         android:gravity="center_vertical"
         android:orientation="horizontal"
-        android:paddingStart="2dp"
-        android:paddingEnd="2dp"
+        android:paddingStart="14dp"
+        android:paddingEnd="8dp"
         android:visibility="gone">
 
         <TextView
@@ -88,13 +109,11 @@
     <LinearLayout
         android:id="@+id/emptyState"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="0dp"
+        android:layout_weight="1"
         android:gravity="center"
         android:orientation="vertical"
-        android:paddingStart="24dp"
-        android:paddingTop="34dp"
-        android:paddingEnd="24dp"
-        android:paddingBottom="34dp"
+        android:padding="24dp"
         android:visibility="gone">
 
         <ImageView
@@ -129,8 +148,10 @@
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/appRecycler"
         android:layout_width="match_parent"
-        android:layout_height="520dp"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="@android:color/transparent"
         android:clipToPadding="false"
         android:nestedScrollingEnabled="true"
-        android:paddingBottom="8dp" />
+        android:paddingBottom="112dp" />
 </LinearLayout>
