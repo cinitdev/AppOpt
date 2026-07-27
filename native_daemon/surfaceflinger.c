@@ -1,5 +1,6 @@
 #define SF_MAX_CANDS  16
 #define SF_LAYER_MAX  256
+#include <poll.h>
 
 /* =====================================================================
  * 直连 binder 抓 SurfaceFlinger dump (对齐 Scene 思路, 替代 fork dumpsys)
@@ -307,4 +308,124 @@ ssize_t sf_dump_binder(const char* const args[], int nargs,
     return (ssize_t)d.used;
 }
 #endif /* APPOPT_HAVE_BINDER */
+
+/* Binder 不可用时的最终降级。CLI 只由 fps_fallback.c 低频调用；这里负责给
+ * dumpsys 设置硬超时并持续排空 stdout，避免厂商 SurfaceFlinger 卡住守护线程。 */
+ssize_t sf_dump_cli_bounded(const char* const args[], int nargs,
+                            char* buf, size_t bufsz) {
+    enum { SF_CLI_MAX_ARGS = 16, SF_CLI_TIMEOUT_MS = 1500 };
+    if (!buf || bufsz == 0 || nargs < 0 || nargs > SF_CLI_MAX_ARGS) return -1;
+    buf[0] = '\0';
+
+    int pfd[2];
+    if (pipe(pfd) != 0) return -1;
+    (void)fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return -1;
+    }
+    if (child == 0) {
+        if (dup2(pfd[1], STDOUT_FILENO) < 0) _exit(127);
+        int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDERR_FILENO);
+            if (null_fd != STDERR_FILENO) close(null_fd);
+        }
+        close(pfd[0]);
+        close(pfd[1]);
+
+        char* argv[SF_CLI_MAX_ARGS + 3];
+        argv[0] = (char*)"/system/bin/dumpsys";
+        argv[1] = (char*)"SurfaceFlinger";
+        for (int i = 0; i < nargs; i++) {
+            if (!args || !args[i]) _exit(127);
+            argv[i + 2] = (char*)args[i];
+        }
+        argv[nargs + 2] = NULL;
+        execv(argv[0], argv);
+        _exit(127);
+    }
+
+    close(pfd[1]);
+    int flags = fcntl(pfd[0], F_GETFL, 0);
+    if (flags >= 0) (void)fcntl(pfd[0], F_SETFL, flags | O_NONBLOCK);
+
+    size_t used = 0;
+    bool timed_out = false;
+    bool exited = false;
+    int status = 0;
+    long long started = monotonic_ms();
+    int timeout_ticks = 0;
+    char discard[4096];
+    while (!exited) {
+        int drain_chunks = 0;
+        for (;;) {
+            char* target = used + 1 < bufsz ? buf + used : discard;
+            size_t capacity = used + 1 < bufsz ? bufsz - 1 - used : sizeof(discard);
+            ssize_t n = read(pfd[0], target, capacity);
+            if (n > 0) {
+                if (target != discard) used += (size_t)n;
+                if (++drain_chunks >= 64) break;
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) {
+            exited = true;
+            break;
+        }
+        if (waited < 0 && errno != EINTR) {
+            break;
+        }
+
+        long long now = monotonic_ms();
+        bool clock_available = started > 0 && now > 0;
+        if ((clock_available && now - started >= SF_CLI_TIMEOUT_MS) ||
+            (!clock_available && ++timeout_ticks >= SF_CLI_TIMEOUT_MS / 50 + 2)) {
+            timed_out = true;
+            (void)kill(child, SIGKILL);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+            exited = true;
+            break;
+        }
+
+        struct pollfd poll_fd = { .fd = pfd[0], .events = POLLIN | POLLHUP };
+        (void)poll(&poll_fd, 1, 50);
+    }
+
+    /* 子进程结束后排空管道里尚未读取的尾部。 */
+    for (;;) {
+        char* target = used + 1 < bufsz ? buf + used : discard;
+        size_t capacity = used + 1 < bufsz ? bufsz - 1 - used : sizeof(discard);
+        ssize_t n = read(pfd[0], target, capacity);
+        if (n > 0) {
+            if (target != discard) used += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(pfd[0]);
+    buf[used] = '\0';
+
+    bool ok = !timed_out && exited && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!ok) {
+        static long long last_error_log_ms = 0;
+        long long now = monotonic_ms();
+        if (last_error_log_ms == 0 || now <= 0 || now - last_error_log_ms >= 30000) {
+            printf("[FPS][CLI] dumpsys SurfaceFlinger %s，已中止本次采样\n",
+                   timed_out ? "超时" : "执行失败");
+            last_error_log_ms = now;
+        }
+        return -1;
+    }
+    return (ssize_t)used;
+}
 

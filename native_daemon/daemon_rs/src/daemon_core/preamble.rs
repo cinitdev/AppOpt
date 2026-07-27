@@ -28,10 +28,11 @@ use std::os::unix::fs::MetadataExt;
 // 5. 写入后再读回一次，用于发现移植系统/厂商服务把线程绑核抢写回去的情况。
 const VERSION: &str = "1.8.0";
 const DEFAULT_CONFIG: &str = "/data/adb/modules/AppOpt/config/applist.conf";
-const DEFAULT_UID_MAP: &str = "/data/adb/modules/AppOpt/config/package_uid.map";
-const RULE_HEALTH_FILE: &str = "/data/adb/modules/AppOpt/config/rule_health.tsv";
+const STATE_DIR: &str = "/data/adb/modules/AppOpt/config/state";
+const DEFAULT_UID_MAP: &str = "/data/adb/modules/AppOpt/config/state/package_uid.map";
+const RULE_HEALTH_FILE: &str = "/data/adb/modules/AppOpt/config/state/rule_health.tsv";
 const FOREGROUND_TASK_STATE_FILE: &str = "/data/adb/modules/AppOpt/config/foreground_task.state";
-const PROCESS_CACHE_FILE: &str = "/data/adb/modules/AppOpt/config/pid_cache.tsv";
+const PROCESS_CACHE_FILE: &str = "/data/adb/modules/AppOpt/config/state/pid_cache.tsv";
 const PROCESS_INDEX_MAGIC: &str = "APPOPT_PROCESS_INDEX_V1";
 const BOOT_ID_FILE: &str = "/proc/sys/kernel/random/boot_id";
 const FOREGROUND_TASK_MAX_AGE_MS: u64 = 12_000;
@@ -43,12 +44,14 @@ const FULL_RESCAN_MAX_MS: u64 = 60_000;
 const PID_SNAPSHOT_ACTIVE_MS: u64 = 2_000;
 const PID_SNAPSHOT_IDLE_MS: u64 = 10_000;
 const PID_DISCOVERY_RETRY_MS: u64 = 6_000;
+const PID_GROWTH_HINT_MIN_MS: u64 = 10_000;
 const PID_SNAPSHOT_LOG_INTERVAL_MS: u64 = 30_000;
+const RUNTIME_CHANGE_LOG_INTERVAL_MS: u64 = 30_000;
+const RUNTIME_SUMMARY_LOG_INTERVAL_MS: u64 = 5 * 60_000;
 const RULE_HEALTH_FULL_SCAN_RETRY_MS: u64 = 5_000;
 const FOREGROUND_DISCOVERY_DELAY_MS: u64 = 2_000;
 const FOREGROUND_DISCOVERY_COOLDOWN_MS: u64 = 10_000;
 const BOOT_ID_READ_RETRY_MS: u64 = 60_000;
-const ROUND_SUMMARY_EVERY: u64 = 30;
 const MAX_ERROR_DETAILS_PER_ROUND: usize = 3;
 const CPU_MASK_WORDS: usize = 16;
 const MAX_CONFIG_OWNER_BYTES: usize = 127;
@@ -186,7 +189,9 @@ struct DaemonState {
     process_index_has_candidates: bool,
     last_pid_snapshot_elapsed_ms: Option<u64>,
     last_pid_snapshot_log_elapsed_ms: Option<u64>,
+    last_proc_growth_scan_elapsed_ms: Option<u64>,
     stable_pid_snapshot_rounds: u32,
+    pid_idle_backoff_logged: bool,
     // 区分“尚未做过初始全扫”和“已经全扫但当前没有目标进程”。
     // known_pids 为空并不代表缓存未初始化，否则无目标进程时会每轮全扫 /proc。
     proc_scan_initialized: bool,
@@ -208,6 +213,7 @@ struct DaemonState {
     last_foreground_discovery_scan_elapsed_ms: Option<u64>,
     round_index: u64,
     logged_round_once: bool,
+    last_runtime_summary_log_elapsed_ms: Option<u64>,
     last_logged_known_pids: usize,
     last_logged_processes: usize,
     rule_health: HashMap<String, RuleHealthEntry>,

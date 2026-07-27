@@ -539,7 +539,6 @@ static int process_index_print_names(int name_count, char* const names[]) {
         }
         for (size_t pid_index = 0; pid_index < current_count && !all_found; pid_index++) {
             pid_t pid = current_pids[pid_index];
-            if (process_index_entry_index(entries, count, pid) >= 0) continue;
             ProcessIndexEntry current;
             if (!process_index_read_entry(pid, 0, NULL, &current)) continue;
             all_found = true;

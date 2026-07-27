@@ -24,6 +24,8 @@ const HISTORY_DIR: &str = "/data/adb/modules/AppOpt/history";
 const CALIB_TOPO_BEGIN: &str = "# AppOpt detected CPU topology begin";
 const CALIB_TOPO_END: &str = "# AppOpt detected CPU topology end";
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+const CALIB_PROGRESS_LOG_ROUNDS: usize = 120;
+const CALIB_MAX_SESSION_DURATION: Duration = Duration::from_secs(6 * 60 * 60);
 const PROCESS_REFRESH_ROUNDS: usize = 10;
 const CALIB_MIN_ROUNDS: usize = 60;
 const MAX_THREAD_RULES: usize = 6;
@@ -49,6 +51,8 @@ struct TrackKey {
 struct TidKey {
     pid: i32,
     tid: i32,
+    // /proc/<pid>/task/<tid>/stat 的 starttime，用来区分被复用的 TID。
+    starttime: u64,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -160,5 +164,6 @@ struct CalibSession {
     // 子进程线程明细只写入历史记录给用户查看，不生成子进程线程规则。
     child_threads: HashMap<ChildThreadKey, ChildThreadSummary>,
     rounds: usize,
+    started_at: Instant,
     last_sample: Option<Instant>,
 }

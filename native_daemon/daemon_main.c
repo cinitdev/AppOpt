@@ -58,6 +58,7 @@ int main(int argc, char **argv) {
 
     CpuTopology topo = init_cpu_topo();
     mkdir(CONFIG_DIR, 0755);
+    mkdir(STATE_DIR, 0755);
     mkdir(LOG_DIR, 0755);
     mkdir(EBPF_DIR, 0755);
     (void)calib_load_policy(&topo);

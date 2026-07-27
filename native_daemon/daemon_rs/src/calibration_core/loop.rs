@@ -23,15 +23,38 @@ pub fn start_calibration_thread(config_file: PathBuf) -> bool {
 }
 
 fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
-    fs::create_dir_all(CONFIG_DIR)?;
-    fs::create_dir_all(HISTORY_DIR)?;
-    write_state("idle")?;
+    if let Err(err) = fs::create_dir_all(CONFIG_DIR) {
+        eprintln!("[CALIB] 初始化配置目录失败，将在后续命令中重试: {err}");
+    }
+    if let Err(err) = fs::create_dir_all(HISTORY_DIR) {
+        eprintln!("[CALIB] 初始化历史目录失败，写入时将重试: {err}");
+    }
+    if let Err(err) = write_state("idle") {
+        eprintln!("[CALIB] 初始状态写入失败，校准线程继续运行: {err}");
+    }
 
     let mut session: Option<CalibSession> = None;
+    let mut last_command_error_log: Option<Instant> = None;
     loop {
         // App 通过写 calibrate.cmd 控制开始/停止。
         // daemon 侧不直接和 Activity 通信，避免 App 被杀时校准线程状态丢失。
-        if let Some(cmd) = read_command()? {
+        let command = match read_command() {
+            Ok(command) => {
+                last_command_error_log = None;
+                command
+            }
+            Err(err) => {
+                let now = Instant::now();
+                if last_command_error_log
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10))
+                {
+                    eprintln!("[CALIB] 校准命令读取失败，将继续重试: {err}");
+                    last_command_error_log = Some(now);
+                }
+                None
+            }
+        };
+        if let Some(cmd) = command {
             if let Some(pkg) = cmd.strip_prefix("start ").map(str::trim) {
                 if !pkg.is_empty() {
                     let processes = collect_pkg_processes(pkg);
@@ -44,22 +67,34 @@ fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
                             processes.len(),
                             process_preview(&processes, 8)
                         );
-                        write_state(&format!("sampling {pkg}"))?;
-                        session = Some(CalibSession::new(pkg.to_string(), processes));
+                        match write_state(&format!("sampling {pkg}")) {
+                            Ok(()) => {
+                                session = Some(CalibSession::new(pkg.to_string(), processes));
+                            }
+                            Err(err) => {
+                                eprintln!("[CALIB] 采样状态写入失败，忽略本次开始命令: {err}");
+                            }
+                        }
                     }
                 }
             } else if cmd == "stop" || cmd.starts_with("stop ") {
                 if let Some(done) = session.take() {
-                    finish_session(done, &config_file)?;
+                    if let Err(err) = finish_session(done, &config_file) {
+                        eprintln!("[CALIB] 校准收尾失败，后台线程将继续运行: {err}");
+                    }
                 }
             }
         }
 
         let mut should_finish = false;
+        let mut session_timed_out = false;
         if let Some(active) = session.as_mut() {
-            if !active.sample_once() {
+            if active.started_at.elapsed() >= CALIB_MAX_SESSION_DURATION {
                 should_finish = true;
-            } else if active.rounds % 20 == 0 {
+                session_timed_out = true;
+            } else if !active.sample_once() {
+                should_finish = true;
+            } else if active.rounds % CALIB_PROGRESS_LOG_ROUNDS == 0 {
                 println!(
                     "[CALIB] 采样中: pkg={} 轮次={} 活跃进程={} 负载项={} 跟踪TID={} 子进程线程摘要={} Top=[{}]",
                     active.pkg,
@@ -74,8 +109,14 @@ fn calibration_loop(config_file: PathBuf) -> io::Result<()> {
         }
         if should_finish {
             if let Some(done) = session.take() {
-                println!("[CALIB] 目标进程已退出: {}", done.pkg);
-                finish_session(done, &config_file)?;
+                if session_timed_out {
+                    println!("[CALIB] 校准会话已达到 6 小时上限: {}", done.pkg);
+                } else {
+                    println!("[CALIB] 主进程已退出: {}", done.pkg);
+                }
+                if let Err(err) = finish_session(done, &config_file) {
+                    eprintln!("[CALIB] 校准收尾失败，后台线程将继续运行: {err}");
+                }
             }
         }
 

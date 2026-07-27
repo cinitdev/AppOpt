@@ -25,7 +25,8 @@ FOREGROUND_HELPER="$MODDIR/config/tools/appopt_foreground_helper.sh"
 FOREGROUND_HELPER_LOG="$MODDIR/logs/ForegroundHelper.log"
 APPOPT_IN_APP_UPDATE_FLAG="/data/adb/appopt_in_app_update"
 
-mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" "$MODDIR/logs"
+mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" \
+	"$MODDIR/config/state" "$MODDIR/logs"
 rm -f "$RS_FALLBACK_FLAG" 2>/dev/null || true
 
 select_daemon_binary() {

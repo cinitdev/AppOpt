@@ -38,6 +38,9 @@ snapshot_module_files() {
     copy_if_exists "$MODDIR/logs/ForegroundHelper.log" "$OUT/ForegroundHelper${suffix}.log"
     copy_if_exists "$MODDIR/config/foreground_task.state" "$OUT/foreground_task${suffix}.state"
     copy_if_exists "$MODDIR/config/.appopt_use_c_daemon" "$OUT/use_c_daemon${suffix}.flag"
+    copy_if_exists "$MODDIR/config/state/package_uid.map" "$OUT/package_uid${suffix}.map"
+    copy_if_exists "$MODDIR/config/state/pid_cache.tsv" "$OUT/pid_cache${suffix}.tsv"
+    copy_if_exists "$MODDIR/config/state/rule_health.tsv" "$OUT/rule_health${suffix}.tsv"
 }
 
 echo "AppOpt 日志目录：$OUT"

@@ -42,11 +42,16 @@ object DatabaseMigrator {
         }
     }
 
+    /** 导入、删除和导出同一包历史时共用这把锁，避免旧文件在删除后重新入库。 */
+    internal fun <T> withPackageLock(pkg: String, action: () -> T): T {
+        return synchronized(getLock(pkg), action)
+    }
+
     /**
      * 把 .log 的新会话增量导入数据库，导入成功后删除 .log 文件
      */
     fun migrateIfNeeded(context: Context, pkg: String): MigrationResult {
-        return synchronized(getLock(pkg)) {  // 同一包名串行执行
+        return withPackageLock(pkg) {  // 同一包名串行执行
             val db = AppOptDbHelper.getInstance(context)
 
             // 已存在的 epoch 集合(去重用)

@@ -87,6 +87,7 @@ object RuleFormatConverter {
         }
 
         val document = RuleSyntax.parse(text)
+        val presentCpus = RuleConfigLogic.readPresentCpuSet()
 
         val groups = LinkedHashMap<String, RuleGroup>()
         val pendingTrivia = mutableListOf<String>()
@@ -115,7 +116,7 @@ object RuleFormatConverter {
         }
 
         groups.values.forEach { group ->
-            val deduplicated = deduplicateRules(group.rules)
+            val deduplicated = deduplicateRules(group.rules, presentCpus)
             group.rules.clear()
             group.rules.addAll(deduplicated)
         }
@@ -173,22 +174,34 @@ object RuleFormatConverter {
         val fallback = group.rules.firstOrNull { it.owner == group.owner && it.thread == null }
         val threads = group.rules.filter { it.owner == group.owner && it.thread != null }
         val children = group.rules.filter { it.owner != group.owner && it.thread == null }
-        val members = threads.size + children.size
+        val untypedBlock = format == CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK ||
+            format == CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK
+        val legacyOnlyThreads = if (untypedBlock) {
+            threads.filter { isAmbiguousUntypedBlockThread(group.owner, it.thread.orEmpty()) }
+        } else {
+            emptyList()
+        }
+        val formattedThreads = if (legacyOnlyThreads.isEmpty()) threads else threads - legacyOnlyThreads.toSet()
+        val members = formattedThreads.size + children.size
 
         // 只有主进程兜底时保持单行，避免生成没有实际成员的空区块。
         if (members == 0) {
-            return fallback?.let { listOf(it.canonicalLine) }.orEmpty()
+            return buildList {
+                addAll(legacyOnlyThreads.map(RuleSyntax.Rule::canonicalLine))
+                fallback?.let { add(it.canonicalLine) }
+            }
         }
 
         if (format == CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK) {
             val output = mutableListOf<String>()
-            if (threads.isEmpty()) {
+            if (formattedThreads.isEmpty()) {
                 fallback?.let { output.add(it.canonicalLine) }
             } else {
                 output.add(fallback?.let { "${group.owner}=${it.cpus} {" } ?: "${group.owner} {")
-                threads.forEach { output.add("    ${it.thread}=${it.cpus}") }
+                formattedThreads.forEach { output.add("    ${it.thread}=${it.cpus}") }
                 output.add("}")
             }
+            output.addAll(legacyOnlyThreads.map(RuleSyntax.Rule::canonicalLine))
             children.forEach { output.add(it.canonicalLine) }
             return output
         }
@@ -214,25 +227,25 @@ object RuleFormatConverter {
         }
         when (format) {
             CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> {
-                threads.forEach { output.add("    ${it.thread}=${it.cpus}") }
+                formattedThreads.forEach { output.add("    ${it.thread}=${it.cpus}") }
                 children.forEach { output.add("    ${it.owner.removePrefix(group.owner)}=${it.cpus}") }
             }
             CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> {
-                threads.forEach { output.add("    thread:${it.thread}=${it.cpus}") }
+                formattedThreads.forEach { output.add("    thread:${it.thread}=${it.cpus}") }
                 children.forEach {
                     output.add("    process:${it.owner.removePrefix("${group.owner}:")}=${it.cpus}")
                 }
             }
             CalibPolicy.RuleOutputFormat.NATURAL_BLOCK -> {
-                threads.forEach { output.add("    thread ${it.thread}=${it.cpus}") }
+                formattedThreads.forEach { output.add("    thread ${it.thread}=${it.cpus}") }
                 children.forEach {
                     output.add("    process ${it.owner.removePrefix("${group.owner}:")}=${it.cpus}")
                 }
             }
             CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> {
-                if (threads.isNotEmpty()) {
+                if (formattedThreads.isNotEmpty()) {
                     output.add("    threads {")
-                    threads.forEach { output.add("        ${it.thread}=${it.cpus}") }
+                    formattedThreads.forEach { output.add("        ${it.thread}=${it.cpus}") }
                     output.add("    }")
                 }
                 if (children.isNotEmpty()) {
@@ -244,15 +257,15 @@ object RuleFormatConverter {
                 }
             }
             CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> {
-                threads.forEach { output.add("    thread(${it.thread}, ${it.cpus})") }
+                formattedThreads.forEach { output.add("    thread(${it.thread}, ${it.cpus})") }
                 children.forEach {
                     output.add("    process(${it.owner.removePrefix("${group.owner}:")}, ${it.cpus})")
                 }
             }
             CalibPolicy.RuleOutputFormat.YAML -> {
-                if (threads.isNotEmpty()) {
+                if (formattedThreads.isNotEmpty()) {
                     output.add("    threads:")
-                    threads.forEach { output.add("        ${it.thread}: ${it.cpus}") }
+                    formattedThreads.forEach { output.add("        ${it.thread}: ${it.cpus}") }
                 }
                 if (children.isNotEmpty()) {
                     output.add("    processes:")
@@ -290,7 +303,12 @@ object RuleFormatConverter {
             CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
             CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> error("旧区块格式只能转换为原作者格式")
         }
+        output.addAll(legacyOnlyThreads.map(RuleSyntax.Rule::canonicalLine))
         return output
+    }
+
+    private fun isAmbiguousUntypedBlockThread(owner: String, thread: String): Boolean {
+        return thread.startsWith(':') || thread.startsWith("$owner:")
     }
 
     internal fun preservedTrivia(rawLines: List<String>): List<String> {
@@ -312,12 +330,17 @@ object RuleFormatConverter {
     }
 
     /** 同一线程、子进程或主进程兜底只保留覆盖核心最多的一条。 */
-    private fun deduplicateRules(rules: List<RuleSyntax.Rule>): List<RuleSyntax.Rule> {
+    private fun deduplicateRules(
+        rules: List<RuleSyntax.Rule>,
+        presentCpus: Set<Int>?
+    ): List<RuleSyntax.Rule> {
         val selected = LinkedHashMap<Pair<String, String?>, RuleSyntax.Rule>()
         for (rule in rules) {
             val key = rule.owner to rule.thread
             val current = selected[key]
-            if (current == null || cpuPreference(rule.cpus) > cpuPreference(current.cpus)) {
+            if (current == null ||
+                cpuPreference(rule.cpus, presentCpus) > cpuPreference(current.cpus, presentCpus)
+            ) {
                 selected[key] = rule
             }
         }
@@ -342,14 +365,17 @@ object RuleFormatConverter {
         }
     }
 
-    private fun cpuPreference(cpus: String): CpuPreference {
-        val parsed = RuleConfigLogic.parseCpuRangeList(cpus)
+    private fun cpuPreference(cpus: String, presentCpus: Set<Int>?): CpuPreference {
+        val parsed = RuleConfigLogic.parseNativeCpuRangeList(cpus)
         if (parsed != null && parsed.isNotEmpty()) {
+            val effective = presentCpus?.let { present -> parsed.filterTo(linkedSetOf(), present::contains) }
+                ?: parsed
+            if (effective.isEmpty()) return CpuPreference(0, 0, -1, 0)
             return CpuPreference(
                 validity = 2,
-                count = parsed.size,
-                highest = parsed.maxOrNull() ?: -1,
-                lowerCoverage = -(parsed.minOrNull() ?: 0)
+                count = effective.size,
+                highest = effective.maxOrNull() ?: -1,
+                lowerCoverage = -(effective.minOrNull() ?: 0)
             )
         }
         return if (cpus.equals("auto", ignoreCase = true)) {

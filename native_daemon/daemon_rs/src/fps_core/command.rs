@@ -1,6 +1,6 @@
     // FPS 命令循环。
     //
-    // App 写入 fps.cmd，daemon 读取后立即删除：
+    // App 写入 fps.cmd，daemon 原子认领后读取并删除：
     // - start <pkg> [socket token]
     // - stop
     //
@@ -13,6 +13,7 @@
         let mut last_selected: Option<Vec<String>> = None;
         let mut selected = Vec::new();
         let mut last_auto_check = Instant::now() - Duration::from_secs(10);
+        let mut last_command_error_log: Option<Instant> = None;
         while !FPS_SHUTDOWN.load(Ordering::Relaxed) {
             let auto_check_interval = if selected.is_empty() {
                 Duration::from_secs(10)
@@ -59,8 +60,22 @@
                 }
             }
             // fps.cmd 是简单命令文件，App 每次启动/停止 FPS 都会写入。
-            // 读取后立即删除，和 C 版消费语义保持一致，避免 daemon 重启后重复执行旧命令。
-            if let Some(cmd) = read_command()? {
+            // 瞬时文件错误不能结束整个 FPS 线程；限频记录后继续保留当前监测状态。
+            let command = match read_command() {
+                Ok(command) => command,
+                Err(err) => {
+                    let now = Instant::now();
+                    if last_command_error_log
+                        .map(|last| now.duration_since(last) >= Duration::from_secs(30))
+                        .unwrap_or(true)
+                    {
+                        eprintln!("[FPS] 读取命令文件失败，稍后重试: {err}");
+                        last_command_error_log = Some(now);
+                    }
+                    None
+                }
+            };
+            if let Some(cmd) = command {
                 if let Some(rest) = cmd.strip_prefix("start ").map(str::trim) {
                     if let Some(mut old) = monitor.take() {
                         old.stop();
@@ -186,7 +201,7 @@
             || focused.is_empty()
             || updated == 0
             || now < updated
-            || now - updated > 12_000
+            || now - updated > FOREGROUND_TASK_MAX_AGE_MS
         {
             return None;
         }
@@ -194,17 +209,33 @@
     }
 
     fn read_command() -> io::Result<Option<String>> {
-        let before = match fs::metadata(FPS_CMD_FILE) {
+        const CLAIMED_FILE: &str = "/data/adb/modules/AppOpt/config/fps.cmd.processing";
+
+        // 固定认领文件允许守护异常退出后继续处理，同时保证 App 在 FPS_CMD_FILE
+        // 写入的新命令不会被消费旧命令时的 remove_file() 一并删掉。
+        match fs::metadata(CLAIMED_FILE) {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                match fs::rename(FPS_CMD_FILE, CLAIMED_FILE) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
+
+        let before = match fs::metadata(CLAIMED_FILE) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
-        let text = match fs::read_to_string(FPS_CMD_FILE) {
-            Ok(text) => text.trim().to_string(),
+        let bytes = match fs::read(CLAIMED_FILE) {
+            Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
-        let after = match fs::metadata(FPS_CMD_FILE) {
+        let after = match fs::metadata(CLAIMED_FILE) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
@@ -214,15 +245,18 @@
         if !stable {
             return Ok(None);
         }
-        let valid = text.starts_with("start ") || text == "stop" || text.starts_with("stop ");
-        if text.is_empty() || !valid {
+        let text = String::from_utf8(bytes).ok().map(|text| text.trim().to_string());
+        let valid = text.as_deref().is_some_and(|text| {
+            text.starts_with("start ") || text == "stop" || text.starts_with("stop ")
+        });
+        if !valid {
             let stale = after
                 .modified()
                 .ok()
                 .and_then(|modified| SystemTime::now().duration_since(modified).ok())
                 .is_some_and(|age| age >= Duration::from_secs(2));
             if stale {
-                match fs::remove_file(FPS_CMD_FILE) {
+                match fs::remove_file(CLAIMED_FILE) {
                     Ok(()) => {}
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                     Err(err) => return Err(err),
@@ -230,12 +264,12 @@
             }
             return Ok(None);
         }
-        match fs::remove_file(FPS_CMD_FILE) {
+        match fs::remove_file(CLAIMED_FILE) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        Ok(Some(text))
+        Ok(text)
     }
 
     #[derive(Clone, Debug)]
@@ -480,16 +514,16 @@
         if status != "ok" {
             return ForegroundHelperState::Unavailable;
         }
-        if updated_wall_ms > 0 {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(0);
-            if now_ms > updated_wall_ms
-                && now_ms.saturating_sub(updated_wall_ms) > FOREGROUND_TASK_MAX_AGE_MS
-            {
-                return ForegroundHelperState::Unavailable;
-            }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        if updated_wall_ms == 0
+            || now_ms == 0
+            || updated_wall_ms > now_ms
+            || now_ms - updated_wall_ms > FOREGROUND_TASK_MAX_AGE_MS
+        {
+            return ForegroundHelperState::Unavailable;
         }
         if focused == pkg || visible.split(',').any(|item| item.trim() == pkg) {
             ForegroundHelperState::Target

@@ -420,9 +420,14 @@ prepare_jank_boost_config() {
 		"$MODPATH/config/boost.restore" "$MODPATH/config/boost.restore.tmp" \
 		"$MODPATH/config/adaptive_governor.restore" \
 		"$MODPATH/config/adaptive_governor.restore.tmp"
-	# PID 缓存只在运行时生成，旧名称和新名称都不迁移。
-	rm -f "$MODPATH/config/process_index.tsv" "$MODPATH/config/process_index.tsv."*.tmp \
-		"$MODPATH/config/pid_cache.tsv" "$MODPATH/config/pid_cache.tsv."*.tmp
+}
+
+# 守护运行状态在开机后重新生成，不从旧模块迁移。
+prepare_runtime_state_dir() {
+	mkdir -p "$MODPATH/config/state"
+	rm -f "$MODPATH/config/state/package_uid.map" "$MODPATH/config/state/package_uid.map."*.tmp \
+		"$MODPATH/config/state/pid_cache.tsv" "$MODPATH/config/state/pid_cache.tsv."*.tmp \
+		"$MODPATH/config/state/rule_health.tsv" "$MODPATH/config/state/rule_health.tsv."*.tmp
 }
 
 normalize_calib_rule_output_format() {
@@ -469,6 +474,7 @@ add_default_rules
 rm -f "$MODPATH/rules.sh"
 prepare_calib_policy
 prepare_jank_boost_config
+prepare_runtime_state_dir
 normalize_calib_rule_output_format
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOpt $MODPATH/config/bin/AppOptRs" 0 2000 0755 0755 u:object_r:magisk_file:s0

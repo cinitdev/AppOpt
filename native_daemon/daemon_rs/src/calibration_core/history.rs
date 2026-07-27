@@ -22,6 +22,9 @@ fn write_history(
     let mut current = String::new();
     writeln!(&mut current, "# {epoch} {rounds}").map_err(fmt_to_io)?;
     for record in records {
+        if record.max_pct < 0.05 && record.avg() < 0.05 {
+            continue;
+        }
         let name = if record.is_process {
             &record.owner
         } else {
@@ -73,7 +76,11 @@ fn write_history(
     }
 
     // 每个包只保留最近几次历史，避免长期校准后 history 目录无限增长。
-    let old = fs::read_to_string(&path).unwrap_or_default();
+    let old = match fs::read_to_string(&path) {
+        Ok(old) => old,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
     let mut next = keep_recent_history(&old, HISTORY_MAX_SESSIONS.saturating_sub(1));
     if !next.is_empty() && !next.ends_with('\n') {
         next.push('\n');

@@ -1,5 +1,7 @@
 package top.suto.appopt
 
+import java.io.File
+
 internal object RuleConfigLogic {
     const val MAX_CPU_INDEX = 1023
     const val MAX_OWNER_BYTES = 127
@@ -50,6 +52,36 @@ internal object RuleConfigLogic {
         }
         return cpus
     }
+
+    /** C parse_cpu_ranges_strict / Rust CpuMask::parse 共用的运行时语义。 */
+    fun parseNativeCpuRangeList(value: String): Set<Int>? {
+        if (value.length > MAX_CPU_TEXT_LENGTH) return null
+        val cpus = linkedSetOf<Int>()
+        var parsedAny = false
+        for (rawPart in value.split(',')) {
+            val part = rawPart.trim()
+            if (part.isEmpty()) continue
+            val dash = part.indexOf('-')
+            if (dash >= 0 && part.indexOf('-', dash + 1) >= 0) return null
+            val firstText = if (dash < 0) part else part.substring(0, dash).trim()
+            val lastText = if (dash < 0) firstText else part.substring(dash + 1).trim()
+            if (firstText.isEmpty() || lastText.isEmpty() ||
+                firstText.any { it !in '0'..'9' } || lastText.any { it !in '0'..'9' }
+            ) {
+                return null
+            }
+            val first = firstText.toIntOrNull() ?: return null
+            val last = lastText.toIntOrNull() ?: return null
+            if (first > last || last > MAX_CPU_INDEX) return null
+            for (cpu in first..last) cpus.add(cpu)
+            parsedAny = true
+        }
+        return cpus.takeIf { parsedAny }
+    }
+
+    fun readPresentCpuSet(): Set<Int>? = runCatching {
+        parseNativeCpuRangeList(File("/sys/devices/system/cpu/present").readText().trim())
+    }.getOrNull()
 
     fun cpuBoundsFromRuleLine(line: String): CpuBounds? {
         val separator = line.indexOf('=')

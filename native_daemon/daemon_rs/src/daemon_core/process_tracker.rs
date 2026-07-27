@@ -4,6 +4,8 @@
 // 通过同一二进制的查询参数读取它。查询结果返回前仍校验 /proc/<pid>/stat，避免 PID 复用。
 
 // 当前磁盘缓存写入 pid_cache.tsv，旧缓存文件不迁移；查询返回前仍校验当前进程身份。
+const PROCESS_INDEX_NAME_MAX_BYTES: usize = 127;
+
 #[derive(Debug, Clone)]
 struct ProcessIndexEntry {
     pid: i32,
@@ -115,8 +117,8 @@ fn read_process_index_entry(
 ) -> io::Result<ProcessIndexEntry> {
     let proc_path = PathBuf::from(format!("/proc/{pid}"));
     let starttime = read_proc_starttime(&proc_path)?;
-    let comm = read_comm(&proc_path).unwrap_or_default();
-    let cmdline = read_cmdline(pid).unwrap_or_default();
+    let comm = truncate_process_index_name(&read_comm(&proc_path).unwrap_or_default());
+    let cmdline = truncate_process_index_name(&read_cmdline(pid).unwrap_or_default());
     Ok(ProcessIndexEntry {
         pid,
         starttime,
@@ -195,8 +197,8 @@ fn write_process_index(
             entry.pid,
             entry.starttime,
             entry.first_seen_elapsed_ms,
-            encode_process_index_hex(&entry.comm),
-            encode_process_index_hex(&entry.cmdline)
+            encode_process_index_hex(&truncate_process_index_name(&entry.comm)),
+            encode_process_index_hex(&truncate_process_index_name(&entry.cmdline))
         ));
     }
     let temporary = format!("{PROCESS_CACHE_FILE}.{}.tmp", std::process::id());
@@ -243,8 +245,7 @@ fn process_index_find_names(names: &[String]) -> io::Result<Vec<String>> {
 
     if matched.iter().any(|value| !value) {
         let current_pids = enumerate_proc_pids()?;
-        let cached_pids = entries.keys().copied().collect::<BTreeSet<_>>();
-        for pid in current_pids.difference(&cached_pids).copied() {
+        for pid in current_pids.iter().copied() {
             let Ok(entry) = read_process_index_entry(pid, 0, None) else {
                 continue;
             };
@@ -321,6 +322,17 @@ fn encode_process_index_hex(value: &str) -> String {
         output.push_str(&format!("{byte:02x}"));
     }
     output
+}
+
+fn truncate_process_index_name(value: &str) -> String {
+    if value.len() <= PROCESS_INDEX_NAME_MAX_BYTES {
+        return value.to_string();
+    }
+    let mut end = PROCESS_INDEX_NAME_MAX_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 fn decode_process_index_hex(value: &str) -> Option<String> {

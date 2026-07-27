@@ -19,6 +19,7 @@ impl CalibSession {
             records: HashMap::new(),
             child_threads: HashMap::new(),
             rounds: 0,
+            started_at: Instant::now(),
             last_sample: None,
         }
     }
@@ -37,15 +38,25 @@ impl CalibSession {
         self.last_sample = Some(now);
 
         let mut alive = HashMap::new();
+        let mut main_alive = false;
+        let mut observed_tids = HashSet::new();
         let mut observed_records: HashSet<TrackKey> = HashSet::new();
         let mut child_round_deltas: HashMap<ChildThreadKey, u64> = HashMap::new();
         for (pid, owner) in self.processes.clone() {
-            if !PathBuf::from(format!("/proc/{pid}")).exists() {
+            // PID 可能在两轮之间被复用，只有 cmdline 仍与原 owner 一致才继续采样。
+            if read_cmdline(pid).ok().as_deref() != Some(owner.as_str()) {
                 continue;
             }
             alive.insert(pid, owner.clone());
             if owner == self.pkg {
-                self.sample_main_threads(pid, &owner, elapsed, &mut observed_records);
+                main_alive = true;
+                self.sample_main_threads(
+                    pid,
+                    &owner,
+                    elapsed,
+                    &mut observed_records,
+                    &mut observed_tids,
+                );
             } else {
                 self.sample_child_process(
                     pid,
@@ -53,12 +64,16 @@ impl CalibSession {
                     elapsed,
                     &mut observed_records,
                     &mut child_round_deltas,
+                    &mut observed_tids,
                 );
             }
         }
         self.processes = alive;
+        self.prev_ticks
+            .retain(|key, _| observed_tids.contains(key));
 
-        if self.processes.is_empty() {
+        // 常驻子进程只参与负载统计，不能单独维持校准会话。
+        if !main_alive {
             return false;
         }
         if elapsed > 0.0 {
@@ -81,6 +96,7 @@ impl CalibSession {
         owner: &str,
         elapsed: f64,
         observed_records: &mut HashSet<TrackKey>,
+        observed_tids: &mut HashSet<TidKey>,
     ) {
         // 主进程线程按 comm 名称聚合。
         // 同名线程可能有多个 TID，这里合并 delta，避免线程重建导致历史曲线断裂。
@@ -103,10 +119,16 @@ impl CalibSession {
                 continue;
             }
             let stat_path = format!("/proc/{pid}/task/{tid}/stat");
-            let Some(ticks) = read_stat_ticks(&stat_path) else {
+            let Some((ticks, starttime)) = read_thread_stat(&stat_path) else {
                 continue;
             };
-            let delta = self.tid_delta(pid, tid, ticks).unwrap_or(0);
+            let tid_key = TidKey {
+                pid,
+                tid,
+                starttime,
+            };
+            observed_tids.insert(tid_key);
+            let delta = self.tid_delta(tid_key, ticks).unwrap_or(0);
             *grouped_delta.entry(name).or_default() += delta;
         }
 
@@ -130,6 +152,7 @@ impl CalibSession {
         elapsed: f64,
         observed_records: &mut HashSet<TrackKey>,
         child_round_deltas: &mut HashMap<ChildThreadKey, u64>,
+        observed_tids: &mut HashSet<TidKey>,
     ) {
         // 子进程只累计总 delta 生成进程级负载，同时保留线程 delta 给 history 展示。
         // 不把子进程线程放入 records，是为了避免生成 daemon 无法解析的子进程线程规则。
@@ -152,10 +175,16 @@ impl CalibSession {
                 continue;
             }
             let stat_path = format!("/proc/{pid}/task/{tid}/stat");
-            let Some(ticks) = read_stat_ticks(&stat_path) else {
+            let Some((ticks, starttime)) = read_thread_stat(&stat_path) else {
                 continue;
             };
-            let delta = self.tid_delta(pid, tid, ticks).unwrap_or(0);
+            let tid_key = TidKey {
+                pid,
+                tid,
+                starttime,
+            };
+            observed_tids.insert(tid_key);
+            let delta = self.tid_delta(tid_key, ticks).unwrap_or(0);
             total_delta += delta;
             if delta > 0 {
                 let key = ChildThreadKey {
@@ -177,9 +206,8 @@ impl CalibSession {
         self.record_pct(key, delta_to_pct(total_delta, elapsed), observed_records);
     }
 
-    fn tid_delta(&mut self, pid: i32, tid: i32, ticks: u64) -> Option<u64> {
+    fn tid_delta(&mut self, key: TidKey, ticks: u64) -> Option<u64> {
         // 首次看到某个 TID 时没有前一帧数据，必须等下一轮才有有效 delta。
-        let key = TidKey { pid, tid };
         let prev_ticks = self.prev_ticks.insert(key, ticks)?;
         if ticks < prev_ticks {
             return None;

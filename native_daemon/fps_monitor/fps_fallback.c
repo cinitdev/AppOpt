@@ -31,13 +31,21 @@ struct fps_fallback_ctx {
 
     /* timestats 回退状态 */
     bool ts_mode;                      /* true = 已切到 timestats */
+    bool ts_enabled;                   /* timestats 开关是否已成功启用 */
     long ts_last;                      /* 上窗口 totalFrames */
     time_t ts_last_time;               /* 上窗口时间(用于算间隔) */
+
+    /* Binder 不可用时才启用 CLI，且每秒最多执行一次。 */
+    bool cli_mode;
+    long long cli_next_ms;
 };
 
 static void timestats_disable(void);
+extern ssize_t sf_dump_cli_bounded(const char* const args[], int nargs,
+                                   char* buf, size_t bufsz);
 
 static bool g_timestats_enabled = false;
+static bool g_timestats_cli = false;
 static bool g_cleanup_registered = false;
 
 static void fps_fallback_process_cleanup(void) {
@@ -60,6 +68,31 @@ static unsigned long long now_monotonic_ns(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0ULL;
     return (unsigned long long)ts.tv_sec * 1000000000ULL +
            (unsigned long long)ts.tv_nsec;
+}
+
+static long long fallback_now_ms(void) {
+    return (long long)(now_monotonic_ns() / 1000000ULL);
+}
+
+static ssize_t sf_dump_for_ctx(fps_fallback_ctx* ctx, const char* const args[], int nargs,
+                               char* buf, size_t bufsz, bool allow_cli) {
+    if (!ctx || !buf || bufsz == 0) return -1;
+    if (!ctx->cli_mode) {
+        ssize_t direct = sf_dump_binder(args, nargs, buf, bufsz);
+        if (direct >= 0) return direct;
+        ctx->cli_mode = true;
+        ctx->ts_mode = true;
+        ctx->ts_enabled = false;
+        ctx->ts_last = -1;
+        ctx->ts_last_time = 0;
+        printf("[Fallback] SurfaceFlinger binder 不可用，切换低频 CLI timestats\n");
+    }
+    if (!allow_cli) return -1;
+
+    long long now = fallback_now_ms();
+    if (ctx->cli_next_ms > 0 && now > 0 && now < ctx->cli_next_ms) return -1;
+    ctx->cli_next_ms = now > 0 ? now + 1000 : ctx->cli_next_ms + 1000;
+    return sf_dump_cli_bounded(args, nargs, buf, bufsz);
 }
 
 static bool latency_ts_is_fresh(unsigned long long latest, unsigned long long now) {
@@ -99,10 +132,11 @@ static bool layer_matches_pkg(const char *text, size_t len, const char *pkg) {
 /* 从 --list 输出里挑出含目标包名的候选 layer 名, 存入 cands(每个 SF_LAYER_MAX)。
  * --list 每行一个层名(可能形如 "63:c486 名字#27294" 带前缀行号, 也可能纯名字),
  * 去掉行首 "N:" 行号前缀。返回候选个数。*/
-static int list_candidates(const char *pkg, char cands[][SF_LAYER_MAX], int maxc) {
+static int list_candidates(fps_fallback_ctx* ctx, const char *pkg,
+                           char cands[][SF_LAYER_MAX], int maxc) {
     static char out[1 << 18];                 /* 256KB, --list 通常几十 KB */
     const char *args[] = { "--list" };
-    if (sf_dump_binder(args, 1, out, sizeof(out)) <= 0) return 0;
+    if (sf_dump_for_ctx(ctx, args, 1, out, sizeof(out), false) <= 0) return 0;
 
     size_t pkglen = strlen(pkg);
     int nc = 0;
@@ -165,13 +199,13 @@ static int list_candidates(const char *pkg, char cands[][SF_LAYER_MAX], int maxc
  * 并把最后时间戳记入 *since, 下一窗口起转入纯差分。
  * 新帧 < 2 无法算时间差返回 -1(本窗口不可用, 但 *since 仍会推进, 不丢帧基准)。
  * valid_out/latest_out 用于区分"--latency 不可用"和"当前层暂时没有新帧"。 */
-static double layer_fps(const char *layer, unsigned long long *since,
+static double layer_fps(fps_fallback_ctx* ctx, const char *layer, unsigned long long *since,
                         int *valid_out, unsigned long long *latest_out) {
     static char out[1 << 16];
     const char *args[] = { "--latency", layer };
     if (valid_out) *valid_out = 0;
     if (latest_out) *latest_out = 0ULL;
-    if (sf_dump_binder(args, 2, out, sizeof(out)) <= 0) return -1.0;
+    if (sf_dump_for_ctx(ctx, args, 2, out, sizeof(out), false) <= 0) return -1.0;
 
     unsigned long long base = since ? *since : 0ULL;
     unsigned long long first = 0, last = 0, maxts = base, latest_valid = 0ULL;
@@ -215,19 +249,28 @@ static double layer_fps(const char *layer, unsigned long long *since,
  *
  * 取瞬时 FPS 的办法和 --latency 差分一致: enable+clear 一次后, 每窗口 -dump 读
  * 目标层累计 totalFrames, 与上窗口做差 / 窗口秒数(而非用 averageFPS 的累计平均)。*/
-static void timestats_enable(void) {
+static bool timestats_enable(fps_fallback_ctx* ctx) {
     char buf[64];
     const char *args[] = { "--timestats", "-enable", "-clear" };
-    if (sf_dump_binder(args, 3, buf, sizeof(buf)) >= 0) {
+    if (sf_dump_for_ctx(ctx, args, 3, buf, sizeof(buf), true) >= 0) {
         g_timestats_enabled = true;
+        g_timestats_cli = ctx && ctx->cli_mode;
+        if (ctx) ctx->ts_enabled = true;
+        return true;
     }
+    return false;
 }
 
 static void timestats_disable(void) {
     char buf[64];
     const char *args[] = { "--timestats", "-disable" };
-    sf_dump_binder(args, 2, buf, sizeof(buf));
+    if (g_timestats_cli) {
+        (void)sf_dump_cli_bounded(args, 2, buf, sizeof(buf));
+    } else if (sf_dump_binder(args, 2, buf, sizeof(buf)) < 0) {
+        (void)sf_dump_cli_bounded(args, 2, buf, sizeof(buf));
+    }
     g_timestats_enabled = false;
+    g_timestats_cli = false;
 }
 
 /* dump timestats, 在含 pkg 的层里取累计 totalFrames 最大者(即主渲染层)。
@@ -236,10 +279,10 @@ static void timestats_disable(void) {
  *   totalFrames = 274
  *   averageFPS = 30.179
  * 返回最大 totalFrames; 无匹配层返回 -1。 */
-static long timestats_frames(const char *pkg) {
+static long timestats_frames(fps_fallback_ctx* ctx, const char *pkg) {
     static char out[1 << 18];
     const char *args[] = { "--timestats", "-dump" };
-    if (sf_dump_binder(args, 2, out, sizeof(out)) <= 0) return -1;
+    if (sf_dump_for_ctx(ctx, args, 2, out, sizeof(out), true) <= 0) return -1;
 
     long best = -1;
     int in_target = 0;
@@ -276,8 +319,11 @@ fps_fallback_ctx *fps_fallback_start(const char *pkg) {
     ctx->miss = 0;
     ctx->probe_fail = 0;
     ctx->ts_mode = false;
+    ctx->ts_enabled = false;
     ctx->ts_last = -1;
     ctx->ts_last_time = 0;
+    ctx->cli_mode = false;
+    ctx->cli_next_ms = 0;
 
     printf("[Fallback] 启动 SF dump 监测: %s (--latency binder 直连差分读)\n", pkg);
     return ctx;
@@ -288,7 +334,8 @@ double fps_fallback_poll(fps_fallback_ctx *ctx) {
 
     /* === timestats 回退模式 === */
     if (ctx->ts_mode) {
-        long now = timestats_frames(ctx->pkg);
+        if (!ctx->ts_enabled && !timestats_enable(ctx)) return 0.0;
+        long now = timestats_frames(ctx, ctx->pkg);
         time_t now_time = time(NULL);
         if (now < 0) return 0.0;
 
@@ -311,7 +358,11 @@ double fps_fallback_poll(fps_fallback_ctx *ctx) {
     /* 未锁主层 / 主层失效: 重新发现 */
     if (ctx->main_layer[0] == '\0') {
         static char cands[SF_MAX_CANDS][SF_LAYER_MAX];
-        int nc = list_candidates(ctx->pkg, cands, SF_MAX_CANDS);
+        int nc = list_candidates(ctx, ctx->pkg, cands, SF_MAX_CANDS);
+        if (ctx->cli_mode) {
+            (void)timestats_enable(ctx);
+            return 0.0;
+        }
         int best = -1;
         double best_fps = -1.0;
         unsigned long long best_ts = 0ULL;
@@ -322,7 +373,11 @@ double fps_fallback_poll(fps_fallback_ctx *ctx) {
             unsigned long long ts = 0ULL;
             unsigned long long latest = 0ULL;
             int valid = 0;
-            double f = layer_fps(cands[i], &ts, &valid, &latest);
+            double f = layer_fps(ctx, cands[i], &ts, &valid, &latest);
+            if (ctx->cli_mode) {
+                (void)timestats_enable(ctx);
+                return 0.0;
+            }
             valid_total += valid;
             if (!latency_ts_is_fresh(latest, now_ns)) continue;
             if (f > best_fps) {
@@ -345,8 +400,9 @@ double fps_fallback_poll(fps_fallback_ctx *ctx) {
              * 如果有时间戳但都不活跃,只是没找到当前主层,继续等/重试,不要切 timestats。 */
             if (nc > 0 && valid_total == 0 && ++ctx->probe_fail >= FPS_PROBE_FAIL) {
                 ctx->ts_mode = true;
+                ctx->ts_enabled = false;
                 ctx->ts_last = -1;
-                timestats_enable();
+                (void)timestats_enable(ctx);
                 printf("[Fallback] --latency 连续 %d 窗口无有效帧时间戳,切换到 timestats (binder 直连)\n",
                        ctx->probe_fail);
             } else if (valid_total > 0) {
@@ -359,7 +415,11 @@ double fps_fallback_poll(fps_fallback_ctx *ctx) {
     /* 已锁主层: 差分读 */
     int valid = 0;
     unsigned long long latest = 0ULL;
-    double fps = layer_fps(ctx->main_layer, &ctx->since, &valid, &latest);
+    double fps = layer_fps(ctx, ctx->main_layer, &ctx->since, &valid, &latest);
+    if (ctx->cli_mode) {
+        (void)timestats_enable(ctx);
+        return 0.0;
+    }
     if (fps < 0.0) {
         if (valid > 0 && latency_ts_is_fresh(latest, now_monotonic_ns())) {
             ctx->miss = 0;

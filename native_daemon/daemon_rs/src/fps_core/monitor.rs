@@ -228,9 +228,19 @@
                             now.duration_since(self.ebpf_last_frame).as_secs_f64()
                         );
                         self.ebpf_alternate_pid_attempted = false;
-                        self.restart_ebpf(choice.pid, &choice.source, now);
-                        thread::sleep(Duration::from_millis(120));
-                        return;
+                        if self.restart_ebpf(choice.pid, &choice.source, now) {
+                            thread::sleep(Duration::from_millis(120));
+                            return;
+                        }
+                        self.ebpf_stale_checks = self.ebpf_stale_checks.saturating_add(1);
+                        println!(
+                            "[FPS] 候选PID未就绪或附加失败，继续累计无帧检查: pkg={} current={} candidate={} {}/{}",
+                            self.pkg,
+                            active_pid,
+                            choice.pid,
+                            self.ebpf_stale_checks,
+                            FPS_EBPF_STALE_FALLBACK_CHECKS
+                        );
                     }
                     Some(choice) => {
                         self.ebpf_stale_checks = self.ebpf_stale_checks.saturating_add(1);
@@ -260,9 +270,10 @@
                                 "[FPS] eBPF 固定 PID 连续无目标新帧, 尝试同包其它进程: pkg={} old_pid={} new_pid={} 来源={}",
                                 self.pkg, active_pid, choice.pid, choice.source
                             );
-                            self.restart_ebpf(choice.pid, &choice.source, now);
-                            thread::sleep(Duration::from_millis(300));
-                            return;
+                            if self.restart_ebpf(choice.pid, &choice.source, now) {
+                                thread::sleep(Duration::from_millis(300));
+                                return;
+                            }
                         }
                         println!(
                             "[FPS] eBPF 固定 PID 连续无目标新帧, 未找到同包其它进程: pkg={} pid={}",
@@ -329,7 +340,7 @@
             thread::sleep(Duration::from_millis(300));
         }
 
-        fn restart_ebpf(&mut self, pid: i32, source: &str, now: Instant) {
+        fn restart_ebpf(&mut self, pid: i32, source: &str, now: Instant) -> bool {
             if !pid_ready_for_ebpf(pid, &self.pkg) {
                 println!(
                     "[FPS] 候选PID已退出或尚未加载libgui，取消eBPF切换: pkg={} pid={} 来源={}",
@@ -338,7 +349,7 @@
                 if self.ctx.is_null() {
                     self.start_fallback();
                 }
-                return;
+                return false;
             }
             let next_ctx = start_ebpf_for_pkg(&self.pkg, pid, source);
             if next_ctx.is_null() {
@@ -352,7 +363,7 @@
                         pid
                     );
                 }
-                return;
+                return false;
             }
             if !self.ctx.is_null() {
                 appopt_ebpf_stop(self.ctx);
@@ -374,6 +385,7 @@
             } else {
                 self.fallback = None;
             }
+            true
         }
 
         fn stop(&mut self) {

@@ -103,7 +103,7 @@ public final class ForegroundHelper {
         }
         configDir = parent == null ? new File("/data/adb/modules/AppOpt/config") : parent;
         appListFile = new File(configDir, "applist.conf");
-        uidMapFile = new File(configDir, "package_uid.map");
+        uidMapFile = new File(new File(configDir, "state"), "package_uid.map");
         lastBootIdReadAttemptElapsed = SystemClock.elapsedRealtime();
         bootId = readBootId();
         restorePreviousState();

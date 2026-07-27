@@ -139,7 +139,19 @@ static bool read_stable_command_file(const char* path, char* cmd_buf, size_t sz,
     if (!path || !cmd_buf || sz == 0 || !is_valid) return false;
     cmd_buf[0] = '\0';
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    /* 先原子认领当前命令。后续 App 再写 path 时会得到一个新文件，消费端只删除
+     * claimed_path，避免“读完旧文件后 unlink(path)”误删刚写入的新命令。若守护
+     * 在读取过程中退出，固定认领文件会在下次启动继续处理。 */
+    char claimed_path[PATH_MAX];
+    int claimed_len = snprintf(claimed_path, sizeof(claimed_path), "%s.processing", path);
+    if (claimed_len <= 0 || (size_t)claimed_len >= sizeof(claimed_path)) return false;
+
+    struct stat claimed_st;
+    if (lstat(claimed_path, &claimed_st) != 0) {
+        if (errno != ENOENT || rename(path, claimed_path) != 0) return false;
+    }
+
+    int fd = open(claimed_path, O_RDONLY | O_CLOEXEC);
     if (fd == -1) return false;
 
     struct stat before, after;
@@ -156,7 +168,7 @@ static bool read_stable_command_file(const char* path, char* cmd_buf, size_t sz,
     close(fd);
 
     if (n <= 0) {
-        if (!file_mtime_recent(&after)) unlink(path);
+        if (!file_mtime_recent(&after)) unlink(claimed_path);
         return false;
     }
 
@@ -172,17 +184,16 @@ static bool read_stable_command_file(const char* path, char* cmd_buf, size_t sz,
         return false;
     }
     if (!complete) {
-        if (!file_mtime_recent(&after)) unlink(path);
+        if (!file_mtime_recent(&after)) unlink(claimed_path);
         return false;
     }
 
     if (!is_valid(cmd_buf)) {
-        if (!file_mtime_recent(&after)) unlink(path);
+        if (!file_mtime_recent(&after)) unlink(claimed_path);
         return false;
     }
 
-    unlink(path);
-    return true;
+    return unlink(claimed_path) == 0 || errno == ENOENT;
 }
 
 static void parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {

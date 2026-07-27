@@ -7,10 +7,11 @@
     use std::collections::BTreeSet;
     use std::ffi::{CStr, CString};
     use std::fs;
-    use std::io;
+    use std::io::{self, Read};
     use std::mem;
     use std::path::PathBuf;
     use std::ptr;
+    use std::process::{Command, Stdio};
     use std::slice;
     use std::thread;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +38,7 @@
     const FPS_BPF_OBJ: &str = "/data/adb/modules/AppOpt/config/ebpf/queuebuffer_probe.bpf.o";
     const FOREGROUND_TASK_STATE_FILE: &str = "/data/adb/modules/AppOpt/config/foreground_task.state";
     const JANK_BOOST_FILE: &str = "/data/adb/modules/AppOpt/config/jank_boost.conf";
-    const FOREGROUND_TASK_MAX_AGE_MS: u64 = 10_000;
+    const FOREGROUND_TASK_MAX_AGE_MS: u64 = 12_000;
     const FPS_WINDOW: Duration = Duration::from_millis(1000);
     const FPS_EBPF_STALE: Duration = Duration::from_millis(2500);
     const FPS_EBPF_PID_CHECK: Duration = Duration::from_millis(1000);

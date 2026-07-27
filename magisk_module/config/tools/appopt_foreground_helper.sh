@@ -179,7 +179,7 @@ start_helper() {
     # PID 文件失效时仍可能残留旧 helper，先清理孤儿，避免多个进程争写同一状态文件。
     stop_all_helpers
     [ "${1:-}" = "force" ] || ! helper_restart_cooling_down || return 0
-    mkdir -p "$MODDIR/config" "$MODDIR/logs"
+    mkdir -p "$MODDIR/config" "$MODDIR/config/state" "$MODDIR/logs"
     rm -f "$PID_FILE"
     [ -f "$JAR" ] || {
         echo "[前台助手] 找不到 jar: $JAR" >> "$LOG"

@@ -136,6 +136,20 @@ static int append_config_rule(
     cpu_set_t set;
     CPU_ZERO(&set);
     if (!parse_cpu_ranges_strict(parsed->cpus, &set, NULL)) return 1;
+    cpu_set_t effective_set = set;
+    if (CPU_COUNT(&cfg->topo.present_cpus) > 0) {
+        CPU_AND(&effective_set, &set, &cfg->topo.present_cpus);
+    }
+    if (CPU_COUNT(&effective_set) == 0) {
+        if (parsed->thread[0]) {
+            printf("忽略不包含当前设备核心的线程规则: %s{%s}=%s\n",
+                   parsed->owner, parsed->thread, parsed->cpus);
+        } else {
+            printf("忽略不包含当前设备核心的进程规则: %s=%s\n",
+                   parsed->owner, parsed->cpus);
+        }
+        return 1;
+    }
     if (!parsed->thread[0]) {
         remove_config_name(auto_packages, auto_count, parsed->owner);
     }
@@ -149,12 +163,10 @@ static int append_config_rule(
         }
     }
     if (duplicate >= 0 &&
-        compare_config_cpu_sets(&set, &(*rules)[duplicate].cpus) <= 0) {
+        compare_config_cpu_sets(&effective_set, &(*rules)[duplicate].cpus) <= 0) {
         return add_unique_config_name(packages, package_count, parsed->owner) < 0 ? -1 : 0;
     }
 
-    cpu_set_t effective_set;
-    CPU_AND(&effective_set, &set, &cfg->topo.present_cpus);
     char* dir_name = CPU_COUNT(&effective_set) > 0 ? cpu_set_to_str(&effective_set) : NULL;
     if (CPU_COUNT(&effective_set) > 0 && !dir_name) return -1;
 
@@ -172,7 +184,7 @@ static int append_config_rule(
             cfg->topo.cpuset_enabled = false;
         }
     }
-    rule.cpus = set;
+    rule.cpus = effective_set;
     free(dir_name);
 
     if (duplicate >= 0) {
@@ -1644,7 +1656,10 @@ static void update_cache(
     struct sysinfo info;
     if (sysinfo(&info) == 0) {
         int current_proc_count = info.procs;
-        if (current_proc_count > cache->last_proc_count) {
+        bool growth_hint_allowed = cache->last_proc_growth_scan_elapsed_ms == 0 ||
+            now_elapsed == 0 || now_elapsed < cache->last_proc_growth_scan_elapsed_ms ||
+            now_elapsed - cache->last_proc_growth_scan_elapsed_ms >= PID_GROWTH_HINT_MIN_MS;
+        if (current_proc_count > cache->last_proc_count && growth_hint_allowed) {
             /* 合并处理进程/线程数量波动，避免线程创建导致 2 秒主循环
              * 每轮都枚举 /proc。 */
             cache->proc_growth_pending = true;
@@ -1660,7 +1675,8 @@ static void update_cache(
     unsigned long long index_interval =
         cache->process_index_has_candidates || cache->stable_pid_snapshot_rounds < 3 ?
             PID_SNAPSHOT_ACTIVE_MS : PID_SNAPSHOT_IDLE_MS;
-    bool index_refresh_due = full_scan_requested || cache->proc_growth_pending ||
+    bool growth_refresh_requested = cache->proc_growth_pending;
+    bool index_refresh_due = full_scan || growth_refresh_requested ||
         !cache->process_index_initialized ||
         cache->last_pid_snapshot_elapsed_ms == 0 || now_elapsed == 0 ||
         now_elapsed < cache->last_pid_snapshot_elapsed_ms ||
@@ -1669,7 +1685,7 @@ static void update_cache(
     memset(&process_index, 0, sizeof(process_index));
     bool need_index_read = index_refresh_due || cache->process_index_has_candidates;
     if (need_index_read && !process_index_prepare(
-            now_elapsed, index_refresh_due, full_scan_requested, &process_index)) {
+            now_elapsed, index_refresh_due, full_scan, &process_index)) {
         memset(&process_index, 0, sizeof(process_index));
         if (snapshot_log_due) {
             fprintf(stderr, "进程索引刷新失败，保留现有缓存并等待下轮重试\n");
@@ -1682,6 +1698,9 @@ static void update_cache(
             cache->process_index_initialized = true;
             cache->last_pid_snapshot_elapsed_ms = now_elapsed;
             cache->proc_growth_pending = false;
+            if (growth_refresh_requested) {
+                cache->last_proc_growth_scan_elapsed_ms = now_elapsed;
+            }
             if (was_initialized && process_index.added == 0 && process_index.exited == 0) {
                 unsigned int previous = cache->stable_pid_snapshot_rounds;
                 if (cache->stable_pid_snapshot_rounds < UINT_MAX) {
@@ -1700,8 +1719,9 @@ static void update_cache(
                 process_index.added, process_index.exited,
                 process_index.num_candidate_pids);
             cache->last_pid_snapshot_log_elapsed_ms = now_elapsed;
-        } else if (entered_idle_backoff) {
+        } else if (entered_idle_backoff && !cache->pid_idle_backoff_logged) {
             printf("进程索引长时间无变化，空闲时退避到 10 秒\n");
+            cache->pid_idle_backoff_logged = true;
             cache->last_pid_snapshot_log_elapsed_ms = now_elapsed;
         }
     }

@@ -55,6 +55,7 @@
 #define MAX_CLUSTERS       8
 #define MODULE_DIR         "/data/adb/modules/AppOpt"
 #define CONFIG_DIR         MODULE_DIR "/config"
+#define STATE_DIR          CONFIG_DIR "/state"
 #define LOG_DIR            MODULE_DIR "/logs"
 #define EBPF_DIR           CONFIG_DIR "/ebpf"
 #define CALIB_CMD_FILE     CONFIG_DIR "/calibrate.cmd"
@@ -63,9 +64,10 @@
 #define CALIB_POLICY_LOCK  CONFIG_DIR "/calib_policy.conf.lock"
 #define CALIB_CONFIG_LOCK  CONFIG_DIR "/applist.conf.lock"
 #define HISTORY_DIR        MODULE_DIR "/history"
-#define RULE_HEALTH_FILE    CONFIG_DIR "/rule_health.tsv"
+#define PACKAGE_UID_MAP_FILE STATE_DIR "/package_uid.map"
+#define RULE_HEALTH_FILE    STATE_DIR "/rule_health.tsv"
 #define FOREGROUND_TASK_STATE_FILE CONFIG_DIR "/foreground_task.state"
-#define PROCESS_CACHE_FILE CONFIG_DIR "/pid_cache.tsv"
+#define PROCESS_CACHE_FILE STATE_DIR "/pid_cache.tsv"
 #define PROCESS_INDEX_MAGIC "APPOPT_PROCESS_INDEX_V1"
 #define FOREGROUND_TASK_MAX_AGE_MS 12000ULL
 #define RULE_HEALTH_OBSERVE_SECS 30
@@ -75,6 +77,7 @@
 #define PID_SNAPSHOT_ACTIVE_MS 2000ULL
 #define PID_SNAPSHOT_IDLE_MS 10000ULL
 #define PID_DISCOVERY_RETRY_MS 6000ULL
+#define PID_GROWTH_HINT_MIN_MS 10000ULL
 #define PID_SNAPSHOT_LOG_INTERVAL_MS 30000ULL
 #define RULE_HEALTH_FULL_SCAN_RETRY_MS 5000ULL
 #define FOREGROUND_DISCOVERY_DELAY_MS 2000ULL
@@ -194,8 +197,10 @@ typedef struct {
     bool process_index_initialized;
     bool process_index_has_candidates;
     unsigned int stable_pid_snapshot_rounds;
+    bool pid_idle_backoff_logged;
     unsigned long long last_pid_snapshot_elapsed_ms;
     unsigned long long last_pid_snapshot_log_elapsed_ms;
+    unsigned long long last_proc_growth_scan_elapsed_ms;
     bool initialized;
     unsigned long long last_refresh_elapsed_ms;
     unsigned long long last_full_scan_elapsed_ms;

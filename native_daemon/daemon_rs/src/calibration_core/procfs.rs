@@ -32,25 +32,62 @@ fn collect_pkg_processes(pkg: &str) -> Vec<ProcInfo> {
 }
 
 fn read_command() -> io::Result<Option<String>> {
-    let text = match fs::read_to_string(CALIB_CMD_FILE) {
-        Ok(text) => text.trim().to_string(),
+    let claimed = format!("{CALIB_CMD_FILE}.processing");
+    match fs::metadata(&claimed) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            match fs::rename(CALIB_CMD_FILE, &claimed) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    }
+
+    let before = fs::metadata(&claimed)?;
+    let bytes = match fs::read(&claimed) {
+        Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    if text.is_empty() {
+    let after = match fs::metadata(&claimed) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let stable = before.len() == after.len()
+        && before.modified().ok() == after.modified().ok();
+    if !stable {
         return Ok(None);
     }
-    let valid = text.starts_with("start ") || text == "stop" || text.starts_with("stop ");
-    match fs::remove_file(CALIB_CMD_FILE) {
+
+    let text = String::from_utf8(bytes).ok().map(|text| text.trim().to_string());
+    let valid = text.as_deref().is_some_and(|text| {
+        text.starts_with("start ") || text == "stop" || text.starts_with("stop ")
+    });
+    if !valid {
+        let stale = after
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= Duration::from_secs(2));
+        if stale {
+            match fs::remove_file(&claimed) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        return Ok(None);
+    }
+
+    match fs::remove_file(&claimed) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
-    if valid {
-        Ok(Some(text))
-    } else {
-        Ok(None)
-    }
+    Ok(text)
 }
 
 fn write_state(state: &str) -> io::Result<()> {
@@ -61,17 +98,22 @@ fn write_state(state: &str) -> io::Result<()> {
 fn read_cmdline(pid: i32) -> io::Result<String> {
     let data = fs::read(format!("/proc/{pid}/cmdline"))?;
     let first = data.split(|byte| *byte == 0).next().unwrap_or_default();
-    Ok(String::from_utf8_lossy(first).trim().to_string())
+    let basename = first
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or_default();
+    Ok(String::from_utf8_lossy(basename).trim().to_string())
 }
 
-fn read_stat_ticks(path: &str) -> Option<u64> {
+fn read_thread_stat(path: &str) -> Option<(u64, u64)> {
     let text = fs::read_to_string(path).ok()?;
     let end = text.rfind(')')?;
     let rest = text.get(end + 2..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
     let utime = fields.get(11)?.parse::<u64>().ok()?;
     let stime = fields.get(12)?.parse::<u64>().ok()?;
-    Some(utime + stime)
+    let starttime = fields.get(19)?.parse::<u64>().ok()?;
+    Some((utime + stime, starttime))
 }
 
 fn parse_pid_text(text: &str) -> Option<i32> {

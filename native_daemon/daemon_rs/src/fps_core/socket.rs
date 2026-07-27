@@ -38,10 +38,20 @@
                     "fps socket missing fd",
                 ));
             };
-            if let Err(err) = socket_send_all(fd, line.as_bytes()) {
-                self.disabled = true;
-                self.close();
-                return Err(err);
+            match socket_send_nowait(fd, line.as_bytes()) {
+                Ok(SocketSendResult::Complete) => {}
+                Ok(SocketSendResult::WouldBlock) => {
+                    // App 一时来不及读取时直接丢本次样本，避免改走文件通道增加 IO。
+                }
+                Ok(SocketSendResult::Partial) => {
+                    // 流式协议不能留下半行；断开后由下一次样本重新握手。
+                    self.close();
+                }
+                Err(err) => {
+                    self.disabled = true;
+                    self.close();
+                    return Err(err);
+                }
             }
             Ok(())
         }
@@ -51,7 +61,21 @@
             let token = self.token.as_deref().unwrap_or_default();
             let fd = unix_connect_abstract(name)?;
             let hello = format!("hello {token}\n");
-            socket_send_all(fd, hello.as_bytes())?;
+            let hello_result = socket_send_nowait(fd, hello.as_bytes());
+            match hello_result {
+                Ok(SocketSendResult::Complete) => {}
+                Ok(SocketSendResult::WouldBlock | SocketSendResult::Partial) => {
+                    close_fd(fd);
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "fps socket handshake incomplete",
+                    ));
+                }
+                Err(err) => {
+                    close_fd(fd);
+                    return Err(err);
+                }
+            }
             self.fd = Some(fd);
             Ok(())
         }
@@ -80,24 +104,100 @@
 
     fn unix_connect_abstract(name: &str) -> io::Result<i32> {
         let fd = create_unix_socket()?;
-        let (addr, addr_len) = abstract_sockaddr(name)?;
+        let (addr, addr_len) = match abstract_sockaddr(name) {
+            Ok(address) => address,
+            Err(err) => {
+                close_fd(fd);
+                return Err(err);
+            }
+        };
         let rc = unsafe { connect(fd, &addr, addr_len) };
         if rc == 0 {
-            Ok(fd)
-        } else {
-            let err = io::Error::last_os_error();
+            return Ok(fd);
+        }
+
+        let err = io::Error::last_os_error();
+        if !err.raw_os_error().is_some_and(|code| {
+            code == libc::EINPROGRESS || code == libc::EAGAIN || code == libc::EWOULDBLOCK
+        }) {
             close_fd(fd);
-            Err(err)
+            return Err(err);
+        }
+
+        let started = Instant::now();
+        let timeout = Duration::from_millis(150);
+        loop {
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                close_fd(fd);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fps socket connect timeout",
+                ));
+            }
+            let remaining_ms = timeout
+                .saturating_sub(elapsed)
+                .as_millis()
+                .clamp(1, i32::MAX as u128) as i32;
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let poll_rc = unsafe { libc::poll(&mut poll_fd, 1, remaining_ms) };
+            if poll_rc < 0 {
+                let poll_err = io::Error::last_os_error();
+                if poll_err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                close_fd(fd);
+                return Err(poll_err);
+            }
+            if poll_rc == 0 {
+                continue;
+            }
+
+            let mut socket_error = 0i32;
+            let mut socket_error_len = mem::size_of::<i32>() as libc::socklen_t;
+            let opt_rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut socket_error as *mut i32).cast(),
+                    &mut socket_error_len,
+                )
+            };
+            if opt_rc != 0 {
+                let opt_err = io::Error::last_os_error();
+                close_fd(fd);
+                return Err(opt_err);
+            }
+            if socket_error == 0 {
+                return Ok(fd);
+            }
+            close_fd(fd);
+            return Err(io::Error::from_raw_os_error(socket_error));
         }
     }
 
     fn create_unix_socket() -> io::Result<i32> {
         let fd = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
-        if fd >= 0 {
-            Ok(fd)
-        } else {
-            Err(io::Error::last_os_error())
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
         }
+        let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if descriptor_flags < 0
+            || status_flags < 0
+            || unsafe { libc::fcntl(fd, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC) } < 0
+            || unsafe { libc::fcntl(fd, libc::F_SETFL, status_flags | libc::O_NONBLOCK) } < 0
+        {
+            let err = io::Error::last_os_error();
+            close_fd(fd);
+            return Err(err);
+        }
+        Ok(fd)
     }
 
     fn abstract_sockaddr(name: &str) -> io::Result<(SockAddrUn, u32)> {
@@ -119,28 +219,37 @@
         Ok((addr, addr_len))
     }
 
-    fn socket_send_all(fd: i32, data: &[u8]) -> io::Result<()> {
-        let mut off = 0usize;
-        while off < data.len() {
+    enum SocketSendResult {
+        Complete,
+        WouldBlock,
+        Partial,
+    }
+
+    fn socket_send_nowait(fd: i32, data: &[u8]) -> io::Result<SocketSendResult> {
+        loop {
             let sent = unsafe {
                 send(
                     fd,
-                    data[off..].as_ptr().cast(),
-                    data.len() - off,
-                    MSG_NOSIGNAL,
+                    data.as_ptr().cast(),
+                    data.len(),
+                    MSG_NOSIGNAL | MSG_DONTWAIT,
                 )
             };
-            if sent > 0 {
-                off += sent as usize;
-                continue;
+            if sent == data.len() as isize {
+                return Ok(SocketSendResult::Complete);
+            }
+            if sent >= 0 {
+                return Ok(SocketSendResult::Partial);
             }
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            if err.kind() == io::ErrorKind::WouldBlock {
+                return Ok(SocketSendResult::WouldBlock);
+            }
             return Err(err);
         }
-        Ok(())
     }
 
     fn close_fd(fd: i32) {
@@ -158,6 +267,7 @@
     const AF_UNIX: i32 = 1;
     const SOCK_STREAM: i32 = 1;
     const MSG_NOSIGNAL: i32 = 0x4000;
+    const MSG_DONTWAIT: i32 = 0x40;
 
     unsafe extern "C" {
         fn socket(domain: i32, type_: i32, protocol: i32) -> i32;

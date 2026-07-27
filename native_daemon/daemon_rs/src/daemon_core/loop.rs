@@ -7,6 +7,7 @@
 // 这个文件只关心调度节奏和日志摘要，具体规则解析/扫描/绑核分别在 config.rs、scan.rs、
 // affinity.rs 中实现。
 fn daemon_loop(args: &Args) -> io::Result<()> {
+    fs::create_dir_all(STATE_DIR)?;
     println!("[RS] 启动 AppOpt Rust 守护 v{VERSION}");
     println!("[RS] 作者: suto & 一只小柒夏");
     println!("[RS] 配置文件: {}", args.config.display());
@@ -269,16 +270,19 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
         }
     }
 
+    let scan_clock = elapsed_realtime_ms();
     let proc_total = system_process_count();
     let proc_count_grew = matches!(
         (state.last_proc_total, proc_total),
         (Some(last), Some(current)) if current > last
     );
-    if proc_count_grew {
+    let growth_hint_allowed = state.last_proc_growth_scan_elapsed_ms.is_none_or(|last| {
+        scan_clock >= last && scan_clock.saturating_sub(last) >= PID_GROWTH_HINT_MIN_MS
+    });
+    if proc_count_grew && growth_hint_allowed {
         state.proc_growth_scan_pending = true;
     }
     let cache_uninitialized = !state.proc_scan_initialized;
-    let scan_clock = elapsed_realtime_ms();
     let periodic_rescan = state.last_full_scan_elapsed_ms.is_some_and(|last| {
         scan_clock >= last && scan_clock.saturating_sub(last) >= FULL_RESCAN_MAX_MS
     });
@@ -323,15 +327,19 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     };
     let scan_started = Instant::now();
     let previous_known_pids = state.known_pids.clone();
+    let growth_refresh_requested = state.proc_growth_scan_pending;
     let mut process_index_round = match prepare_process_index_round(
         state,
         scan_clock,
-        full_scan_requested || state.proc_growth_scan_pending,
-        full_scan_requested,
+        full_scan || growth_refresh_requested,
+        full_scan,
     ) {
         Ok(update) => {
             if update.view.refreshed {
                 state.proc_growth_scan_pending = false;
+                if growth_refresh_requested {
+                    state.last_proc_growth_scan_elapsed_ms = Some(scan_clock);
+                }
             }
             update
         }
@@ -351,8 +359,9 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
             process_index_round.view.exited,
             process_index_round.view.candidate_pids.len()
         );
-    } else if process_index_round.entered_idle_backoff {
+    } else if process_index_round.entered_idle_backoff && !state.pid_idle_backoff_logged {
         println!("[RS] 进程索引长时间无变化，空闲时退避到 10 秒");
+        state.pid_idle_backoff_logged = true;
         state.last_pid_snapshot_log_elapsed_ms = Some(scan_clock);
     }
     if !full_scan && process_index_round.view.added > 0 {
@@ -442,13 +451,24 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     let has_new_hit_pid = hits
         .iter()
         .any(|hit| !previous_known_pids.contains(&hit.pid));
-    let detail_log = config_changed
-        || !state.logged_round_once
-        || has_new_hit_pid
-        || (full_scan && !scan_complete)
+    let first_summary = !state.logged_round_once;
+    let forced_summary = config_changed || first_summary;
+    let runtime_state_changed = has_new_hit_pid
         || known_pids != state.last_logged_known_pids
-        || processes != state.last_logged_processes
-        || (state.round_index + 1) % ROUND_SUMMARY_EVERY == 0;
+        || processes != state.last_logged_processes;
+    let scan_incomplete = full_scan && !scan_complete;
+    let last_summary = state.last_runtime_summary_log_elapsed_ms;
+    let state_change_summary_due = (runtime_state_changed || scan_incomplete)
+        && last_summary.is_none_or(|last| {
+            scan_clock < last
+                || scan_clock.saturating_sub(last) >= RUNTIME_CHANGE_LOG_INTERVAL_MS
+        });
+    let periodic_summary_due = last_summary.is_some_and(|last| {
+        scan_clock < last
+            || scan_clock.saturating_sub(last) >= RUNTIME_SUMMARY_LOG_INTERVAL_MS
+    });
+    let detail_log = forced_summary || state_change_summary_due || periodic_summary_due;
+    let hit_preview_log = config_changed || first_summary;
 
     if let Err(err) = update_rule_health(
         &rules,
@@ -505,9 +525,9 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
         if stats.cpuset_failed > 0 {
             println!("[RS] cpuset辅助写入失败: {}", stats.cpuset_failed);
         }
-        if !hits.is_empty() {
+        if hit_preview_log && !hits.is_empty() {
             log_hit_preview(&hits, 5, &previous_known_pids);
-        } else if !plan.is_empty() {
+        } else if hit_preview_log && !plan.is_empty() {
             println!(
                 "[RS] 未命中任何进程: appId映射包={} 缺少映射包={}",
                 plan.by_app_id.values().map(BTreeSet::len).sum::<usize>(),
@@ -515,6 +535,7 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
             );
         }
         state.logged_round_once = true;
+        state.last_runtime_summary_log_elapsed_ms = Some(scan_clock);
         state.last_logged_known_pids = known_pids;
         state.last_logged_processes = processes;
     }

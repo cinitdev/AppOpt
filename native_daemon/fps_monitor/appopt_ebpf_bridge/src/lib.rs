@@ -495,24 +495,26 @@ fn attach_symbols(bpf: &mut Ebpf, pid: i32) -> Result<CString, String> {
     );
 
     // 同一个 Android 版本/ROM 里可能同时存在多个 queueBuffer 变体。
-    // attach 成功只说明符号存在，不代表目标 App 持续走这条热路径。
-    // 所以这里挂上所有可用候选符号，再由用户态按 PID/Surface/TID 去重统计。
-    let mut attached = Vec::new();
+    // 仍挂上所有可用候选以覆盖不同热路径，但日志只展示首个挂载成功的符号。
+    let mut first_attached = None;
     for symbol in LIBGUI_FRAME_SYMBOLS {
         match program.attach(*symbol, Path::new("libgui.so"), scope) {
-            Ok(_) => attached.push(*symbol),
+            Ok(_) => {
+                if first_attached.is_none() {
+                    first_attached = Some(*symbol);
+                }
+            }
             Err(err) => last_error = err.to_string(),
         }
     }
 
-    if attached.is_empty() {
-        Err(if last_error.is_empty() {
+    match first_attached {
+        Some(symbol) => Ok(cstring_lossy(symbol)),
+        None => Err(if last_error.is_empty() {
             "all libgui symbols failed".to_string()
         } else {
             last_error
-        })
-    } else {
-        Ok(cstring_lossy(attached.join(",")))
+        }),
     }
 }
 

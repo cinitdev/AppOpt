@@ -25,30 +25,45 @@ object ConfigReader {
     }
 
     fun readPackagesOrNull(): ConfigPackages? =
-        DaemonBridge.readConfigRawOrNull()?.let(::parsePackages)
+        DaemonBridge.readConfigRawOrNull()?.let {
+            parsePackages(it, RuleConfigLogic.readPresentCpuSet())
+        }
 
-    internal fun parsePackages(text: String): ConfigPackages {
+    internal fun parsePackages(text: String, presentCpus: Set<Int>? = null): ConfigPackages {
         if (text.isBlank()) return ConfigPackages(emptyList(), emptyList())
         val auto = LinkedHashSet<String>()
         val configured = LinkedHashSet<String>()
+        val fixedProcessOwners = HashSet<String>()
         val configuredRuleCounts = LinkedHashMap<String, Int>()
         val ruleHealthKeys = LinkedHashSet<String>()
-        for (rule in RuleSyntax.parse(text).rules) {
-            if (rule.thread != null && rule.cpus.equals("auto", ignoreCase = true)) continue
-            val key = rule.owner
-            if (rule.thread == null && rule.cpus.equals("auto", ignoreCase = true)) {
-                auto.add(rule.owner)
-            } else {
-                configured.add(key)
-                configuredRuleCounts[key] = (configuredRuleCounts[key] ?: 0) + 1
-                val healthKey = if (rule.thread != null) {
-                    DaemonBridge.ruleHealthKey("T", key, rule.thread)
-                } else if (key.contains(':')) {
-                    DaemonBridge.ruleHealthKey("P", key, null)
-                } else {
-                    null
+        for (segment in RuleSyntax.parse(text).segments) {
+            if (!segment.valid || segment.rules.isEmpty()) continue
+            val validRules = segment.rules.filter(::isNativeCompatibleRule)
+            if (segment.block && validRules.size != segment.rules.size) continue
+            for (rule in validRules) {
+                if (!rule.cpus.equals("auto", ignoreCase = true) && presentCpus != null) {
+                    val requested = RuleConfigLogic.parseNativeCpuRangeList(rule.cpus).orEmpty()
+                    if (requested.none(presentCpus::contains)) continue
                 }
-                if (healthKey != null) ruleHealthKeys.add(healthKey)
+                val key = rule.owner
+                if (rule.thread == null && rule.cpus.equals("auto", ignoreCase = true)) {
+                    if (key !in fixedProcessOwners) auto.add(key)
+                } else {
+                    configured.add(key)
+                    configuredRuleCounts[key] = (configuredRuleCounts[key] ?: 0) + 1
+                    if (rule.thread == null) {
+                        fixedProcessOwners.add(key)
+                        auto.remove(key)
+                    }
+                    val healthKey = if (rule.thread != null) {
+                        DaemonBridge.ruleHealthKey("T", key, rule.thread)
+                    } else if (key.contains(':')) {
+                        DaemonBridge.ruleHealthKey("P", key, null)
+                    } else {
+                        null
+                    }
+                    if (healthKey != null) ruleHealthKeys.add(healthKey)
+                }
             }
         }
         return ConfigPackages(
@@ -57,5 +72,12 @@ object ConfigReader {
             configuredRuleCounts,
             ruleHealthKeys
         )
+    }
+
+    private fun isNativeCompatibleRule(rule: RuleSyntax.Rule): Boolean {
+        if (!RuleConfigLogic.ownerFitsNativeBuffer(rule.owner)) return false
+        if (rule.thread?.let(RuleConfigLogic::threadFitsNativeBuffer) == false) return false
+        if (rule.cpus.equals("auto", ignoreCase = true)) return rule.thread == null
+        return RuleConfigLogic.parseNativeCpuRangeList(rule.cpus) != null
     }
 }

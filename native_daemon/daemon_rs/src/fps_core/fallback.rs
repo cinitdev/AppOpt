@@ -1,9 +1,10 @@
     // SurfaceFlinger FPS fallback。
     //
     // eBPF 是逐帧最优路径，但部分内核/ROM 可能不支持或 libgui 符号变动。
-    // fallback 通过 binder 直连 SurfaceFlinger dump：
+    // fallback 优先通过 binder 直连 SurfaceFlinger dump：
     // - 优先 --latency <layer>，从图层帧时间戳计算 FPS。
     // - latency 连续失败后切 --timestats。
+    // - binder 不可用时最终降级到有硬超时的低频 dumpsys timestats。
     //
     // 这条路径不是完美等价于 eBPF：它更接近 SurfaceFlinger 图层输出帧率，
     // 但胜在不依赖 BPF 能力，适合作为兼容兜底。
@@ -17,17 +18,23 @@
         miss: u32,
         probe_fail: u32,
         ts_mode: bool,
+        ts_enabled: bool,
         ts_last: i64,
         ts_last_time: Option<Instant>,
+        cli_mode: bool,
+        cli_next: Option<Instant>,
+        cli_last_error_log: Option<Instant>,
     }
 
     impl SfFallback {
         fn new(pkg: String) -> Option<Self> {
-            let binder = match BinderSf::new() {
-                Ok(binder) => Some(binder),
+            let (binder, cli_mode) = match BinderSf::new() {
+                Ok(binder) => (Some(binder), false),
                 Err(err) => {
-                    eprintln!("[Fallback] SurfaceFlinger binder 不可用: {err}");
-                    None
+                    eprintln!(
+                        "[Fallback] SurfaceFlinger binder 不可用，切换低频 CLI timestats: {err}"
+                    );
+                    (None, true)
                 }
             };
             Some(Self {
@@ -37,9 +44,13 @@
                 since: 0,
                 miss: 0,
                 probe_fail: 0,
-                ts_mode: false,
+                ts_mode: cli_mode,
+                ts_enabled: false,
                 ts_last: -1,
                 ts_last_time: None,
+                cli_mode,
+                cli_next: None,
+                cli_last_error_log: None,
             })
         }
 
@@ -55,6 +66,10 @@
             let mut valid = 0usize;
             let mut latest = 0u64;
             let fps = self.layer_fps(&self.main_layer.clone(), &mut valid, &mut latest);
+            if self.cli_mode {
+                let _ = self.enable_timestats();
+                return 0.0;
+            }
             if fps >= 0.0 {
                 self.miss = 0;
                 self.probe_fail = 0;
@@ -78,6 +93,10 @@
             // 遍历 SurfaceFlinger 图层，挑目标包名相关且 latency 数据最新的图层。
             // 如果 latency 完全拿不到有效数据，多次失败后切 timestats。
             let candidates = self.list_candidates();
+            if self.cli_mode {
+                let _ = self.enable_timestats();
+                return 0.0;
+            }
             let candidate_count = candidates.len();
             let candidate_preview = preview_layers(&candidates);
             let now_ns = now_monotonic_ns();
@@ -92,6 +111,10 @@
                 let mut saved_since = self.since;
                 let fps =
                     self.layer_fps_with_since(&layer, &mut saved_since, &mut valid, &mut latest);
+                if self.cli_mode {
+                    let _ = self.enable_timestats();
+                    return 0.0;
+                }
                 valid_total += valid;
                 if !latency_ts_is_fresh(latest, now_ns) {
                     continue;
@@ -146,7 +169,7 @@
         }
 
         fn list_candidates(&mut self) -> Vec<String> {
-            let Some(out) = self.sf_dump(&["--list"]) else {
+            let Some(out) = self.sf_dump(&["--list"], false) else {
                 return Vec::new();
             };
             let mut result = Vec::new();
@@ -189,7 +212,7 @@
         ) -> f64 {
             *valid_out = 0;
             *latest_out = 0;
-            let Some(out) = self.sf_dump(&["--latency", layer]) else {
+            let Some(out) = self.sf_dump(&["--latency", layer], false) else {
                 return -1.0;
             };
             let base = *since;
@@ -241,15 +264,31 @@
             }
         }
 
-        fn enable_timestats(&mut self) {
-            let _ = self.sf_dump(&["--timestats", "-enable", "-clear"]);
+        fn enable_timestats(&mut self) -> bool {
+            if self.ts_enabled {
+                self.ts_mode = true;
+                return true;
+            }
             self.ts_mode = true;
             self.ts_last = -1;
             self.ts_last_time = None;
-            println!("[Fallback] 切换到 SurfaceFlinger timestats");
+            let enabled = self
+                .sf_dump(&["--timestats", "-enable", "-clear"], true)
+                .is_some();
+            self.ts_enabled = enabled;
+            if enabled {
+                println!(
+                    "[Fallback] 切换到 SurfaceFlinger timestats ({})",
+                    if self.cli_mode { "CLI" } else { "binder 直连" }
+                );
+            }
+            enabled
         }
 
         fn poll_timestats(&mut self) -> f64 {
+            if !self.ts_enabled && !self.enable_timestats() {
+                return 0.0;
+            }
             let now_frames = self.timestats_frames();
             if now_frames < 0 {
                 return 0.0;
@@ -272,7 +311,7 @@
         }
 
         fn timestats_frames(&mut self) -> i64 {
-            let Some(out) = self.sf_dump(&["--timestats", "-dump"]) else {
+            let Some(out) = self.sf_dump(&["--timestats", "-dump"], true) else {
                 return -1;
             };
             let mut best = -1i64;
@@ -298,31 +337,159 @@
             best
         }
 
-        fn sf_dump(&mut self, args: &[&str]) -> Option<String> {
-            let Some(binder) = self.binder.as_mut() else {
-                println!("[Fallback] SurfaceFlinger binder 不可用, 无法执行 dump: {}", args.join(" "));
+        fn sf_dump(&mut self, args: &[&str], allow_cli: bool) -> Option<String> {
+            if !self.cli_mode {
+                if let Some(binder) = self.binder.as_mut() {
+                    match binder.dump(args) {
+                        Ok(out) => return Some(out),
+                        Err(err) => {
+                            println!(
+                                "[Fallback] SurfaceFlinger binder dump 失败，切换低频 CLI timestats: args={} err={}",
+                                args.join(" "),
+                                err
+                            );
+                        }
+                    }
+                }
+                self.binder = None;
+                self.cli_mode = true;
+                self.ts_mode = true;
+                self.ts_enabled = false;
+                self.ts_last = -1;
+                self.ts_last_time = None;
+            }
+            if !allow_cli {
                 return None;
-            };
-            match binder.dump(args) {
+            }
+
+            let now = Instant::now();
+            if self.cli_next.is_some_and(|next| now < next) {
+                return None;
+            }
+            self.cli_next = Some(now + Duration::from_secs(1));
+            match sf_dump_cli_bounded(args) {
                 Ok(out) => Some(out),
                 Err(err) => {
-                    println!(
-                        "[Fallback] SurfaceFlinger dump 失败: args={} err={}",
-                        args.join(" "),
-                        err
-                    );
+                    self.log_cli_error(args, &err);
                     None
                 }
             }
+        }
+
+        fn log_cli_error(&mut self, args: &[&str], err: &io::Error) {
+            let now = Instant::now();
+            if self
+                .cli_last_error_log
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(30))
+            {
+                return;
+            }
+            self.cli_last_error_log = Some(now);
+            println!(
+                "[FPS][CLI] dumpsys SurfaceFlinger 执行失败，已中止本次采样: args={} err={}",
+                args.join(" "),
+                err
+            );
+        }
+
+        fn disable_timestats(&mut self) {
+            let args = ["--timestats", "-disable"];
+            let binder_disabled = if self.cli_mode {
+                false
+            } else {
+                self.binder
+                    .as_mut()
+                    .is_some_and(|binder| binder.dump(&args).is_ok())
+            };
+            if !binder_disabled {
+                if let Err(err) = sf_dump_cli_bounded(&args) {
+                    self.log_cli_error(&args, &err);
+                }
+            }
+            self.ts_enabled = false;
         }
     }
 
     impl Drop for SfFallback {
         fn drop(&mut self) {
             if self.ts_mode {
-                let _ = self.sf_dump(&["--timestats", "-disable"]);
+                self.disable_timestats();
             }
         }
+    }
+
+    fn sf_dump_cli_bounded(args: &[&str]) -> io::Result<String> {
+        const MAX_OUTPUT: usize = 1 << 20;
+        const TIMEOUT: Duration = Duration::from_millis(1500);
+
+        let mut child = Command::new("/system/bin/dumpsys")
+            .arg("SurfaceFlinger")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "dumpsys stdout unavailable")
+        })?;
+        let reader = match thread::Builder::new()
+            .name("AppOptSfCli".to_string())
+            .spawn(move || {
+                let mut output = Vec::with_capacity(MAX_OUTPUT.min(256 * 1024));
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let read = stdout.read(&mut chunk)?;
+                    if read == 0 {
+                        break;
+                    }
+                    let remaining = MAX_OUTPUT.saturating_sub(output.len());
+                    output.extend_from_slice(&chunk[..read.min(remaining)]);
+                }
+                Ok::<Vec<u8>, io::Error>(output)
+            }) {
+            Ok(reader) => reader,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
+        };
+
+        let started = Instant::now();
+        let (status, timed_out) = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break (status, false),
+                Ok(None) if started.elapsed() < TIMEOUT => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let status = child.wait()?;
+                    break (status, true);
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err(err);
+                }
+            }
+        };
+        let output = reader.join().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "dumpsys stdout reader panicked")
+        })??;
+        if timed_out {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "dumpsys SurfaceFlinger timeout",
+            ));
+        }
+        if !status.success() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("dumpsys SurfaceFlinger exit status {status}"),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output).into_owned())
     }
 
     fn unwrap_requested_layer_name(line: &str) -> String {

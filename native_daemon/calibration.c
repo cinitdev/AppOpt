@@ -14,11 +14,12 @@ typedef struct {
     size_t sample_count;
 } ThreadSample;
 
-/* per-(pid,tid) 的 CPU 跟踪, 用于在多进程下正确计算每个线程的增量,
- * 避免不同进程的同名线程互相覆盖基准值。 */
+/* 按 (pid,tid,starttime) 跟踪 CPU，用于在多进程下正确计算每个线程的增量，
+ * 避免不同进程的同名线程互相覆盖基准值，也避免 TID 复用沿用旧基线。 */
 typedef struct {
     pid_t pid;
     pid_t tid;
+    unsigned long long starttime; /* /proc stat 字段 22，防止 TID 复用沿用旧基线 */
     unsigned long long last;     /* 上一次采样的绝对 (utime+stime) */
     bool has_last;
     bool alive;
@@ -50,45 +51,68 @@ typedef struct {
     size_t child_thread_cap;
     size_t round_count;          /* 已完成的采样轮数, 即折线序列长度 */
     long long last_sample_ms;    /* 上一轮采样完成时间, 用于计算真实 CPU 占用 */
+    long long started_ms;        /* 本次校准开始时间, 用于异常长会话兜底收尾 */
     long clock_ticks_per_second;
 } CalibData;
 
-/* 在 stat 文件中解析 utime(14) + stime(15)。stat 的 comm 字段可能含空格/括号,
- * 故从最后一个 ')' 之后开始按空格切分, 该位置之后第 12、13 个字段即 utime、stime。 */
-static bool read_thread_cpu(int task_fd, const char* tid_name, unsigned long long* out) {
-    int fd = openat(task_fd, tid_name, O_RDONLY | O_DIRECTORY);
-    if (fd == -1) return false;
+/* 在 stat 文件中解析 utime(14) + stime(15) 与 starttime(22)。stat 的 comm 字段
+ * 可能含空格/括号，故从最后一个 ')' 之后开始按空格切分。 */
+static bool read_thread_cpu(int thread_fd, unsigned long long* cpu_out,
+                            unsigned long long* starttime_out) {
+    if (thread_fd < 0 || !cpu_out || !starttime_out) return false;
     char buf[512];
-    bool ok = read_file(fd, "stat", buf, sizeof(buf));
-    close(fd);
-    if (!ok) return false;
+    if (!read_file(thread_fd, "stat", buf, sizeof(buf))) return false;
 
     char* rp = strrchr(buf, ')');
     if (!rp) return false;
     rp++;                              /* 跳到 comm 之后 */
-    /* 此处起第一个 token 是 state(字段3), utime 是字段14 => 之后第 11 个 token */
+    /* 此处第一个 token 是 state(字段 3)。 */
     int field = 2;
-    unsigned long long utime = 0, stime = 0;
-    char* tok = strtok(rp, " \t\n");
+    unsigned long long utime = 0;
+    unsigned long long stime = 0;
+    unsigned long long starttime = 0;
+    bool have_utime = false;
+    bool have_stime = false;
+    bool have_starttime = false;
+    char* save = NULL;
+    char* tok = strtok_r(rp, " \t\n", &save);
     while (tok) {
         field++;
-        if (field == 14) utime = strtoull(tok, NULL, 10);
-        else if (field == 15) { stime = strtoull(tok, NULL, 10); break; }
-        tok = strtok(NULL, " \t\n");
+        if (field == 14) {
+            utime = strtoull(tok, NULL, 10);
+            have_utime = true;
+        } else if (field == 15) {
+            stime = strtoull(tok, NULL, 10);
+            have_stime = true;
+        } else if (field == 22) {
+            starttime = strtoull(tok, NULL, 10);
+            have_starttime = true;
+            break;
+        }
+        tok = strtok_r(NULL, " \t\n", &save);
     }
-    *out = utime + stime;
+    if (!have_utime || !have_stime || !have_starttime || starttime == 0) return false;
+    *cpu_out = utime + stime;
+    *starttime_out = starttime;
     return true;
 }
 
+#define CALIB_MAX_SESSION_MS (6LL * 60LL * 60LL * 1000LL)
+#define CALIB_PROGRESS_LOG_ROUNDS 120
+
 typedef struct {
     pid_t pid;
+    unsigned long long starttime;
     char owner[MAX_PKG_LEN];
 } CalibProcess;
 
 /* 收集属于该应用的所有进程: 主进程 (cmdline==pkg) 与子进程 (cmdline 以 "pkg:" 开头)。
  * 例如 com.tencent.tmgp.sgame 与 com.tencent.tmgp.sgame:GiftProcess 都计入。
- * 结果保留 pid 与真实进程名, 返回收集到的进程数。 */
+ * 结果保留 pid、starttime 与真实进程名, 返回收集到的进程数。 */
 static size_t collect_pkg_processes(const char* pkg, CalibProcess* out, size_t max) {
+    if (!pkg || !pkg[0] || !out || max == 0) return 0;
+    size_t plen = strlen(pkg);
+    if (plen >= MAX_PKG_LEN) return 0;
     DIR* d = opendir("/proc");
     if (!d) return 0;
     int dfd = dirfd(d);
@@ -98,8 +122,8 @@ static size_t collect_pkg_processes(const char* pkg, CalibProcess* out, size_t m
     }
     struct dirent* e;
     size_t n = 0;
-    size_t plen = strlen(pkg);
-    while ((e = readdir(d)) && n < max) {
+    bool have_main = false;
+    while ((e = readdir(d))) {
         char* end;
         long pid = strtol(e->d_name, &end, 10);
         if (*end != '\0') continue;
@@ -107,20 +131,58 @@ static size_t collect_pkg_processes(const char* pkg, CalibProcess* out, size_t m
         if (pfd == -1) continue;
         char cmd[MAX_PKG_LEN] = {0};
         bool ok = read_file(pfd, "cmdline", cmd, sizeof(cmd));
-        close(pfd);
-        if (!ok) continue;
+        if (!ok) {
+            close(pfd);
+            continue;
+        }
         char* name = strrchr(cmd, '/');
         name = name ? name + 1 : cmd;
         /* 主进程: 完全相等; 子进程: "pkg:子进程名" */
-        if (strcmp(name, pkg) == 0 ||
-            (strncmp(name, pkg, plen) == 0 && name[plen] == ':')) {
-            out[n].pid = (pid_t)pid;
-            build_str(out[n].owner, sizeof(out[n].owner), name, NULL);
-            n++;
+        bool is_main = strcmp(name, pkg) == 0;
+        bool is_child = strncmp(name, pkg, plen) == 0 && name[plen] == ':';
+        if (!is_main && !is_child) {
+            close(pfd);
+            continue;
+        }
+        unsigned long long process_cpu = 0;
+        unsigned long long process_starttime = 0;
+        ok = read_thread_cpu(pfd, &process_cpu, &process_starttime);
+        close(pfd);
+        if (!ok) continue;
+        size_t slot = SIZE_MAX;
+        if (is_main) {
+            if (n < max) {
+                if (!have_main && n > 0) {
+                    out[n] = out[0];
+                    slot = 0;
+                } else {
+                    slot = n;
+                }
+                n++;
+            } else if (!have_main) {
+                slot = 0;
+            }
+            have_main = true;
+        } else if (is_child && n < max) {
+            slot = n++;
+        }
+        if (slot != SIZE_MAX) {
+            out[slot].pid = (pid_t)pid;
+            out[slot].starttime = process_starttime;
+            build_str(out[slot].owner, sizeof(out[slot].owner), name, NULL);
         }
     }
     closedir(d);
     return n;
+}
+
+static bool calib_has_main_process(const CalibProcess* procs, size_t count,
+                                   const char* pkg) {
+    if (!procs || !pkg) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(procs[i].owner, pkg) == 0) return true;
+    }
+    return false;
 }
 
 /* 在 data 中按样本类型、进程名和线程名查找, 不存在则追加, 返回索引。 */
@@ -157,12 +219,19 @@ static long calib_find_or_add(CalibData* data, const char* owner, const char* na
     return (long)data->count++;
 }
 
-/* 在 tid 跟踪表中按 (pid,tid) 查找, 不存在则追加, 返回指针; 失败返回 NULL */
+/* 在 tid 跟踪表中按 (pid,tid) 查找；starttime 变化时重置增量基线。 */
 static TidTrack* calib_track_tid(CalibData* data, pid_t pid, pid_t tid,
-                                 const char* name) {
+                                 unsigned long long starttime, const char* name) {
     for (size_t i = 0; i < data->tcount; i++) {
-        if (data->tids[i].pid == pid && data->tids[i].tid == tid)
+        if (data->tids[i].pid == pid && data->tids[i].tid == tid) {
+            if (data->tids[i].starttime != starttime) {
+                data->tids[i].starttime = starttime;
+                data->tids[i].last = 0;
+                data->tids[i].has_last = false;
+            }
+            build_str(data->tids[i].name, sizeof(data->tids[i].name), name, NULL);
             return &data->tids[i];
+        }
     }
     if (data->tcount >= CALIB_MAX_TRACKED_TIDS) return NULL;
     if (data->tcount >= data->tcap) {
@@ -176,6 +245,7 @@ static TidTrack* calib_track_tid(CalibData* data, pid_t pid, pid_t tid,
     memset(tk, 0, sizeof(*tk));
     tk->pid = pid;
     tk->tid = tid;
+    tk->starttime = starttime;
     build_str(tk->name, sizeof(tk->name), name, NULL);
     return tk;
 }
@@ -206,16 +276,36 @@ static ChildThreadSummary* calib_track_child_thread(CalibData* data,
 
 /* 对单个进程 task/ 做一遍扫描。主进程按线程累计, 子进程把所有线程增量
  * 汇总为一个进程样本, 避免大量短时低负载线程稀释子进程实际负载。 */
-static bool calib_sample_proc(CalibData* data, pid_t pid, const char* owner) {
-    char taskpath[64];
-    snprintf(taskpath, sizeof(taskpath), "/proc/%d/task", pid);
-    DIR* td = opendir(taskpath);
-    if (!td) return false;
-    int task_fd = dirfd(td);
-    if (task_fd < 0) {
-        closedir(td);
+static bool calib_sample_proc(CalibData* data, pid_t pid, const char* owner,
+                              unsigned long long expected_starttime) {
+    char procpath[64];
+    snprintf(procpath, sizeof(procpath), "/proc/%d", pid);
+    int process_fd = open(procpath, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (process_fd == -1) return false;
+
+    char cmd[MAX_PKG_LEN] = {0};
+    unsigned long long process_cpu = 0;
+    unsigned long long process_starttime = 0;
+    bool identity_ok = read_file(process_fd, "cmdline", cmd, sizeof(cmd)) &&
+        read_thread_cpu(process_fd, &process_cpu, &process_starttime);
+    char* current_owner = strrchr(cmd, '/');
+    current_owner = current_owner ? current_owner + 1 : cmd;
+    identity_ok = identity_ok && strcmp(current_owner, owner) == 0 &&
+        process_starttime == expected_starttime;
+    if (!identity_ok) {
+        close(process_fd);
         return false;
     }
+
+    int raw_task_fd = openat(process_fd, "task", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    close(process_fd);
+    if (raw_task_fd == -1) return false;
+    DIR* td = fdopendir(raw_task_fd);
+    if (!td) {
+        close(raw_task_fd);
+        return false;
+    }
+    int task_fd = dirfd(td);
     const bool is_main_process = strcmp(owner, data->pkg) == 0;
     ThreadSample* process_sample = NULL;
     if (!is_main_process) {
@@ -238,15 +328,15 @@ static bool calib_sample_proc(CalibData* data, pid_t pid, const char* owner) {
         if (tfd == -1) continue;
         char tname[MAX_THREAD_LEN] = {0};
         bool ok = read_file(tfd, "comm", tname, sizeof(tname));
+        unsigned long long cpu = 0;
+        unsigned long long starttime = 0;
+        if (ok) ok = read_thread_cpu(tfd, &cpu, &starttime);
         close(tfd);
         if (!ok) continue;
-        strtrim(tname);
+        char* trimmed_name = strtrim(tname);
 
-        unsigned long long cpu;
-        if (!read_thread_cpu(task_fd, te->d_name, &cpu)) continue;
-
-        /* 用 (pid,tid) 跟踪正确的增量基准 */
-        TidTrack* tk = calib_track_tid(data, pid, (pid_t)tid, tname);
+        /* 用 (pid,tid,starttime) 跟踪正确的增量基准。 */
+        TidTrack* tk = calib_track_tid(data, pid, (pid_t)tid, starttime, trimmed_name);
         if (!tk) continue;
         tk->alive = true;
         unsigned long long delta = 0;
@@ -255,7 +345,7 @@ static bool calib_sample_proc(CalibData* data, pid_t pid, const char* owner) {
         tk->has_last = true;
 
         if (is_main_process) {
-            long idx = calib_find_or_add(data, owner, tname, false);
+            long idx = calib_find_or_add(data, owner, trimmed_name, false);
             if (idx < 0) continue;
             ThreadSample* s = &data->threads[idx];
             s->alive = true;
@@ -265,7 +355,7 @@ static bool calib_sample_proc(CalibData* data, pid_t pid, const char* owner) {
             process_sample->busy += delta;
             process_sample->round_delta += delta;
             if (delta > 0) {
-                ChildThreadSummary* summary = calib_track_child_thread(data, owner, tname);
+                ChildThreadSummary* summary = calib_track_child_thread(data, owner, trimmed_name);
                 if (summary) {
                     summary->busy += delta;
                     summary->round_delta += delta;
@@ -317,11 +407,11 @@ static void calib_prune_dead_tids(CalibData* data) {
 }
 
 /* 对目标应用做一次采样: 主进程保留线程维度, :子进程仅保留整体负载。
- * 返回 false 表示应用所有进程都已消失 (游戏退出)。 */
+ * 返回 false 表示主进程已消失或身份校验失败，常驻子进程不能单独维持校准。 */
 static bool calib_sample_once(CalibData* data) {
     CalibProcess procs[64];
     size_t np = collect_pkg_processes(data->pkg, procs, 64);
-    if (np == 0) return false;
+    if (np == 0 || !calib_has_main_process(procs, np, data->pkg)) return false;
 
     for (size_t i = 0; i < data->count; i++) {
         data->threads[i].alive = false;
@@ -333,11 +423,16 @@ static bool calib_sample_once(CalibData* data) {
     for (size_t i = 0; i < data->tcount; i++) data->tids[i].alive = false;
 
     bool any = false;
+    bool main_sampled = false;
     bool had_baseline = data->last_sample_ms > 0;
     for (size_t i = 0; i < np; i++) {
-        if (calib_sample_proc(data, procs[i].pid, procs[i].owner)) any = true;
+        if (calib_sample_proc(data, procs[i].pid, procs[i].owner,
+                              procs[i].starttime)) {
+            any = true;
+            if (strcmp(procs[i].owner, data->pkg) == 0) main_sampled = true;
+        }
     }
-    if (!any) return false;
+    if (!any || !main_sampled) return false;
 
     long long now_ms = monotonic_ms();
     if (data->clock_ticks_per_second <= 0) {
@@ -384,7 +479,8 @@ static bool calib_rule_name_syntax_ok(const char* name) {
     for (size_t i = 0; name[i]; i++) {
         unsigned char c = (unsigned char)name[i];
         if (c == '{' || c == '}' || c == '=' || c == '/' || c == '\\' ||
-            c == '*' || c == '\n' || c == '\r') {
+            c == '*' || c == '?' || c == '[' || c == ']' ||
+            c == '\n' || c == '\r' || (c < ' ' && c != '\t')) {
             return false;
         }
     }
@@ -405,99 +501,327 @@ static bool calib_wildcard_name_syntax_ok(const char* name) {
     return has_wildcard;
 }
 
-static bool calib_wildcard_candidate(const char* name, char* out, size_t out_sz) {
-    if (!name || !out || out_sz == 0 || !calib_rule_name_syntax_ok(name)) return false;
-    out[0] = '\0';
+#define CALIB_MAX_NUMBER_SEGMENTS ((MAX_THREAD_LEN + 1) / 2)
 
-    size_t digit_pos = 0;
-    while (name[digit_pos] && !isdigit((unsigned char)name[digit_pos])) digit_pos++;
-    if (!name[digit_pos]) return false;
+typedef struct {
+    bool valid;
+    size_t length;
+    size_t count;
+    size_t starts[CALIB_MAX_NUMBER_SEGMENTS];
+    size_t ends[CALIB_MAX_NUMBER_SEGMENTS];
+    size_t stable_anchors;
+} CalibNumericShape;
 
-    size_t prefix_len = digit_pos;
-    while (prefix_len > 0 && isspace((unsigned char)name[prefix_len - 1])) prefix_len--;
+typedef struct {
+    bool valid;
+    char own_base[MAX_THREAD_LEN];
+    char canonical[MAX_THREAD_LEN];
+    size_t observed_coverage;
+    size_t specificity;
+    size_t pattern_chars;
+} CalibRuleBaseInfo;
 
-    int alpha = 0;
-    for (size_t i = 0; i < prefix_len; i++) {
-        if (isalpha((unsigned char)name[i])) alpha++;
-    }
-    if (prefix_len < 4 || alpha < 2) return false;
-
-    size_t first_digit_end = digit_pos;
-    while (isdigit((unsigned char)name[first_digit_end])) first_digit_end++;
-    bool has_stable_suffix = false;
-    for (size_t i = first_digit_end; name[i]; i++) {
-        if (isalpha((unsigned char)name[i])) {
-            has_stable_suffix = true;
-            break;
-        }
-    }
-
-    if (has_stable_suffix) {
-        static const char numeric_glob[] = "[0-9]*";
-        const size_t numeric_glob_len = sizeof(numeric_glob) - 1;
-        size_t src = 0;
-        size_t dst = 0;
-        bool overflow = false;
-        while (name[src]) {
-            if (isdigit((unsigned char)name[src])) {
-                if (dst + numeric_glob_len + 1 > out_sz) {
-                    overflow = true;
-                    break;
-                }
-                memcpy(out + dst, numeric_glob, numeric_glob_len);
-                dst += numeric_glob_len;
-                while (isdigit((unsigned char)name[src])) src++;
-            } else {
-                if (dst + 2 > out_sz) {
-                    overflow = true;
-                    break;
-                }
-                out[dst++] = name[src++];
-            }
-        }
-        if (!overflow) {
-            out[dst] = '\0';
-            if (calib_wildcard_name_syntax_ok(out)) return true;
-        }
-    }
-
-    if (prefix_len + 2 > out_sz) return false;
-
-    memcpy(out, name, prefix_len);
-    out[prefix_len] = '*';
-    out[prefix_len + 1] = '\0';
-    return calib_wildcard_name_syntax_ok(out);
+static bool calib_ascii_alpha(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
 
-static int calib_wildcard_candidate_count(const CalibData* data, const char* owner,
-                                          const char* candidate) {
-    if (!data || !owner || !candidate || !candidate[0]) return 0;
-    int count = 0;
-    for (size_t i = 0; i < data->count; i++) {
-        if (strcmp(data->threads[i].owner, owner) != 0) continue;
-        char other[MAX_THREAD_LEN];
-        if (calib_wildcard_candidate(data->threads[i].name, other, sizeof(other)) &&
-            strcmp(other, candidate) == 0) {
-            count++;
+static bool calib_direct_number_delimiter(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '-' || c == '_';
+}
+
+/* 数字只按 ASCII 字节分段，非 ASCII 字节原样保留，避免截断 UTF-8。 */
+static bool calib_parse_numeric_shape(const char* name, CalibNumericShape* out) {
+    if (!name || !out || !calib_rule_name_syntax_ok(name)) return false;
+    memset(out, 0, sizeof(*out));
+    out->length = strlen(name);
+
+    for (size_t i = 0; i < out->length;) {
+        unsigned char c = (unsigned char)name[i];
+        if (c >= '0' && c <= '9') {
+            if (out->count >= CALIB_MAX_NUMBER_SEGMENTS) return false;
+            size_t end = i + 1;
+            while (end < out->length) {
+                unsigned char next = (unsigned char)name[end];
+                if (next < '0' || next > '9') break;
+                end++;
+            }
+            out->starts[out->count] = i;
+            out->ends[out->count] = end;
+            out->count++;
+            i = end;
+            continue;
         }
+
+        if (calib_ascii_alpha(c)) {
+            out->stable_anchors++;
+        } else if (c >= 0x80 && (c & 0xc0) != 0x80) {
+            /* 每个 UTF-8 首字节视为一个稳定字符，续字节不重复计数。 */
+            out->stable_anchors++;
+        }
+        i++;
+    }
+    out->valid = true;
+    return true;
+}
+
+static bool calib_numeric_shapes_equal(const char* left, const CalibNumericShape* ls,
+                                       const char* right, const CalibNumericShape* rs) {
+    if (!left || !right || !ls || !rs || !ls->valid || !rs->valid ||
+        ls->count != rs->count) {
+        return false;
+    }
+
+    size_t left_pos = 0;
+    size_t right_pos = 0;
+    for (size_t i = 0; i < ls->count; i++) {
+        size_t left_len = ls->starts[i] - left_pos;
+        size_t right_len = rs->starts[i] - right_pos;
+        if (left_len != right_len || memcmp(left + left_pos, right + right_pos, left_len) != 0) {
+            return false;
+        }
+        left_pos = ls->ends[i];
+        right_pos = rs->ends[i];
+    }
+
+    size_t left_tail = ls->length - left_pos;
+    size_t right_tail = rs->length - right_pos;
+    return left_tail == right_tail &&
+        memcmp(left + left_pos, right + right_pos, left_tail) == 0;
+}
+
+static bool calib_numeric_segment_differs(const char* left, const CalibNumericShape* ls,
+                                          const char* right, const CalibNumericShape* rs,
+                                          size_t segment) {
+    size_t left_len = ls->ends[segment] - ls->starts[segment];
+    size_t right_len = rs->ends[segment] - rs->starts[segment];
+    return left_len != right_len ||
+        memcmp(left + ls->starts[segment], right + rs->starts[segment], left_len) != 0;
+}
+
+static bool calib_numeric_segment_direct(const char* name, const CalibNumericShape* shape,
+                                         size_t segment) {
+    size_t start = shape->starts[segment];
+    size_t end = shape->ends[segment];
+    if (start == 0 || !calib_direct_number_delimiter((unsigned char)name[start - 1])) {
+        return false;
+    }
+    return end == shape->length ||
+        calib_direct_number_delimiter((unsigned char)name[end]);
+}
+
+static bool calib_append_pattern_bytes(char* out, size_t out_sz, size_t* used,
+                                       const char* text, size_t length) {
+    if (!out || !used || !text || *used + length + 1 > out_sz) return false;
+    memcpy(out + *used, text, length);
+    *used += length;
+    out[*used] = '\0';
+    return true;
+}
+
+static bool calib_build_own_rule_base(const CalibData* data,
+                                      const CalibNumericShape* shapes,
+                                      size_t idx, char* out, size_t out_sz) {
+    if (!data || !shapes || idx >= data->count || !out || out_sz == 0 ||
+        !shapes[idx].valid) {
+        return false;
+    }
+
+    const ThreadSample* sample = &data->threads[idx];
+    const CalibNumericShape* shape = &shapes[idx];
+    bool direct[CALIB_MAX_NUMBER_SEGMENTS] = {0};
+    bool varied[CALIB_MAX_NUMBER_SEGMENTS] = {0};
+    size_t dynamic_count = 0;
+    size_t dynamic_segment = SIZE_MAX;
+
+    for (size_t s = 0; s < shape->count; s++) {
+        direct[s] = calib_numeric_segment_direct(sample->name, shape, s);
+    }
+
+    for (size_t other = 0; other < data->count; other++) {
+        if (other == idx || data->threads[other].is_process || !shapes[other].valid ||
+            strcmp(data->threads[other].owner, sample->owner) != 0 ||
+            !calib_numeric_shapes_equal(sample->name, shape,
+                                        data->threads[other].name, &shapes[other])) {
+            continue;
+        }
+        for (size_t s = 0; s < shape->count; s++) {
+            if (calib_numeric_segment_differs(sample->name, shape,
+                                              data->threads[other].name, &shapes[other], s)) {
+                varied[s] = true;
+            }
+        }
+    }
+
+    if (shape->stable_anchors >= 2) {
+        for (size_t s = 0; s < shape->count; s++) {
+            if (direct[s] || varied[s]) {
+                dynamic_count++;
+                dynamic_segment = s;
+            }
+        }
+    }
+
+    if (dynamic_count == 0) {
+        build_str(out, out_sz, sample->name, NULL);
+        return out[0] != '\0';
+    }
+
+    bool simple_trailing_star = dynamic_count == 1 && direct[dynamic_segment] &&
+        shape->ends[dynamic_segment] == shape->length;
+    static const char numeric_glob[] = "[0-9]*";
+    char candidate[MAX_THREAD_LEN] = {0};
+    size_t used = 0;
+    size_t source_pos = 0;
+
+    for (size_t s = 0; s < shape->count; s++) {
+        bool dynamic = direct[s] || varied[s];
+        size_t literal_end = shape->starts[s];
+        /* 只有裸 '*' 能吸收被省略的空白；数字字符类前必须保留原分隔符。 */
+        if (dynamic && direct[s] && simple_trailing_star) {
+            while (literal_end > source_pos &&
+                   (sample->name[literal_end - 1] == ' ' ||
+                    sample->name[literal_end - 1] == '\t')) {
+                literal_end--;
+            }
+        }
+        if (!calib_append_pattern_bytes(candidate, sizeof(candidate), &used,
+                                        sample->name + source_pos,
+                                        literal_end - source_pos)) {
+            goto keep_exact;
+        }
+        if (dynamic) {
+            const char* glob = simple_trailing_star ? "*" : numeric_glob;
+            if (!calib_append_pattern_bytes(candidate, sizeof(candidate), &used,
+                                            glob, strlen(glob))) {
+                goto keep_exact;
+            }
+        } else if (!calib_append_pattern_bytes(candidate, sizeof(candidate), &used,
+                                               sample->name + shape->starts[s],
+                                               shape->ends[s] - shape->starts[s])) {
+            goto keep_exact;
+        }
+        source_pos = shape->ends[s];
+    }
+
+    if (!calib_append_pattern_bytes(candidate, sizeof(candidate), &used,
+                                    sample->name + source_pos,
+                                    shape->length - source_pos) ||
+        !calib_wildcard_name_syntax_ok(candidate)) {
+        goto keep_exact;
+    }
+    build_str(out, out_sz, candidate, NULL);
+    return true;
+
+keep_exact:
+    build_str(out, out_sz, sample->name, NULL);
+    return out[0] != '\0';
+}
+
+static size_t calib_utf8_char_count(const char* text) {
+    if (!text) return 0;
+    size_t count = 0;
+    for (size_t i = 0; text[i]; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if ((c & 0xc0) != 0x80) count++;
     }
     return count;
 }
 
-static void calib_rule_base_for_thread(const CalibData* data, size_t idx, char* out, size_t out_sz) {
-    if (!data || idx >= data->count || !out || out_sz == 0) return;
-    out[0] = '\0';
+/* specificity 表示模式必须匹配的原子数，越少表示覆盖越宽。 */
+static size_t calib_pattern_specificity(const char* pattern) {
+    if (!pattern) return SIZE_MAX;
+    size_t specificity = 0;
+    for (size_t i = 0; pattern[i];) {
+        unsigned char c = (unsigned char)pattern[i];
+        if (c == '*') {
+            i++;
+            continue;
+        }
+        if (c == '[') {
+            const char* close = strchr(pattern + i + 1, ']');
+            if (close) {
+                specificity++;
+                i = (size_t)(close - pattern) + 1;
+                continue;
+            }
+        }
+        specificity++;
+        i++;
+        while (pattern[i] && ((unsigned char)pattern[i] & 0xc0) == 0x80) i++;
+    }
+    return specificity;
+}
 
-    char candidate[MAX_THREAD_LEN];
-    if (calib_wildcard_candidate(data->threads[idx].name, candidate, sizeof(candidate)) &&
-        calib_wildcard_candidate_count(data, data->threads[idx].owner, candidate) >= 2) {
-        build_str(out, out_sz, candidate, NULL);
-        return;
+static bool calib_wider_pattern(const CalibRuleBaseInfo* candidate,
+                                const CalibRuleBaseInfo* current) {
+    if (candidate->observed_coverage != current->observed_coverage) {
+        return candidate->observed_coverage > current->observed_coverage;
+    }
+    if (candidate->specificity != current->specificity) {
+        return candidate->specificity < current->specificity;
+    }
+    if (candidate->pattern_chars != current->pattern_chars) {
+        return candidate->pattern_chars < current->pattern_chars;
+    }
+    return strcmp(candidate->own_base, current->own_base) < 0;
+}
+
+/* own base 只计算一次；canonical 再从已生成通配模式中选择观察覆盖最宽者。 */
+static CalibRuleBaseInfo* calib_prepare_rule_bases(const CalibData* data) {
+    if (!data || data->count == 0) return NULL;
+    CalibNumericShape* shapes = calloc(data->count, sizeof(*shapes));
+    CalibRuleBaseInfo* infos = calloc(data->count, sizeof(*infos));
+    if (!shapes || !infos) {
+        free(shapes);
+        free(infos);
+        return NULL;
     }
 
-    if (calib_rule_name_syntax_ok(data->threads[idx].name)) {
-        build_str(out, out_sz, data->threads[idx].name, NULL);
+    for (size_t i = 0; i < data->count; i++) {
+        if (data->threads[i].is_process ||
+            !calib_parse_numeric_shape(data->threads[i].name, &shapes[i])) {
+            continue;
+        }
+        infos[i].valid = calib_build_own_rule_base(data, shapes, i,
+                                                  infos[i].own_base,
+                                                  sizeof(infos[i].own_base));
     }
+
+    for (size_t i = 0; i < data->count; i++) {
+        if (!infos[i].valid || !strchr(infos[i].own_base, '*')) continue;
+        for (size_t other = 0; other < data->count; other++) {
+            if (!infos[other].valid ||
+                strcmp(data->threads[i].owner, data->threads[other].owner) != 0) {
+                continue;
+            }
+            if (fnmatch(infos[i].own_base, data->threads[other].name, FNM_NOESCAPE) == 0) {
+                infos[i].observed_coverage++;
+            }
+        }
+        infos[i].specificity = calib_pattern_specificity(infos[i].own_base);
+        infos[i].pattern_chars = calib_utf8_char_count(infos[i].own_base);
+    }
+
+    for (size_t i = 0; i < data->count; i++) {
+        if (!infos[i].valid) continue;
+        const CalibRuleBaseInfo* widest = NULL;
+        for (size_t candidate = 0; candidate < data->count; candidate++) {
+            if (!infos[candidate].valid || !strchr(infos[candidate].own_base, '*') ||
+                strcmp(data->threads[i].owner, data->threads[candidate].owner) != 0 ||
+                fnmatch(infos[candidate].own_base, data->threads[i].name,
+                        FNM_NOESCAPE) != 0) {
+                continue;
+            }
+            if (!widest || calib_wider_pattern(&infos[candidate], widest)) {
+                widest = &infos[candidate];
+            }
+        }
+        build_str(infos[i].canonical, sizeof(infos[i].canonical),
+                  widest ? widest->own_base : infos[i].own_base, NULL);
+    }
+
+    free(shapes);
+    return infos;
 }
 
 /* 排序比较: busy 降序 */
@@ -1111,6 +1435,8 @@ typedef struct {
     double max_pct;              /* 组内最高瞬时占比 */
     double score;                /* 综合评分, 用于 Top N 排序 */
     bool is_wild;                /* base 是否含通配符 */
+    int tier;                    /* 0=不输出, 1=中档, 2=高档 */
+    bool overlaps_best;          /* 已由最佳通配规则覆盖, 避免运行时 CPU_OR */
 } CalibGroup;
 
 static int calib_group_tier(const CalibGroup* g, const CalibPolicy* p) {
@@ -1122,6 +1448,135 @@ static int calib_group_tier(const CalibGroup* g, const CalibPolicy* p) {
         return 1;  /* 中核 */
     }
     return 0;
+}
+
+static bool calib_group_precedes(const CalibGroup* left, const CalibGroup* right) {
+    if (left->score != right->score) return left->score > right->score;
+    if (left->avg_pct != right->avg_pct) return left->avg_pct > right->avg_pct;
+    if (left->max_pct != right->max_pct) return left->max_pct > right->max_pct;
+    return strcmp(left->base, right->base) < 0;
+}
+
+static bool calib_patterns_overlap_observed(const CalibData* data,
+                                            const CalibRuleBaseInfo* infos,
+                                            const char* owner,
+                                            const char* left,
+                                            const char* right) {
+    if (!data || !infos || !owner || !left || !right) return false;
+    for (size_t i = 0; i < data->count; i++) {
+        if (!infos[i].valid || strcmp(data->threads[i].owner, owner) != 0) continue;
+        if (fnmatch(left, data->threads[i].name, FNM_NOESCAPE) == 0 &&
+            fnmatch(right, data->threads[i].name, FNM_NOESCAPE) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 两个 canonical 模式观察上交叉且双方各有独占成员时，最佳规则会产生歧义。 */
+static bool calib_best_pattern_ambiguous(const CalibData* data,
+                                         const CalibRuleBaseInfo* infos,
+                                         const CalibGroup* groups, size_t group_count,
+                                         const char* owner, const char* best_pattern) {
+    if (!data || !infos || !groups || !owner || !best_pattern) return true;
+    for (size_t g = 0; g < group_count; g++) {
+        if (strcmp(groups[g].owner, owner) != 0 ||
+            strcmp(groups[g].base, best_pattern) == 0) {
+            continue;
+        }
+        bool intersects = false;
+        bool best_only = false;
+        bool other_only = false;
+        for (size_t i = 0; i < data->count; i++) {
+            if (!infos[i].valid || strcmp(data->threads[i].owner, owner) != 0) continue;
+            bool matches_best = fnmatch(best_pattern, data->threads[i].name,
+                                        FNM_NOESCAPE) == 0;
+            bool matches_other = fnmatch(groups[g].base, data->threads[i].name,
+                                         FNM_NOESCAPE) == 0;
+            intersects |= matches_best && matches_other;
+            best_only |= matches_best && !matches_other;
+            other_only |= matches_other && !matches_best;
+        }
+        if (intersects && best_only && other_only) return true;
+    }
+    return false;
+}
+
+static size_t calib_group_root(size_t* parent, size_t node) {
+    size_t root = node;
+    while (parent[root] != root) root = parent[root];
+    while (parent[node] != node) {
+        size_t next = parent[node];
+        parent[node] = root;
+        node = next;
+    }
+    return root;
+}
+
+static void calib_group_union(size_t* parent, size_t left, size_t right) {
+    size_t left_root = calib_group_root(parent, left);
+    size_t right_root = calib_group_root(parent, right);
+    if (left_root != right_root) parent[right_root] = left_root;
+}
+
+/* 普通组只按本次观察到的原始名称判定重叠。同一连通分量统一提升到最高档，
+ * 使所有可能同时命中的生成规则拥有相同 CPU 掩码。 */
+static void calib_resolve_group_tiers(const CalibData* data,
+                                      const CalibRuleBaseInfo* infos,
+                                      CalibGroup* groups, size_t group_count,
+                                      const char* best_owner, const char* best_pattern,
+                                      bool best_active) {
+    if (!data || !infos || !groups || group_count == 0) return;
+
+    size_t* parent = malloc(group_count * sizeof(*parent));
+    int* component_tier = calloc(group_count, sizeof(*component_tier));
+    if (!parent || !component_tier) {
+        /* 无法完成冲突消解时不冒险输出可能被 CPU_OR 扩大的普通规则。 */
+        for (size_t g = 0; g < group_count; g++) groups[g].tier = 0;
+        free(parent);
+        free(component_tier);
+    } else {
+        for (size_t g = 0; g < group_count; g++) parent[g] = g;
+
+        /* 每个观察名称连接所有能命中它的 canonical 组，保持 O(n²×名称长度)。 */
+        for (size_t i = 0; i < data->count; i++) {
+            if (!infos[i].valid) continue;
+            size_t first = SIZE_MAX;
+            for (size_t g = 0; g < group_count; g++) {
+                if (strcmp(groups[g].owner, data->threads[i].owner) != 0 ||
+                    fnmatch(groups[g].base, data->threads[i].name, FNM_NOESCAPE) != 0) {
+                    continue;
+                }
+                if (first == SIZE_MAX) {
+                    first = g;
+                } else {
+                    calib_group_union(parent, first, g);
+                }
+            }
+        }
+
+        for (size_t g = 0; g < group_count; g++) {
+            size_t root = calib_group_root(parent, g);
+            if (groups[g].tier > component_tier[root]) component_tier[root] = groups[g].tier;
+        }
+        for (size_t g = 0; g < group_count; g++) {
+            groups[g].tier = component_tier[calib_group_root(parent, g)];
+        }
+
+        free(parent);
+        free(component_tier);
+    }
+
+    /* 普通组已先完成统一升档；Best 生效后再屏蔽所有观察上重叠的组。 */
+    if (best_active) {
+        for (size_t g = 0; g < group_count; g++) {
+            if (strcmp(groups[g].owner, best_owner) == 0 &&
+                calib_patterns_overlap_observed(data, infos, best_owner,
+                                                best_pattern, groups[g].base)) {
+                groups[g].overlaps_best = true;
+            }
+        }
+    }
 }
 
 static bool calib_append_rule(char** out, size_t* remain, int* lines,
@@ -1429,18 +1884,23 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     /* 1) 按 busy 降序排序 */
     qsort(data->threads, data->count, sizeof(ThreadSample), calib_cmp_busy);
 
+    CalibRuleBaseInfo* rule_bases = calib_prepare_rule_bases(data);
+    if (!rule_bases) return 0;
+
     /* 2) 主进程线程聚合为精确/通配组; 子进程整体样本稍后单独分级。 */
     CalibGroup* groups = calloc(data->count, sizeof(CalibGroup));
-    if (!groups) return 0;
+    if (!groups) {
+        free(rule_bases);
+        return 0;
+    }
     size_t ng = 0;
     unsigned long long total = 0;
     for (size_t i = 0; i < data->count; i++) {
         total += data->threads[i].busy;
         if (data->threads[i].is_process ||
-            strcmp(data->threads[i].owner, data->pkg) != 0) continue;
-        char base[MAX_THREAD_LEN];
-        calib_rule_base_for_thread(data, i, base, sizeof(base));
-        if (!base[0]) continue;
+            strcmp(data->threads[i].owner, data->pkg) != 0 ||
+            !rule_bases[i].valid || !rule_bases[i].canonical[0]) continue;
+        const char* base = rule_bases[i].canonical;
         long gi = -1;
         for (size_t g = 0; g < ng; g++) {
             if (strcmp(groups[g].owner, data->threads[i].owner) == 0 &&
@@ -1467,22 +1927,27 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
         }
         if (max_pct > groups[gi].max_pct) groups[gi].max_pct = max_pct;
     }
-    if (total == 0) { free(groups); return 0; }
+    if (total == 0) {
+        free(groups);
+        free(rule_bases);
+        return 0;
+    }
 
     for (size_t g = 0; g < ng; g++) {
         if (groups[g].avg_pct > 100.0) groups[g].avg_pct = 100.0;
         groups[g].score = calib_load_score(groups[g].avg_pct, groups[g].max_pct);
+        groups[g].tier = calib_group_tier(&groups[g], &policy);
     }
 
     /* 组按 avg/max 综合评分降序, 峰值线程不会被累计 busy 掩盖。 */
     for (size_t a = 0; a + 1 < ng; a++)
         for (size_t b = 0; b + 1 < ng - a; b++)
-            if (groups[b].score < groups[b + 1].score) {
+            if (calib_group_precedes(&groups[b + 1], &groups[b])) {
                 CalibGroup t = groups[b]; groups[b] = groups[b + 1]; groups[b + 1] = t;
             }
 
     /* 3) 按负载分级, 同时参考 avg 与 max:
-     *    - 单个线程综合负载第一, 且 avg/max 都达到策略重载阈值: 独占最高性能簇, 并固定输出在第一行。
+     *    - 单个线程综合负载第一, 且 avg/max 都达到策略重载阈值: 使用最高性能簇, 并固定输出在第一行。
      *    - avg 与 max 同时达到 group_high 阈值: 高频中核。
      *    - avg 与 max 同时达到 group_mid 阈值: 中核。
      *    - 子进程按整体负载进入中档/高档, 不参与最佳线程竞争。
@@ -1499,11 +1964,15 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     for (size_t i = 0; i < data->count; i++) {
         if (data->threads[i].is_process ||
             strcmp(data->threads[i].owner, data->pkg) != 0) continue;
-        if (!calib_rule_name_syntax_ok(data->threads[i].name)) continue;
+        if (!rule_bases[i].valid) continue;
         double avg_pct, max_pct;
         calib_thread_pct_stats(&data->threads[i], &avg_pct, &max_pct);
         double score = calib_load_score(avg_pct, max_pct);
-        if (score > best_score) {
+        bool better = best_idx == SIZE_MAX || score > best_score ||
+            (score == best_score && (avg_pct > best_avg ||
+             (avg_pct == best_avg && (max_pct > best_max ||
+              (max_pct == best_max && strcmp(data->threads[i].name, big_thread) < 0)))));
+        if (better) {
             best_score = score;
             best_avg = avg_pct;
             best_max = max_pct;
@@ -1513,7 +1982,13 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
         }
     }
     if (best_idx != SIZE_MAX) {
-        calib_rule_base_for_thread(data, best_idx, big_rule, sizeof(big_rule));
+        /* 最高负载线程即使被同族动态通配 canonical 吸收，也应让整个无歧义组
+         * 保留 best 档，避免 RenderThread 与 RenderThread 2 合并后降为 high 档。 */
+        bool ambiguous = calib_best_pattern_ambiguous(
+            data, rule_bases, groups, ng, big_owner, rule_bases[best_idx].canonical);
+        if (!ambiguous) {
+            build_str(big_rule, sizeof(big_rule), rule_bases[best_idx].canonical, NULL);
+        }
     }
 
     char* p = out_buf;
@@ -1521,11 +1996,13 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     int lines = 0;
     int thread_lines = 0;
     const int max_thread_lines = policy.max_thread_rules;
-    const bool big_rule_is_wild = (strchr(big_rule, '*') != NULL);
-    const bool has_big_thread = big_thread[0] && big_rule[0] && !big_rule_is_wild &&
+    const bool has_big_thread = big_thread[0] && big_rule[0] &&
         (best_avg >= policy.best_avg && best_max >= policy.best_max);
     const char* big_tier = calib_policy_core_range(topo, policy.best_tier, policy.best_cores);
     const char* base_tier = calib_policy_core_range(topo, policy.fallback_tier, policy.fallback_cores);
+    const bool best_active = has_big_thread && big_tier && big_tier[0];
+    calib_resolve_group_tiers(data, rule_bases, groups, ng,
+                              big_owner, big_rule, best_active);
     size_t fallback_reserve = 0;
     if (base_tier && base_tier[0]) {
         fallback_reserve = strlen(data->pkg) + 1 + strlen(base_tier) + 1;
@@ -1533,7 +2010,7 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
     }
     size_t explicit_remain = remain - fallback_reserve;
 
-    if (has_big_thread && big_tier && big_tier[0]) {
+    if (best_active) {
         if (!calib_append_rule(&p, &explicit_remain, &lines, big_owner, big_rule, big_tier))
             goto append_fallback;
         thread_lines++;
@@ -1543,17 +2020,7 @@ static int calib_generate_rules(CalibData* data, const CpuTopology* topo,
         for (int wild_pass = 0; wild_pass <= 1 && thread_lines < max_thread_lines; wild_pass++) {
             for (size_t g = 0; g < ng && thread_lines < max_thread_lines; g++) {
                 if ((groups[g].is_wild ? 1 : 0) != wild_pass) continue;
-                if (calib_group_tier(&groups[g], &policy) != tier_pass) continue;
-                if (has_big_thread && strcmp(groups[g].owner, big_owner) == 0) {
-                    if (strcmp(groups[g].base, big_rule) == 0) continue;
-                    if (strchr(big_rule, '*') != NULL && !groups[g].is_wild) {
-                        if (fnmatch(big_rule, groups[g].base, FNM_NOESCAPE) == 0) continue;
-                    } else if (groups[g].is_wild) {
-                        if (fnmatch(groups[g].base, big_thread, FNM_NOESCAPE) == 0) continue;
-                    } else if (strcmp(groups[g].base, big_thread) == 0) {
-                        continue;
-                    }
-                }
+                if (groups[g].overlaps_best || groups[g].tier != tier_pass) continue;
 
                 const char* tier = (tier_pass == 2) ?
                     calib_policy_core_range(topo, policy.high_tier, policy.high_cores) :
@@ -1611,6 +2078,7 @@ append_fallback:
         }
     }
     free(groups);
+    free(rule_bases);
     return lines;
 }
 
@@ -1721,20 +2189,35 @@ static bool calib_write_history(const char* pkg, CalibData* data) {
 
     /* 2) 读入已有内容, 找到各段(以 '#' 开头的行)的起始偏移 */
     char* old = NULL;
-    long old_len = 0;
-    FILE* rf = fopen(path, "r");
+    size_t old_len = 0;
+    FILE* rf = fopen(path, "rb");
+    if (!rf && errno != ENOENT) {
+        free(cur);
+        return false;
+    }
     if (rf) {
-        fseek(rf, 0, SEEK_END);
-        old_len = ftell(rf);
-        fseek(rf, 0, SEEK_SET);
+        bool read_ok = fseek(rf, 0, SEEK_END) == 0;
+        long end = read_ok ? ftell(rf) : -1;
+        if (end < 0 || (uintmax_t)end > (uintmax_t)(SIZE_MAX - 1)) {
+            read_ok = false;
+        } else {
+            old_len = (size_t)end;
+        }
+        if (read_ok && fseek(rf, 0, SEEK_SET) != 0) read_ok = false;
         if (old_len > 0) {
-            old = malloc((size_t)old_len + 1);
-            if (old) {
-                size_t rd = fread(old, 1, (size_t)old_len, rf);
-                old[rd] = '\0';
+            old = malloc(old_len + 1);
+            if (!old || fread(old, 1, old_len, rf) != old_len || ferror(rf)) {
+                read_ok = false;
+            } else {
+                old[old_len] = '\0';
             }
         }
-        fclose(rf);
+        if (fclose(rf) != 0) read_ok = false;
+        if (!read_ok) {
+            free(old);
+            free(cur);
+            return false;
+        }
     }
 
     /* 3) 统计旧段数, 计算需保留的旧段起点 (保留最近 MAX-1 段, 给本次留一段) */
@@ -2300,6 +2783,7 @@ static void calib_free(CalibData* d) {
     d->child_thread_count = d->child_thread_cap = 0;
     d->round_count = 0;
     d->last_sample_ms = 0;
+    d->started_ms = 0;
     d->clock_ticks_per_second = 0;
 }
 
@@ -2322,19 +2806,21 @@ static void* calib_thread(void* arg) {
         if (calib_read_cmd(cmd, sizeof(cmd))) {
             if (is_start_command(cmd)) {
                 const char* pkg = strtrim(cmd + 6);
-                CalibProcess probe[8];
-                size_t np = collect_pkg_processes(pkg, probe, 8);
-                if (np > 0 && strlen(pkg) < MAX_PKG_LEN) {
+                CalibProcess probe[64];
+                size_t np = collect_pkg_processes(pkg, probe, 64);
+                if (np > 0 && calib_has_main_process(probe, np, pkg) &&
+                    strlen(pkg) < MAX_PKG_LEN) {
                     calib_free(&data);
                     memset(&data, 0, sizeof(data));
                     build_str(data.pkg, sizeof(data.pkg), pkg, NULL);
+                    data.started_ms = monotonic_ms();
                     sampling = true;
                     char st[MAX_PKG_LEN + 16];
                     snprintf(st, sizeof(st), "sampling %s", pkg);
                     calib_set_state(st);
                     printf("[校准] 开始采样 %s (%zu 个进程)\n", pkg, np);
                 } else {
-                    printf("[校准] 忽略 start: %s 未找到运行中的进程 (应用未启动?) 或包名过长\n", pkg);
+                    printf("[校准] 忽略 start: %s 未找到运行中的主进程 (应用未启动?) 或包名过长\n", pkg);
                 }
             } else if (is_stop_command(cmd)) {
                 if (sampling) {
@@ -2394,14 +2880,23 @@ static void* calib_thread(void* arg) {
 
         if (sampling) {
             size_t prev_rounds = data.round_count;
-            if (!calib_sample_once(&data)) {
-                /* 进程消失, 用已采集数据直接出规则 */
+            long long now_ms = monotonic_ms();
+            bool timed_out = data.started_ms > 0 && now_ms >= data.started_ms &&
+                now_ms - data.started_ms >= CALIB_MAX_SESSION_MS;
+            if (timed_out || !calib_sample_once(&data)) {
+                /* 主进程消失或异常长会话到达上限时，用已采集数据直接收尾。 */
                 sampling = false;
-                printf("[校准] %s 进程已退出, 用现有 %zu 轮/%zu 个负载项(跟踪 %zu 个TID, 子进程活跃线程摘要 %zu 个)数据直接生成规则\n",
-                       data.pkg, data.round_count, data.count, data.tcount,
-                       data.child_thread_count);
+                if (timed_out) {
+                    printf("[校准] %s 已达到 6 小时会话上限, 用现有 %zu 轮/%zu 个负载项(跟踪 %zu 个TID, 子进程活跃线程摘要 %zu 个)数据直接生成规则\n",
+                           data.pkg, data.round_count, data.count, data.tcount,
+                           data.child_thread_count);
+                } else {
+                    printf("[校准] %s 主进程已退出, 用现有 %zu 轮/%zu 个负载项(跟踪 %zu 个TID, 子进程活跃线程摘要 %zu 个)数据直接生成规则\n",
+                           data.pkg, data.round_count, data.count, data.tcount,
+                           data.child_thread_count);
+                }
                 if (data.round_count < CALIB_MIN_ROUNDS) {
-                    printf("[校准] 警告: %s 进程退出时采样不足 (仅 %zu 轮, 建议 >=%d 轮), 未生成规则\n",
+                    printf("[校准] 警告: %s 自动收尾时采样不足 (仅 %zu 轮, 建议 >=%d 轮), 未生成规则\n",
                            data.pkg, data.round_count, CALIB_MIN_ROUNDS);
                     char st[MAX_PKG_LEN + 64];
                     snprintf(st, sizeof(st), "done %s;reason=short", data.pkg);
@@ -2442,8 +2937,9 @@ static void* calib_thread(void* arg) {
                 calib_set_state(st);
                 free(rules);
                 calib_free(&data);
-            } else if (data.round_count != prev_rounds && data.round_count % 20 == 0) {
-                /* 每 20 轮(约 10s)报一次进度, 避免每 0.5s 刷屏 */
+            } else if (data.round_count != prev_rounds &&
+                       data.round_count % CALIB_PROGRESS_LOG_ROUNDS == 0) {
+                /* 每 120 轮(约 60s)报一次进度，保留长会话心跳但避免持续刷屏。 */
                 printf("[校准] %s 采样中... 已 %zu 轮, 当前记录 %zu 个负载项(跟踪 %zu 个TID, 子进程活跃线程摘要 %zu 个)\n",
                        data.pkg, data.round_count, data.count, data.tcount,
                        data.child_thread_count);

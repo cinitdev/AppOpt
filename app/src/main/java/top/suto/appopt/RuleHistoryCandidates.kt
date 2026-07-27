@@ -136,20 +136,42 @@ object RuleHistoryCandidates {
     ): ThreadWildcardSuggestion? {
         if (selected.kind != RuleHistoryKind.THREAD) return null
         val exactName = selected.thread?.trim().orEmpty()
-        val pattern = wildcardCandidate(exactName) ?: return null
+        if (!rawThreadNameSyntaxOk(exactName)) return null
 
-        val sameOwnerNames = candidates.asSequence()
-            .filter { it.kind == RuleHistoryKind.THREAD && it.owner == selected.owner }
-            .mapNotNull { it.thread?.trim()?.takeIf(String::isNotEmpty) }
+        val sameOwnerNames = sequenceOf(exactName)
+            .plus(
+                candidates.asSequence()
+                    .filter { it.kind == RuleHistoryKind.THREAD && it.owner == selected.owner }
+                    .mapNotNull { it.thread?.trim()?.takeIf(String::isNotEmpty) }
+            )
+            .filter(::rawThreadNameSyntaxOk)
             .distinct()
             .toList()
-        val groupedNames = sameOwnerNames.filter { wildcardCandidate(it) == pattern }
-        if (groupedNames.size < 2) return null
+        val choice = sameOwnerNames.asSequence()
+            .mapNotNull { ownWildcardCandidate(it, sameOwnerNames) }
+            .distinct()
+            .mapNotNull { candidate ->
+                val regex = generatedWildcardRegex(candidate)
+                if (!regex.matches(exactName)) return@mapNotNull null
+                PatternChoice(
+                    pattern = candidate,
+                    regex = regex,
+                    coverage = sameOwnerNames.count(regex::matches),
+                    requiredAtoms = wildcardRequiredAtoms(candidate),
+                    codePointLength = candidate.codePointCount(0, candidate.length)
+                )
+            }
+            .sortedWith { left, right -> comparePatternChoices(left, right) }
+            .firstOrNull()
+            ?: return null
+        val pattern = choice.pattern
 
         val matchedNames = sameOwnerNames
-            .filter { matchesGeneratedWildcard(it, pattern) }
+            .filter(choice.regex::matches)
             .sortedWith(Comparator(::compareThreadNames))
-        if (matchedNames.size < 2) return null
+        if (exactName !in matchedNames) {
+            return null
+        }
 
         return ThreadWildcardSuggestion(
             exactName = exactName,
@@ -158,39 +180,162 @@ object RuleHistoryCandidates {
         )
     }
 
-    private fun wildcardCandidate(name: String): String? {
-        if (name.isEmpty() || name == "*" || name.any { it in "{}=/\\*\n\r" }) return null
-        val digitPosition = name.indexOfFirst { it in '0'..'9' }
-        if (digitPosition < 0) return null
-        val prefix = name.substring(0, digitPosition).trimEnd()
-        val asciiLetters = prefix.count { it in 'a'..'z' || it in 'A'..'Z' }
-        if (prefix.length < 4 || asciiLetters < 2) return null
+    private data class NumericShape(
+        val literals: List<String>,
+        val numbers: List<String>
+    )
 
-        var firstDigitEnd = digitPosition
-        while (firstDigitEnd < name.length && name[firstDigitEnd] in '0'..'9') {
-            firstDigitEnd++
+    private data class PatternChoice(
+        val pattern: String,
+        val regex: Regex,
+        val coverage: Int,
+        val requiredAtoms: Int,
+        val codePointLength: Int
+    )
+
+    private fun rawThreadNameSyntaxOk(name: String): Boolean {
+        return name.isNotEmpty() && name != "*" && name.none {
+            it in "{}=/\\*?[]\n\r" || (it < ' ' && it != '\t')
         }
-        val hasStableSuffix = name.substring(firstDigitEnd).any {
-            it in 'a'..'z' || it in 'A'..'Z'
-        }
-        if (hasStableSuffix) {
-            val precisePattern = buildString {
-                var index = 0
-                while (index < name.length) {
-                    if (name[index] in '0'..'9') {
-                        append("[0-9]*")
-                        while (index < name.length && name[index] in '0'..'9') index++
-                    } else {
-                        append(name[index++])
-                    }
-                }
-            }
-            if (precisePattern.length <= 31) return precisePattern
-        }
-        return "$prefix*".takeIf { it.length <= 31 }
     }
 
-    private fun matchesGeneratedWildcard(name: String, pattern: String): Boolean {
+    private fun ownWildcardCandidate(name: String, sameOwnerNames: List<String>): String? {
+        val selected = numericShape(name) ?: return null
+        val compatible = sameOwnerNames.asSequence()
+            .filter { it != name }
+            .mapNotNull(::numericShape)
+            .filter { it.literals == selected.literals && it.numbers.size == selected.numbers.size }
+            .toList()
+        val varying = BooleanArray(selected.numbers.size)
+        for (shape in compatible) {
+            for (index in selected.numbers.indices) {
+                if (shape.numbers[index] != selected.numbers[index]) varying[index] = true
+            }
+        }
+
+        val direct = BooleanArray(selected.numbers.size) { index ->
+            val previous = selected.literals[index].lastOrNull()
+            val next = selected.literals[index + 1].firstOrNull()
+            previous != null && isDirectNumberDelimiter(previous) &&
+                (next == null || isDirectNumberDelimiter(next))
+        }
+        val dynamic = BooleanArray(selected.numbers.size) { direct[it] || varying[it] }
+        if (dynamic.none { it } || stableAnchorCount(selected) < 2) return null
+
+        val dynamicIndexes = dynamic.indices.filter { dynamic[it] }
+        if (dynamicIndexes.size == 1) {
+            val index = dynamicIndexes.single()
+            if (direct[index] && index == selected.numbers.lastIndex && selected.literals.last().isEmpty()) {
+                val prefix = buildString {
+                    for (part in 0 until index) {
+                        append(selected.literals[part])
+                        append(selected.numbers[part])
+                    }
+                    append(selected.literals[index])
+                }.trimEnd(' ', '\t')
+                return validGeneratedPattern("$prefix*")
+            }
+        }
+
+        val pattern = buildString {
+            for (index in selected.numbers.indices) {
+                append(selected.literals[index])
+                append(if (dynamic[index]) "[0-9]*" else selected.numbers[index])
+            }
+            append(selected.literals.last())
+        }
+        return validGeneratedPattern(pattern)
+    }
+
+    private fun isDirectNumberDelimiter(char: Char): Boolean {
+        return char == ' ' || char == '\t' || char == '-' || char == '_'
+    }
+
+    private fun stableAnchorCount(shape: NumericShape): Int {
+        var count = 0
+        for (literal in shape.literals) {
+            var index = 0
+            while (index < literal.length) {
+                val codePoint = literal.codePointAt(index)
+                if (codePoint in 'a'.code..'z'.code || codePoint in 'A'.code..'Z'.code ||
+                    codePoint >= 0x80
+                ) {
+                    count++
+                }
+                index += Character.charCount(codePoint)
+            }
+        }
+        return count
+    }
+
+    private fun wildcardRequiredAtoms(pattern: String): Int {
+        var required = 0
+        var index = 0
+        while (index < pattern.length) {
+            val codePoint = pattern.codePointAt(index)
+            when (codePoint) {
+                '*'.code -> index++
+                '['.code -> {
+                    required++
+                    val close = pattern.indexOf(']', index + 1)
+                    index = if (close >= 0) close + 1 else index + 1
+                }
+                else -> {
+                    required++
+                    index += Character.charCount(codePoint)
+                }
+            }
+        }
+        return required
+    }
+
+    private fun comparePatternChoices(left: PatternChoice, right: PatternChoice): Int {
+        if (left.coverage != right.coverage) return right.coverage.compareTo(left.coverage)
+        if (left.requiredAtoms != right.requiredAtoms) {
+            return left.requiredAtoms.compareTo(right.requiredAtoms)
+        }
+        if (left.codePointLength != right.codePointLength) {
+            return left.codePointLength.compareTo(right.codePointLength)
+        }
+        val leftBytes = left.pattern.toByteArray(Charsets.UTF_8)
+        val rightBytes = right.pattern.toByteArray(Charsets.UTF_8)
+        val shared = minOf(leftBytes.size, rightBytes.size)
+        for (index in 0 until shared) {
+            val comparison = (leftBytes[index].toInt() and 0xff)
+                .compareTo(rightBytes[index].toInt() and 0xff)
+            if (comparison != 0) return comparison
+        }
+        return leftBytes.size.compareTo(rightBytes.size)
+    }
+
+    private fun numericShape(name: String): NumericShape? {
+        val literals = mutableListOf<String>()
+        val numbers = mutableListOf<String>()
+        var literalStart = 0
+        var index = 0
+        while (index < name.length) {
+            if (name[index] !in '0'..'9') {
+                index++
+                continue
+            }
+            literals += name.substring(literalStart, index)
+            val numberStart = index
+            while (index < name.length && name[index] in '0'..'9') index++
+            numbers += name.substring(numberStart, index)
+            literalStart = index
+        }
+        if (numbers.isEmpty()) return null
+        literals += name.substring(literalStart)
+        return NumericShape(literals, numbers)
+    }
+
+    private fun validGeneratedPattern(pattern: String): String? {
+        return pattern.takeIf {
+            it != "*" && it.contains('*') && RuleConfigLogic.threadFitsNativeBuffer(it)
+        }
+    }
+
+    private fun generatedWildcardRegex(pattern: String): Regex {
         val regex = buildString {
             append('^')
             var index = 0
@@ -212,7 +357,7 @@ object RuleHistoryCandidates {
             }
             append('$')
         }
-        return Regex(regex).matches(name)
+        return Regex(regex)
     }
 
     private fun compareThreadNames(left: String, right: String): Int {

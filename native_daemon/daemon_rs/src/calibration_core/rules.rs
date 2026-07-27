@@ -54,6 +54,11 @@ fn finish_session(session: CalibSession, config_file: &Path) -> io::Result<()> {
             top_record_summary(records.iter(), 8)
         );
     }
+    if !records.iter().any(|record| record.sum_pct > 0.0) {
+        println!("[CALIB] 未生成规则: pkg={} reason=no_load", session.pkg);
+        write_state(&format!("done {};reason=no_load", session.pkg))?;
+        return Ok(());
+    }
     let rules = generate_rules(&session.pkg, &records);
     if rules.is_empty() {
         println!("[CALIB] 未生成规则: pkg={} reason=no_load", session.pkg);
@@ -91,35 +96,30 @@ fn generate_rules(pkg: &str, records: &[LoadRecord]) -> Vec<String> {
         load_score(b)
             .partial_cmp(&load_score(a))
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.avg()
+                    .partial_cmp(&a.avg())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.max_pct
+                    .partial_cmp(&a.max_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.name.cmp(&b.name))
     });
 
-    let best = main_threads.first().copied().and_then(|record| {
-        let base = rule_base_for_thread(&record.name, &main_threads);
-        (record.avg() >= policy.best_avg
-            && record.max_pct >= policy.best_max
-            && !base.contains('*'))
-        .then_some((record, base))
-    });
-    if let Some((_, best_base)) = best.as_ref() {
-        // 第一档只挑最重的一个线程，用最高性能核心，避免把一堆线程都推到超大核。
-        push_rule(
-            &mut rules,
-            &mut used,
-            format!(
-                "{pkg}{{{}}}={}",
-                best_base,
-                policy.best_cores
-            ),
-        );
-    }
+    let mut prepared_threads = prepare_thread_rules(&main_threads);
+    assign_canonical_bases(&mut prepared_threads);
 
     let mut groups = Vec::<GeneratedThreadGroup>::new();
-    for record in &main_threads {
-        let base = rule_base_for_thread(&record.name, &main_threads);
+    for prepared in &prepared_threads {
+        let record = prepared.record;
+        let base = &prepared.canonical_base;
         let is_wild = base.contains('*');
         let index = groups
             .iter()
-            .position(|group| group.base == base)
+            .position(|group| group.base == *base)
             .unwrap_or_else(|| {
                 groups.push(GeneratedThreadGroup {
                     base: base.clone(),
@@ -127,6 +127,7 @@ fn generate_rules(pkg: &str, records: &[LoadRecord]) -> Vec<String> {
                     max_pct: 0.0,
                     score: 0.0,
                     is_wild,
+                    tier_rank: 0,
                 });
                 groups.len() - 1
             });
@@ -142,42 +143,75 @@ fn generate_rules(pkg: &str, records: &[LoadRecord]) -> Vec<String> {
     for group in &mut groups {
         group.avg_pct = group.avg_pct.min(100.0);
         group.score = load_score_values(group.avg_pct, group.max_pct);
+        group.tier_rank = generated_group_tier_rank(group, &policy);
     }
+
+    let group_coverages = observed_group_coverages(&groups, &prepared_threads);
+    normalize_overlapping_group_tiers(&mut groups, &group_coverages);
+
+    let best = prepared_threads.first().and_then(|prepared| {
+        let record = prepared.record;
+        (record.avg() >= policy.best_avg
+            && record.max_pct >= policy.best_max
+            && !best_group_is_ambiguous(
+                &prepared.canonical_base,
+                &groups,
+                &group_coverages,
+            ))
+        .then_some(prepared)
+    });
+    let best_overlapping_bases = best
+        .map(|best| {
+            overlapping_group_bases(&best.canonical_base, &groups, &group_coverages)
+        })
+        .unwrap_or_default();
+    if let Some(best) = best {
+        // 最高负载线程若被归并进动态通配组，整组保留最高档；
+        // 交叉覆盖有歧义时仍由 best_group_is_ambiguous 阻止误晋级。
+        push_rule(
+            &mut rules,
+            &mut used,
+            format!(
+                "{pkg}{{{}}}={}",
+                best.canonical_base, policy.best_cores
+            ),
+        );
+    }
+
     groups.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.avg_pct
+                    .partial_cmp(&a.avg_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.max_pct
+                    .partial_cmp(&a.max_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.base.cmp(&b.base))
     });
 
     let mut thread_rule_count = rules.len();
-    for tier in [RuleTier::High, RuleTier::Mid] {
+    for tier_rank in [2u8, 1u8] {
         // 同档位先输出精确线程，再输出通配组，与 C 版保持一致。
         for wild_pass in [false, true] {
             for group in groups.iter().filter(|group| group.is_wild == wild_pass) {
                 if thread_rule_count >= policy.max_thread_rules {
                     break;
                 }
-                let pass = match tier {
-                    RuleTier::High => {
-                        group.avg_pct >= policy.high_avg && group.max_pct >= policy.high_max
-                    }
-                    RuleTier::Mid => {
-                        group.avg_pct >= policy.mid_avg && group.max_pct >= policy.mid_max
-                    }
-                };
-                if !pass {
+                if group.tier_rank != tier_rank {
                     continue;
                 }
-                if let Some((best, best_base)) = best.as_ref() {
-                    if group.base == *best_base
-                        || (group.is_wild && wildcard_match(&group.base, &best.name))
-                    {
-                        continue;
-                    }
+                if best_overlapping_bases.contains(&group.base) {
+                    continue;
                 }
-                let cpus = match tier {
-                    RuleTier::High => &policy.high_cores,
-                    RuleTier::Mid => &policy.mid_cores,
+                let cpus = match tier_rank {
+                    2 => &policy.high_cores,
+                    _ => &policy.mid_cores,
                 };
                 let previous = rules.len();
                 push_rule(
@@ -296,83 +330,417 @@ struct GeneratedThreadGroup {
     max_pct: f64,
     score: f64,
     is_wild: bool,
+    // 2=高负载档，1=中负载档，0=不单独生成。
+    tier_rank: u8,
 }
 
-fn rule_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| match ch {
-            '{' | '}' | '=' | '\n' | '\r' => '_',
-            _ => ch,
+struct PreparedThreadRule<'a> {
+    record: &'a LoadRecord,
+    own_base: String,
+    canonical_base: String,
+}
+
+struct ParsedThreadName {
+    literals: Vec<String>,
+    digits: Vec<String>,
+    digit_spans: Vec<(usize, usize)>,
+}
+
+struct PatternCoverage {
+    base: String,
+    matches: Vec<bool>,
+    count: usize,
+    required_atoms: usize,
+    char_len: usize,
+}
+
+fn prepare_thread_rules<'a>(records: &[&'a LoadRecord]) -> Vec<PreparedThreadRule<'a>> {
+    let parsed = records
+        .iter()
+        .map(|record| parse_thread_name(&record.name))
+        .collect::<Vec<_>>();
+
+    // literal 序列就是数字名称的“形状”。只有同形状、同位置出现不同数字，
+    // 才能给 Worker1/Worker2 这类无分隔数字提供动态证据。
+    let mut shape_values = HashMap::<Vec<String>, Vec<HashSet<String>>>::new();
+    for parts in parsed.iter().flatten() {
+        let values = shape_values
+            .entry(parts.literals.clone())
+            .or_insert_with(|| vec![HashSet::new(); parts.digits.len()]);
+        for (index, digits) in parts.digits.iter().enumerate() {
+            values[index].insert(digits.clone());
+        }
+    }
+
+    records
+        .iter()
+        .zip(parsed.iter())
+        .filter_map(|(record, parts)| {
+            let parts = parts.as_ref()?;
+            let values = shape_values.get(&parts.literals)?;
+            let own_base = render_thread_base(&record.name, parts, values)?;
+            Some(PreparedThreadRule {
+                record,
+                canonical_base: own_base.clone(),
+                own_base,
+            })
         })
         .collect()
 }
 
-fn rule_base_for_thread(name: &str, records: &[&LoadRecord]) -> String {
-    // 对 Thread-16、pool-17-thread-3 这类带随机数字的线程尝试生成通配符。
-    // 只有历史里至少匹配到两个同类名称时才使用通配符，避免单个线程被过度泛化。
-    let Some(candidate) = wildcard_candidate(name) else {
-        return rule_name(name);
-    };
-    let matched = records
-        .iter()
-        .filter(|record| wildcard_match(&candidate, &record.name))
-        .count();
-    if matched >= 2 {
-        candidate
-    } else {
-        rule_name(name)
-    }
-}
-
-fn wildcard_candidate(name: &str) -> Option<String> {
-    if name.is_empty() || !rule_name_syntax_ok(name) {
+fn parse_thread_name(name: &str) -> Option<ParsedThreadName> {
+    if !raw_thread_name_syntax_ok(name) {
         return None;
     }
-    let bytes = name.as_bytes();
-    let first_digit = bytes.iter().position(|byte| byte.is_ascii_digit())?;
-    let mut last_digit_end = first_digit;
-    while last_digit_end < bytes.len() && bytes[last_digit_end].is_ascii_digit() {
-        last_digit_end += 1;
-    }
 
-    if name[last_digit_end..]
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        let mut out = String::from(&name[..first_digit]);
-        out.push('*');
-        return wildcard_name_syntax_ok(&out).then_some(out);
-    }
+    let mut literals = Vec::new();
+    let mut digits = Vec::new();
+    let mut digit_spans = Vec::new();
+    let mut cursor = 0usize;
+    let mut literal_start = 0usize;
 
-    let mut out = String::with_capacity(name.len());
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx].is_ascii_digit() {
-            out.push('*');
-            while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-                idx += 1;
+    while cursor < name.len() {
+        let ch = name[cursor..].chars().next()?;
+        if !ch.is_ascii_digit() {
+            cursor += ch.len_utf8();
+            continue;
+        }
+
+        literals.push(name[literal_start..cursor].to_string());
+        let digit_start = cursor;
+        while cursor < name.len() {
+            let digit = name[cursor..].chars().next()?;
+            if !digit.is_ascii_digit() {
+                break;
             }
-        } else {
-            out.push(bytes[idx] as char);
-            idx += 1;
+            cursor += digit.len_utf8();
+        }
+        digits.push(name[digit_start..cursor].to_string());
+        digit_spans.push((digit_start, cursor));
+        literal_start = cursor;
+    }
+    literals.push(name[literal_start..].to_string());
+
+    Some(ParsedThreadName {
+        literals,
+        digits,
+        digit_spans,
+    })
+}
+
+fn render_thread_base(
+    name: &str,
+    parts: &ParsedThreadName,
+    shape_values: &[HashSet<String>],
+) -> Option<String> {
+    if parts.digits.is_empty() {
+        return Some(name.to_string());
+    }
+
+    let direct = parts
+        .digit_spans
+        .iter()
+        .map(|span| digit_run_has_direct_dynamic_boundary(name, *span))
+        .collect::<Vec<_>>();
+    let dynamic = direct
+        .iter()
+        .enumerate()
+        .map(|(index, direct)| *direct || shape_values[index].len() >= 2)
+        .collect::<Vec<_>>();
+
+    if !dynamic.iter().any(|value| *value) || stable_anchor_count(parts) < 2 {
+        return Some(name.to_string());
+    }
+
+    let dynamic_count = dynamic.iter().filter(|value| **value).count();
+    let dynamic_index = dynamic.iter().position(|value| *value);
+    if dynamic_count == 1 {
+        let index = dynamic_index?;
+        let (start, end) = parts.digit_spans[index];
+        if direct[index] && end == name.len() {
+            let prefix = name[..start].trim_end_matches(|ch| matches!(ch, ' ' | '\t'));
+            let out = format!("{prefix}*");
+            return Some(if wildcard_name_syntax_ok(&out) {
+                out
+            } else {
+                name.to_string()
+            });
         }
     }
-    if out != name && wildcard_name_syntax_ok(&out) {
-        Some(out)
+
+    let mut out = String::with_capacity(name.len() + dynamic_count * 5);
+    let mut cursor = 0usize;
+    for (index, (start, end)) in parts.digit_spans.iter().copied().enumerate() {
+        out.push_str(&name[cursor..start]);
+        if dynamic[index] {
+            out.push_str("[0-9]*");
+        } else {
+            out.push_str(&name[start..end]);
+        }
+        cursor = end;
+    }
+    out.push_str(&name[cursor..]);
+    Some(if wildcard_name_syntax_ok(&out) {
+        out
     } else {
-        None
+        name.to_string()
+    })
+}
+
+fn digit_run_has_direct_dynamic_boundary(name: &str, (start, end): (usize, usize)) -> bool {
+    let Some(previous) = name[..start].chars().next_back() else {
+        return false;
+    };
+    if !is_direct_number_delimiter(previous) {
+        return false;
+    }
+    name[end..]
+        .chars()
+        .next()
+        .is_none_or(is_direct_number_delimiter)
+}
+
+fn is_direct_number_delimiter(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '-' | '_')
+}
+
+fn stable_anchor_count(parts: &ParsedThreadName) -> usize {
+    parts
+        .literals
+        .iter()
+        .flat_map(|literal| literal.chars())
+        .filter(|ch| ch.is_ascii_alphabetic() || !ch.is_ascii())
+        .count()
+}
+
+fn assign_canonical_bases(threads: &mut [PreparedThreadRule<'_>]) {
+    let wildcard_bases = threads
+        .iter()
+        .filter(|thread| thread.own_base.contains('*'))
+        .map(|thread| thread.own_base.clone())
+        .collect::<HashSet<_>>();
+    let coverages = wildcard_bases
+        .into_iter()
+        .map(|base| {
+            let matches = threads
+                .iter()
+                .map(|thread| wildcard_match(&base, &thread.record.name))
+                .collect::<Vec<_>>();
+            PatternCoverage {
+                count: matches.iter().filter(|value| **value).count(),
+                required_atoms: wildcard_required_atoms(&base),
+                char_len: base.chars().count(),
+                base,
+                matches,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (index, thread) in threads.iter_mut().enumerate() {
+        let mut widest: Option<&PatternCoverage> = None;
+        for coverage in coverages.iter().filter(|coverage| coverage.matches[index]) {
+            if widest.is_none_or(|current| pattern_is_wider(coverage, current)) {
+                widest = Some(coverage);
+            }
+        }
+        if let Some(widest) = widest {
+            thread.canonical_base.clone_from(&widest.base);
+        }
     }
 }
 
-fn rule_name_syntax_ok(name: &str) -> bool {
+fn pattern_is_wider(candidate: &PatternCoverage, current: &PatternCoverage) -> bool {
+    candidate.count > current.count
+        || (candidate.count == current.count
+            && (candidate.required_atoms < current.required_atoms
+                || (candidate.required_atoms == current.required_atoms
+                    && (candidate.char_len < current.char_len
+                        || (candidate.char_len == current.char_len
+                            && candidate.base < current.base)))))
+}
+
+fn wildcard_required_atoms(pattern: &str) -> usize {
+    let chars = pattern.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut required = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '*' => index += 1,
+            '[' => {
+                required += 1;
+                index += 1;
+                while index < chars.len() && chars[index] != ']' {
+                    index += 1;
+                }
+                if index < chars.len() {
+                    index += 1;
+                }
+            }
+            _ => {
+                required += 1;
+                index += 1;
+            }
+        }
+    }
+    required
+}
+
+fn generated_group_tier_rank(group: &GeneratedThreadGroup, policy: &CalibPolicy) -> u8 {
+    if group.avg_pct >= policy.high_avg && group.max_pct >= policy.high_max {
+        2
+    } else if group.avg_pct >= policy.mid_avg && group.max_pct >= policy.mid_max {
+        1
+    } else {
+        0
+    }
+}
+
+fn observed_group_coverages(
+    groups: &[GeneratedThreadGroup],
+    threads: &[PreparedThreadRule<'_>],
+) -> Vec<Vec<bool>> {
+    groups
+        .iter()
+        .map(|group| {
+            threads
+                .iter()
+                .map(|thread| wildcard_match(&group.base, &thread.record.name))
+                .collect()
+        })
+        .collect()
+}
+
+fn normalize_overlapping_group_tiers(
+    groups: &mut [GeneratedThreadGroup],
+    coverages: &[Vec<bool>],
+) {
+    if groups.len() < 2 {
+        return;
+    }
+
+    // 同一个观察名称命中的组属于同一连通分量。一次记录只把其命中组并到首组，
+    // 避免逐组、逐记录、再逐组的三层扫描。
+    let mut parents = (0..groups.len()).collect::<Vec<_>>();
+    let mut ranks = vec![0u8; groups.len()];
+    let observed_count = coverages.first().map_or(0, Vec::len);
+    for record_index in 0..observed_count {
+        let mut first = None;
+        for group_index in 0..groups.len() {
+            if !coverages[group_index][record_index] {
+                continue;
+            }
+            if let Some(first) = first {
+                dsu_union(&mut parents, &mut ranks, first, group_index);
+            } else {
+                first = Some(group_index);
+            }
+        }
+    }
+
+    let mut highest = HashMap::<usize, u8>::new();
+    for (index, group) in groups.iter().enumerate() {
+        let root = dsu_find(&mut parents, index);
+        highest
+            .entry(root)
+            .and_modify(|tier| *tier = (*tier).max(group.tier_rank))
+            .or_insert(group.tier_rank);
+    }
+    for (index, group) in groups.iter_mut().enumerate() {
+        let root = dsu_find(&mut parents, index);
+        group.tier_rank = highest.get(&root).copied().unwrap_or(group.tier_rank);
+    }
+}
+
+fn dsu_find(parents: &mut [usize], index: usize) -> usize {
+    if parents[index] != index {
+        parents[index] = dsu_find(parents, parents[index]);
+    }
+    parents[index]
+}
+
+fn dsu_union(parents: &mut [usize], ranks: &mut [u8], left: usize, right: usize) {
+    let mut left_root = dsu_find(parents, left);
+    let mut right_root = dsu_find(parents, right);
+    if left_root == right_root {
+        return;
+    }
+    if ranks[left_root] < ranks[right_root] {
+        std::mem::swap(&mut left_root, &mut right_root);
+    }
+    parents[right_root] = left_root;
+    if ranks[left_root] == ranks[right_root] {
+        ranks[left_root] += 1;
+    }
+}
+
+fn best_group_is_ambiguous(
+    best_base: &str,
+    groups: &[GeneratedThreadGroup],
+    coverages: &[Vec<bool>],
+) -> bool {
+    let Some(best_index) = groups.iter().position(|group| group.base == best_base) else {
+        return true;
+    };
+
+    groups.iter().enumerate().any(|(index, group)| {
+        if index == best_index || group.base == best_base {
+            return false;
+        }
+        let mut intersects = false;
+        let mut best_only = false;
+        let mut other_only = false;
+        for (best_matches, other_matches) in coverages[best_index].iter().zip(&coverages[index]) {
+            match (*best_matches, *other_matches) {
+                (true, true) => intersects = true,
+                (true, false) => best_only = true,
+                (false, true) => other_only = true,
+                (false, false) => {}
+            }
+        }
+        intersects && best_only && other_only
+    })
+}
+
+fn overlapping_group_bases(
+    best_base: &str,
+    groups: &[GeneratedThreadGroup],
+    coverages: &[Vec<bool>],
+) -> HashSet<String> {
+    let Some(best_index) = groups.iter().position(|group| group.base == best_base) else {
+        return HashSet::new();
+    };
+    groups
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            coverages[best_index]
+                .iter()
+                .zip(&coverages[*index])
+                .any(|(best_matches, group_matches)| *best_matches && *group_matches)
+        })
+        .map(|(_, group)| group.base.clone())
+        .collect()
+}
+
+fn raw_thread_name_syntax_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|ch| {
+            !matches!(
+                ch,
+                '{' | '}' | '=' | '/' | '\\' | '*' | '?' | '[' | ']' | '\n' | '\r'
+            ) && (ch == '\t' || ch >= ' ')
+        })
+}
+
+fn rule_pattern_syntax_ok(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
-            .all(|ch| !matches!(ch, '{' | '}' | '=' | '\n' | '\r') && ch >= ' ')
+            .all(|ch| !matches!(ch, '{' | '}' | '=' | '/' | '\\' | '\n' | '\r'))
 }
 
 fn wildcard_name_syntax_ok(name: &str) -> bool {
-    rule_name_syntax_ok(name) && name.contains('*')
+    name != "*" && name.len() < 32 && rule_pattern_syntax_ok(name) && name.contains('*')
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
@@ -450,4 +818,3 @@ fn wildcard_class_matches(pattern: &[char], index: usize, ch: char) -> Option<us
     }
     None
 }
-
