@@ -47,7 +47,6 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.checkbox.MaterialCheckBox
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.google.android.material.tabs.TabLayout
 import kotlin.concurrent.thread
 import top.suto.appopt.databinding.ActivityMainBinding
@@ -134,7 +133,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var activityDestroyed = false
     private var firstResume = true
     private lateinit var appAdapter: AppAdapter
-    private lateinit var bottomNavigation: BottomNavigationView
+    private lateinit var bottomNavigation: ResponsiveBottomNavigationView
     private lateinit var bottomNavigationBlur: BackdropBlurLayout
     private var selectedTopLevelPage = R.id.navApps
     private var lastAppsPageRefreshAt = SystemClock.elapsedRealtime()
@@ -472,18 +471,20 @@ class MainActivity : AppCompatActivity() {
     private fun setupTopLevelNavigation(savedInstanceState: Bundle?) {
         selectedTopLevelPage = savedInstanceState?.getInt(STATE_TOP_LEVEL_PAGE, R.id.navApps)
             ?: R.id.navApps
-        bottomNavigation.setOnItemSelectedListener { item ->
-            showTopLevelPage(item.itemId)
+        bottomNavigation.setOnItemSelectedListener { itemId ->
+            showTopLevelPage(itemId)
         }
         bottomNavigation.setOnItemReselectedListener { }
-        bottomNavigation.menu.findItem(selectedTopLevelPage)?.isChecked = true
+        bottomNavigation.setSelectedItemSilently(selectedTopLevelPage)
         showTopLevelPage(selectedTopLevelPage, force = true)
     }
 
     private fun centerFloatingBottomNavigation() {
-        val horizontalPadding = dp(36f)
-        val availableWidth = (resources.displayMetrics.widthPixels - horizontalPadding).coerceAtLeast(dp(280f))
-        val targetWidth = minOf(availableWidth, dp(560f))
+        val horizontalPadding = resources.getDimensionPixelSize(R.dimen.bottom_navigation_screen_margin)
+        val minWidth = resources.getDimensionPixelSize(R.dimen.bottom_navigation_min_width)
+        val maxWidth = resources.getDimensionPixelSize(R.dimen.bottom_navigation_max_width)
+        val availableWidth = (resources.displayMetrics.widthPixels - horizontalPadding).coerceAtLeast(minWidth)
+        val targetWidth = minOf(availableWidth, maxWidth)
         (bottomNavigationBlur.layoutParams as? android.widget.FrameLayout.LayoutParams)?.let { params ->
             params.width = targetWidth
             params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL

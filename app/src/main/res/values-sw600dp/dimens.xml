@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="bottom_navigation_host_height">116dp</dimen>
+    <dimen name="bottom_navigation_horizontal_padding">24dp</dimen>
+    <dimen name="bottom_navigation_top_margin">4dp</dimen>
+    <dimen name="bottom_navigation_blur_height">84dp</dimen>
+    <dimen name="bottom_navigation_content_height">80dp</dimen>
+    <dimen name="bottom_navigation_content_translation_y">0dp</dimen>
+    <dimen name="bottom_navigation_max_width">560dp</dimen>
+    <dimen name="bottom_navigation_min_width">320dp</dimen>
+    <dimen name="bottom_navigation_screen_margin">48dp</dimen>
+</resources>

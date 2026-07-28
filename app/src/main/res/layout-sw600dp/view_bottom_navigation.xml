@@ -36,7 +36,5 @@
             android:background="@android:color/transparent"
             android:elevation="0dp"
             android:translationY="@dimen/bottom_navigation_content_translation_y" />
-
     </top.suto.appopt.BackdropBlurLayout>
-
 </FrameLayout>
