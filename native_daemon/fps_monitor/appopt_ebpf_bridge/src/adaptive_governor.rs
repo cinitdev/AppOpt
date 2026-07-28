@@ -1,7 +1,7 @@
 //! 基于 sched_switch 利用率的短时 CPU 调速器。
 //!
-//! 该模块只在用户明确为应用开启卡顿增强且应用位于前台时工作。正常状态
-//! 不挂载 eBPF，也不轮询 `/proc/stat`；进入卡顿档后才按需启动采样后端。
+//! 该模块只在用户明确为应用开启卡顿增强且应用位于前台时工作。进入卡顿档后
+//! 按需启动采样后端，恢复后只短暂保留挂载以避免连续卡顿时频繁重载。
 
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -29,6 +29,7 @@ mod platform {
     const SAMPLE_INTERVAL: Duration = Duration::from_millis(320);
     const PROC_INTERVAL: Duration = Duration::from_millis(500);
     const RESTORE_WAIT: Duration = Duration::from_millis(1200);
+    const SAMPLER_COOLDOWN: Duration = Duration::from_millis(1600);
     const EBPF_EMPTY_SAMPLE_LIMIT: u32 = 3;
     const RESTORE_FILE: &str = "/data/adb/modules/AppOpt/config/adaptive_governor.restore";
 
@@ -75,6 +76,11 @@ mod platform {
         },
     }
 
+    enum VendorApplyResult {
+        Handled(bool),
+        Unavailable,
+    }
+
     #[derive(Clone, Copy)]
     struct CpuTimes {
         id: usize,
@@ -93,6 +99,7 @@ mod platform {
         backend: Option<UtilBackend>,
         policies: Vec<PolicyTarget>,
         vendor: Option<VendorTarget>,
+        vendor_usable: bool,
         shared: Arc<Shared>,
         ebpf_empty_samples: u32,
     }
@@ -118,6 +125,7 @@ mod platform {
             let _ = recover_stale();
             let policies = policy_targets();
             let vendor = vendor_target();
+            let vendor_usable = vendor.is_some();
             let policy_note = if policies.is_empty() {
                 "没有可用 CPU policy 节点".to_string()
             } else if vendor.is_some() {
@@ -126,7 +134,7 @@ mod platform {
                 format!("CPU policy 数={}，使用通用 cpufreq", policies.len())
             };
             let startup = format!(
-                "CPU 调速器按需启动；{}；正常状态不挂载采样器，GPU 由系统 Power HAL 管理",
+                "CPU 调速器按需启动；{}；恢复后采样器短暂冷却再卸载，GPU 由系统 Power HAL 管理",
                 policy_note
             );
             let shared = Arc::new(Shared {
@@ -146,6 +154,7 @@ mod platform {
                         backend: None,
                         policies,
                         vendor,
+                        vendor_usable,
                         shared: worker_shared,
                         ebpf_empty_samples: 0,
                     }
@@ -226,31 +235,55 @@ mod platform {
             let mut last_level = 0;
             let mut last_sample = Instant::now();
             let mut latest_util = Vec::new();
+            let mut idle_since: Option<Instant> = None;
+            let mut reported_sample_level = 0;
             loop {
                 if self.shared.stop.load(Ordering::Acquire) {
                     let restored = self.restore();
                     self.backend = None;
-                    self.publish_restore(restored);
+                    latest_util.clear();
+                    self.publish_restore(restored, false);
                     break;
                 }
 
                 let level = self.shared.level.load(Ordering::Acquire);
                 if level == 0 {
-                    let restored = self.restore();
-                    self.backend = None;
-                    latest_util.clear();
-                    self.ebpf_empty_samples = 0;
-                    last_level = 0;
-                    self.publish_restore(restored);
-                    self.wait_for_wake(None, 0);
+                    let restore_requested =
+                        last_level != 0 || self.shared.applied_level.load(Ordering::Acquire) != 0;
+                    if restore_requested {
+                        let restored = self.restore();
+                        last_level = 0;
+                        reported_sample_level = 0;
+                        self.vendor_usable = self.vendor.is_some();
+                        idle_since = self.backend.as_ref().map(|_| Instant::now());
+                        self.publish_restore(restored, idle_since.is_some());
+                    }
+                    if let Some(since) = idle_since {
+                        let elapsed = since.elapsed();
+                        if elapsed >= SAMPLER_COOLDOWN {
+                            self.backend = None;
+                            latest_util.clear();
+                            self.ebpf_empty_samples = 0;
+                            idle_since = None;
+                            self.publish_sampler_unloaded();
+                            self.wait_for_wake(None, 0);
+                        } else {
+                            self.wait_for_wake(Some(SAMPLER_COOLDOWN - elapsed), 0);
+                        }
+                    } else {
+                        self.wait_for_wake(None, 0);
+                    }
                     continue;
                 }
+                idle_since = None;
 
                 if self.backend.is_none() {
                     self.refresh_originals();
                     let (backend, label) = load_backend();
                     self.backend = Some(backend);
                     self.ebpf_empty_samples = 0;
+                    latest_util.clear();
+                    reported_sample_level = 0;
                     last_sample = Instant::now();
                     println!("[boost] CPU 利用率采样器已按需启动：{label}");
                 }
@@ -258,6 +291,7 @@ mod platform {
                 if level != last_level {
                     self.apply_util(&latest_util, level);
                     self.publish_level(level);
+                    reported_sample_level = if latest_util.is_empty() { 0 } else { level };
                     last_level = level;
                 }
 
@@ -283,6 +317,7 @@ mod platform {
                             self.backend = Some(UtilBackend::Proc { previous });
                             self.ebpf_empty_samples = 0;
                             latest_util.clear();
+                            reported_sample_level = 0;
                             last_sample = Instant::now();
                             println!(
                                 "[boost] eBPF CPU 利用率采样异常（{reason}），已切换 /proc/stat"
@@ -294,6 +329,10 @@ mod platform {
                     }
                     latest_util = sample.values;
                     self.apply_util(&latest_util, level);
+                    if !latest_util.is_empty() && reported_sample_level != level {
+                        self.publish_sample_ready(level);
+                        reported_sample_level = level;
+                    }
                     last_sample = Instant::now();
                 }
                 self.wait_for_wake(Some(interval.saturating_sub(last_sample.elapsed())), level);
@@ -317,13 +356,17 @@ mod platform {
             }
         }
 
-        fn publish_restore(&self, restored: bool) {
+        fn publish_restore(&self, restored: bool, sampler_cooling: bool) {
             let _guard = self.shared.wake.lock().ok();
             self.shared.restore_ok.store(restored, Ordering::Release);
             self.shared.applied_level.store(0, Ordering::Release);
             if let Ok(mut status) = self.shared.status.lock() {
                 *status = if restored {
-                    "正常状态：采样器已卸载，频率参数已恢复".to_string()
+                    if sampler_cooling {
+                        "正常状态：频率参数已恢复，采样器短暂冷却后卸载".to_string()
+                    } else {
+                        "正常状态：采样器已卸载，频率参数已恢复".to_string()
+                    }
                 } else {
                     "正常状态：部分频率参数恢复失败，已保留恢复记录".to_string()
                 };
@@ -346,6 +389,36 @@ mod platform {
                 _ => "正常监测",
             };
             println!("[boost] CPU 调速器已应用{label}档：{status}");
+        }
+
+        fn publish_sample_ready(&self, level: i32) {
+            let status = self
+                .shared
+                .status
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_default();
+            let label = match level {
+                3 => "严重卡顿",
+                2 => "中度卡顿",
+                1 => "普通卡顿",
+                _ => "当前",
+            };
+            println!("[boost] CPU 利用率采样就绪，已更新{label}档：{status}");
+        }
+
+        fn publish_sampler_unloaded(&self) {
+            if self.shared.applied_level.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            let restored = self.shared.restore_ok.load(Ordering::Acquire);
+            if let Ok(mut status) = self.shared.status.lock() {
+                *status = if restored {
+                    "正常状态：采样器已卸载，频率参数已恢复".to_string()
+                } else {
+                    "正常状态：采样器已卸载，部分频率参数恢复失败".to_string()
+                };
+            }
         }
 
         fn sample_util(&mut self) -> UtilSample {
@@ -438,14 +511,20 @@ mod platform {
                 ));
             }
 
-            let changed = if self.vendor.is_some() {
-                self.apply_vendor_targets(&targets)
+            let (changed, generic_fallback) = if self.vendor_usable {
+                match self.apply_vendor_targets(&targets) {
+                    VendorApplyResult::Handled(changed) => (changed, false),
+                    VendorApplyResult::Unavailable => {
+                        self.vendor_usable = false;
+                        (self.apply_policy_targets(&targets), true)
+                    }
+                }
             } else {
-                self.apply_policy_targets(&targets)
+                (self.apply_policy_targets(&targets), false)
             };
             if let Ok(mut status) = self.shared.status.lock() {
                 let util_summary = if utils.is_empty() {
-                    "等待采样".to_string()
+                    "等待首个样本".to_string()
                 } else {
                     format!("{max_util}%")
                 };
@@ -455,7 +534,7 @@ mod platform {
                     .collect::<Vec<_>>()
                     .join("/");
                 *status = format!(
-                    "util={}; boost={}; policy_min={}{}",
+                    "util={}; boost={}; policy_min={}{}{}",
                     util_summary,
                     boost,
                     if target_summary.is_empty() {
@@ -467,7 +546,12 @@ mod platform {
                         "；已更新"
                     } else {
                         "；保持当前值"
-                    }
+                    },
+                    if generic_fallback {
+                        "；厂商节点不可用，已回退通用 cpufreq"
+                    } else {
+                        ""
+                    },
                 );
             }
         }
@@ -522,26 +606,31 @@ mod platform {
             changed
         }
 
-        fn apply_vendor_targets(&mut self, targets: &[(usize, Vec<usize>, u64)]) -> bool {
+        fn apply_vendor_targets(
+            &mut self,
+            targets: &[(usize, Vec<usize>, u64)],
+        ) -> VendorApplyResult {
             let Some(path) = self.vendor.as_ref().map(|vendor| vendor.path.clone()) else {
-                return false;
+                return VendorApplyResult::Unavailable;
             };
             let Some(current_text) = current_value(&path) else {
-                return false;
+                return VendorApplyResult::Unavailable;
             };
             let current = parse_cpu_pairs(&current_text);
             let Some(vendor) = self.vendor.as_mut() else {
-                return false;
+                return VendorApplyResult::Unavailable;
             };
             reconcile_vendor(vendor, &current);
 
             let backup = vendor.cpus.clone();
             let mut planned = BTreeMap::new();
+            let mut covered = 0usize;
             for (_, cpus, target) in targets {
                 for cpu in cpus {
                     let Some(state) = vendor.cpus.get_mut(cpu) else {
                         continue;
                     };
+                    covered += 1;
                     let wanted = (*target).max(state.original);
                     if current.get(cpu).copied() == Some(wanted) {
                         continue;
@@ -550,14 +639,19 @@ mod platform {
                     planned.insert(*cpu, wanted);
                 }
             }
+            let expected = targets.iter().map(|(_, cpus, _)| cpus.len()).sum::<usize>();
+            if covered == 0 || covered != expected {
+                vendor.cpus = backup;
+                return VendorApplyResult::Unavailable;
+            }
             if planned.is_empty() {
-                return false;
+                return VendorApplyResult::Handled(false);
             }
             if !write_restore(&self.policies, self.vendor.as_ref()) {
                 if let Some(vendor) = self.vendor.as_mut() {
                     vendor.cpus = backup;
                 }
-                return false;
+                return VendorApplyResult::Unavailable;
             }
 
             let mut failed = false;
@@ -572,7 +666,7 @@ mod platform {
                 }
             }
             if !failed {
-                return true;
+                return VendorApplyResult::Handled(true);
             }
 
             let current = current_value(&path)
@@ -602,7 +696,7 @@ mod platform {
                 }
             }
             let _ = write_restore(&self.policies, self.vendor.as_ref());
-            false
+            VendorApplyResult::Unavailable
         }
 
         fn restore(&mut self) -> bool {

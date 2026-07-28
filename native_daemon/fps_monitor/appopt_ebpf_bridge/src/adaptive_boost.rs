@@ -103,6 +103,11 @@ mod platform {
     use std::time::{Duration, Instant};
 
     const SAMPLE_INTERVAL: Duration = Duration::from_millis(900);
+    const INITIAL_BASELINE_SAMPLES: usize = 5;
+    const HIGH_BASELINE_SAMPLES: usize = 4;
+    const HIGH_BASELINE_RATIO: f64 = 1.20;
+    const HIGH_BASELINE_TOLERANCE: f64 = 0.10;
+    const BASELINE_SMOOTHING: f64 = 0.15;
     const MAX_BOOSTED_THREADS: usize = 16;
     const RECOVERY_FILE: &str = "/data/adb/modules/AppOpt/config/boost.restore";
     const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
@@ -150,12 +155,11 @@ mod platform {
         pkg: String,
         pid: i32,
         baseline_samples: Vec<f64>,
+        high_baseline_samples: Vec<f64>,
         baseline_fps: f64,
         moderate_count: u32,
         smooth_count: u32,
         stopped_count: u32,
-        stable_low_count: u32,
-        previous_fps: f64,
         jank_level: i32,
         boosted: bool,
         restore_pending: bool,
@@ -176,12 +180,11 @@ mod platform {
                 pkg,
                 pid: -1,
                 baseline_samples: Vec::with_capacity(8),
+                high_baseline_samples: Vec::with_capacity(HIGH_BASELINE_SAMPLES + 1),
                 baseline_fps: 0.0,
                 moderate_count: 0,
                 smooth_count: 0,
                 stopped_count: 0,
-                stable_low_count: 0,
-                previous_fps: 0.0,
                 jank_level: 0,
                 boosted: false,
                 restore_pending: false,
@@ -259,7 +262,7 @@ mod platform {
 
             if self.baseline_fps <= 0.0 {
                 self.baseline_samples.push(fps);
-                if self.baseline_samples.len() < 5 {
+                if self.baseline_samples.len() < INITIAL_BASELINE_SAMPLES {
                     return None;
                 }
                 self.baseline_samples
@@ -275,36 +278,8 @@ mod platform {
                     value.median_interval_ns > 0
                         && value.max_interval_ns > value.median_interval_ns.saturating_mul(4)
                 });
-            if ordinary
-                && fallback_like
-                && self.previous_fps > 0.0
-                && (fps - self.previous_fps).abs() <= (self.previous_fps * 0.05).max(1.0)
-            {
-                self.stable_low_count = self.stable_low_count.saturating_add(1);
-            } else {
-                self.stable_low_count = 0;
-            }
-            self.previous_fps = fps;
-            if self.stable_low_count >= 5 {
-                let was_active = self.jank_level > 0 || self.boosted || self.restore_pending;
-                let restored = self.restore();
-                self.baseline_fps = fps;
-                self.moderate_count = 0;
-                self.stable_low_count = 0;
-                if was_active {
-                    return Some(if restored {
-                        (3, "检测到稳定帧率档位变化，已恢复增强参数".to_string())
-                    } else {
-                        (
-                            4,
-                            "检测到稳定帧率档位变化，部分增强参数尚未恢复".to_string(),
-                        )
-                    });
-                }
-                return Some((4, format!("已更新帧率基线为 {:.1} FPS", fps)));
-            }
-
             if severe {
+                self.high_baseline_samples.clear();
                 let entering = self.jank_level < 3;
                 self.moderate_count = 0;
                 self.smooth_count = 0;
@@ -336,6 +311,7 @@ mod platform {
             }
 
             if ordinary {
+                self.high_baseline_samples.clear();
                 self.smooth_count = 0;
                 self.moderate_count = if moderate {
                     self.moderate_count.saturating_add(1)
@@ -395,8 +371,12 @@ mod platform {
             } else {
                 self.smooth_count.saturating_add(1)
             };
-            if self.jank_level == 0 && !mild_irregular {
-                self.baseline_fps = self.baseline_fps.max(fps * 0.98).min(fps * 1.05);
+            if self.jank_level == 0 {
+                if let Some(message) = self.update_smooth_baseline(fps, !mild_irregular) {
+                    return Some((4, message));
+                }
+            } else {
+                self.high_baseline_samples.clear();
             }
             if (self.jank_level > 0 || self.boosted || self.restore_pending)
                 && self.smooth_count >= 3
@@ -415,15 +395,51 @@ mod platform {
 
         fn reset_learning(&mut self) {
             self.baseline_samples.clear();
+            self.high_baseline_samples.clear();
             self.baseline_fps = 0.0;
             self.moderate_count = 0;
             self.smooth_count = 0;
             self.stopped_count = 0;
-            self.stable_low_count = 0;
-            self.previous_fps = 0.0;
             self.jank_level = 0;
             self.thread_boost_attempted = false;
             self.thread_sample = None;
+        }
+
+        fn update_smooth_baseline(&mut self, fps: f64, allow_smoothing: bool) -> Option<String> {
+            if fps >= self.baseline_fps * HIGH_BASELINE_RATIO {
+                let stable = if self.high_baseline_samples.is_empty() {
+                    true
+                } else {
+                    let average = self.high_baseline_samples.iter().sum::<f64>()
+                        / self.high_baseline_samples.len() as f64;
+                    (fps - average).abs() <= (average * HIGH_BASELINE_TOLERANCE).max(2.0)
+                };
+                if !stable {
+                    self.high_baseline_samples.clear();
+                }
+                self.high_baseline_samples.push(fps);
+                if self.high_baseline_samples.len() < HIGH_BASELINE_SAMPLES {
+                    return None;
+                }
+
+                self.high_baseline_samples
+                    .sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+                let candidate = self.high_baseline_samples[self.high_baseline_samples.len() / 2];
+                self.high_baseline_samples.clear();
+                let previous = self.baseline_fps;
+                self.baseline_fps = candidate;
+                return Some(format!(
+                    "检测到稳定高帧率档位，基线已从 {:.1} 更新为 {:.1} FPS",
+                    previous, candidate
+                ));
+            }
+
+            self.high_baseline_samples.clear();
+            if allow_smoothing {
+                self.baseline_fps =
+                    self.baseline_fps * (1.0 - BASELINE_SMOOTHING) + fps * BASELINE_SMOOTHING;
+            }
+            None
         }
 
         fn apply_thread_boost(

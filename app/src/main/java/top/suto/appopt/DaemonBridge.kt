@@ -416,7 +416,10 @@ object DaemonBridge {
 
             val rootThread = Thread({
                 val binSelect = daemonBinarySelectShell()
-                runAsRoot("daemon_bin=\$($binSelect); \"\$daemon_bin\" --ping-daemon '$socketName' '$token' 2>/dev/null")
+                runAsRoot(
+                    "daemon_bin=\$($binSelect); \"\$daemon_bin\" --ping-daemon '$socketName' '$token' 2>/dev/null",
+                    timeoutSeconds = 4L
+                )
             }, "AppOptDaemonPing").apply {
                 isDaemon = true
                 start()
@@ -429,6 +432,10 @@ object DaemonBridge {
                 acceptThread.join(300)
             }
             rootThread.join(500)
+            if (rootThread.isAlive) {
+                rootThread.interrupt()
+                rootThread.join(1200)
+            }
             runtime ?: DaemonRuntime(running = false)
         } catch (_: Exception) {
             DaemonRuntime(running = false)
