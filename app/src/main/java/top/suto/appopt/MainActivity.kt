@@ -1740,12 +1740,22 @@ class MainActivity : AppCompatActivity() {
     private fun bindConfiguredAppItem(item: ItemConfiguredAppBinding, entry: AppEntry) {
         item.configName.text = if (entry.installed) entry.label else entry.pkg
         item.configPkg.text = configuredAppMeta(entry)
+        bindConfiguredBoostIndicator(item, entry)
         val healthUi = configuredAppHealth(entry)
         bindHealthHint(item.configHealth, healthUi.label, healthUi.description)
         bindEntryIcon(item.configIcon, entry)
-        item.root.contentDescription = "管理 ${item.configName.text}"
         item.root.setOnClickListener { showConfiguredAppManageSheet(entry) }
         item.configManage.setOnClickListener { showConfiguredAppManageSheet(entry) }
+    }
+
+    private fun bindConfiguredBoostIndicator(item: ItemConfiguredAppBinding, entry: AppEntry) {
+        val enabled = entry.pkg.substringBefore(':') in jankBoostPackages
+        item.configBoost.visibility = if (enabled) View.VISIBLE else View.GONE
+        item.root.contentDescription = if (enabled) {
+            "管理 ${item.configName.text}，已开启掉帧动态调度"
+        } else {
+            "管理 ${item.configName.text}"
+        }
     }
 
     private fun configuredAppMeta(entry: AppEntry): String {
@@ -1839,6 +1849,7 @@ class MainActivity : AppCompatActivity() {
                 if (checked) add(basePkg) else remove(basePkg)
             }.toSet()
             jankBoostPackages = next
+            appAdapter.notifyBoostChanged(basePkg)
             boostSaving = true
             renderBoostState()
             thread {
@@ -1849,6 +1860,7 @@ class MainActivity : AppCompatActivity() {
                         jankBoostPackages = jankBoostPackages.toMutableSet().apply {
                             if (checked) remove(basePkg) else add(basePkg)
                         }.toSet()
+                        appAdapter.notifyBoostChanged(basePkg)
                     }
                     boostSaving = false
                     if (dialog.isShowing) {
@@ -2198,6 +2210,7 @@ class MainActivity : AppCompatActivity() {
 
     private inner class AppAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
         private val payloadIcon = "icon"
+        private val payloadBoost = "boost"
         private val viewTypeAdd = 1
         private val viewTypeNormal = 2
         private val viewTypeConfigured = 3
@@ -2237,6 +2250,15 @@ class MainActivity : AppCompatActivity() {
             if (index >= 0) notifyItemChanged(index, payloadIcon)
         }
 
+        fun notifyBoostChanged(basePkg: String) {
+            if (mode != AppTab.CONFIGURED) return
+            items.forEachIndexed { index, entry ->
+                if (entry.pkg.substringBefore(':') == basePkg) {
+                    notifyItemChanged(index, payloadBoost)
+                }
+            }
+        }
+
         override fun getItemViewType(position: Int): Int {
             return when (mode) {
                 AppTab.ADD -> viewTypeAdd
@@ -2267,15 +2289,21 @@ class MainActivity : AppCompatActivity() {
             position: Int,
             payloads: MutableList<Any>
         ) {
+            val entry = items[position]
+            var handled = false
+            if (payloads.contains(payloadBoost) && holder is ConfiguredHolder) {
+                bindConfiguredBoostIndicator(holder.binding, entry)
+                handled = true
+            }
             if (payloads.contains(payloadIcon)) {
-                val entry = items[position]
                 when (holder) {
                     is AddHolder -> bindEntryIcon(holder.binding.addIcon, entry)
                     is ConfiguredHolder -> bindEntryIcon(holder.binding.configIcon, entry)
                     is NormalHolder -> bindEntryIcon(holder.binding.itemIcon, entry)
                 }
-                return
+                handled = true
             }
+            if (handled) return
             super.onBindViewHolder(holder, position, payloads)
         }
 

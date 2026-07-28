@@ -54,6 +54,16 @@
                         android:textColor="@color/text_primary"
                         android:textSize="15sp"
                         android:textStyle="bold" />
+                    <ImageView
+                        android:id="@+id/configBoost"
+                        android:layout_width="16dp"
+                        android:layout_height="16dp"
+                        android:layout_gravity="center_vertical"
+                        android:layout_marginStart="4dp"
+                        android:contentDescription="已开启掉帧动态调度"
+                        android:src="@drawable/ic_performance_boost"
+                        android:visibility="gone"
+                        app:tint="@color/yellow_capsule" />
                     <TextView
                         android:id="@+id/configHealth"
                         android:layout_width="wrap_content"
