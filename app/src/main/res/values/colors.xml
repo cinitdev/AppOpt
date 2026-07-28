@@ -22,6 +22,16 @@
     <color name="surface_subtle">#F7F7FF</color>
     <color name="surface_selected">#ECECFF</color>
     <color name="surface_teal">#E5F8F4</color>
+    <color name="surface_warm">#FFF3E8</color>
+    <color name="surface_muted">#EFF1F6</color>
+    <color name="log_info">#5B5BD6</color>
+    <color name="log_info_soft">#ECECFF</color>
+    <color name="log_success">#238B61</color>
+    <color name="log_success_soft">#E6F6EF</color>
+    <color name="log_warning">#C96C16</color>
+    <color name="log_warning_soft">#FFF1E3</color>
+    <color name="log_error">#D64545</color>
+    <color name="log_error_soft">#FDEAEA</color>
     <color name="card_bg">#FFFFFF</color>
     <color name="environment_card_bg">#FBFBFF</color>
     <color name="divider">#E6E6F4</color>

@@ -389,6 +389,11 @@ static bool rule_health_sync_config(const AppConfig* cfg, bool* changed_out) {
     rule_health_config_fingerprint_valid = true;
     rule_health_config_ready = true;
     if (changed) rule_health_dirty = true;
+    for (size_t i = 0; i < rule_health_count; i++) {
+        if (rule_health_entries[i].status == RULE_HEALTH_MISSED) {
+            printf("[规则健康] 已停用: %s\n", rule_health_entries[i].rule_line);
+        }
+    }
     if (changed_out) *changed_out = changed;
     return true;
 }
@@ -901,6 +906,7 @@ static void rule_health_finish_observation(
         if (entry->miss_count >= 2) {
             entry->status = RULE_HEALTH_MISSED;
             (*confirmed_miss)++;
+            printf("[规则健康] 已停用: %s\n", entry->rule_line);
         } else {
             entry->status = RULE_HEALTH_PENDING;
             (*first_miss)++;

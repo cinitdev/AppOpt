@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="@drawable/bg_bottom_sheet_card"
@@ -32,7 +33,7 @@
         android:textColor="@color/text_secondary"
         android:textSize="12sp" />
 
-    <LinearLayout
+    <RelativeLayout
         android:id="@+id/modeMaxMember"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -41,13 +42,14 @@
         android:clickable="true"
         android:focusable="true"
         android:foreground="?attr/selectableItemBackground"
-        android:orientation="vertical"
         android:padding="14dp">
 
         <TextView
             android:id="@+id/modeMaxMemberTitle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:layout_toStartOf="@id/modeMaxMemberSelected"
             android:text="平均负载取最高"
             android:textColor="@color/text_primary"
             android:textSize="15sp"
@@ -56,13 +58,26 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_below="@id/modeMaxMemberTitle"
             android:layout_marginTop="4dp"
+            android:layout_toStartOf="@id/modeMaxMemberSelected"
             android:text="默认推荐。AVG 取这一组里最忙的单个线程，MAX 取组内最高峰值。适合避免很多低负载线程被加起来后误判为重载"
             android:textColor="@color/text_secondary"
             android:textSize="12sp" />
-    </LinearLayout>
 
-    <LinearLayout
+        <ImageView
+            android:id="@+id/modeMaxMemberSelected"
+            android:layout_width="22dp"
+            android:layout_height="22dp"
+            android:layout_alignParentEnd="true"
+            android:layout_centerVertical="true"
+            android:contentDescription="已选择"
+            android:src="@drawable/ic_check_circle"
+            android:visibility="gone"
+            app:tint="@color/brand_primary" />
+    </RelativeLayout>
+
+    <RelativeLayout
         android:id="@+id/modeSum"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -71,13 +86,14 @@
         android:clickable="true"
         android:focusable="true"
         android:foreground="?attr/selectableItemBackground"
-        android:orientation="vertical"
         android:padding="14dp">
 
         <TextView
             android:id="@+id/modeSumTitle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:layout_toStartOf="@id/modeSumSelected"
             android:text="平均负载相加"
             android:textColor="@color/text_primary"
             android:textSize="15sp"
@@ -86,11 +102,24 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_below="@id/modeSumTitle"
             android:layout_marginTop="4dp"
+            android:layout_toStartOf="@id/modeSumSelected"
             android:text="更激进。AVG 会累加这一组里的所有线程，MAX 仍取组内最高峰值。适合多个同名工作线程一起承担主要负载的游戏，但更容易升到中高性能核心"
             android:textColor="@color/text_secondary"
             android:textSize="12sp" />
-    </LinearLayout>
+
+        <ImageView
+            android:id="@+id/modeSumSelected"
+            android:layout_width="22dp"
+            android:layout_height="22dp"
+            android:layout_alignParentEnd="true"
+            android:layout_centerVertical="true"
+            android:contentDescription="已选择"
+            android:src="@drawable/ic_check_circle"
+            android:visibility="gone"
+            app:tint="@color/brand_primary" />
+    </RelativeLayout>
 
     <com.google.android.material.button.MaterialButton
         android:id="@+id/modeCancel"

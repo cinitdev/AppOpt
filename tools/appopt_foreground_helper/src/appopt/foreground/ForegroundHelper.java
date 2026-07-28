@@ -86,6 +86,12 @@ public final class ForegroundHelper {
     private static final TreeMap<String, Long> lastExitElapsed = new TreeMap<>();
     private static final TreeMap<String, LifecycleRecord> lifecyclePackages = new TreeMap<>();
 
+    private enum UidMapWriteResult {
+        FAILED,
+        UNCHANGED,
+        UPDATED
+    }
+
     private ForegroundHelper() {
     }
 
@@ -582,7 +588,8 @@ public final class ForegroundHelper {
             return;
         }
 
-        if (!writeUidMap(uidMap)) {
+        UidMapWriteResult writeResult = writeUidMap(uidMap);
+        if (writeResult == UidMapWriteResult.FAILED) {
             return;
         }
 
@@ -590,8 +597,10 @@ public final class ForegroundHelper {
         lastUidMapConfigLength = length;
         lastUidMapSyncElapsed = nowElapsed;
         lastUidMapCount = uidMap.size();
-        System.out.println("[前台助手] package_uid.map 已更新: rules="
-            + packages.size() + " uid=" + uidMap.size() + " reason=" + reason);
+        if (writeResult == UidMapWriteResult.UPDATED) {
+            System.out.println("[前台助手] package_uid.map 已更新: rules="
+                + packages.size() + " uid=" + uidMap.size() + " reason=" + reason);
+        }
     }
 
     private static Set<String> readRulePackages(File file) throws IOException {
@@ -728,11 +737,11 @@ public final class ForegroundHelper {
         throw new NoSuchMethodException("IPackageManager.getPackageInfo");
     }
 
-    private static boolean writeUidMap(TreeMap<String, Integer> uidMap) {
+    private static UidMapWriteResult writeUidMap(TreeMap<String, Integer> uidMap) {
         File parent = uidMapFile.getParentFile();
         if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
             System.err.println("[前台助手] 无法创建 UID 映射目录: " + parent);
-            return false;
+            return UidMapWriteResult.FAILED;
         }
         String content = uidMapContent(uidMap);
         try {
@@ -740,7 +749,7 @@ public final class ForegroundHelper {
                 String old = new String(java.nio.file.Files.readAllBytes(uidMapFile.toPath()), StandardCharsets.UTF_8);
                 if (old.equals(content)) {
                     uidMapFile.setReadable(true, false);
-                    return true;
+                    return UidMapWriteResult.UNCHANGED;
                 }
             }
         } catch (Throwable ignored) {
@@ -757,7 +766,7 @@ public final class ForegroundHelper {
         } catch (Throwable error) {
             System.err.println("[前台助手] 写入 package_uid.map 失败: " + errorText(error));
             temp.delete();
-            return false;
+            return UidMapWriteResult.FAILED;
         }
 
         if (!temp.renameTo(uidMapFile)) {
@@ -765,11 +774,11 @@ public final class ForegroundHelper {
             if (!temp.renameTo(uidMapFile)) {
                 System.err.println("[前台助手] 原子替换 package_uid.map 失败: " + uidMapFile);
                 temp.delete();
-                return false;
+                return UidMapWriteResult.FAILED;
             }
         }
         uidMapFile.setReadable(true, false);
-        return true;
+        return UidMapWriteResult.UPDATED;
     }
 
     private static String uidMapContent(TreeMap<String, Integer> uidMap) {

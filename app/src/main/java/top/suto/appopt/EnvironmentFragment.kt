@@ -23,6 +23,7 @@ class EnvironmentFragment : TopLevelFragment() {
     private var lastRefreshFinishedAt = 0L
     private var updateGeneration = 0
     private var updateBusy = false
+    private var diagnosticBusy = false
     private var cachedUpdateInfo: ModuleUpdater.UpdateInfo? = null
     private var cachedUpdateResult: ModuleUpdater.CheckResult? = null
     private var updateCheckStarted = false
@@ -59,6 +60,7 @@ class EnvironmentFragment : TopLevelFragment() {
         binding.environmentUsageButton.setOnClickListener { requestUsageAccess() }
         binding.environmentRefreshButton.setOnClickListener { refreshEnvironment(force = true) }
         binding.environmentRefresh.setOnRefreshListener { refreshEnvironment(force = true) }
+        binding.environmentDiagnosticRow.setOnClickListener { exportDiagnosticPackage() }
         binding.environmentUpdateButton.setOnClickListener {
             cachedUpdateInfo?.let(::showModuleUpdateDialog) ?: checkModuleUpdate(manual = true)
         }
@@ -296,6 +298,32 @@ class EnvironmentFragment : TopLevelFragment() {
         }
     }
 
+    private fun exportDiagnosticPackage() {
+        if (diagnosticBusy) {
+            toast("正在导出诊断包")
+            return
+        }
+        diagnosticBusy = true
+        binding.environmentDiagnosticRow.isEnabled = false
+        binding.environmentDiagnosticRow.alpha = 0.55f
+        toast("正在导出诊断包")
+        val currentViewGeneration = viewGeneration
+        thread(name = "AppOptDiagnosticExport") {
+            val result = DiagnosticExporter.export(appContext)
+            runOnUiThread {
+                if (currentViewGeneration != viewGeneration || _binding == null ||
+                    isFinishing || isDestroyed) return@runOnUiThread
+                diagnosticBusy = false
+                binding.environmentDiagnosticRow.isEnabled = true
+                binding.environmentDiagnosticRow.alpha = 1f
+                result.fold(
+                    onSuccess = { toast("已导出到 $it") },
+                    onFailure = { toast("导出失败: ${it.message ?: "无法写入 Download"}") }
+                )
+            }
+        }
+    }
+
     private fun checkModuleUpdate(manual: Boolean) {
         if (_binding == null) return
         if (updateBusy) {
@@ -409,6 +437,7 @@ class EnvironmentFragment : TopLevelFragment() {
         refreshGeneration++
         refreshInFlight = false
         refreshPending = false
+        diagnosticBusy = false
         _binding = null
         super.onDestroyView()
     }

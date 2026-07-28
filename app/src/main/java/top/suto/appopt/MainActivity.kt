@@ -30,6 +30,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityEvent
 import android.view.animation.LinearInterpolator
 import android.widget.GridLayout
 import android.widget.ImageView
@@ -63,6 +64,7 @@ import top.suto.appopt.databinding.ItemAutoAppBinding
 import top.suto.appopt.databinding.ItemConfigRuleBinding
 import top.suto.appopt.databinding.ItemConfiguredAppBinding
 import top.suto.appopt.databinding.ItemRuleHistoryCandidateBinding
+import top.suto.appopt.databinding.ViewUsageGuideOverlayBinding
 import top.suto.appopt.db.AppOptDbHelper
 import java.text.SimpleDateFormat
 import java.util.Collections
@@ -137,6 +139,16 @@ class MainActivity : AppCompatActivity() {
     private var selectedTopLevelPage = R.id.navApps
     private var lastAppsPageRefreshAt = SystemClock.elapsedRealtime()
     private var appsPageRefreshRunnable: Runnable? = null
+    private var usageGuideBinding: ViewUsageGuideOverlayBinding? = null
+    private var usageGuideSteps: List<UsageGuide.Step> = emptyList()
+    private var usageGuideIndex = 0
+    private var usageGuideForced = false
+    private var usageGuidePreviousPage = R.id.navApps
+    private var usageGuidePreviousAppTab = AppTab.PENDING
+    private var usageGuidePreviousSettingsTab = 0
+    private var usageGuideBackCallback: OnBackPressedCallback? = null
+    private var startupGuideShown = false
+    private var usageGuideAddInFlight = false
 
     private data class ForegroundHelperStatus(
         val state: DaemonBridge.TaskForegroundState? = null,
@@ -156,6 +168,7 @@ class MainActivity : AppCompatActivity() {
             R.id.navApps,
             R.id.navEnvironment,
             R.id.navHistory,
+            R.id.navLog,
             R.id.navSettings
         )
     }
@@ -230,6 +243,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
+        val pendingGuideSteps = UsageGuide.pendingSteps(this)
         setContentView(binding.root)
         bottomNavigation = findViewById(R.id.bottomNavigation)
         bottomNavigationBlur = findViewById(R.id.bottomNavigationBlur)
@@ -304,6 +318,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     renderEnvironmentOverview()
                     buildAppList()
+                    maybeShowStartupUsageGuide(pendingGuideSteps)
                     showModuleWarningIfNeeded()
                     maybeCheckStartupUpdate()
                 }
@@ -490,9 +505,336 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    fun showUsageGuide(showAll: Boolean) {
+        showUsageGuide(showAll, requestedSteps = null)
+    }
+
+    private fun maybeShowStartupUsageGuide(steps: List<UsageGuide.Step>) {
+        if (startupGuideShown || steps.isEmpty() || activityDestroyed) return
+        startupGuideShown = true
+        showUsageGuide(showAll = false, requestedSteps = steps)
+    }
+
+    private fun showUsageGuide(
+        showAll: Boolean,
+        requestedSteps: List<UsageGuide.Step>?
+    ) {
+        if (activityDestroyed || isFinishing || isDestroyed || usageGuideBinding != null) return
+        val steps = requestedSteps ?: if (showAll) UsageGuide.steps else UsageGuide.pendingSteps(this)
+        if (steps.isEmpty()) return
+
+        usageGuideSteps = steps
+        usageGuideIndex = 0
+        usageGuideForced = !showAll
+        usageGuideAddInFlight = false
+        usageGuidePreviousPage = selectedTopLevelPage
+        usageGuidePreviousAppTab = appTab
+        usageGuidePreviousSettingsTab =
+            (supportFragmentManager.findFragmentByTag(topLevelFragmentTag(R.id.navSettings)) as? SettingsFragment)
+                ?.currentUsageGuideTabIndex() ?: 0
+
+        val overlay = ViewUsageGuideOverlayBinding.inflate(layoutInflater, binding.root, false)
+        usageGuideBinding = overlay
+        binding.root.addView(
+            overlay.root,
+            ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        overlay.root.bringToFront()
+        overlay.guideCoachClose.visibility = if (usageGuideForced) View.GONE else View.VISIBLE
+        overlay.guideCoachClose.setOnClickListener { finishUsageGuide(markCompleted = false) }
+        overlay.guideCoachPrevious.setOnClickListener {
+            showPreviousUsageGuideStep()
+        }
+        overlay.guideCoachNext.setOnClickListener { handleUsageGuideNext() }
+
+        usageGuideBackCallback = object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (!usageGuideForced) finishUsageGuide(markCompleted = false)
+            }
+        }.also { onBackPressedDispatcher.addCallback(this, it) }
+        renderUsageGuideStep()
+    }
+
+    private fun renderUsageGuideStep() {
+        val overlay = usageGuideBinding ?: return
+        val step = usageGuideSteps.getOrNull(usageGuideIndex) ?: return
+        if (step.target == UsageGuide.Target.START_CALIBRATION && appLists.pending.isEmpty() &&
+            usageGuideIndex < usageGuideSteps.lastIndex) {
+            usageGuideIndex++
+            renderUsageGuideStep()
+            return
+        }
+        overlay.root.clearSpotlight()
+        overlay.guideCoachMode.text = when {
+            !usageGuideForced -> "完整教程"
+            usageGuideSteps.size == UsageGuide.steps.size -> "首次使用"
+            else -> "新功能"
+        }
+        overlay.guideCoachProgress.text = "${usageGuideIndex + 1} / ${usageGuideSteps.size}"
+        val existingPendingGuide = step.target == UsageGuide.Target.ADD_APP && appLists.pending.isNotEmpty()
+        overlay.guideCoachTitle.text = if (existingPendingGuide) {
+            "已有待校准应用"
+        } else {
+            step.title
+        }
+        overlay.guideCoachDescription.text = if (existingPendingGuide) {
+            "已检测到待校准列表中有应用，无需重复添加。下一步会介绍右侧播放按钮，以及如何启动悬浮校准。"
+        } else {
+            step.description
+        }
+        updateUsageGuideControls(step)
+        overlay.root.contentDescription =
+            "${overlay.guideCoachMode.text}，第 ${usageGuideIndex + 1} 步，共 ${usageGuideSteps.size} 步，${overlay.guideCoachTitle.text}"
+
+        navigateToUsageGuideTarget(step.target)
+        val expectedIndex = usageGuideIndex
+        mainHandler.postDelayed(
+            { resolveUsageGuideTarget(step.target, expectedIndex, attempt = 0) },
+            90L
+        )
+        overlay.root.sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_FOCUSED)
+    }
+
+    private fun updateUsageGuideControls(step: UsageGuide.Step) {
+        val overlay = usageGuideBinding ?: return
+        overlay.guideCoachPrevious.visibility = if (usageGuideIndex == 0) View.INVISIBLE else View.VISIBLE
+        overlay.guideCoachPrevious.isEnabled = !usageGuideAddInFlight
+        when {
+            usageGuideAddInFlight -> {
+                overlay.guideCoachNext.isEnabled = false
+                overlay.guideCoachNext.text = "正在添加"
+            }
+            requiresUsageGuideAdd(step) -> {
+                overlay.guideCoachNext.isEnabled = !addableAppsLoading
+                overlay.guideCoachNext.text =
+                    if (addableAppsLoading) "正在加载应用" else "请点击列表中的 +"
+            }
+            usageGuideIndex == usageGuideSteps.lastIndex -> {
+                overlay.guideCoachNext.isEnabled = true
+                overlay.guideCoachNext.text = "完成"
+            }
+            else -> {
+                overlay.guideCoachNext.isEnabled = true
+                overlay.guideCoachNext.text = "下一步"
+            }
+        }
+    }
+
+    private fun requiresUsageGuideAdd(step: UsageGuide.Step): Boolean =
+        usageGuideForced && step.target == UsageGuide.Target.ADD_APP &&
+            appLists.pending.isEmpty() && (addableAppsLoading || appLists.addable.isNotEmpty())
+
+    private fun handleUsageGuideNext() {
+        if (usageGuideAddInFlight) return
+        val step = usageGuideSteps.getOrNull(usageGuideIndex) ?: return
+        if (requiresUsageGuideAdd(step)) {
+            if (!addableAppsLoading) toast("请先在亮起的列表中添加一个应用")
+            return
+        }
+        if (usageGuideIndex == usageGuideSteps.lastIndex) {
+            finishUsageGuide(markCompleted = usageGuideForced)
+            return
+        }
+        usageGuideIndex++
+        renderUsageGuideStep()
+    }
+
+    private fun showPreviousUsageGuideStep() {
+        if (usageGuideAddInFlight || usageGuideIndex <= 0) return
+        var previous = usageGuideIndex - 1
+        if (usageGuideSteps.getOrNull(previous)?.target == UsageGuide.Target.START_CALIBRATION &&
+            appLists.pending.isEmpty()) {
+            previous--
+        }
+        usageGuideIndex = previous.coerceAtLeast(0)
+        renderUsageGuideStep()
+    }
+
+    private fun navigateToUsageGuideTarget(target: UsageGuide.Target) {
+        when (target) {
+            UsageGuide.Target.APP_TABS -> {
+                selectTopLevelPage(R.id.navApps)
+                selectAppTab(AppTab.PENDING)
+            }
+
+            UsageGuide.Target.ADD_APP -> {
+                selectTopLevelPage(R.id.navApps)
+                selectAppTab(if (appLists.pending.isEmpty()) AppTab.ADD else AppTab.PENDING)
+            }
+
+            UsageGuide.Target.START_CALIBRATION -> {
+                selectTopLevelPage(R.id.navApps)
+                selectAppTab(AppTab.PENDING)
+            }
+
+            UsageGuide.Target.CONFIGURED_APP -> {
+                selectTopLevelPage(R.id.navApps)
+                selectAppTab(AppTab.CONFIGURED)
+            }
+
+            UsageGuide.Target.ENVIRONMENT_TOOLS -> selectTopLevelPage(R.id.navEnvironment)
+            UsageGuide.Target.HISTORY_AND_LOGS -> selectTopLevelPage(R.id.navHistory)
+            UsageGuide.Target.RULE_GENERATION,
+            UsageGuide.Target.RULE_GENERATION_LIMIT,
+            UsageGuide.Target.SIMILAR_THREADS,
+            UsageGuide.Target.PERFORMANCE_TIERS,
+            UsageGuide.Target.PROCESS_FALLBACK,
+            UsageGuide.Target.HELP_BUTTON -> selectTopLevelPage(R.id.navSettings)
+        }
+        if (!supportFragmentManager.isStateSaved) {
+            supportFragmentManager.executePendingTransactions()
+        }
+    }
+
+    private fun resolveUsageGuideTarget(
+        target: UsageGuide.Target,
+        expectedIndex: Int,
+        attempt: Int
+    ) {
+        val overlay = usageGuideBinding ?: return
+        if (expectedIndex != usageGuideIndex || usageGuideSteps.getOrNull(expectedIndex)?.target != target) return
+
+        val targetView = when (target) {
+            UsageGuide.Target.APP_TABS -> binding.appSection.appTabs
+            UsageGuide.Target.ADD_APP -> if (appLists.pending.isEmpty()) {
+                addAppGuideTarget()
+            } else {
+                appGuideTarget(AppTab.PENDING, preferListRow = false)
+            }
+            UsageGuide.Target.START_CALIBRATION -> appGuideTarget(AppTab.PENDING, preferListRow = true)
+            UsageGuide.Target.CONFIGURED_APP -> appGuideTarget(AppTab.CONFIGURED, preferListRow = true)
+            UsageGuide.Target.ENVIRONMENT_TOOLS ->
+                topLevelFragmentView(R.id.navEnvironment)?.findViewById(R.id.environmentDiagnosticRow)
+            UsageGuide.Target.HISTORY_AND_LOGS -> bottomNavigation
+            UsageGuide.Target.RULE_GENERATION,
+            UsageGuide.Target.RULE_GENERATION_LIMIT,
+            UsageGuide.Target.SIMILAR_THREADS,
+            UsageGuide.Target.PERFORMANCE_TIERS,
+            UsageGuide.Target.PROCESS_FALLBACK,
+            UsageGuide.Target.HELP_BUTTON ->
+                (supportFragmentManager.findFragmentByTag(topLevelFragmentTag(R.id.navSettings)) as? SettingsFragment)
+                    ?.prepareUsageGuideTarget(target)
+        }
+
+        if (targetView == null || !targetView.isShown || targetView.width <= 0 || targetView.height <= 0) {
+            val maxAttempts = when {
+                target == UsageGuide.Target.ADD_APP && addableAppsLoading -> 100
+                target == UsageGuide.Target.RULE_GENERATION ||
+                    target == UsageGuide.Target.RULE_GENERATION_LIMIT ||
+                    target == UsageGuide.Target.SIMILAR_THREADS ||
+                    target == UsageGuide.Target.PERFORMANCE_TIERS ||
+                    target == UsageGuide.Target.PROCESS_FALLBACK -> 160
+                else -> 16
+            }
+            if (attempt < maxAttempts) {
+                mainHandler.postDelayed(
+                    { resolveUsageGuideTarget(target, expectedIndex, attempt + 1) },
+                    70L
+                )
+            } else {
+                overlay.root.spotlight(binding.mainContent, overlay.guideCoachCard)
+                if (target == UsageGuide.Target.ADD_APP) {
+                    updateUsageGuideControls(usageGuideSteps[expectedIndex])
+                }
+            }
+            return
+        }
+
+        targetView.requestRectangleOnScreen(
+            Rect(0, 0, targetView.width, targetView.height),
+            false
+        )
+        mainHandler.postDelayed({
+            val currentOverlay = usageGuideBinding ?: return@postDelayed
+            if (expectedIndex == usageGuideIndex && targetView.isShown) {
+                val step = usageGuideSteps[expectedIndex]
+                val interactiveAdd = requiresUsageGuideAdd(step) && targetView.id == R.id.appRecycler
+                currentOverlay.root.spotlight(
+                    targetView,
+                    currentOverlay.guideCoachCard,
+                    allowTargetTouch = interactiveAdd
+                )
+                updateUsageGuideControls(step)
+            }
+        }, 110L)
+    }
+
+    private fun addAppGuideTarget(): View? {
+        if (appTab != AppTab.ADD) selectAppTab(AppTab.ADD)
+        if (binding.appSection.appRecycler.isShown &&
+            binding.appSection.appRecycler.getChildAt(0) != null) {
+            return binding.appSection.appRecycler
+        }
+        if (!addableAppsLoading && appLists.addable.isEmpty()) {
+            val strip = binding.appSection.appTabs.getChildAt(0) as? ViewGroup
+            return strip?.getChildAt(AppTab.ADD.ordinal) ?: binding.appSection.appTabs
+        }
+        return null
+    }
+
+    private fun onUsageGuideAutoAddStarted() {
+        val step = usageGuideSteps.getOrNull(usageGuideIndex) ?: return
+        if (usageGuideAddInFlight || !requiresUsageGuideAdd(step)) return
+        usageGuideAddInFlight = true
+        usageGuideBinding?.root?.clearSpotlight()
+        updateUsageGuideControls(step)
+    }
+
+    private fun onUsageGuideAutoAddFinished(pkg: String, success: Boolean) {
+        val step = usageGuideSteps.getOrNull(usageGuideIndex) ?: return
+        if (!usageGuideAddInFlight || step.target != UsageGuide.Target.ADD_APP) return
+        usageGuideAddInFlight = false
+        if (success && appLists.pending.any { it.pkg == pkg }) {
+            if (usageGuideIndex < usageGuideSteps.lastIndex) usageGuideIndex++
+            renderUsageGuideStep()
+        } else {
+            selectAppTab(AppTab.ADD)
+            renderUsageGuideStep()
+        }
+    }
+
+    private fun appGuideTarget(tab: AppTab, preferListRow: Boolean): View {
+        if (appTab != tab) selectAppTab(tab)
+        if (preferListRow) {
+            binding.appSection.appRecycler.getChildAt(0)?.let { return it }
+        }
+        val strip = binding.appSection.appTabs.getChildAt(0) as? ViewGroup
+        return strip?.getChildAt(tab.ordinal) ?: binding.appSection.appTabs
+    }
+
+    private fun topLevelFragmentView(itemId: Int): View? =
+        supportFragmentManager.findFragmentByTag(topLevelFragmentTag(itemId))?.view
+
+    private fun finishUsageGuide(markCompleted: Boolean) {
+        val overlay = usageGuideBinding ?: return
+        if (markCompleted) UsageGuide.markCompleted(this, usageGuideSteps)
+        usageGuideBinding = null
+        usageGuideAddInFlight = false
+        usageGuideBackCallback?.remove()
+        usageGuideBackCallback = null
+        (overlay.root.parent as? ViewGroup)?.removeView(overlay.root)
+
+        val previousPage = usageGuidePreviousPage
+        selectTopLevelPage(previousPage)
+        if (previousPage == R.id.navApps) {
+            selectAppTab(usageGuidePreviousAppTab)
+        } else if (previousPage == R.id.navSettings) {
+            mainHandler.post {
+                (supportFragmentManager.findFragmentByTag(topLevelFragmentTag(R.id.navSettings)) as? SettingsFragment)
+                    ?.restoreUsageGuideTab(usageGuidePreviousSettingsTab)
+            }
+        }
+
+        if (activityResumed) showFloatingInterruptionIfNeeded()
+        showModuleWarningIfNeeded()
+        maybeCheckStartupUpdate()
+    }
+
     /**
-     * 历史与设置页面首次创建的视图较多，在主界面空闲后提前创建，避免用户点击时才同步膨胀。
-     * 两个页面错开执行，防止启动阶段连续占用主线程。
+     * 历史、日志与设置页面在主界面空闲后错开预热，避免首次点击时同步膨胀视图。
      */
     private fun scheduleTopLevelPrewarm() {
         mainHandler.postDelayed(
@@ -500,8 +842,12 @@ class MainActivity : AppCompatActivity() {
             450L
         )
         mainHandler.postDelayed(
+            { prewarmTopLevelPageWhenIdle(R.id.navLog) },
+            850L
+        )
+        mainHandler.postDelayed(
             { prewarmTopLevelPageWhenIdle(R.id.navSettings) },
-            950L
+            1150L
         )
     }
 
@@ -635,6 +981,7 @@ class MainActivity : AppCompatActivity() {
     private fun createTopLevelFragment(itemId: Int): Fragment = when (itemId) {
         R.id.navEnvironment -> EnvironmentFragment()
         R.id.navHistory -> HistoryListFragment()
+        R.id.navLog -> LogFragment()
         R.id.navSettings -> SettingsFragment()
         else -> error("未知顶级页面: $itemId")
     }
@@ -647,7 +994,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showFloatingInterruptionIfNeeded() {
-        if (floatingInterruptionDialogShowing || activityDestroyed) return
+        if (usageGuideBinding != null || floatingInterruptionDialogShowing || activityDestroyed) return
         val incident = FloatingBallSessionState.consumeIncident(
             this,
             FloatingBallService.isRunningInProcess()
@@ -819,6 +1166,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         activityDestroyed = true
+        usageGuideBackCallback?.remove()
+        usageGuideBackCallback = null
+        usageGuideBinding = null
         cancelSettledHealthRefresh()
         appsPageRefreshRunnable?.let(mainHandler::removeCallbacks)
         appsPageRefreshRunnable = null
@@ -979,7 +1329,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showModuleWarningIfNeeded() {
-        if (moduleWarningShown || environmentLoading || !hasRoot || pendingModuleUpdate || moduleCompatible) return
+        if (usageGuideBinding != null || moduleWarningShown || environmentLoading || !hasRoot ||
+            pendingModuleUpdate || moduleCompatible) return
         moduleWarningShown = true
         MaterialAlertDialogBuilder(this)
             .setTitle("模块版本不兼容")
@@ -993,7 +1344,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun maybeCheckStartupUpdate() {
-        if (startupUpdateCheckStarted || activityDestroyed || !hasRoot || pendingModuleUpdate) return
+        if (usageGuideBinding != null || startupUpdateCheckStarted || activityDestroyed ||
+            !hasRoot || pendingModuleUpdate) return
         startupUpdateCheckStarted = true
         thread(name = "AppOptStartupUpdateCheck") {
             val result = try {
@@ -1467,7 +1819,7 @@ class MainActivity : AppCompatActivity() {
             view.configuredManageBoostDescription.text = when {
                 !entry.installed -> "应用未安装，暂不可用"
                 !usable -> "模块不可用，暂时无法修改"
-                else -> "按掉帧程度接管 CPU 调速，必要时提升活跃线程优先级，流畅后恢复"
+                else -> "按掉帧程度接管 CPU 调速，必要时提升活跃线程优先级，流畅后恢复(不保证有效)"
             }
             view.configuredManageBoostDescription.setTextColor(
                 ContextCompat.getColor(this, R.color.text_secondary)
@@ -2326,6 +2678,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val pkg = entry.pkg
+        onUsageGuideAutoAddStarted()
         val generation = beginConfigMutation()
         val previousLists = appLists
         val previousProcessNames = processNames
@@ -2359,10 +2712,12 @@ class MainActivity : AppCompatActivity() {
                         processNames = resolvedNames
                         appLists = visibleLists
                         buildAppList()
+                        onUsageGuideAutoAddFinished(pkg, success = true)
                     } else {
                         appLists = previousLists
                         buildAppList()
                         toast("添加配置失败，请检查 Root 或模块权限")
+                        onUsageGuideAutoAddFinished(pkg, success = false)
                     }
                 }
             } catch (error: Exception) {
@@ -2371,6 +2726,7 @@ class MainActivity : AppCompatActivity() {
                     appLists = previousLists
                     buildAppList()
                     toast("添加配置失败，请重试")
+                    onUsageGuideAutoAddFinished(pkg, success = false)
                 }
             }
         }

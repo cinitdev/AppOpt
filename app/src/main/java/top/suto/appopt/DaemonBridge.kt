@@ -51,6 +51,7 @@ object DaemonBridge {
     private const val POLICY_UPDATE_FILE = "$UPDATE_CONFIG_DIR/calib_policy.conf"
     private const val HISTORY_DIR = "$MODULE_DIR/history"
     private const val LOG_FILE = "$LOG_DIR/AppOpt.log"
+    private const val FOREGROUND_HELPER_LOG_FILE = "$LOG_DIR/ForegroundHelper.log"
     private const val FPS_CMD_FILE = "$CONFIG_DIR/fps.cmd"
     private const val FOREGROUND_TASK_STATE_FILE = "$CONFIG_DIR/foreground_task.state"
     private const val FOREGROUND_HELPER_SCRIPT = "$CONFIG_DIR/tools/appopt_foreground_helper.sh"
@@ -671,6 +672,12 @@ object DaemonBridge {
     /** 读取本次开机以来的守护进程日志，只取最后 maxLines 行避免 UI 解析过大文件。 */
     fun readDaemonLog(maxLines: Int = 500): String {
         val out = runAsRoot("tail -n $maxLines $LOG_FILE 2>/dev/null")
+        return if (out.isNotErrored()) out else ""
+    }
+
+    /** 读取前台助手最近的输出，限制行数以避免异常大日志拖慢界面。 */
+    fun readForegroundHelperLog(maxLines: Int = 500): String {
+        val out = runAsRoot("tail -n $maxLines $FOREGROUND_HELPER_LOG_FILE 2>/dev/null")
         return if (out.isNotErrored()) out else ""
     }
 

@@ -260,13 +260,14 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     }
     let runtime_rules = runtime_rule_health_rules(&rules, state);
     let plan = build_scan_plan(&runtime_rules, &uid_map, args.target_pkg.as_deref());
-    let config_changed =
-        state.last_config_key != Some(config_key) || state.last_uid_map_key != uid_key;
+    let rule_config_changed = state.last_config_key != Some(config_key);
+    let config_changed = rule_config_changed || state.last_uid_map_key != uid_key;
     if config_changed {
         log_config_summary(&rules, &uid_map, &plan);
-        let disabled = rules.len().saturating_sub(runtime_rules.len());
-        if disabled > 0 {
-            println!("[RS] 规则健康已停用: {} 条连续两次未检测到的规则", disabled);
+    }
+    if rule_config_changed {
+        for rule_line in disabled_rule_health_lines(&rules, state) {
+            println!("[RS] 规则健康已停用: {rule_line}");
         }
     }
 

@@ -1,6 +1,5 @@
 package top.suto.appopt
 
-import android.content.Intent
 import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
@@ -15,12 +14,13 @@ import android.widget.EditText
 import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.view.doOnPreDraw
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.checkbox.MaterialCheckBox
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.tabs.TabLayout
 import com.google.android.material.textfield.TextInputLayout
 import java.util.concurrent.Executors
-import kotlin.concurrent.thread
 import top.suto.appopt.databinding.FragmentSettingsBinding
 import top.suto.appopt.databinding.DialogPolicyModeBinding
 import top.suto.appopt.databinding.DialogRuleOutputFormatBinding
@@ -34,11 +34,11 @@ class SettingsFragment : TopLevelFragment() {
     private var policyLoadGeneration = 0
     private var policyLoadInFlight = false
     private var policyLoaded = false
+    private var policyGuideLayoutReady = false
     private var lastPolicyLoadFinishedAt = 0L
     private var lockedByPendingUpdate = false
     private var hasRoot = false
     private var moduleVersion: DaemonBridge.ModuleVersion? = null
-    private var diagnosticBusy = false
     private var policyEditable = false
     private var suppressPolicyChange = false
     private var currentWildcardGroup = CalibPolicy.WildcardGroup.MAX_MEMBER
@@ -54,7 +54,13 @@ class SettingsFragment : TopLevelFragment() {
     private var coreWarningRunnable: Runnable? = null
     private var coreWarningView: TextView? = null
     private var saveSeq = 0
+    private var selectedSettingsTab = SettingsTab.RULES
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    private enum class SettingsTab(val title: String) {
+        RULES("规则生成"),
+        PERFORMANCE("性能档位")
+    }
 
     private companion object {
         const val MIN_MODULE_VERSION_CODE = DaemonBridge.REQUIRED_MODULE_VERSION_CODE
@@ -76,17 +82,11 @@ class SettingsFragment : TopLevelFragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         prepareTopLevelPage(binding.settingsHeader)
+        setupSettingsTabs()
 
-        binding.settingsHistoryRow.setOnClickListener {
-            (activity as? MainActivity)?.selectTopLevelPage(R.id.navHistory)
+        binding.settingsHelpButton.setOnClickListener {
+            (activity as? MainActivity)?.showUsageGuide(showAll = true)
         }
-        binding.settingsLogRow.setOnClickListener {
-            startActivity(Intent(requireContext(), LogActivity::class.java))
-        }
-        binding.settingsDiagnosticRow.setOnClickListener {
-            exportDiagnosticPackage()
-        }
-        binding.settingsHelpRow.setOnClickListener { showHelp() }
         binding.wildcardModeRow.setOnClickListener {
             if (policyEditable) showWildcardModeDialog()
         }
@@ -103,6 +103,111 @@ class SettingsFragment : TopLevelFragment() {
         setPolicyStatus("正在读取策略")
     }
 
+    private fun setupSettingsTabs() {
+        val tabs = binding.settingsTabs
+        tabs.removeAllTabs()
+        SettingsTab.entries.forEach { tab ->
+            tabs.addTab(tabs.newTab().setText(tab.title), false)
+        }
+        tabs.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab) {
+                showSettingsTab(SettingsTab.entries.getOrElse(tab.position) { SettingsTab.RULES })
+            }
+
+            override fun onTabUnselected(tab: TabLayout.Tab) = Unit
+
+            override fun onTabReselected(tab: TabLayout.Tab) {
+                when (selectedSettingsTab) {
+                    SettingsTab.RULES -> binding.ruleSettingsPage.smoothScrollTo(0, 0)
+                    SettingsTab.PERFORMANCE -> binding.performanceSettingsPage.smoothScrollTo(0, 0)
+                }
+            }
+        })
+        tabs.getTabAt(selectedSettingsTab.ordinal)?.select()
+        showSettingsTab(selectedSettingsTab)
+    }
+
+    private fun showSettingsTab(tab: SettingsTab) {
+        selectedSettingsTab = tab
+        binding.ruleSettingsPage.visibility = if (tab == SettingsTab.RULES) View.VISIBLE else View.GONE
+        binding.performanceSettingsPage.visibility =
+            if (tab == SettingsTab.PERFORMANCE) View.VISIBLE else View.GONE
+    }
+
+    fun prepareUsageGuideTarget(target: UsageGuide.Target): View? {
+        if (_binding == null) return null
+        if (target == UsageGuide.Target.RULE_GENERATION ||
+            target == UsageGuide.Target.RULE_GENERATION_LIMIT ||
+            target == UsageGuide.Target.SIMILAR_THREADS ||
+            target == UsageGuide.Target.PERFORMANCE_TIERS ||
+            target == UsageGuide.Target.PROCESS_FALLBACK) {
+            if (!policyLoaded || policyLoadInFlight || !policyGuideLayoutReady) return null
+        }
+        return when (target) {
+            UsageGuide.Target.RULE_GENERATION -> {
+                selectSettingsTabForGuide(SettingsTab.RULES)
+                binding.ruleSettingsPage.scrollTo(0, 0)
+                binding.ruleOutputFormatRow
+            }
+
+            UsageGuide.Target.RULE_GENERATION_LIMIT -> {
+                selectSettingsTabForGuide(SettingsTab.RULES)
+                binding.generationLimitCard.also {
+                    scrollUsageGuideTargetToTop(binding.ruleSettingsPage, it)
+                }
+            }
+
+            UsageGuide.Target.SIMILAR_THREADS -> {
+                selectSettingsTabForGuide(SettingsTab.RULES)
+                binding.wildcardModeRow.also {
+                    scrollUsageGuideTargetToTop(binding.ruleSettingsPage, it)
+                }
+            }
+
+            UsageGuide.Target.PERFORMANCE_TIERS -> {
+                selectSettingsTabForGuide(SettingsTab.PERFORMANCE)
+                binding.performanceSettingsPage.scrollTo(0, 0)
+                binding.performanceTierBestCard
+            }
+
+            UsageGuide.Target.PROCESS_FALLBACK -> {
+                selectSettingsTabForGuide(SettingsTab.PERFORMANCE)
+                binding.processFallbackCard.also {
+                    scrollUsageGuideTargetToTop(binding.performanceSettingsPage, it)
+                }
+            }
+
+            UsageGuide.Target.HELP_BUTTON -> binding.settingsHelpButton
+            else -> null
+        }
+    }
+
+    private fun selectSettingsTabForGuide(tab: SettingsTab) {
+        if (selectedSettingsTab != tab) {
+            binding.settingsTabs.getTabAt(tab.ordinal)?.select()
+        } else {
+            showSettingsTab(tab)
+        }
+    }
+
+    private fun scrollUsageGuideTargetToTop(scrollView: ViewGroup, target: View) {
+        val targetTop = (target.top - 12.dp).coerceAtLeast(0)
+        when (scrollView) {
+            is androidx.core.widget.NestedScrollView -> scrollView.scrollTo(0, targetTop)
+            else -> target.requestRectangleOnScreen(
+                android.graphics.Rect(0, 0, target.width, target.height),
+                false
+            )
+        }
+    }
+
+    fun currentUsageGuideTabIndex(): Int = selectedSettingsTab.ordinal
+
+    fun restoreUsageGuideTab(index: Int) {
+        if (_binding == null) return
+        binding.settingsTabs.getTabAt(index.coerceIn(0, SettingsTab.entries.lastIndex))?.select()
+    }
+
     override fun onTopLevelPageSelected() {
         if (_binding == null) return
         if (!policyLoaded ||
@@ -116,6 +221,7 @@ class SettingsFragment : TopLevelFragment() {
         if (policyLoadInFlight) return
         cancelAutoSave()
         policyLoadInFlight = true
+        policyGuideLayoutReady = false
         val generation = ++policyLoadGeneration
         val currentViewGeneration = viewGeneration
         policyEditable = false
@@ -166,6 +272,7 @@ class SettingsFragment : TopLevelFragment() {
                     })
                     policyEditable = root && moduleOk && !lockedByPendingUpdate && file?.readSuccess == true
                     setPolicyInputsEnabled(policyEditable)
+                    markPolicyGuideLayoutReady(generation, currentViewGeneration)
                 }
             } catch (error: Exception) {
                 android.util.Log.e("AppOpt", "读取校准策略失败", error)
@@ -178,7 +285,18 @@ class SettingsFragment : TopLevelFragment() {
                     policyEditable = false
                     setPolicyInputsEnabled(false)
                     setPolicyStatus("策略文件读取失败，请检查 Root 权限后重试")
+                    markPolicyGuideLayoutReady(generation, currentViewGeneration)
                 }
+            }
+        }
+    }
+
+    private fun markPolicyGuideLayoutReady(generation: Int, currentViewGeneration: Int) {
+        if (_binding == null) return
+        binding.root.doOnPreDraw {
+            if (_binding != null && generation == policyLoadGeneration &&
+                currentViewGeneration == viewGeneration) {
+                policyGuideLayoutReady = true
             }
         }
     }
@@ -391,32 +509,6 @@ class SettingsFragment : TopLevelFragment() {
         }
     }
 
-    private fun exportDiagnosticPackage() {
-        if (diagnosticBusy) {
-            toast("正在导出诊断包")
-            return
-        }
-        diagnosticBusy = true
-        binding.settingsDiagnosticRow.isEnabled = false
-        binding.settingsDiagnosticRow.alpha = 0.55f
-        toast("正在导出诊断包")
-        val currentViewGeneration = viewGeneration
-        thread {
-            val result = DiagnosticExporter.export(appContext)
-            runOnUiThread {
-                if (currentViewGeneration != viewGeneration || _binding == null ||
-                    isFinishing || isDestroyed) return@runOnUiThread
-                diagnosticBusy = false
-                binding.settingsDiagnosticRow.isEnabled = true
-                binding.settingsDiagnosticRow.alpha = 1f
-                result.fold(
-                    onSuccess = { toast("已导出到 $it") },
-                    onFailure = { toast("导出失败: ${it.message ?: "无法写入 Download"}") }
-                )
-            }
-        }
-    }
-
     private fun setPolicyInputsEnabled(enabled: Boolean) {
         val alpha = if (enabled) 1f else 0.55f
         val inputs = listOf(
@@ -460,8 +552,10 @@ class SettingsFragment : TopLevelFragment() {
         val view = DialogPolicyModeBinding.inflate(layoutInflater)
         val dialog = BottomSheetDialog(requireContext())
         val maxCurrent = currentWildcardGroup == CalibPolicy.WildcardGroup.MAX_MEMBER
-        view.modeMaxMemberTitle.text = if (maxCurrent) "平均负载取最高（当前）" else "平均负载取最高"
-        view.modeSumTitle.text = if (!maxCurrent) "平均负载相加（当前）" else "平均负载相加"
+        view.modeMaxMemberTitle.text = "平均负载取最高"
+        view.modeSumTitle.text = "平均负载相加"
+        view.modeMaxMemberSelected.visibility = if (maxCurrent) View.VISIBLE else View.GONE
+        view.modeSumSelected.visibility = if (maxCurrent) View.GONE else View.VISIBLE
         view.modeMaxMember.setOnClickListener {
             dialog.dismiss()
             setWildcardMode(CalibPolicy.WildcardGroup.MAX_MEMBER)
@@ -936,13 +1030,6 @@ class SettingsFragment : TopLevelFragment() {
         }
     }
 
-    private fun showHelp() {
-        val view = layoutInflater.inflate(R.layout.section_help, binding.root, false)
-        val dialog = BottomSheetDialog(requireContext())
-        dialog.setContentView(view)
-        dialog.show()
-    }
-
     private fun Double.formatOne(): String {
         val rounded = kotlin.math.round(this * 10.0) / 10.0
         return if (rounded % 1.0 == 0.0) rounded.toInt().toString() else rounded.toString()
@@ -988,11 +1075,11 @@ class SettingsFragment : TopLevelFragment() {
         policyLoadGeneration++
         policyLoadInFlight = false
         policyLoaded = false
+        policyGuideLayoutReady = false
         ++saveSeq
         coreWarningRunnable?.let { mainHandler.removeCallbacks(it) }
         coreWarningRunnable = null
         coreWarningView = null
-        diagnosticBusy = false
         formatConversionBusy = false
         _binding = null
         super.onDestroyView()

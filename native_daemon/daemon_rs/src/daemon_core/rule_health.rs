@@ -121,18 +121,30 @@ fn ensure_rule_health_loaded(state: &mut DaemonState) -> io::Result<()> {
 fn runtime_rule_health_rules(rules: &[Rule], state: &DaemonState) -> Vec<Rule> {
     rules
         .iter()
-        .filter(|rule| {
-            let Some(entry) = rule_health_entry_from_rule(rule) else {
-                return true;
-            };
-            let key = rule_health_entry_key(&entry);
-            !state
-                .rule_health
-                .get(&key)
-                .is_some_and(|health| health.status == RuleHealthStatus::Missed)
-        })
+        .filter(|rule| !rule_health_rule_disabled(rule, state))
         .cloned()
         .collect()
+}
+
+fn disabled_rule_health_lines(rules: &[Rule], state: &DaemonState) -> Vec<String> {
+    rules
+        .iter()
+        .filter(|rule| rule_health_rule_disabled(rule, state))
+        .map(Rule::line)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn rule_health_rule_disabled(rule: &Rule, state: &DaemonState) -> bool {
+    let Some(entry) = rule_health_entry_from_rule(rule) else {
+        return false;
+    };
+    let key = rule_health_entry_key(&entry);
+    state
+        .rule_health
+        .get(&key)
+        .is_some_and(|health| health.status == RuleHealthStatus::Missed)
 }
 
 fn update_rule_health(
@@ -520,6 +532,7 @@ fn finish_rule_health_observation(
         entry.miss_count = entry.miss_count.saturating_add(1);
         entry.status = if entry.miss_count >= 2 {
             confirmed_miss += 1;
+            println!("[RS] 规则健康已停用: {}", entry.rule_line);
             RuleHealthStatus::Missed
         } else {
             first_miss += 1;

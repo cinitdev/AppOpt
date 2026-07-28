@@ -200,7 +200,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="3dp"
-                    android:text="按掉帧程度接管 CPU 调速，必要时提升活跃线程优先级，流畅后恢复"
+                    android:text="按掉帧程度接管 CPU 调速，必要时提升活跃线程优先级，流畅后恢复(不保证有效)"
                     android:textColor="@color/text_secondary"
                     android:textSize="12sp" />
             </LinearLayout>

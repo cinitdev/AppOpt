@@ -19,11 +19,17 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import android.view.WindowManager
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 
 object AppToast {
     private var currentToast: Toast? = null
     private var currentDialog: Dialog? = null
+    private var currentDialogContent: View? = null
     private var currentDialogHide: Runnable? = null
+    private var currentDialogOwner: LifecycleOwner? = null
+    private var currentDialogObserver: LifecycleEventObserver? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @SuppressLint("ShowToast")
@@ -37,6 +43,8 @@ object AppToast {
         val activity = context.findActivity()
         if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
             if (showOverActivity(activity, message, duration)) return
+        } else {
+            dismissCurrentDialog()
         }
 
         val appContext = context.applicationContext
@@ -70,15 +78,19 @@ object AppToast {
 
     /** 使用独立、不可交互的应用窗口，确保提示显示在 BottomSheet 和普通 Dialog 上方。 */
     private fun showOverActivity(activity: Activity, message: String, duration: Int): Boolean {
+        val lifecycleOwner = activity as? LifecycleOwner
+        if (lifecycleOwner != null &&
+            !lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            dismissCurrentDialog()
+            return false
+        }
+
         val density = activity.resources.displayMetrics.density
         fun dp(value: Float): Int = (value * density + 0.5f).toInt()
 
         currentToast?.cancel()
         currentToast = null
-        currentDialogHide?.let(mainHandler::removeCallbacks)
-        currentDialogHide = null
-        currentDialog?.dismiss()
-        currentDialog = null
+        dismissCurrentDialog()
 
         val container = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -136,23 +148,47 @@ object AppToast {
                 dimAmount = 0f
             }
         }
-        dialog.setOnDismissListener {
-            if (currentDialog === dialog) {
-                currentDialogHide?.let(mainHandler::removeCallbacks)
-                currentDialogHide = null
-                currentDialog = null
+        var lifecycleObserver: LifecycleEventObserver? = null
+        lifecycleObserver = lifecycleOwner?.let { owner ->
+            LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_STOP || event == Lifecycle.Event.ON_DESTROY) {
+                    lifecycleObserver?.let(owner.lifecycle::removeObserver)
+                    if (currentDialog === dialog) {
+                        dismissCurrentDialog()
+                    } else {
+                        cancelAnimation(container)
+                        dismissSafely(dialog)
+                    }
+                }
             }
+        }
+        dialog.setOnDismissListener {
+            cancelAnimation(container)
+            lifecycleObserver?.let { observer ->
+                lifecycleOwner?.lifecycle?.removeObserver(observer)
+            }
+            releaseCurrentDialog(dialog)
         }
         try {
             dialog.show()
         } catch (_: WindowManager.BadTokenException) {
+            dialog.setOnDismissListener(null)
+            return false
+        } catch (_: IllegalArgumentException) {
+            dialog.setOnDismissListener(null)
             return false
         } catch (_: IllegalStateException) {
+            dialog.setOnDismissListener(null)
             return false
         }
         currentDialog = dialog
+        currentDialogContent = container
+        currentDialogOwner = lifecycleOwner
+        currentDialogObserver = lifecycleObserver
+        lifecycleObserver?.let { lifecycleOwner?.lifecycle?.addObserver(it) }
         container.post {
-            if (dialog.isShowing) {
+            if (currentDialog === dialog && dialog.isShowing &&
+                !activity.isFinishing && !activity.isDestroyed) {
                 container.animate()
                     .alpha(1f)
                     .translationY(0f)
@@ -163,19 +199,80 @@ object AppToast {
 
         val showMs = if (duration == Toast.LENGTH_LONG) 3200L else 1900L
         val hide = Runnable {
-            if (currentDialog !== dialog || !dialog.isShowing) return@Runnable
+            if (currentDialog !== dialog) return@Runnable
+            if (!dialog.isShowing || activity.isFinishing || activity.isDestroyed) {
+                dismissCurrentDialog()
+                return@Runnable
+            }
             container.animate()
                 .alpha(0f)
                 .translationY(dp(8f).toFloat())
                 .setDuration(140L)
                 .withEndAction {
-                    if (currentDialog === dialog) dialog.dismiss()
+                    if (currentDialog === dialog) dismissCurrentDialog()
                 }
                 .start()
         }
         currentDialogHide = hide
         mainHandler.postDelayed(hide, showMs)
         return true
+    }
+
+    private fun releaseCurrentDialog(dialog: Dialog) {
+        if (currentDialog !== dialog) return
+        currentDialogHide?.let(mainHandler::removeCallbacks)
+        currentDialogObserver?.let { observer ->
+            currentDialogOwner?.lifecycle?.removeObserver(observer)
+        }
+        currentDialog = null
+        currentDialogContent = null
+        currentDialogHide = null
+        currentDialogOwner = null
+        currentDialogObserver = null
+    }
+
+    private fun dismissCurrentDialog() {
+        val dialog = currentDialog
+        val content = currentDialogContent
+        val hide = currentDialogHide
+        val owner = currentDialogOwner
+        val observer = currentDialogObserver
+
+        currentDialog = null
+        currentDialogContent = null
+        currentDialogHide = null
+        currentDialogOwner = null
+        currentDialogObserver = null
+
+        hide?.let(mainHandler::removeCallbacks)
+        observer?.let { owner?.lifecycle?.removeObserver(it) }
+        cancelAnimation(content)
+        dialog?.setOnDismissListener(null)
+        dialog?.let(::dismissSafely)
+    }
+
+    private fun cancelAnimation(view: View?) {
+        view?.animate()
+            ?.setListener(null)
+            ?.withEndAction(null)
+            ?.cancel()
+    }
+
+    private fun dismissSafely(dialog: Dialog) {
+        try {
+            val decor = dialog.window?.decorView
+            if (dialog.isShowing && decor?.isAttachedToWindow != false) {
+                dialog.dismiss()
+            }
+        } catch (_: IllegalArgumentException) {
+            // 系统已先移除窗口，下面的 finally 仍会断开 Dialog 对 Activity 的引用。
+        } catch (_: WindowManager.BadTokenException) {
+            // Activity token 已失效，只保留本地清理，不能再操作 WindowManager。
+        } catch (_: IllegalStateException) {
+            // Activity 正在销毁，避免再次提交窗口事务。
+        } finally {
+            dialog.setOnDismissListener(null)
+        }
     }
 
     private fun toastBackground(radius: Float): GradientDrawable {

@@ -41,10 +41,6 @@
             android:exported="false" />
 
         <activity
-            android:name=".LogActivity"
-            android:exported="false" />
-
-        <activity
             android:name=".UpdateInstallActivity"
             android:exported="false" />
 
