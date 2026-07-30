@@ -86,7 +86,7 @@ AppOpt改版特色.md                 功能特色说明
 项目使用 `native_daemon/fps_monitor/aya` 子模块保存精简版 Aya。首次克隆建议带上子模块：
 
 ```bash
-git clone --recurse-submodules <repo-url>
+git clone --recurse-submodules https://github.com/cinitdev/AppOpt.git
 ```
 
 如果已经克隆过项目，在项目根目录执行：
