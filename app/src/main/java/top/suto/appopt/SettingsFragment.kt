@@ -49,6 +49,7 @@ class SettingsFragment : TopLevelFragment() {
     private var cpusetBusy = false
     private var cpusetSupported = false
     private var currentCpusetName = CalibPolicy.DEFAULT_CPUSET_NAME
+    private var presentCpus: Set<Int> = emptySet()
     private var currentDetectedTopologyBlock = ""
     private var availableCpus: List<Int> = (0..7).toList()
     private val bestCores = linkedSetOf<Int>()
@@ -250,6 +251,7 @@ class SettingsFragment : TopLevelFragment() {
                 val version = if (root) DaemonBridge.readModuleVersion() else null
                 val file = if (root) DaemonBridge.readCalibPolicyRaw() else null
                 val cpusetSupported = root && DaemonBridge.supportsCustomCpuset()
+                val presentCpus = if (root) DaemonBridge.readPresentCpus() else emptySet()
                 val rawPolicy = file?.takeIf { it.readSuccess }?.content?.takeIf { it.isNotBlank() }
                 val policy = rawPolicy
                     ?.takeIf { it.isNotBlank() }
@@ -263,6 +265,7 @@ class SettingsFragment : TopLevelFragment() {
                     lastPolicyLoadFinishedAt = SystemClock.elapsedRealtime()
                     hasRoot = root
                     moduleVersion = version
+                    this.presentCpus = presentCpus
                     lockedByPendingUpdate = file?.lockedByPendingUpdate == true
                     val moduleOk = version?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
                     val moduleLabel = version?.let { "${it.versionName} (${it.versionCode})" }
@@ -492,8 +495,9 @@ class SettingsFragment : TopLevelFragment() {
         val moduleOk = moduleVersion?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
         policyEditable = hasRoot && moduleOk && !lockedByPendingUpdate
         setPolicyInputsEnabled(policyEditable)
+        val effectivePolicy = readPolicyFromInputs() ?: policy
         val seq = ++saveSeq
-        savePolicy(policy, seq, successMessage = "已恢复默认策略")
+        savePolicy(effectivePolicy, seq, successMessage = "已恢复默认策略")
     }
 
     private fun moduleDefaultPolicy(): CalibPolicy {
@@ -1104,6 +1108,7 @@ class SettingsFragment : TopLevelFragment() {
     }
 
     private fun availableCpuList(policy: CalibPolicy, topology: Map<String, String>): List<Int> {
+        if (presentCpus.isNotEmpty()) return presentCpus.sorted()
         val detected = topology["all"]?.let { parseCpuRanges(it) }.orEmpty()
         if (detected.isNotEmpty()) return detected.sorted()
 
@@ -1117,9 +1122,9 @@ class SettingsFragment : TopLevelFragment() {
         }
         if (fromPolicy.isNotEmpty()) {
             val max = fromPolicy.maxOrNull() ?: 7
-            return (0..max.coerceAtLeast(7)).toList()
+            return (0..max).toList()
         }
-        return (0..7).toList()
+        return listOf(0)
     }
 
     private fun parseDetectedTopology(block: String): Map<String, String> {

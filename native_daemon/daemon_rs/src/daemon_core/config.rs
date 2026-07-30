@@ -38,11 +38,8 @@ fn parse_config_text(text: &str) -> Vec<Rule> {
                     .filter(|rule| !(rule.auto && rule.thread.is_some()))
             })
             .collect::<Vec<_>>();
-        if group.block && parsed.iter().any(Option::is_none) {
-            continue;
-        }
-        // 区块的语法原子性已在上面确认；不存在于本机的 CPU 只忽略当前规则，
-        // 不应该连带丢弃同区块的其他有效规则。
+        // 区块结构的原子性已经由 rule_syntax 确认。成员的 CPU 值或规则键无效时
+        // 只忽略该成员，不能让一条坏规则拖累同一区块的其他正常规则。
         rules.extend(
             parsed
                 .into_iter()

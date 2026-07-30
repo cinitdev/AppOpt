@@ -79,12 +79,21 @@ pub(crate) fn format_generated_rules(
         .filter_map(Option::as_ref)
         .filter(|rule| rule.thread.is_none() && rule.owner.starts_with(&format!("{pkg}:")))
         .collect::<Vec<_>>();
+    let ambiguous_untyped_threads = threads
+        .iter()
+        .copied()
+        .filter(|rule| is_ambiguous_untyped_thread(pkg, rule))
+        .collect::<Vec<_>>();
+    let unambiguous_threads = threads
+        .iter()
+        .copied()
+        .filter(|rule| !is_ambiguous_untyped_thread(pkg, rule))
+        .collect::<Vec<_>>();
     let others = parsed
         .iter()
         .filter_map(|rule| match rule {
             Some(rule)
-                if (rule.owner == pkg && rule.thread.is_none())
-                    || (rule.owner == pkg && rule.thread.is_some())
+                if rule.owner == pkg
                     || (rule.thread.is_none() && rule.owner.starts_with(&format!("{pkg}:"))) =>
             {
                 None
@@ -106,7 +115,7 @@ pub(crate) fn format_generated_rules(
     match output_format {
         RuleOutputFormat::Legacy => unreachable!(),
         RuleOutputFormat::AuthorBlock => {
-            if threads.is_empty() {
+            if unambiguous_threads.is_empty() {
                 fallback
                     .as_ref()
                     .map(|cpus| format!("{pkg}={cpus}"))
@@ -117,7 +126,7 @@ pub(crate) fn format_generated_rules(
                     Some(cpus) => format!("{pkg}={cpus} {{"),
                     None => format!("{pkg} {{"),
                 });
-                for rule in threads {
+                for rule in &unambiguous_threads {
                     out.push(format!(
                         "    {}={}",
                         rule.thread.as_deref().unwrap_or_default(),
@@ -127,9 +136,14 @@ pub(crate) fn format_generated_rules(
                 out.push("}".to_string());
             }
             out.extend(children.into_iter().map(|rule| rule.original.clone()));
+            out.extend(
+                ambiguous_untyped_threads
+                    .iter()
+                    .map(|rule| rule.original.clone()),
+            );
         }
         RuleOutputFormat::CompactExtendedBlock => {
-            if threads.is_empty() && children.is_empty() {
+            if unambiguous_threads.is_empty() && children.is_empty() {
                 fallback
                     .as_ref()
                     .map(|cpus| format!("{pkg}={cpus}"))
@@ -137,12 +151,17 @@ pub(crate) fn format_generated_rules(
                     .for_each(|line| out.push(line));
             } else {
                 out.push(format!("{pkg}{{"));
-                append_block_members(&mut out, pkg, &threads, &children);
+                append_block_members(&mut out, pkg, &unambiguous_threads, &children);
                 out.push(match fallback.as_ref() {
                     Some(cpus) => format!("}}={cpus}"),
                     None => "}".to_string(),
                 });
             }
+            out.extend(
+                ambiguous_untyped_threads
+                    .iter()
+                    .map(|rule| rule.original.clone()),
+            );
         }
         RuleOutputFormat::TaggedBlock => {
             out.push(format!("{pkg}={{"));
@@ -249,6 +268,12 @@ pub(crate) fn format_generated_rules(
     }
     out.extend(others);
     out
+}
+
+fn is_ambiguous_untyped_thread(pkg: &str, rule: &GeneratedRule) -> bool {
+    rule.thread
+        .as_deref()
+        .is_some_and(|thread| thread.starts_with(':') || thread.starts_with(&format!("{pkg}:")))
 }
 
 fn append_block_members(

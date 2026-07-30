@@ -7,7 +7,6 @@ pub struct CanonicalRule {
 
 pub struct CanonicalGroup {
     pub rules: Vec<CanonicalRule>,
-    pub block: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -70,7 +69,6 @@ fn parse_document(text: &str) -> ParsedDocument {
             valid &= parsed.is_some();
             groups.push(CanonicalGroup {
                 rules: parsed.unwrap_or_default(),
-                block: true,
             });
             ranges.push(BlockRange {
                 owner: header.owner,
@@ -112,7 +110,6 @@ fn parse_document(text: &str) -> ParsedDocument {
                 } else {
                     Vec::new()
                 },
-                block: true,
             });
             ranges.push(BlockRange {
                 owner: header.owner,
@@ -124,10 +121,7 @@ fn parse_document(text: &str) -> ParsedDocument {
         }
 
         let rules = parse_legacy_rule(code).into_iter().collect();
-        groups.push(CanonicalGroup {
-            rules,
-            block: false,
-        });
+        groups.push(CanonicalGroup { rules });
         index += 1;
     }
 

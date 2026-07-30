@@ -171,9 +171,11 @@ object RuleFormatConverter {
             return group.rules.map(RuleSyntax.Rule::canonicalLine)
         }
 
-        val fallback = group.rules.firstOrNull { it.owner == group.owner && it.thread == null }
-        val threads = group.rules.filter { it.owner == group.owner && it.thread != null }
-        val children = group.rules.filter { it.owner != group.owner && it.thread == null }
+        val invalidRules = group.rules.filterNot(::isRuntimeRuleValid)
+        val runtimeRules = group.rules.filter(::isRuntimeRuleValid)
+        val fallback = runtimeRules.firstOrNull { it.owner == group.owner && it.thread == null }
+        val threads = runtimeRules.filter { it.owner == group.owner && it.thread != null }
+        val children = runtimeRules.filter { it.owner != group.owner && it.thread == null }
         val untypedBlock = format == CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK ||
             format == CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK
         val legacyOnlyThreads = if (untypedBlock) {
@@ -189,6 +191,7 @@ object RuleFormatConverter {
             return buildList {
                 addAll(legacyOnlyThreads.map(RuleSyntax.Rule::canonicalLine))
                 fallback?.let { add(it.canonicalLine) }
+                addAll(invalidRules.map(RuleSyntax.Rule::canonicalLine))
             }
         }
 
@@ -203,6 +206,7 @@ object RuleFormatConverter {
             }
             output.addAll(legacyOnlyThreads.map(RuleSyntax.Rule::canonicalLine))
             children.forEach { output.add(it.canonicalLine) }
+            output.addAll(invalidRules.map(RuleSyntax.Rule::canonicalLine))
             return output
         }
 
@@ -304,7 +308,15 @@ object RuleFormatConverter {
             CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> error("旧区块格式只能转换为原作者格式")
         }
         output.addAll(legacyOnlyThreads.map(RuleSyntax.Rule::canonicalLine))
+        output.addAll(invalidRules.map(RuleSyntax.Rule::canonicalLine))
         return output
+    }
+
+    private fun isRuntimeRuleValid(rule: RuleSyntax.Rule): Boolean {
+        if (!RuleConfigLogic.ownerFitsNativeBuffer(rule.owner)) return false
+        if (rule.thread != null && !RuleConfigLogic.threadFitsNativeBuffer(rule.thread)) return false
+        if (rule.cpus.equals("auto", ignoreCase = true)) return rule.thread == null
+        return RuleConfigLogic.parseNativeCpuRangeList(rule.cpus)?.isNotEmpty() == true
     }
 
     private fun isAmbiguousUntypedBlockThread(owner: String, thread: String): Boolean {

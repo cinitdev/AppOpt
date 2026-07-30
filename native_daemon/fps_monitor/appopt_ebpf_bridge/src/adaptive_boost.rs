@@ -107,6 +107,9 @@ mod platform {
     const HIGH_BASELINE_SAMPLES: usize = 4;
     const HIGH_BASELINE_RATIO: f64 = 1.20;
     const HIGH_BASELINE_TOLERANCE: f64 = 0.10;
+    const LOW_BASELINE_SAMPLES: usize = 6;
+    const LOW_BASELINE_RATIO: f64 = 0.90;
+    const LOW_BASELINE_TOLERANCE: f64 = 0.08;
     const BASELINE_SMOOTHING: f64 = 0.15;
     const MAX_BOOSTED_THREADS: usize = 16;
     const RECOVERY_FILE: &str = "/data/adb/modules/AppOpt/config/boost.restore";
@@ -156,6 +159,7 @@ mod platform {
         pid: i32,
         baseline_samples: Vec<f64>,
         high_baseline_samples: Vec<f64>,
+        low_baseline_samples: Vec<f64>,
         baseline_fps: f64,
         moderate_count: u32,
         smooth_count: u32,
@@ -181,6 +185,7 @@ mod platform {
                 pid: -1,
                 baseline_samples: Vec::with_capacity(8),
                 high_baseline_samples: Vec::with_capacity(HIGH_BASELINE_SAMPLES + 1),
+                low_baseline_samples: Vec::with_capacity(LOW_BASELINE_SAMPLES + 1),
                 baseline_fps: 0.0,
                 moderate_count: 0,
                 smooth_count: 0,
@@ -259,6 +264,10 @@ mod platform {
                         || value.max_interval_ns > value.median_interval_ns.saturating_mul(28) / 10)
             });
             let fallback_like = metrics.is_none_or(|value| value.flags & 1 != 0);
+            let stable_frame_time = metrics.is_none_or(|value| {
+                value.flags & 1 != 0
+                    || (value.frame_count >= 6 && value.median_interval_ns > 0 && !mild_irregular)
+            });
 
             if self.baseline_fps <= 0.0 {
                 self.baseline_samples.push(fps);
@@ -269,6 +278,41 @@ mod platform {
                     .sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
                 self.baseline_fps = self.baseline_samples[self.baseline_samples.len() / 2];
                 return Some((4, format!("已学习帧率基线 {:.1} FPS", self.baseline_fps)));
+            }
+
+            if let Some(candidate) = self.stable_lower_baseline(fps, stable_frame_time) {
+                let previous = self.baseline_fps;
+                let was_active = self.jank_level > 0 || self.boosted || self.restore_pending;
+                let restored = self.restore();
+                self.baseline_fps = candidate;
+                self.moderate_count = 0;
+                self.smooth_count = 0;
+                self.thread_sample = None;
+                self.high_baseline_samples.clear();
+                return Some(if was_active {
+                    if restored {
+                        (
+                            3,
+                            format!(
+                                "检测到稳定帧率档位变化，基线已从 {:.1} 更新为 {:.1} FPS，已恢复增强参数",
+                                previous, candidate
+                            ),
+                        )
+                    } else {
+                        (
+                            4,
+                            format!(
+                                "检测到稳定帧率档位变化，基线已从 {:.1} 更新为 {:.1} FPS，部分增强参数尚未恢复",
+                                previous, candidate
+                            ),
+                        )
+                    }
+                } else {
+                    (
+                        4,
+                        format!("帧率基线已从 {:.1} 更新为 {:.1} FPS", previous, candidate),
+                    )
+                });
             }
 
             let ordinary = fps < self.baseline_fps * 0.85 && (mild_irregular || fallback_like);
@@ -396,6 +440,7 @@ mod platform {
         fn reset_learning(&mut self) {
             self.baseline_samples.clear();
             self.high_baseline_samples.clear();
+            self.low_baseline_samples.clear();
             self.baseline_fps = 0.0;
             self.moderate_count = 0;
             self.smooth_count = 0;
@@ -403,6 +448,34 @@ mod platform {
             self.jank_level = 0;
             self.thread_boost_attempted = false;
             self.thread_sample = None;
+        }
+
+        fn stable_lower_baseline(&mut self, fps: f64, stable_frame_time: bool) -> Option<f64> {
+            if !stable_frame_time || fps >= self.baseline_fps * LOW_BASELINE_RATIO {
+                self.low_baseline_samples.clear();
+                return None;
+            }
+
+            let stable = if self.low_baseline_samples.is_empty() {
+                true
+            } else {
+                let average = self.low_baseline_samples.iter().sum::<f64>()
+                    / self.low_baseline_samples.len() as f64;
+                (fps - average).abs() <= (average * LOW_BASELINE_TOLERANCE).max(2.0)
+            };
+            if !stable {
+                self.low_baseline_samples.clear();
+            }
+            self.low_baseline_samples.push(fps);
+            if self.low_baseline_samples.len() < LOW_BASELINE_SAMPLES {
+                return None;
+            }
+
+            self.low_baseline_samples
+                .sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+            let candidate = self.low_baseline_samples[self.low_baseline_samples.len() / 2];
+            self.low_baseline_samples.clear();
+            Some(candidate)
         }
 
         fn update_smooth_baseline(&mut self, fps: f64, allow_smoothing: bool) -> Option<String> {

@@ -78,7 +78,8 @@ object DaemonBridge {
 
     data class RootCommandResult(
         val output: String,
-        val success: Boolean
+        val success: Boolean,
+        val timedOut: Boolean = false
     )
 
     data class TopAppState(
@@ -309,7 +310,8 @@ object DaemonBridge {
         val out = runAsRoot(cmd, timeoutSeconds.coerceAtLeast(1L))
         return RootCommandResult(
             output = out.substringBefore(ERR_MARK),
-            success = out.isNotErrored()
+            success = out.isNotErrored(),
+            timedOut = out.contains(ROOT_TIMEOUT_MARK)
         )
     }
 
@@ -1498,6 +1500,7 @@ object DaemonBridge {
     }
 
     private const val ERR_MARK = "__APPOPT_ERR__"
+    private const val ROOT_TIMEOUT_MARK = "__APPOPT_TIMEOUT__"
 
     private fun String.isNotErrored(): Boolean = !this.contains(ERR_MARK)
 
@@ -1646,12 +1649,19 @@ object DaemonBridge {
 
     /** 等待 root 子进程结束，并读取 stdout；超时或非零退出会附加错误标记。 */
     private fun waitAndRead(process: Process, timeoutSeconds: Long = ROOT_TIMEOUT_SECONDS): String {
-        val outRef = AtomicReference("")
+        val out = StringBuilder()
         val readFailed = AtomicReference(false)
         val reader = Thread {
             try {
                 process.inputStream.bufferedReader().use { input ->
-                    outRef.set(input.readText())
+                    val buffer = CharArray(4096)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        synchronized(out) {
+                            out.append(buffer, 0, count)
+                        }
+                    }
                 }
             } catch (_: Exception) {
                 readFailed.set(true)
@@ -1669,12 +1679,12 @@ object DaemonBridge {
         }
         if (!finished) {
             stopRootProcess(process, reader)
-            return ERR_MARK
+            return synchronized(out) { out.toString() } + ERR_MARK + ROOT_TIMEOUT_MARK
         }
 
         joinRootReader(reader)
-        val out = outRef.get()
-        return if (process.exitValue() != 0 || readFailed.get()) "$out$ERR_MARK" else out
+        val output = synchronized(out) { out.toString() }
+        return if (process.exitValue() != 0 || readFailed.get()) "$output$ERR_MARK" else output
     }
 
     /** Root 进程超时后主动关闭读取端，并等待读取线程退出，避免关闭流异常逃逸到主进程。 */
@@ -1734,7 +1744,8 @@ object DaemonBridge {
             stopRootProcess(process, reader)
             return RootCommandResult(
                 output = synchronized(out) { out.toString() },
-                success = false
+                success = false,
+                timedOut = true
             )
         }
 
@@ -1755,11 +1766,21 @@ object DaemonBridge {
             // "stderr 写满管道缓冲(~64KB)->子进程阻塞写、父进程阻塞读 stdout"的死锁,
             // 又不像合并 stderr 那样污染 stdout(hasRoot 等按内容精确解析)。
             // (不用 Redirect.DISCARD: 那是 Java9+ API, Android 上不可用。)
-            val process = ProcessBuilder("su", "-c", cmd)
+            val marker = "__APPOPT_SU_C_${UUID.randomUUID()}__"
+            val wrapped = "printf '%s\\n' '$marker';\n$cmd"
+            val process = ProcessBuilder("su", "-c", wrapped)
                 .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
                 .start()
             try {
-                waitAndRead(process, timeoutSeconds)
+                val output = waitAndRead(process, timeoutSeconds)
+                val clean = stripSuShellMarker(output, marker)
+                if (clean != null) {
+                    clean
+                } else if (output.contains(ROOT_TIMEOUT_MARK)) {
+                    output
+                } else {
+                    return runViaStdin(cmd, timeoutSeconds)
+                }
             } finally {
                 process.destroy()
             }
@@ -1796,11 +1817,26 @@ object DaemonBridge {
         onOutput: (String) -> Unit
     ): RootCommandResult {
         return try {
-            val process = ProcessBuilder("su", "-c", cmd)
+            val marker = "__APPOPT_SU_C_${UUID.randomUUID()}__"
+            val wrapped = "printf '%s\\n' '$marker';\n$cmd"
+            val process = ProcessBuilder("su", "-c", wrapped)
                 .redirectError(ProcessBuilder.Redirect.to(DEV_NULL))
                 .start()
             try {
-                waitAndStream(process, timeoutSeconds, onOutput)
+                var markerSeen = false
+                val result = waitAndStream(process, timeoutSeconds) { chunk ->
+                    if (chunk.trimEnd('\r', '\n') == marker) {
+                        markerSeen = true
+                    } else if (markerSeen) {
+                        onOutput(chunk)
+                    }
+                }
+                val output = stripSuShellMarker(result.output, marker)
+                if (output == null) {
+                    if (result.timedOut) return result
+                    return runViaStdinStreaming(cmd, timeoutSeconds, onOutput)
+                }
+                result.copy(output = output)
             } finally {
                 process.destroy()
             }
@@ -1831,5 +1867,22 @@ object DaemonBridge {
         } catch (_: Exception) {
             RootCommandResult(output = "", success = false)
         }
+    }
+
+    private fun stripSuShellMarker(output: String, marker: String): String? {
+        var offset = 0
+        for (rawLine in output.splitToSequence('\n')) {
+            val lineEnd = offset + rawLine.length
+            if (rawLine.trimEnd('\r') == marker) {
+                val contentStart = if (lineEnd < output.length && output[lineEnd] == '\n') {
+                    lineEnd + 1
+                } else {
+                    lineEnd
+                }
+                return output.substring(contentStart)
+            }
+            offset = lineEnd + 1
+        }
+        return null
     }
 }
