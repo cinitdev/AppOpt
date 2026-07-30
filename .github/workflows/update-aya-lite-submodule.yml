@@ -7,7 +7,10 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
+
+concurrency:
+  group: update-aya-lite-submodule
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -16,6 +19,7 @@ jobs:
     env:
       AYA_SUBMODULE_PATH: native_daemon/fps_monitor/aya
       AYA_BRIDGE_LOCK: native_daemon/fps_monitor/appopt_ebpf_bridge/Cargo.lock
+      TARGET_BRANCH: master
 
     steps:
       - name: Checkout
@@ -39,7 +43,6 @@ jobs:
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "aya_commit=$(git -C "$AYA_SUBMODULE_PATH" rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "aya_full_commit=$(git -C "$AYA_SUBMODULE_PATH" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK
         if: steps.update.outputs.changed == 'true'
@@ -86,12 +89,10 @@ jobs:
           chmod +x ./gradlew ./build_module.sh
           ./build_module.sh release
 
-      - name: Create update pull request
+      - name: Commit updated submodule
         if: steps.update.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
           AYA_COMMIT: ${{ steps.update.outputs.aya_commit }}
-          AYA_FULL_COMMIT: ${{ steps.update.outputs.aya_full_commit }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -102,30 +103,10 @@ jobs:
             exit 0
           fi
 
-          BRANCH="bot/update-aya-lite"
-          git checkout -B "$BRANCH"
-          git commit -m "chore: update aya-lite submodule"
-          git push --force-with-lease origin "$BRANCH"
-
-          {
-            echo "自动更新 \`$AYA_SUBMODULE_PATH\` 子模块。"
-            echo
-            echo "- aya-lite commit: \`$AYA_FULL_COMMIT\`"
-            echo "- 本次已执行: \`./build_module.sh release\`"
-            echo
-            echo "上游同步信息："
-            echo
-            cat "$AYA_SUBMODULE_PATH/UPSTREAM.md"
-          } > /tmp/aya-lite-pr-body.md
-
-          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
-            gh pr edit "$BRANCH" \
-              --title "chore: update aya-lite submodule to ${AYA_COMMIT}" \
-              --body-file /tmp/aya-lite-pr-body.md
-          else
-            gh pr create \
-              --base "${GITHUB_REF_NAME:-main}" \
-              --head "$BRANCH" \
-              --title "chore: update aya-lite submodule to ${AYA_COMMIT}" \
-              --body-file /tmp/aya-lite-pr-body.md
+          git commit -m "chore: update aya-lite submodule to ${AYA_COMMIT}"
+          git fetch origin "$TARGET_BRANCH"
+          if [ "$(git rev-parse "origin/$TARGET_BRANCH")" != "$GITHUB_SHA" ]; then
+            echo "::error::$TARGET_BRANCH changed during the build; refusing to overwrite it"
+            exit 1
           fi
+          git push origin "HEAD:$TARGET_BRANCH"
