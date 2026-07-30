@@ -173,40 +173,46 @@ fn parse_uid_map_with_key(path: &Path) -> io::Result<(HashMap<String, u32>, Opti
     Ok((map, Some(key)))
 }
 
-fn build_scan_plan(
+fn build_runtime_rule_index(
     rules: &[Rule],
     uid_map: &HashMap<String, u32>,
     target_pkg: Option<&str>,
-) -> ScanPlan {
-    let mut plan = ScanPlan::default();
-
-    // 把规则整理成“扫描计划”：
-    // - 有 UID 的包按 appId 建索引，同包名的 Android 多用户/应用分身共享 appId。
-    // - all_pkgs 为所有包提供严格 cmdline 兜底；fallback_pkgs 只记录缺少映射的包。
-    // - --pkg 只用于调试/单包扫描，不影响正常守护模式。
-    //
-    // 规则 owner 可能是主包名或子进程名；UID 映射只按基础包名建立。
-    for rule in rules.iter().filter(|rule| !rule.auto) {
+    state: &DaemonState,
+) -> RuntimeRuleIndex {
+    let mut index = RuntimeRuleIndex::default();
+    for (rule_index, rule) in rules.iter().enumerate() {
+        if rule.auto || rule_health_rule_disabled(rule, state) {
+            continue;
+        }
         let Some(base_pkg) = base_package(&rule.owner) else {
             continue;
         };
-        if let Some(target) = target_pkg {
-            if base_pkg != target {
-                continue;
-            }
+        if target_pkg.is_some_and(|target| target != base_pkg) {
+            continue;
         }
-        plan.all_pkgs.insert(base_pkg.to_string());
+
+        index.active_rule_indices.push(rule_index);
+        index
+            .rules_by_owner
+            .entry(rule.owner.clone())
+            .or_default()
+            .push(rule_index);
+        if rule.thread.is_some() || rule.owner.contains(':') {
+            index.health_rule_packages.insert(base_pkg.to_string());
+        }
+        index.plan.all_pkgs.insert(base_pkg.to_string());
         if let Some(uid) = uid_map.get(base_pkg) {
-            plan.by_app_id
+            index
+                .plan
+                .by_app_id
                 .entry(android_app_id(*uid))
                 .or_default()
                 .insert(base_pkg.to_string());
         } else {
-            plan.fallback_pkgs.insert(base_pkg.to_string());
+            index.plan.fallback_pkgs.insert(base_pkg.to_string());
         }
     }
-
-    plan
+    index
 }
 
 fn android_app_id(uid: u32) -> u32 {
@@ -233,18 +239,4 @@ fn content_file_key(bytes: &[u8]) -> FileKey {
         len: bytes.len() as u64,
         content_hash: hash,
     }
-}
-
-fn build_rules_by_owner(rules: &[Rule]) -> HashMap<&str, Vec<&Rule>> {
-    let mut rules_by_owner: HashMap<&str, Vec<&Rule>> = HashMap::new();
-    for rule in rules {
-        // auto 是校准生成占位，真正核心范围由策略生成后写回，不在这里执行。
-        if !rule.auto {
-            rules_by_owner
-                .entry(rule.owner.as_str())
-                .or_default()
-                .push(rule);
-        }
-    }
-    rules_by_owner
 }

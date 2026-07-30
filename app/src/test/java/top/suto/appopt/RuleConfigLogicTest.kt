@@ -127,4 +127,30 @@ class RuleConfigLogicTest {
 
         assertTrue(environmentRequests.isCurrent(environment))
     }
+
+    @Test
+    fun calibrationPolicyPersistsCpusetNameInTheSharedConfig() {
+        val parsed = CalibPolicy.parse(
+            """
+            version=1
+            cpuset_name=GameThreads
+            """.trimIndent()
+        )
+
+        assertEquals("GameThreads", parsed.cpusetName)
+        assertTrue(parsed.toConfigText().lineSequence().any { it == "cpuset_name=GameThreads" })
+        assertEquals("GameThreads", CalibPolicy.parse(parsed.toConfigText()).cpusetName)
+    }
+
+    @Test
+    fun calibrationPolicyRejectsInvalidCpusetNames() {
+        assertEquals(
+            CalibPolicy.DEFAULT_CPUSET_NAME,
+            CalibPolicy.parse("cpuset_name=../invalid").cpusetName
+        )
+        assertNull(CalibPolicy.normalizeCpusetNameOrNull(".hidden"))
+        assertNull(CalibPolicy.normalizeCpusetNameOrNull("name/child"))
+        assertNull(CalibPolicy.normalizeCpusetNameOrNull("a".repeat(49)))
+        assertEquals("game-threads.v2", CalibPolicy.normalizeCpusetNameOrNull("game-threads.v2"))
+    }
 }

@@ -22,7 +22,7 @@ fn metadata_uid(_path: &Path) -> io::Result<u32> {
 fn read_cmdline(pid: i32) -> io::Result<String> {
     let data = fs::read(format!("/proc/{pid}/cmdline"))?;
     let first = data.split(|byte| *byte == 0).next().unwrap_or_default();
-    // C 版按 argv[0] 的 basename 匹配系统进程；Android 应用进程名本身不含路径。
+    // 按 argv[0] 的 basename 匹配系统进程；Android 应用进程名本身不含路径。
     let basename = first
         .rsplit(|byte| *byte == b'/')
         .next()

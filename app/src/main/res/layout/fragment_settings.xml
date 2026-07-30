@@ -829,6 +829,86 @@
                     app:iconGravity="textStart"
                     app:iconPadding="8dp"
                     app:iconSize="18dp" />
+
+                <TextView
+                    style="@style/SettingsSectionLabel"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="18dp"
+                    android:text="运行方式" />
+
+                <LinearLayout
+                    android:id="@+id/cpusetNameRow"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:background="@drawable/bg_list_group"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:foreground="?attr/selectableItemBackground"
+                    android:gravity="center_vertical"
+                    android:minHeight="64dp"
+                    android:orientation="horizontal"
+                    android:paddingStart="14dp"
+                    android:paddingTop="8dp"
+                    android:paddingEnd="10dp"
+                    android:paddingBottom="8dp">
+
+                    <FrameLayout
+                        android:layout_width="36dp"
+                        android:layout_height="36dp"
+                        android:background="@drawable/bg_settings_badge_fallback">
+
+                        <ImageView
+                            android:layout_width="20dp"
+                            android:layout_height="20dp"
+                            android:layout_gravity="center"
+                            android:contentDescription="@null"
+                            android:src="@drawable/ic_daemon"
+                            app:tint="@color/brand_primary" />
+                    </FrameLayout>
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="11dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            style="@style/SettingsRowTitle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="cpuset 运行组" />
+
+                        <TextView
+                            android:id="@+id/cpusetNameDesc"
+                            style="@style/SettingsRowDescription"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="3dp"
+                            android:text="决定 Rust 守护将受控线程加入哪个 cpuset，不改变规则核心分配" />
+                    </LinearLayout>
+
+                    <TextView
+                        android:id="@+id/cpusetNameValue"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="10dp"
+                        android:ellipsize="end"
+                        android:gravity="center_vertical|end"
+                        android:maxWidth="108dp"
+                        android:maxLines="1"
+                        android:text="AppOptRs"
+                        android:textColor="@color/brand_primary"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+
+                    <ImageView
+                        style="@style/SettingsChevron"
+                        android:layout_marginStart="6dp"
+                        android:contentDescription="选择 cpuset 运行组" />
+                </LinearLayout>
+
             </LinearLayout>
         </androidx.core.widget.NestedScrollView>
     </FrameLayout>

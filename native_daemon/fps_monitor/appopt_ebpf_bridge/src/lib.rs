@@ -23,10 +23,12 @@ use aya::{
 
 mod adaptive_boost;
 mod adaptive_governor;
+mod process_events;
 pub use adaptive_boost::{
     AppOptFrameMetrics, AppOptJankCtx, appopt_jank_create, appopt_jank_last_event,
     appopt_jank_recover, appopt_jank_stop, appopt_jank_update,
 };
+pub use process_events::{ProcessEventBatch, ProcessEventMonitor};
 
 // Rust daemon 通过 C ABI 调用这个 bridge。
 // 这里负责加载 aya eBPF 对象、附加 libgui uprobe、读取 RingBuf/PerfEvent 帧事件，

@@ -230,7 +230,6 @@ object DiagnosticExporter {
         echo
         echo '# module daemon pid'
         daemon_bin=/data/adb/modules/AppOpt/config/bin/AppOptRs
-        [ -x "${'$'}daemon_bin" ] || daemon_bin=/data/adb/modules/AppOpt/config/bin/AppOpt
         find_pid() {
             name="${'$'}1"
             found=$("${'$'}daemon_bin" --find-pid "${'$'}name" 2>/dev/null) || found=''
@@ -240,7 +239,6 @@ object DiagnosticExporter {
             printf '%s\n' "${'$'}found"
         }
         find_pid AppOptRs
-        find_pid AppOpt
         echo
         echo '# app pid'
         find_pid top.suto.appopt

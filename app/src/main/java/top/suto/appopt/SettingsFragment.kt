@@ -22,6 +22,7 @@ import com.google.android.material.tabs.TabLayout
 import com.google.android.material.textfield.TextInputLayout
 import java.util.concurrent.Executors
 import top.suto.appopt.databinding.FragmentSettingsBinding
+import top.suto.appopt.databinding.DialogCpusetNameBinding
 import top.suto.appopt.databinding.DialogPolicyModeBinding
 import top.suto.appopt.databinding.DialogRuleOutputFormatBinding
 
@@ -44,6 +45,10 @@ class SettingsFragment : TopLevelFragment() {
     private var currentWildcardGroup = CalibPolicy.WildcardGroup.MAX_MEMBER
     private var currentRuleOutputFormat = CalibPolicy.RuleOutputFormat.LEGACY
     private var formatConversionBusy = false
+    private var cpusetEditable = false
+    private var cpusetBusy = false
+    private var cpusetSupported = false
+    private var currentCpusetName = CalibPolicy.DEFAULT_CPUSET_NAME
     private var currentDetectedTopologyBlock = ""
     private var availableCpus: List<Int> = (0..7).toList()
     private val bestCores = linkedSetOf<Int>()
@@ -93,6 +98,9 @@ class SettingsFragment : TopLevelFragment() {
         binding.ruleOutputFormatRow.setOnClickListener {
             if (policyEditable) showRuleOutputFormatDialog()
         }
+        binding.cpusetNameRow.setOnClickListener {
+            if (cpusetEditable) showCpusetNameDialog()
+        }
 
         setupAutoSave()
         binding.resetPolicy.setOnClickListener {
@@ -100,6 +108,7 @@ class SettingsFragment : TopLevelFragment() {
         }
 
         setPolicyInputsEnabled(false)
+        updateCpusetNameRow()
         setPolicyStatus("正在读取策略")
     }
 
@@ -140,7 +149,8 @@ class SettingsFragment : TopLevelFragment() {
             target == UsageGuide.Target.RULE_GENERATION_LIMIT ||
             target == UsageGuide.Target.SIMILAR_THREADS ||
             target == UsageGuide.Target.PERFORMANCE_TIERS ||
-            target == UsageGuide.Target.PROCESS_FALLBACK) {
+            target == UsageGuide.Target.PROCESS_FALLBACK ||
+            target == UsageGuide.Target.CPUSET_RUNTIME) {
             if (!policyLoaded || policyLoadInFlight || !policyGuideLayoutReady) return null
         }
         return when (target) {
@@ -173,6 +183,13 @@ class SettingsFragment : TopLevelFragment() {
             UsageGuide.Target.PROCESS_FALLBACK -> {
                 selectSettingsTabForGuide(SettingsTab.PERFORMANCE)
                 binding.processFallbackCard.also {
+                    scrollUsageGuideTargetToTop(binding.performanceSettingsPage, it)
+                }
+            }
+
+            UsageGuide.Target.CPUSET_RUNTIME -> {
+                selectSettingsTabForGuide(SettingsTab.PERFORMANCE)
+                binding.cpusetNameRow.also {
                     scrollUsageGuideTargetToTop(binding.performanceSettingsPage, it)
                 }
             }
@@ -232,6 +249,7 @@ class SettingsFragment : TopLevelFragment() {
                 val root = DaemonBridge.hasRoot()
                 val version = if (root) DaemonBridge.readModuleVersion() else null
                 val file = if (root) DaemonBridge.readCalibPolicyRaw() else null
+                val cpusetSupported = root && DaemonBridge.supportsCustomCpuset()
                 val rawPolicy = file?.takeIf { it.readSuccess }?.content?.takeIf { it.isNotBlank() }
                 val policy = rawPolicy
                     ?.takeIf { it.isNotBlank() }
@@ -249,6 +267,7 @@ class SettingsFragment : TopLevelFragment() {
                     val moduleOk = version?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
                     val moduleLabel = version?.let { "${it.versionName} (${it.versionCode})" }
                     bindPolicy(policy)
+                    this.cpusetSupported = cpusetSupported
                     binding.policyLockedNotice.visibility =
                         if (lockedByPendingUpdate || (root && !moduleOk)) View.VISIBLE else View.GONE
                     binding.policyLockedNotice.text = when {
@@ -271,7 +290,9 @@ class SettingsFragment : TopLevelFragment() {
                         else -> "当前配置：${file?.path.orEmpty()}，修改后自动保存"
                     })
                     policyEditable = root && moduleOk && !lockedByPendingUpdate && file?.readSuccess == true
+                    cpusetEditable = policyEditable && cpusetSupported
                     setPolicyInputsEnabled(policyEditable)
+                    updateCpusetNameRow()
                     markPolicyGuideLayoutReady(generation, currentViewGeneration)
                 }
             } catch (error: Exception) {
@@ -283,7 +304,10 @@ class SettingsFragment : TopLevelFragment() {
                     policyLoaded = true
                     lastPolicyLoadFinishedAt = SystemClock.elapsedRealtime()
                     policyEditable = false
+                    cpusetEditable = false
+                    cpusetSupported = false
                     setPolicyInputsEnabled(false)
+                    updateCpusetNameRow()
                     setPolicyStatus("策略文件读取失败，请检查 Root 权限后重试")
                     markPolicyGuideLayoutReady(generation, currentViewGeneration)
                 }
@@ -308,6 +332,7 @@ class SettingsFragment : TopLevelFragment() {
             currentDetectedTopologyBlock = policy.detectedTopologyBlock
             currentWildcardGroup = policy.wildcardGroup
             currentRuleOutputFormat = policy.ruleOutputFormat.generationTarget()
+            currentCpusetName = policy.cpusetName
 
             val topology = parseDetectedTopology(currentDetectedTopologyBlock)
             availableCpus = availableCpuList(policy, topology)
@@ -396,6 +421,7 @@ class SettingsFragment : TopLevelFragment() {
             wildcardGroup = currentWildcardGroup,
             ruleOutputFormat = currentRuleOutputFormat,
             fallbackCores = formatCpuSet(fallbackCores),
+            cpusetName = currentCpusetName,
             detectedTopologyBlock = currentDetectedTopologyBlock
         ).normalized()
     }
@@ -477,6 +503,7 @@ class SettingsFragment : TopLevelFragment() {
             highCores = topology["middle_high"] ?: topology["middle"] ?: CalibPolicy.DEFAULT_HIGH_CORES,
             midCores = topology["middle"] ?: CalibPolicy.DEFAULT_MID_CORES,
             fallbackCores = topology["nonbig"] ?: CalibPolicy.DEFAULT_FALLBACK_CORES,
+            cpusetName = currentCpusetName,
             detectedTopologyBlock = currentDetectedTopologyBlock
         ).normalized()
     }
@@ -533,6 +560,139 @@ class SettingsFragment : TopLevelFragment() {
         setCoreGridEnabled(binding.midCoresGrid, enabled, alpha)
         setCoreGridEnabled(binding.fallbackCoresGrid, enabled, alpha)
         binding.resetPolicy.isEnabled = enabled
+    }
+
+    private fun updateCpusetNameRow() {
+        if (_binding == null) return
+        binding.cpusetNameValue.text = currentCpusetName
+        binding.cpusetNameDesc.text = when {
+            !policyLoaded -> "正在读取 Rust 守护运行设置"
+            !hasRoot -> "需要 Root 权限读取和保存运行设置"
+            lockedByPendingUpdate -> "模块更新待重启，当前不能修改运行设置"
+            !cpusetSupported -> "当前 Rust 守护不支持自定义 cpuset，请先更新模块"
+            else -> "受控线程使用 /dev/cpuset/$currentCpusetName，不改变规则核心分配"
+        }
+        val enabled = cpusetEditable && !cpusetBusy
+        binding.cpusetNameRow.isEnabled = enabled
+        binding.cpusetNameRow.alpha = if (enabled) 1f else 0.55f
+    }
+
+    private fun showCpusetNameDialog() {
+        if (!cpusetEditable || cpusetBusy) return
+        val view = DialogCpusetNameBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(requireContext())
+        var useCustom = currentCpusetName != CalibPolicy.DEFAULT_CPUSET_NAME
+        if (useCustom) view.cpusetCustomInput.setText(currentCpusetName)
+
+        fun updatePreview() {
+            val raw = if (useCustom) view.cpusetCustomInput.text?.toString().orEmpty().trim()
+            else CalibPolicy.DEFAULT_CPUSET_NAME
+            view.cpusetPathPreview.text = "/dev/cpuset/${raw.ifBlank { "…" }}"
+        }
+
+        fun updateSelection(focusInput: Boolean = false) {
+            view.cpusetDefaultSelected.visibility = if (useCustom) View.GONE else View.VISIBLE
+            view.cpusetCustomSelected.visibility = if (useCustom) View.VISIBLE else View.GONE
+            view.cpusetCustomInputLayout.visibility = if (useCustom) View.VISIBLE else View.GONE
+            if (!useCustom) {
+                view.cpusetCustomInputLayout.error = null
+                view.cpusetCustomInputLayout.isErrorEnabled = false
+            } else if (focusInput) {
+                view.cpusetCustomInput.post { view.cpusetCustomInput.requestFocus() }
+            }
+            updatePreview()
+        }
+
+        view.cpusetCustomInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                view.cpusetCustomInputLayout.error = null
+                view.cpusetCustomInputLayout.isErrorEnabled = false
+                updatePreview()
+            }
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+        view.cpusetDefaultOption.setOnClickListener {
+            useCustom = false
+            updateSelection()
+        }
+        view.cpusetCustomOption.setOnClickListener {
+            useCustom = true
+            updateSelection(focusInput = true)
+        }
+        view.cpusetCancel.setOnClickListener { dialog.dismiss() }
+        view.cpusetSave.setOnClickListener {
+            val requestedName = if (useCustom) {
+                CalibPolicy.normalizeCpusetNameOrNull(
+                    view.cpusetCustomInput.text?.toString().orEmpty()
+                )
+            } else {
+                CalibPolicy.DEFAULT_CPUSET_NAME
+            }
+            if (requestedName == null) {
+                view.cpusetCustomInputLayout.error = "请输入 1-48 位有效名称，且不能以点开头"
+                view.cpusetCustomInputLayout.isErrorEnabled = true
+                view.cpusetCustomInput.requestFocus()
+                return@setOnClickListener
+            }
+            if (requestedName == currentCpusetName) {
+                dialog.dismiss()
+                toast("当前已经使用此 cpuset 运行组")
+                return@setOnClickListener
+            }
+
+            cancelAutoSave()
+            val updatedPolicy = readPolicyFromInputs()?.copy(cpusetName = requestedName)?.normalized()
+            if (updatedPolicy == null) {
+                toast("当前校准策略存在无效输入，请修正后重试")
+                return@setOnClickListener
+            }
+
+            cpusetBusy = true
+            updateCpusetNameRow()
+            view.cpusetSave.isEnabled = false
+            view.cpusetSave.text = "正在保存"
+            val currentViewGeneration = viewGeneration
+            POLICY_IO_EXECUTOR.execute {
+                val saved = DaemonBridge.writeCalibPolicyRaw(updatedPolicy.toConfigText())
+                val restartStatus = if (saved) {
+                    DaemonBridge.restartRustDaemon()
+                } else {
+                    DaemonBridge.RustDaemonRestartStatus.FAILED
+                }
+                runOnUiThread {
+                    if (currentViewGeneration != viewGeneration || _binding == null ||
+                        isFinishing || isDestroyed) return@runOnUiThread
+                    cpusetBusy = false
+                    if (saved) {
+                        currentCpusetName = requestedName
+                        dialog.dismiss()
+                        val message = when (restartStatus) {
+                            DaemonBridge.RustDaemonRestartStatus.REQUESTED ->
+                                "已保存，Rust 守护将在数秒内自动重启"
+                            DaemonBridge.RustDaemonRestartStatus.NOT_RUNNING ->
+                                "已保存，将在下次启动 Rust 守护时生效"
+                            DaemonBridge.RustDaemonRestartStatus.FAILED ->
+                                "已保存，自动重启失败；重启设备后生效"
+                        }
+                        toast(message)
+                    } else {
+                        view.cpusetSave.isEnabled = true
+                        view.cpusetSave.text = "保存并重启守护"
+                        toast("运行设置保存失败，请检查 Root 或模块状态")
+                    }
+                    updateCpusetNameRow()
+                }
+            }
+        }
+        updateSelection()
+        dialog.setContentView(view.root)
+        dialog.setOnShowListener {
+            dialog.behavior.state =
+                com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+            dialog.behavior.skipCollapsed = true
+        }
+        dialog.show()
     }
 
     private fun updateWildcardModeText() {
@@ -1081,6 +1241,8 @@ class SettingsFragment : TopLevelFragment() {
         coreWarningRunnable = null
         coreWarningView = null
         formatConversionBusy = false
+        cpusetBusy = false
+        cpusetEditable = false
         _binding = null
         super.onDestroyView()
     }

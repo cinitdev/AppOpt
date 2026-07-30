@@ -1,6 +1,6 @@
 // 一次性调试命令。
 //
-// --scan-once 只输出会命中的进程/线程和规则，不写 affinity，适合在真机上和 C 版日志对照。
+// --scan-once 只输出会命中的进程/线程和规则，不写 affinity，适合真机诊断。
 // --apply-once 会执行一次绑核后退出，适合排查某条规则是否能正常写入。
 //
 // 注意：这里故意直接调用 scan_proc 全量扫描，不使用 daemon 的 PID 缓存；调试命令要反映
@@ -12,16 +12,20 @@ fn run_once(args: &Args, apply: bool) -> io::Result<()> {
     if let Err(err) = ensure_rule_health_loaded(&mut health_state) {
         eprintln!("[RS] 规则健康状态读取失败，本次调试不禁用任何规则: {err}");
     }
-    let runtime_rules = runtime_rule_health_rules(&rules, &health_state);
-    let plan = build_scan_plan(&runtime_rules, &uid_map, args.target_pkg.as_deref());
+    let index = build_runtime_rule_index(
+        &rules,
+        &uid_map,
+        args.target_pkg.as_deref(),
+        &health_state,
+    );
 
     println!(
         "[RS] 调试参数: 配置={} 运行规则={}/{} UID映射={} 目标包数={} 指定目标={} 模式={}",
         args.config.display(),
-        runtime_rules.len(),
+        index.active_rule_indices.len(),
         rules.len(),
         args.uid_map.display(),
-        plan.package_count(),
+        index.plan.package_count(),
         args.target_pkg.as_deref().unwrap_or("*"),
         if apply {
             "执行一次绑核"
@@ -30,7 +34,7 @@ fn run_once(args: &Args, apply: bool) -> io::Result<()> {
         }
     );
 
-    let scan_result = scan_proc(&runtime_rules, &plan, &BTreeSet::new())?;
+    let scan_result = scan_proc(&rules, &index, &BTreeSet::new())?;
     if !scan_result.complete {
         eprintln!("[RS] 本次扫描存在瞬时读取缺口，正向命中可用，不能用于健康负向结论");
     }
@@ -49,7 +53,8 @@ fn run_once(args: &Args, apply: bool) -> io::Result<()> {
     print_hits(&hits, apply);
 
     if apply {
-        let stats = apply_hits(&hits, true);
+        let mut managed_tids = HashMap::new();
+        let stats = apply_hits(&hits, true, &args.cpuset_name, &mut managed_tids);
         println!(
             "[RS] 执行汇总: 命中进程={} 已应用={} 已跳过={} 系统限制={} 失败={} 无效规则={} 被系统改写={}",
             hits.len(),

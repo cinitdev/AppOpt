@@ -6,8 +6,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 NATIVE_DIR="$ROOT/native_daemon"
-SRC="$NATIVE_DIR/AppOpt.c"
-FOREGROUND_MONITOR_SRC="$NATIVE_DIR/foreground_monitor.c"
 FPS_MON="$NATIVE_DIR/fps_monitor"
 RUST_BRIDGE="$FPS_MON/appopt_ebpf_bridge"
 RUST_DAEMON="$NATIVE_DIR/daemon_rs"
@@ -108,14 +106,11 @@ ZIP="$ROOT/build/AppOpt.zip"
 [ -d "$BASE_DIR" ] || { echo "! 找不到模块基底目录: $BASE_DIR"; exit 1; }
 [ -f "$MODULE_PROP" ] || { echo "! 找不到模块属性文件: $MODULE_PROP"; exit 1; }
 [ -d "$NATIVE_DIR" ] || { echo "! 找不到 native 源码目录: $NATIVE_DIR"; exit 1; }
-[ -f "$SRC" ] || { echo "! 找不到主源码: $SRC"; exit 1; }
-[ -f "$FOREGROUND_MONITOR_SRC" ] || { echo "! 找不到前台检测源码: $FOREGROUND_MONITOR_SRC"; exit 1; }
 [ -d "$FPS_MON" ] || { echo "! 找不到 fps_monitor 目录: $FPS_MON"; exit 1; }
 [ -d "$RUST_BRIDGE" ] || { echo "! 找不到 Rust bridge: $RUST_BRIDGE"; exit 1; }
 [ -f "$RUST_DAEMON/Cargo.toml" ] || { echo "! 找不到 Rust daemon: $RUST_DAEMON"; exit 1; }
 [ -f "$RUST_DAEMON_MAIN" ] || { echo "! 找不到 Rust daemon 入口: $RUST_DAEMON_MAIN"; exit 1; }
 [ -f "$RUST_DAEMON_VERSION_SRC" ] || { echo "! 找不到 Rust daemon 版本文件: $RUST_DAEMON_VERSION_SRC"; exit 1; }
-[ -f "$FPS_MON/ebpf_fps.c" ] || { echo "! 找不到 Rust C 适配层: $FPS_MON/ebpf_fps.c"; exit 1; }
 
 ensure_aya_submodule() {
     [ -f "$ROOT/.gitmodules" ] || return 0
@@ -128,12 +123,21 @@ ensure_aya_submodule() {
 
     echo "- 检查子模块: $AYA_SUBMODULE_REL"
     if [ "${APPOPT_SKIP_SUBMODULE_UPDATE:-0}" = "1" ]; then
-        echo "- 跳过子模块指针重置，使用当前 $AYA_SUBMODULE_REL 工作区"
+        echo "- 跳过子模块远端更新，使用当前 $AYA_SUBMODULE_REL 工作区"
     else
+        local BEFORE_COMMIT AFTER_COMMIT
+        BEFORE_COMMIT="$(git -C "$AYA_SUBMODULE" rev-parse --short HEAD 2>/dev/null || true)"
         (
             cd "$ROOT"
-            git submodule update --init --recursive "$AYA_SUBMODULE_REL"
+            git submodule sync -- "$AYA_SUBMODULE_REL"
+            git submodule update --init --remote --recursive "$AYA_SUBMODULE_REL"
         )
+        AFTER_COMMIT="$(git -C "$AYA_SUBMODULE" rev-parse --short HEAD 2>/dev/null || true)"
+        if [ -n "$BEFORE_COMMIT" ] && [ "$BEFORE_COMMIT" != "$AFTER_COMMIT" ]; then
+            echo "- 子模块已更新: $BEFORE_COMMIT -> $AFTER_COMMIT"
+        elif [ -n "$AFTER_COMMIT" ]; then
+            echo "- 子模块已是远端最新提交: $AFTER_COMMIT"
+        fi
     fi
 
     (
@@ -316,9 +320,9 @@ read_app_package() {
 }
 
 sync_source_versions() {
-    local version_code version_name source_version_name current_code current_name current_c_version current_rs_version
+    local version_code version_name source_version_name current_code current_name current_rs_version
     local current_module_version current_module_code
-    local synced_code synced_name synced_c_version synced_rs_version synced_module_version synced_module_code
+    local synced_code synced_name synced_rs_version synced_module_version synced_module_code
     version_code="$(read_app_version_code)"
     version_name="$(read_app_version_name)"
     [ -n "$version_code" ] || { echo "! 无法读取 App versionCode"; exit 1; }
@@ -328,7 +332,6 @@ sync_source_versions() {
     source_version_name="${source_version_name#V}"
     current_code="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
     current_name="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
-    current_c_version="$(sed -n -E 's/^#define[[:space:]]+VERSION[[:space:]]+"([^"]*)".*/\1/p' "$SRC" | head -n1)"
     current_rs_version="$(sed -n -E 's/^const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)"
     current_module_version="$(sed -n 's/^version=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
     current_module_code="$(sed -n 's/^versionCode=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
@@ -340,10 +343,6 @@ sync_source_versions() {
     if [ "$current_name" != "$source_version_name" ]; then
         echo "- 同步 REQUIRED_MODULE_VERSION_NAME: ${current_name:-缺失} -> $source_version_name"
         sed -E -i "s/(REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*)\"[^\"]*\"/\1\"$source_version_name\"/" "$DAEMON_BRIDGE"
-    fi
-    if [ "$current_c_version" != "$source_version_name" ]; then
-        echo "- 同步 AppOpt.c VERSION: ${current_c_version:-缺失} -> $source_version_name"
-        sed -E -i "s/(^#define[[:space:]]+VERSION[[:space:]]+)\"[^\"]*\"/\1\"$source_version_name\"/" "$SRC"
     fi
     if [ "$current_rs_version" != "$source_version_name" ]; then
         echo "- 同步 AppOptRs VERSION: ${current_rs_version:-缺失} -> $source_version_name"
@@ -360,7 +359,6 @@ sync_source_versions() {
 
     synced_code="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
     synced_name="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
-    synced_c_version="$(sed -n -E 's/^#define[[:space:]]+VERSION[[:space:]]+"([^"]*)".*/\1/p' "$SRC" | head -n1)"
     synced_rs_version="$(sed -n -E 's/^const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)"
     synced_module_version="$(sed -n 's/^version=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
     synced_module_code="$(sed -n 's/^versionCode=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
@@ -370,10 +368,6 @@ sync_source_versions() {
     }
     [ "$synced_name" = "$source_version_name" ] || {
         echo "! REQUIRED_MODULE_VERSION_NAME 同步失败"
-        exit 1
-    }
-    [ "$synced_c_version" = "$source_version_name" ] || {
-        echo "! AppOpt.c VERSION 同步失败"
         exit 1
     }
     [ "$synced_rs_version" = "$source_version_name" ] || {
@@ -745,40 +739,6 @@ EOF
     echo "- Embedded App: $APP_VARIANT $version_name ($version_code)"
 }
 
-build_rust_bridge() {
-    local rust_target="$1" cc="$2"
-    RUST_BRIDGE_LIB=""
-
-    command -v cargo >/dev/null 2>&1 || { echo "! 找不到 cargo"; exit 1; }
-    rustup target list --installed 2>/dev/null | grep -qx "$rust_target" || {
-        echo "! 未安装 Rust target: $rust_target"
-        exit 1
-    }
-
-    local ar="$BIN/llvm-ar${EXT}"
-    [ -f "$cc" ] || { echo "! 找不到 NDK clang: $cc"; exit 1; }
-    [ -f "$ar" ] || ar=""
-
-    echo "- 构建 Rust/aya bridge: $rust_target"
-    local target_dir="$ROOT/build/rust-target"
-    local target_env cargo_cc cargo_ar
-    target_env="$(printf '%s' "$rust_target" | tr '[:lower:]-' '[:upper:]_')"
-    cargo_cc="$(path_for_cargo "$cc")"
-    [ -n "$ar" ] && cargo_ar="$(path_for_cargo "$ar")" || cargo_ar=""
-
-    env \
-        "CARGO_TARGET_${target_env}_LINKER=$cargo_cc" \
-        "CARGO_TARGET_${target_env}_AR=$cargo_ar" \
-        "RUSTC_BOOTSTRAP=1" \
-        "RUSTFLAGS=${RUSTFLAGS:-} $RUST_NO_LOCATION_FLAGS" \
-        cargo build --manifest-path "$RUST_BRIDGE/Cargo.toml" \
-            --release --target "$rust_target" --target-dir "$target_dir"
-
-    local lib="$target_dir/$rust_target/release/libappopt_ebpf_bridge.a"
-    [ -f "$lib" ] || { echo "! 找不到 Rust bridge 产物: $lib"; exit 1; }
-    RUST_BRIDGE_LIB="$lib"
-}
-
 build_rust_daemon() {
     local rust_target="$1" cc="$2" abidir="$3"
 
@@ -835,11 +795,17 @@ build_and_embed_app
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"
 BPF_PERF_SRC="$FPS_MON/bpf/queuebuffer_probe_perf.bpf.c"
 BPF_CPU_UTIL_SRC="$FPS_MON/bpf/cpu_util_monitor.bpf.c"
+BPF_PROCESS_EVENTS_SRC="$FPS_MON/bpf/process_events.bpf.c"
+BPF_PROCESS_EVENTS_PERF_SRC="$FPS_MON/bpf/process_events_perf.bpf.c"
 mkdir -p "$WORK/config/ebpf"
 BPF_CPU_UTIL_OBJ="$WORK/config/ebpf/cpu_util_monitor.bpf.o"
+BPF_PROCESS_EVENTS_OBJ="$WORK/config/ebpf/process_events.bpf.o"
+BPF_PROCESS_EVENTS_PERF_OBJ="$WORK/config/ebpf/process_events_perf.bpf.o"
 [ -f "$BPF_SRC" ] || { echo "! 找不到 BPF 源码: $BPF_SRC"; exit 1; }
 [ -f "$BPF_PERF_SRC" ] || { echo "! 找不到 PerfEvent BPF 源码: $BPF_PERF_SRC"; exit 1; }
 [ -f "$BPF_CPU_UTIL_SRC" ] || { echo "! 找不到 CPU 利用率 BPF 源码: $BPF_CPU_UTIL_SRC"; exit 1; }
+[ -f "$BPF_PROCESS_EVENTS_SRC" ] || { echo "! 找不到进程事件 BPF 源码: $BPF_PROCESS_EVENTS_SRC"; exit 1; }
+[ -f "$BPF_PROCESS_EVENTS_PERF_SRC" ] || { echo "! 找不到进程事件 PerfEvent BPF 源码: $BPF_PROCESS_EVENTS_PERF_SRC"; exit 1; }
 
 CLANG="$BIN/clang"
 [ ! -f "$CLANG" ] && CLANG="$BIN/clang.exe"
@@ -895,30 +861,16 @@ build_bpf_pair_for_abi armeabi-v7a __TARGET_ARCH_arm   arm-linux-androideabi  AP
 build_bpf_pair_for_abi x86_64      __TARGET_ARCH_x86   x86_64-linux-android   APPOPT_BPF_X86_64
 build_bpf_pair_for_abi x86         __TARGET_ARCH_x86   i686-linux-android      APPOPT_BPF_I386
 build_common_bpf_obj "$BPF_CPU_UTIL_SRC" "$BPF_CPU_UTIL_OBJ" "cpu_util_monitor.bpf.c"
+build_common_bpf_obj "$BPF_PROCESS_EVENTS_SRC" "$BPF_PROCESS_EVENTS_OBJ" "process_events.bpf.c"
+build_common_bpf_obj "$BPF_PROCESS_EVENTS_PERF_SRC" "$BPF_PROCESS_EVENTS_PERF_OBJ" "process_events_perf.bpf.c"
 
 build_abi() {
     local triple="$1" abidir="$2" rust_target="$3"
     local cc="$BIN/${triple}${API}-clang${EXT}"
-    local dst="$WORK/config/bin/$abidir/AppOpt"
 
     [ -f "$cc" ] || { echo "! 找不到 $abidir 编译器: $cc"; exit 1; }
     mkdir -p "$WORK/config/bin/$abidir"
-
-    build_rust_bridge "$rust_target" "$cc"
-
-    echo "- 构建 $abidir (AppOpt + Rust/aya eBPF bridge)"
-    "$cc" -Wall -Wextra -O2 -pthread \
-        -I"$ROOT" \
-        -I"$FPS_MON" \
-        "$SRC" \
-        "$FOREGROUND_MONITOR_SRC" \
-        "$FPS_MON/ebpf_fps.c" \
-        "$FPS_MON/fps_fallback.c" \
-        "$RUST_BRIDGE_LIB" \
-        -ldl -llog \
-        -o "$dst"
-
-    [ -f "$LLVM_STRIP" ] && "$LLVM_STRIP" --strip-all "$dst" || true
+    echo "- 构建 $abidir Rust 守护进程"
     build_rust_daemon "$rust_target" "$cc" "$abidir"
 }
 
@@ -927,7 +879,7 @@ build_abi armv7a-linux-androideabi armeabi-v7a   armv7-linux-androideabi
 build_abi x86_64-linux-android     x86_64        x86_64-linux-android
 build_abi i686-linux-android       x86           i686-linux-android
 
-VER=$(grep -E '#define[[:space:]]+VERSION' "$SRC" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+VER=$(sed -n -E 's/^const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)
 if [ -n "$VER" ] && [ -f "$WORK/module.prop" ]; then
     #sed -i -E "s/^version=.*/version=${VER}-增强版/" "$WORK/module.prop"
     echo "- module.prop 版本: ${VER}"

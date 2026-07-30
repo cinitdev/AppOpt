@@ -24,6 +24,7 @@ object UsageGuide {
         SIMILAR_THREADS,
         PERFORMANCE_TIERS,
         PROCESS_FALLBACK,
+        CPUSET_RUNTIME,
         HELP_BUTTON
     }
 
@@ -68,13 +69,13 @@ object UsageGuide {
         Step(
             id = "history_logs_diagnostics_v1",
             title = "历史与日志各有用途",
-            description = "历史记录保存每次校准的线程负载，也为规则编辑器提供去重候选；日志页会整理 C/Rust 守护进程和前台助手输出，并可按提醒或错误筛选。",
+            description = "历史记录保存每次校准的线程负载，也为规则编辑器提供去重候选；日志页会整理 Rust 守护进程和前台助手输出，并可按提醒或错误筛选。",
             target = Target.HISTORY_AND_LOGS
         ),
         Step(
             id = "rule_generation_settings_v1",
             title = "规则写入决定保存格式",
-            description = "生成格式会转换现有规则，并决定 C / Rust 校准结束后的写入外观；不同格式只影响规则展示和编辑方式，不改变最终绑核效果。",
+            description = "生成格式会转换现有规则，并决定 Rust 校准结束后的写入外观；不同格式只影响规则展示和编辑方式，不改变最终绑核效果。",
             target = Target.RULE_GENERATION
         ),
         Step(
@@ -100,6 +101,12 @@ object UsageGuide {
             title = "进程兜底承接其余线程",
             description = "主进程中没有命中单独线程规则的线程会使用这里选择的核心。它不是额外的负载档位，也不会覆盖已经命中的线程规则；修改后影响后续校准生成的兜底规则。",
             target = Target.PROCESS_FALLBACK
+        ),
+        Step(
+            id = "cpuset_runtime_v1",
+            title = "运行组属于 Rust 守护全局设置",
+            description = "默认使用 /dev/cpuset/AppOptRs。自定义名称只改变 Rust 守护创建的 cpuset 根目录，不改变规则中的核心范围，也不是单个应用设置；保存后会安全重启 Rust 守护。",
+            target = Target.CPUSET_RUNTIME
         ),
         Step(
             id = "reopen_guide_v1",

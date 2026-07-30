@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // 校准线程负责读取 App 写入的 calibrate.cmd，采样目标应用的 CPU 负载并生成规则。
 //
-// 当前策略和 C 版保持核心行为一致，但修正了子进程线程规则的问题：
+// 当前策略同时支持主进程线程和子进程线程规则：
 // - 主进程：记录每个线程的真实 CPU 使用率，用于生成 com.pkg{thread}=cpus。
 // - 子进程：记录整个子进程的 CPU 使用率，用于生成 com.pkg:proc=cpus。
 // - 子进程线程：只写入 history 明细给用户看，不生成 com.pkg:proc{thread}，

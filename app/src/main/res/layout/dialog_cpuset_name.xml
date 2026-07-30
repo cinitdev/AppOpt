@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/bg_bottom_sheet_card"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="20dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="18dp">
+
+        <View
+            android:layout_width="42dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="16dp"
+            android:background="@drawable/bg_banner" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="cpuset 运行组"
+            android:textColor="@color/text_primary"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="设置 Rust 守护创建的 cpuset 根目录。保存后会重启 Rust 守护；正在校准时请稍后修改"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <RelativeLayout
+            android:id="@+id/cpusetDefaultOption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:minHeight="62dp"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/cpusetDefaultTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/cpusetDefaultSelected"
+                android:text="使用默认运行组"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_below="@id/cpusetDefaultTitle"
+                android:layout_marginTop="4dp"
+                android:layout_toStartOf="@id/cpusetDefaultSelected"
+                android:text="/dev/cpuset/AppOptRs"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/cpusetDefaultSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择默认运行组"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <RelativeLayout
+            android:id="@+id/cpusetCustomOption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_action_row"
+            android:clickable="true"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackground"
+            android:minHeight="62dp"
+            android:padding="14dp">
+
+            <TextView
+                android:id="@+id/cpusetCustomTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_toStartOf="@id/cpusetCustomSelected"
+                android:text="自定义运行组名称"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_below="@id/cpusetCustomTitle"
+                android:layout_marginTop="4dp"
+                android:layout_toStartOf="@id/cpusetCustomSelected"
+                android:text="适合需要区分多个调度模块运行组的高级用户"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <ImageView
+                android:id="@+id/cpusetCustomSelected"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:contentDescription="已选择自定义运行组"
+                android:src="@drawable/ic_check_circle"
+                android:visibility="gone"
+                app:tint="@color/brand_primary" />
+        </RelativeLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/cpusetCustomInputLayout"
+            style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:hint="运行组名称"
+            android:visibility="gone"
+            app:counterEnabled="true"
+            app:counterMaxLength="48"
+            app:helperText="允许字母、数字、下划线、短横线和点，不能以点开头">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/cpusetCustomInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:digits="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-."
+                android:inputType="textNoSuggestions"
+                android:maxLength="48"
+                android:singleLine="true" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <TextView
+            android:id="@+id/cpusetPathPreview"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:fontFamily="monospace"
+            android:text="/dev/cpuset/AppOptRs"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/cpusetSave"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="16dp"
+            android:text="保存并重启守护"
+            app:cornerRadius="8dp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/cpusetCancel"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="8dp"
+            android:text="取消"
+            app:cornerRadius="8dp" />
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>

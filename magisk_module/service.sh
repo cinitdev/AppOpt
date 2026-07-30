@@ -16,10 +16,11 @@ wait_sys_boot_completed
 
 MODDIR=${0%/*}
 cd "$MODDIR"
-BIN_C="$MODDIR/config/bin/AppOpt"
-BIN_RS="$MODDIR/config/bin/AppOptRs"
-RS_FALLBACK_FLAG="$MODDIR/config/.appopt_use_c_daemon"
+BIN="$MODDIR/config/bin/AppOptRs"
+DAEMON_PROC_NAME="AppOptRs"
+RS_RESTART_FLAG="$MODDIR/config/.appopt_restart_rs_daemon"
 CONF="$MODDIR/config/applist.conf"
+CALIB_POLICY="$MODDIR/config/calib_policy.conf"
 LOG="$MODDIR/logs/AppOpt.log"
 FOREGROUND_HELPER="$MODDIR/config/tools/appopt_foreground_helper.sh"
 FOREGROUND_HELPER_LOG="$MODDIR/logs/ForegroundHelper.log"
@@ -27,19 +28,7 @@ APPOPT_IN_APP_UPDATE_FLAG="/data/adb/appopt_in_app_update"
 
 mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" \
 	"$MODDIR/config/state" "$MODDIR/logs"
-rm -f "$RS_FALLBACK_FLAG" 2>/dev/null || true
-
-select_daemon_binary() {
-	if [ -x "$BIN_RS" ] && [ ! -f "$RS_FALLBACK_FLAG" ]; then
-		BIN="$BIN_RS"
-		DAEMON_PROC_NAME="AppOptRs"
-	else
-		BIN="$BIN_C"
-		DAEMON_PROC_NAME="AppOpt"
-	fi
-}
-
-select_daemon_binary
+rm -f "$RS_RESTART_FLAG" 2>/dev/null || true
 
 # 二进制不存在直接退出
 [ -f "$BIN" ] || exit 0
@@ -54,6 +43,19 @@ read_app_prop() {
 	local file="$2"
 	[ -f "$file" ] || return
 	sed -n "s/^${key}=//p" "$file" | head -n 1
+}
+
+read_cpuset_name() {
+	local name
+	name="$(sed -n 's/^[[:space:]]*cpuset_name[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*$/\1/p' "$CALIB_POLICY" 2>/dev/null | tail -n 1)"
+	[ -n "$name" ] || name="AppOptRs"
+	if [ "${#name}" -gt 48 ]; then
+		name="AppOptRs"
+	fi
+	case "$name" in
+		.*|*[!A-Za-z0-9_.-]*) name="AppOptRs" ;;
+	esac
+	printf '%s' "$name"
 }
 
 run_app_helper() {
@@ -155,33 +157,24 @@ is_our_daemon_running() {
     return 1
 }
 
-# Watchdog: prefer Rust daemon, but fall back to C for this boot if Rust crashes quickly.
+# Watchdog: keep the Rust daemon alive and preserve explicit configuration restarts.
 (
-    RS_CRASH_COUNT=0
     while true; do
         start_foreground_helper >/dev/null 2>&1 || true
-        select_daemon_binary
         if ! is_our_daemon_running; then
-            echo "- 启动守护进程: $BIN" >>"$LOG"
+            CPUSET_NAME="$(read_cpuset_name)"
+            echo "- 启动 Rust 守护进程: $BIN cpuset=/dev/cpuset/$CPUSET_NAME" >>"$LOG"
             START_TS="$(date +%s 2>/dev/null || echo 0)"
-            "$BIN" -c "$CONF" -s 2 >>"$LOG" 2>&1
+            "$BIN" -c "$CONF" -s 2 -b "$CPUSET_NAME" >>"$LOG" 2>&1
             EXIT_CODE=$?
             END_TS="$(date +%s 2>/dev/null || echo 0)"
             RUNTIME=$((END_TS - START_TS))
             [ "$RUNTIME" -lt 0 ] && RUNTIME=0
-            if [ "$BIN" = "$BIN_RS" ]; then
-                if [ "$RUNTIME" -lt 20 ]; then
-                    RS_CRASH_COUNT=$((RS_CRASH_COUNT + 1))
-                else
-                    RS_CRASH_COUNT=0
-                fi
-                echo "- Rust daemon exited: code=$EXIT_CODE runtime=${RUNTIME}s count=$RS_CRASH_COUNT" >>"$LOG"
-                if [ "$RS_CRASH_COUNT" -ge 3 ] && [ -x "$BIN_C" ]; then
-                    echo "- Rust daemon crashed repeatedly, fallback to C daemon until next boot" >>"$LOG"
-                    : > "$RS_FALLBACK_FLAG"
-                    RS_CRASH_COUNT=0
-                fi
+            if [ -f "$RS_RESTART_FLAG" ]; then
+                rm -f "$RS_RESTART_FLAG"
+                echo "- Rust daemon configuration restart requested" >>"$LOG"
             fi
+            echo "- Rust daemon exited: code=$EXIT_CODE runtime=${RUNTIME}s" >>"$LOG"
         fi
         sleep 5
     done

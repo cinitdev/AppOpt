@@ -14,9 +14,7 @@ STATE="$MODDIR/config/foreground_task.state"
 PID_FILE="$MODDIR/config/foreground_helper.pid"
 LOG="$MODDIR/logs/ForegroundHelper.log"
 NICE_NAME="appopt_foreground_helper"
-BIN_C="$MODDIR/config/bin/AppOpt"
 BIN_RS="$MODDIR/config/bin/AppOptRs"
-RS_FALLBACK_FILE="$MODDIR/config/.appopt_use_c_daemon"
 RESTART_COOLDOWN_SECONDS=20
 
 find_app_process() {
@@ -52,11 +50,9 @@ is_helper_pid() {
 }
 
 helper_pids() {
-    query_bin="$BIN_C"
-    [ -x "$BIN_RS" ] && [ ! -f "$RS_FALLBACK_FILE" ] && query_bin="$BIN_RS"
-    if [ -x "$query_bin" ]; then
+    if [ -x "$BIN_RS" ]; then
         found=0
-        for pid in $("$query_bin" --find-pid "$NICE_NAME" 2>/dev/null); do
+        for pid in $("$BIN_RS" --find-pid "$NICE_NAME" 2>/dev/null); do
             if is_helper_pid "$pid"; then
                 echo "$pid"
                 found=1

@@ -9,7 +9,7 @@
     // 这里不要直接读 App UI 状态。FPS 模块只对 fps.cmd 负责，上层悬浮窗关闭时会写 stop。
     impl FpsMonitor {
         fn start(pkg: String, socket_name: Option<String>, socket_token: Option<String>) -> Self {
-            // 和 C 版 FPS 逻辑保持一致：游戏刚被拉起时 /proc/cmdline 可能短暂不可见，
+            // 游戏刚被拉起时 /proc/cmdline 可能短暂不可见，
             // 先等一小段时间，并优先锁定 top-app/foreground_window 里的目标 PID。
             // 这能避免直接锁主进程，导致 Unity/游戏渲染进程的帧被漏计。
             let initial_choice = wait_pkg_pid(&pkg, 30, Duration::from_millis(100));
@@ -466,7 +466,7 @@
     }
 
     fn start_ebpf_for_pkg(pkg: &str, pid: i32, source: &str) -> *mut AppOptEbpfCtx {
-        // 这里已经不走 C 版 FPS 逻辑，Rust 守护进程直接加载 bpf.o 并附加 libgui uprobe。
+        // Rust 守护进程直接加载 bpf.o 并附加 libgui uprobe。
         // bridge 内部会优先尝试 RingBuf；RingBuf mmap 不可用时自动加载 PerfEvent 备用对象。
         let ctx = match (CString::new(FPS_BPF_OBJ), CString::new(pkg)) {
             (Ok(bpf_path), Ok(c_pkg)) => {

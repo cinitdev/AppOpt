@@ -259,13 +259,10 @@ class EnvironmentFragment : TopLevelFragment() {
     }
 
     private fun daemonLabel(runtime: DaemonBridge.DaemonRuntime): String {
-        val kind = runtime.kindLabel
         val version = runtime.versionName?.takeIf { it.isNotBlank() }
         return when {
-            kind != null && version != null -> "$kind $version"
-            kind != null -> kind
-            version != null -> "运行中 $version"
-            else -> "运行中"
+            version != null -> "Rust 版 $version"
+            else -> "Rust 版"
         }
     }
 

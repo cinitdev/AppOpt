@@ -287,7 +287,7 @@
     }
 
     fn wait_pkg_pid(pkg: &str, attempts: u32, delay: Duration) -> Option<PidChoice> {
-        // 对齐 C 版 fps_wait_pkg_pid：启动目标应用后给系统一点时间创建进程，
+        // 启动目标应用后给系统一点时间创建进程，
         // 前几轮不允许子进程兜底，避免刚启动就锁到 push/MSF 等非渲染进程。
         for _ in 0..attempts {
             if let Some(choice) = find_preferred_pkg_pid(pkg, false) {

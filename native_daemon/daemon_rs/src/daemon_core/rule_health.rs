@@ -100,6 +100,7 @@ fn rule_health_entry_checked_in_lifecycle(
 fn finish_rule_health_update(changed: bool, state: &mut DaemonState) -> io::Result<()> {
     if changed {
         state.rule_health_dirty = true;
+        state.runtime_rule_index_dirty = true;
     }
     if !state.rule_health_dirty {
         return Ok(());
@@ -115,15 +116,8 @@ fn ensure_rule_health_loaded(state: &mut DaemonState) -> io::Result<()> {
     }
     state.rule_health = load_rule_health(Path::new(RULE_HEALTH_FILE))?;
     state.rule_health_loaded = true;
+    state.runtime_rule_index_dirty = true;
     Ok(())
-}
-
-fn runtime_rule_health_rules(rules: &[Rule], state: &DaemonState) -> Vec<Rule> {
-    rules
-        .iter()
-        .filter(|rule| !rule_health_rule_disabled(rule, state))
-        .cloned()
-        .collect()
 }
 
 fn disabled_rule_health_lines(rules: &[Rule], state: &DaemonState) -> Vec<String> {

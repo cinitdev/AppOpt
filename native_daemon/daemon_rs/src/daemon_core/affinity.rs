@@ -6,7 +6,12 @@
 //
 // mismatched 对移植系统很关键：有些 ROM/厂商服务会反复把线程绑回 4-7、6-7 之类的范围，
 // 这时不是 AppOpt 规则没命中，而是外部调度服务在抢写。
-fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
+fn apply_hits(
+    hits: &[ProcHit],
+    detail_log: bool,
+    cpuset_name: &str,
+    managed_tids: &mut HashMap<i32, ManagedTidEntry>,
+) -> ApplyStats {
     let mut stats = ApplyStats::default();
     let mut invalid_details = 0usize;
     let mut restricted_details = 0usize;
@@ -17,6 +22,7 @@ fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
     let mut identity_details = 0usize;
 
     let present_mask = read_present_cpus().and_then(|cpus| CpuMask::parse(&cpus));
+    let base_cpuset = Path::new("/dev/cpuset").join(cpuset_name);
 
     for hit in hits {
         for action in &hit.actions {
@@ -69,6 +75,67 @@ fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
             };
             let effective_cpus = mask.to_list();
 
+            let needs_cpuset_sync = managed_tids.get(&action.tid).is_none_or(|entry| {
+                entry.tgid != hit.pid || entry.starttime != action.tid_starttime ||
+                    !entry.cpuset_synced
+            });
+            if needs_cpuset_sync {
+                if !action_identity_is_current(
+                    hit,
+                    action,
+                    "cpuset",
+                    detail_log,
+                    &mut identity_details,
+                ) {
+                    stats.skipped += 1;
+                    continue;
+                }
+                let cpuset_synced = match move_tid_to_cpuset(
+                    action.tid,
+                    &mask,
+                    &base_cpuset,
+                    cpuset_name,
+                ) {
+                    Ok(()) => true,
+                    Err(err) if is_thread_gone_error(&err) => {
+                        stats.skipped += 1;
+                        continue;
+                    }
+                    Err(err) => {
+                        let expected_reject = is_cpuset_expected_reject(&err);
+                        if !expected_reject {
+                            stats.cpuset_failed += 1;
+                        }
+                        if !expected_reject
+                            && should_log_detail(detail_log, &mut cpuset_failed_details)
+                        {
+                            eprintln!(
+                                "[RS] cpuset辅助写入失败 进程={} 线程={} 线程名={} 规则={} 核心={} 错误={}",
+                                hit.pid,
+                                action.tid,
+                                action.name,
+                                action.rule,
+                                effective_cpus,
+                                error_text_zh(&err)
+                            );
+                        }
+                        expected_reject
+                    }
+                };
+                let last_seen_round = managed_tids
+                    .get(&action.tid)
+                    .map_or(0, |entry| entry.last_seen_round);
+                managed_tids.insert(
+                    action.tid,
+                    ManagedTidEntry {
+                        tgid: hit.pid,
+                        starttime: action.tid_starttime,
+                        last_seen_round,
+                        cpuset_synced,
+                    },
+                );
+            }
+
             // 已经在目标核心上就不重复写 affinity，减少长期守护进程对系统的打扰。
             match read_allowed_mask(hit.pid, action.tid) {
                 Ok(Some(current)) if current == mask => {
@@ -93,35 +160,6 @@ fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
                 }
             }
 
-            if !action_identity_is_current(hit, action, "cpuset", detail_log, &mut identity_details)
-            {
-                stats.skipped += 1;
-                continue;
-            }
-
-            if let Err(err) = move_tid_to_cpuset(action.tid, &mask) {
-                if is_thread_gone_error(&err) {
-                    stats.skipped += 1;
-                    continue;
-                }
-                if !is_cpuset_expected_reject(&err) {
-                    stats.cpuset_failed += 1;
-                }
-                if !is_cpuset_expected_reject(&err)
-                    && should_log_detail(detail_log, &mut cpuset_failed_details)
-                {
-                    eprintln!(
-                        "[RS] cpuset辅助写入失败 进程={} 线程={} 线程名={} 规则={} 核心={} 错误={}",
-                        hit.pid,
-                        action.tid,
-                        action.name,
-                        action.rule,
-                        effective_cpus,
-                        error_text_zh(&err)
-                    );
-                }
-            }
-
             if !action_identity_is_current(
                 hit,
                 action,
@@ -141,7 +179,7 @@ fn apply_hits(hits: &[ProcHit], detail_log: bool) -> ApplyStats {
                         Ok(Some(current)) if current != mask => {
                             if current.is_subset_of(&mask) {
                                 // Android cpuset/cgroup 可能会把有效核心收窄成规则的子集。
-                                // C 版不会记录这种读回差异；这里也不把它算成异常。
+                                // 这种读回差异不计为异常，避免厂商调度短暂抢写造成误报。
                             } else {
                                 stats.mismatched += 1;
                                 if should_log_detail(detail_log, &mut mismatch_details) {
@@ -250,7 +288,7 @@ fn log_limited_detail_count(kind: &str, detail_count: usize) {
 }
 
 fn is_cpuset_expected_reject(err: &io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(1 | 13 | 22))
+    matches!(err.raw_os_error(), Some(1 | 13 | 19 | 22 | 30 | 95))
         || matches!(
             err.kind(),
             io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
@@ -419,7 +457,12 @@ fn read_allowed_mask(pid: i32, tid: i32) -> io::Result<Option<CpuMask>> {
     Ok(None)
 }
 
-fn move_tid_to_cpuset(tid: i32, mask: &CpuMask) -> io::Result<()> {
+fn move_tid_to_cpuset(
+    tid: i32,
+    mask: &CpuMask,
+    base_cpuset: &Path,
+    cpuset_name: &str,
+) -> io::Result<()> {
     let cpuset_root = Path::new("/dev/cpuset");
     if !cpuset_root.exists() {
         return Ok(());
@@ -431,9 +474,13 @@ fn move_tid_to_cpuset(tid: i32, mask: &CpuMask) -> io::Result<()> {
     }
 
     let present = read_present_cpus().unwrap_or_else(|| cpus.clone());
-    ensure_cpuset_dir(Path::new(BASE_CPUSET), &present, "0")?;
+    // 自定义名称可能指向 ROM 已有的 cpuset。已有自定义目录只作为父组使用，
+    // 不改写其 cpus/mems/权限；AppOpt 自己的默认目录仍按旧逻辑维护。
+    if !base_cpuset.exists() || cpuset_name == DEFAULT_CPUSET_NAME {
+        ensure_cpuset_dir(base_cpuset, &present, "0")?;
+    }
 
-    let target = Path::new(BASE_CPUSET).join(&cpus);
+    let target = base_cpuset.join(&cpus);
     ensure_cpuset_dir(&target, &cpus, "0")?;
 
     let mut tasks = fs::OpenOptions::new()

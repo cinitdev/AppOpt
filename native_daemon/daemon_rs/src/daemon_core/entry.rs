@@ -50,6 +50,7 @@ where
     let mut parsed = Args {
         config: PathBuf::from(DEFAULT_CONFIG),
         uid_map: PathBuf::from(DEFAULT_UID_MAP),
+        cpuset_name: DEFAULT_CPUSET_NAME.to_string(),
         scan_once: false,
         apply_once: false,
         version: false,
@@ -118,6 +119,12 @@ where
                     .ok_or_else(|| format!("{arg} 需要 UID 映射文件路径"))?;
                 parsed.uid_map = PathBuf::from(value);
             }
+            "-b" | "--cpuset-name" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} 需要 cpuset 名称"))?;
+                parsed.cpuset_name = validate_cpuset_name(&value)?;
+            }
             "--pkg" => {
                 let value = args
                     .next()
@@ -148,9 +155,24 @@ where
     Ok(parsed)
 }
 
+fn validate_cpuset_name(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    if name.is_empty() || name.len() > 48 {
+        return Err("cpuset 名称长度必须为 1-48 个 ASCII 字符".to_string());
+    }
+    if name.starts_with('.')
+        || !name.bytes().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'-' | b'.')
+        })
+    {
+        return Err("cpuset 名称只能包含字母、数字、下划线、短横线和点，且不能以点开头".to_string());
+    }
+    Ok(name.to_string())
+}
+
 fn print_help() {
     println!(
-        "用法: AppOptRs [-c applist.conf] [-s 秒数] [--uid-map package_uid.map] [--pkg 包名] [--scan-once|--apply-once]\n\
+        "用法: AppOptRs [-c applist.conf] [-s 秒数] [-b cpuset名称] [--uid-map package_uid.map] [--pkg 包名] [--scan-once|--apply-once]\n\
          \n\
          模式:\n\
            默认模式       常驻守护并持续执行绑核\n\
@@ -158,8 +180,9 @@ fn print_help() {
            --scan-once   只打印命中的进程/线程规则, 不修改绑核\n\
            --app-state <包名>  打印 cgroup 前台包状态\n\
            --find-pid <进程名>  从 AppOpt 进程索引查询 PID\n\
-           --find-processes <名称...>  输出当前存在的进程名\n\
-           -P, --ping-daemon <socket> <token>  请求守护进程回连 App 验证 socket\n\
+            --find-processes <名称...>  输出当前存在的进程名\n\
+            -b, --cpuset-name <名称>  设置 /dev/cpuset 下的 AppOpt 运行组名称\n\
+            -P, --ping-daemon <socket> <token>  请求守护进程回连 App 验证 socket\n\
            -v            打印版本和启动诊断\n"
     );
 }

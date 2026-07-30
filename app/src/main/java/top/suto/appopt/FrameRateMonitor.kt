@@ -14,7 +14,7 @@ import java.util.UUID
 /**
  * 真实帧率(FPS)接收器。
  *
- * 优先使用 Android 本地 socket 接收 C 守护进程推送的 FPS 文本行, 失败时保留旧的
+ * 优先使用 Android 本地 socket 接收 Rust 守护进程推送的 FPS 文本行, 失败时保留旧的
  * fps 文件 + FileObserver 方案作为兜底。这样 socket 被 SELinux/ROM 行为拦住时,
  * 悬浮球仍能继续显示文件通道输出。
  */

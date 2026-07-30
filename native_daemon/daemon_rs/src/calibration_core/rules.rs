@@ -6,7 +6,7 @@
 // - 子进程只生成 com.pkg:proc=cpus，不生成 com.pkg:proc{thread}=cpus。
 // - 最后总是追加主包名兜底规则，避免没有单独命中的线程跑到未指定核心。
 //
-// 这里的目标不是“生成越多规则越好”，而是生成用户能理解、C/Rust daemon 都能执行的规则。
+// 这里的目标不是“生成越多规则越好”，而是生成用户能理解且守护进程能稳定执行的规则。
 fn finish_session(session: CalibSession, config_file: &Path) -> io::Result<()> {
     // 60 轮 * 500ms 约等于 30 秒，采样太短时负载峰值很容易误判。
     if session.rounds < CALIB_MIN_ROUNDS {
@@ -197,7 +197,7 @@ fn generate_rules(pkg: &str, records: &[LoadRecord]) -> Vec<String> {
 
     let mut thread_rule_count = rules.len();
     for tier_rank in [2u8, 1u8] {
-        // 同档位先输出精确线程，再输出通配组，与 C 版保持一致。
+        // 同档位先输出精确线程，再输出通配组，保持稳定的规则顺序。
         for wild_pass in [false, true] {
             for group in groups.iter().filter(|group| group.is_wild == wild_pass) {
                 if thread_rule_count >= policy.max_thread_rules {

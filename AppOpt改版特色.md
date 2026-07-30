@@ -2,18 +2,18 @@
 
 > 基于原版 **AppOpt v1.6.3**(作者 suto)深度扩展。原版是一个专注、可靠的 CPU 线程绑核守护进程;本增强版在其内核之上，新增了**自动校准、真实帧率监测、历史负载记录**三大守护进程能力，并从零做了一个**配套图形 App**，把命令行工具变成人人可用的一键工具。
 >
-> 当前版本默认优先运行 Rust 守护进程 `AppOptRs`，C 版 `AppOpt` 作为兼容兜底；前台识别由 root `app_process` 启动的 `appopt_foreground_helper.jar` 辅助。
+> 当前版本只维护 Rust 守护进程 `AppOptRs`；前台识别由 root `app_process` 启动的 `appopt_foreground_helper.jar` 辅助。
 >
 > 兼容 Magisk / KernelSU / APatch，规则即时生效、无需重启。
 
 ---
 
-## 一、守护进程（Rust 优先 / C 兜底）新增能力
+## 一、Rust 守护进程新增能力
 
-原版只做"按配置文件静态绑核"。增强版让守护进程**会观察、会学习、会测帧**，并把长期运行主路径迁移到 Rust，C 版保留为稳定兜底：
+原版只做"按配置文件静态绑核"。增强版让守护进程**会观察、会学习、会测帧**，并将长期运行与新增功能统一到 Rust：
 
-- **Rust 守护进程优先**
-  `service.sh` 默认优先启动 `AppOptRs`。Rust 版读取 `applist.conf` 与 `package_uid.map`，先用 UID 缩小候选进程，再缓存已命中的 PID/TID，减少长期运行时对 `/proc` 的全量遍历。Rust 版连续快速异常退出时，会在本次开机内回退到 C 版 `AppOpt`。
+- **Rust 守护进程**
+  `service.sh` 启动 `AppOptRs`。Rust 版读取 `applist.conf` 与 `package_uid.map`，先用 UID 缩小候选进程，再缓存已命中的 PID/TID，减少长期运行时对 `/proc` 的全量遍历。异常退出后由看门狗继续拉起 Rust 守护进程。
 
 - **ActivityTaskManager 前台助手**
   `appopt_foreground_helper.jar` 通过 root `app_process` 常驻，监听前台任务并写入 `foreground_task.state`；同时生成 `package_uid.map`，让 Rust 守护进程不依赖 `cmd` / `pm` / `dumpsys` 获取包名 UID。App 前台判断优先使用 helper，不可用时再回退到 UsageStats、cgroup 前台组和 dumpsys。
@@ -57,11 +57,11 @@
 
 ## 三、原版 vs 增强版
 
-| 能力 | 原版 v1.6.3 | 增强版 v1.7.5 |
+| 能力 | 原版 v1.6.3 | 增强版 |
 |---|:---:|:---:|
 | 线程绑核（cpuset + 亲和） | ✓ | ✓ |
 | 配置热重载（inotify） | ✓ | ✓ |
-| Rust 守护进程优先 / C 兜底 | ✗ | **✓ 新增** |
+| Rust 守护进程 | ✗ | **✓ 新增** |
 | UID 预过滤 / PID-TID 缓存 | ✗ | **✓ 新增** |
 | 自动校准生成规则 | ✗ | **✓ 新增** |
 | 真实帧率监测 | ✗ | **✓ 新增** |

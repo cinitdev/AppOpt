@@ -24,7 +24,7 @@ struct CpuTiers {
 
 impl CpuTiers {
     fn detect() -> Self {
-        // 按 cpuinfo_max_freq 分簇，保持和 C 版/设置页自动核心分配一致。
+        // 按 cpuinfo_max_freq 分簇，与设置页自动核心分配保持一致。
         let present = present_cpus();
         let count = present.last().copied().unwrap_or(0) + 1;
         let clusters = cpu_clusters(&present);

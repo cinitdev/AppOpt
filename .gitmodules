@@ -1,3 +1,4 @@
 [submodule "native_daemon/fps_monitor/aya"]
 	path = native_daemon/fps_monitor/aya
 	url = https://github.com/cinitdev/AppOpt-aya-lite.git
+	branch = main

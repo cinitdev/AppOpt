@@ -45,8 +45,10 @@ extract_bin() {
 	else
 		abort "! Unsupported platform: $ARCH"
 	fi
-	cp $MODPATH/config/bin/$BIN_ABI_DIR/AppOpt $MODPATH/config/bin/AppOpt
-	[ -f $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs ] && cp $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs $MODPATH/config/bin/AppOptRs
+	[ -f $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs ] \
+		|| abort "! 缺少 Rust 守护进程: $BIN_ABI_DIR/AppOptRs"
+	cp $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs $MODPATH/config/bin/AppOptRs \
+		|| abort "! 安装 Rust 守护进程失败"
 	[ -d "$MODPATH/config/ebpf/$BIN_ABI_DIR" ] || abort "! 缺少 eBPF ABI 目录: $BIN_ABI_DIR"
 	cp "$MODPATH/config/ebpf/$BIN_ABI_DIR/queuebuffer_probe.bpf.o" "$MODPATH/config/ebpf/queuebuffer_probe.bpf.o" 2>/dev/null \
 		|| abort "! 安装 queueBuffer RingBuf eBPF 对象失败"
@@ -57,24 +59,11 @@ extract_bin() {
 	ui_print "- Device platform: $ARCH"
 	rm -rf $MODPATH/config/bin/armeabi-v7a $MODPATH/config/bin/arm64-v8a $MODPATH/config/bin/x86 $MODPATH/config/bin/x86_64
 	rm -rf $MODPATH/config/ebpf/armeabi-v7a $MODPATH/config/ebpf/arm64-v8a $MODPATH/config/ebpf/x86 $MODPATH/config/ebpf/x86_64
-	[ -f $MODPATH/config/bin/AppOpt ] && chmod a+x $MODPATH/config/bin/AppOpt
-	[ -f $MODPATH/config/bin/AppOptRs ] && chmod a+x $MODPATH/config/bin/AppOptRs
-	if [ -f $MODPATH/config/bin/AppOptRs ]; then
-		if $MODPATH/config/bin/AppOptRs -v; then
-			ui_print "- Rust 守护验证通过，将优先使用 AppOptRs"
-			if [ -f $MODPATH/config/bin/AppOpt ]; then
-				$MODPATH/config/bin/AppOpt -v >/dev/null 2>&1 || ui_print "- C 守护验证失败，仅保留 Rust 守护"
-			fi
-			return
-		fi
-		ui_print "- Rust 守护验证失败，删除 AppOptRs 并使用 C 守护"
-		rm -f $MODPATH/config/bin/AppOptRs
-	else
-		ui_print "- Rust 守护不可用，将使用 C 守护"
+	chmod a+x $MODPATH/config/bin/AppOptRs
+	if ! $MODPATH/config/bin/AppOptRs -v; then
+		abort "! Rust 守护验证失败，请检查模块 zip 文件或设备架构"
 	fi
-	if ! $MODPATH/config/bin/AppOpt -v >/dev/null 2>&1; then
-		abort "! 主程序验证失败，请检查模块zip文件是否损坏"
-	fi
+	ui_print "- Rust 守护验证通过: AppOptRs"
 }
 
 run_pkg_helper() {
@@ -365,6 +354,15 @@ add_default_rules() {
 	unset APPOPT_RULES_FILE
 	ui_print "- 已生成默认线程规则配置"
 }
+normalize_cpuset_name() {
+	local name="$1"
+	[ -n "$name" ] && [ "${#name}" -le 48 ] || return 1
+	case "$name" in
+		.*|*[!A-Za-z0-9_.-]*) return 1 ;;
+	esac
+	printf '%s' "$name"
+}
+
 prepare_calib_policy() {
 	mkdir -p $MODPATH/config
 	local ACTIVE_POLICY="/data/adb/modules/AppOpt/config/calib_policy.conf"
@@ -399,8 +397,31 @@ wildcard_group=max_member
 rule_output_format=legacy
 max_thread_rules=6
 fallback=cores:$FALLBACK_CORES
+cpuset_name=AppOptRs
 EOF
 		ui_print "- 已生成默认自动校准策略配置"
+	fi
+
+	local CPUSET_NAME TMP_POLICY
+	CPUSET_NAME="$(sed -n 's/^[[:space:]]*cpuset_name[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*$/\1/p' "$PENDING_POLICY" 2>/dev/null | tail -n 1)"
+	CPUSET_NAME="$(normalize_cpuset_name "$CPUSET_NAME" 2>/dev/null)" || CPUSET_NAME=""
+	if [ -z "$CPUSET_NAME" ]; then
+		CPUSET_NAME="AppOptRs"
+		TMP_POLICY="$PENDING_POLICY.cpuset.tmp"
+		if awk '
+		{
+			trimmed = $0
+			sub(/^[[:space:]]*/, "", trimmed)
+			if (trimmed ~ /^cpuset_name[[:space:]]*=/) next
+			print
+		}' "$PENDING_POLICY" > "$TMP_POLICY" &&
+			printf 'cpuset_name=%s\n' "$CPUSET_NAME" >> "$TMP_POLICY" &&
+			mv -f "$TMP_POLICY" "$PENDING_POLICY"; then
+			ui_print "- Rust cpuset 运行组：已写入自动校准策略"
+		else
+			rm -f "$TMP_POLICY"
+			ui_print "! Rust cpuset 运行组写入失败，将使用默认 AppOptRs"
+		fi
 	fi
 }
 
@@ -477,7 +498,7 @@ prepare_jank_boost_config
 prepare_runtime_state_dir
 normalize_calib_rule_output_format
 set_perm_recursive "$MODPATH" 0 0 0755 0644
-set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOpt $MODPATH/config/bin/AppOptRs" 0 2000 0755 0755 u:object_r:magisk_file:s0
+set_perm_recursive "$MODPATH/*.sh $MODPATH/config/bin/AppOptRs" 0 2000 0755 0755 u:object_r:magisk_file:s0
 [ -d "$MODPATH/config/app/tools" ] && chmod 0755 "$MODPATH/config/app/tools" "$MODPATH/config/app/tools"/*.sh 2>/dev/null
 [ -d "$MODPATH/config/tools" ] && chmod 0755 "$MODPATH/config/tools" "$MODPATH/config/tools"/*.sh 2>/dev/null
 install_or_update_app

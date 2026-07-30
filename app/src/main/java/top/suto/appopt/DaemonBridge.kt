@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.UUID
 
 /**
- * 与 C 守护进程的 IPC 桥接。
+ * 与 Rust 守护进程的 IPC 桥接。
  *
  * 守护进程运行在 /data/adb/modules/AppOpt/ 下, 该目录普通应用无权限读写,
  * 因此命令/状态文件的读写全部通过 root (su) 执行; 高频数据和守护验证走 socket。
@@ -33,9 +33,7 @@ object DaemonBridge {
     private const val MODULE_DIR = "/data/adb/modules/AppOpt"
     private const val MODULE_UPDATE_DIR = "/data/adb/modules_update/AppOpt"
     private const val CONFIG_DIR = "$MODULE_DIR/config"
-    private const val BIN_FILE = "$CONFIG_DIR/bin/AppOpt"
     private const val BIN_RS_FILE = "$CONFIG_DIR/bin/AppOptRs"
-    private const val RS_FALLBACK_FILE = "$CONFIG_DIR/.appopt_use_c_daemon"
     private const val LOG_DIR = "$MODULE_DIR/logs"
     private const val UPDATE_CONFIG_DIR = "$MODULE_UPDATE_DIR/config"
     private const val RUNTIME_STATE_DIR = "$CONFIG_DIR/state"
@@ -49,6 +47,7 @@ object DaemonBridge {
     private const val POLICY_FILE = "$CONFIG_DIR/calib_policy.conf"
     private const val POLICY_LOCK_DIR = "$CONFIG_DIR/calib_policy.conf.lock"
     private const val POLICY_UPDATE_FILE = "$UPDATE_CONFIG_DIR/calib_policy.conf"
+    private const val RS_RESTART_FILE = "$CONFIG_DIR/.appopt_restart_rs_daemon"
     private const val HISTORY_DIR = "$MODULE_DIR/history"
     private const val LOG_FILE = "$LOG_DIR/AppOpt.log"
     private const val FOREGROUND_HELPER_LOG_FILE = "$LOG_DIR/ForegroundHelper.log"
@@ -58,8 +57,8 @@ object DaemonBridge {
     private const val FOREGROUND_TASK_MAX_AGE_MS = 12_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 181
-    const val REQUIRED_MODULE_VERSION_NAME = "1.8.1"
+    const val REQUIRED_MODULE_VERSION_CODE = 182
+    const val REQUIRED_MODULE_VERSION_NAME = "1.8.2"
     private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
@@ -109,18 +108,10 @@ object DaemonBridge {
 
     data class DaemonRuntime(
         val running: Boolean,
-        val kind: String? = null,
         val versionName: String? = null,
         val pid: Int? = null,
         val raw: String = ""
-    ) {
-        val kindLabel: String?
-            get() = when (kind?.lowercase(Locale.ROOT)) {
-                "rust", "rs", "appoptrs" -> "Rust 版"
-                "c", "native", "appopt" -> "C 版"
-                else -> null
-            }
-    }
+    )
 
     enum class RuleHealthStatus {
         VALID,
@@ -332,10 +323,10 @@ object DaemonBridge {
 
     /**
      * 读取已刷入模块版本。兼容性判断只看 module.prop 的 versionCode；
-     * C 二进制 `AppOpt -v` 仅作为辅助显示信息, 不决定模块版本是否合格。
+     * Rust 二进制 `AppOptRs -v` 仅作为辅助显示信息, 不决定模块版本是否合格。
      */
     fun readModuleVersion(): ModuleVersion? {
-        val binSelect = daemonBinarySelectShell()
+        val daemonBin = shellQuote(BIN_RS_FILE)
         val cmd = """
             prop="$MODULE_DIR/module.prop"
             prop_code=
@@ -343,7 +334,7 @@ object DaemonBridge {
             bin_version=
             [ -f "${'$'}prop" ] && prop_code=${'$'}(sed -n 's/^versionCode=//p' "${'$'}prop" 2>/dev/null | head -n 1)
             [ -f "${'$'}prop" ] && prop_version=${'$'}(sed -n 's/^version=//p' "${'$'}prop" 2>/dev/null | head -n 1)
-            daemon_bin=${'$'}($binSelect)
+            daemon_bin=$daemonBin
             if [ -x "${'$'}daemon_bin" ]; then
                 bin_out=$("${'$'}daemon_bin" -v 2>/dev/null)
                 bin_version=${'$'}(printf '%s\n' "${'$'}bin_out" | sed -n 's/.*AppOpt 版本[[:space:]]*//p' | tail -n 1)
@@ -380,12 +371,7 @@ object DaemonBridge {
      */
     fun isDaemonRunning(): Boolean = readDaemonRuntime().running
 
-    fun readDaemonRuntime(): DaemonRuntime {
-        val runtime = verifyDaemonSocketReverse()
-        if (!runtime.running || runtime.kind != null) return runtime
-        val inferredKind = inferDaemonKindByPid(runtime.pid)
-        return if (inferredKind != null) runtime.copy(kind = inferredKind) else runtime
-    }
+    fun readDaemonRuntime(): DaemonRuntime = verifyDaemonSocketReverse()
 
     private fun verifyDaemonSocketReverse(): DaemonRuntime {
         val socketName = "appopt_verify_${android.os.Process.myPid()}_${System.nanoTime()}"
@@ -415,9 +401,9 @@ object DaemonBridge {
             }
 
             val rootThread = Thread({
-                val binSelect = daemonBinarySelectShell()
+                val daemonBin = shellQuote(BIN_RS_FILE)
                 runAsRoot(
-                    "daemon_bin=\$($binSelect); \"\$daemon_bin\" --ping-daemon '$socketName' '$token' 2>/dev/null",
+                    "daemon_bin=$daemonBin; \"\$daemon_bin\" --ping-daemon '$socketName' '$token' 2>/dev/null",
                     timeoutSeconds = 4L
                 )
             }, "AppOptDaemonPing").apply {
@@ -451,12 +437,8 @@ object DaemonBridge {
         val pid = callbackField(line, "pid")?.toIntOrNull() ?: return null
         val versionCode = versionNameToCode(version) ?: return null
         if (versionCode < REQUIRED_MODULE_VERSION_CODE) return null
-        val kind = callbackField(line, "kind")
-            ?: callbackField(line, "impl")
-            ?: callbackField(line, "name")
         return DaemonRuntime(
             running = true,
-            kind = normalizeDaemonKind(kind),
             versionName = version,
             pid = pid,
             raw = line
@@ -469,21 +451,6 @@ object DaemonBridge {
             .firstOrNull { it.startsWith(prefix) }
             ?.removePrefix(prefix)
             ?.takeIf { it.isNotBlank() }
-    }
-
-    private fun inferDaemonKindByPid(pid: Int?): String? {
-        if (pid == null || pid <= 0) return null
-        val out = runAsRoot("cat /proc/$pid/comm 2>/dev/null")
-        if (!out.isNotErrored()) return null
-        return normalizeDaemonKind(out.substringBefore('\n').trim())
-    }
-
-    private fun normalizeDaemonKind(kind: String?): String? {
-        return when (kind?.trim()?.lowercase(Locale.ROOT)) {
-            "rust", "rs", "appoptrs" -> "rust"
-            "c", "native", "appopt" -> "c"
-            else -> null
-        }
     }
 
     /**
@@ -499,9 +466,9 @@ object DaemonBridge {
         val targetSet = targets.toHashSet()
 
         val targetArgs = targets.joinToString(" ") { "'$it'" }
-        val binSelect = daemonBinarySelectShell()
+        val daemonBin = shellQuote(BIN_RS_FILE)
         val cmd = """
-            daemon_bin=${'$'}($binSelect)
+            daemon_bin=$daemonBin
             if [ -x "${'$'}daemon_bin" ] &&
                 "${'$'}daemon_bin" --find-processes $targetArgs 2>/dev/null; then
                 exit 0
@@ -535,11 +502,11 @@ object DaemonBridge {
         if (safePkg.isBlank()) {
             return TopAppState(false, null, 0, emptyList(), backend = "invalid")
         }
-        val binSelect = daemonBinarySelectShell()
+        val daemonBin = shellQuote(BIN_RS_FILE)
         val cmd = buildString {
-            append("daemon_bin=$(")
-            append(binSelect)
-            append("); \"\$daemon_bin\"")
+            append("daemon_bin=")
+            append(daemonBin)
+            append("; \"\$daemon_bin\"")
             append(" --app-state ")
             append(shellQuote(safePkg))
         }
@@ -800,6 +767,60 @@ object DaemonBridge {
         val readSuccess: Boolean
     )
 
+    enum class RustDaemonRestartStatus {
+        REQUESTED,
+        NOT_RUNNING,
+        FAILED
+    }
+
+    fun supportsCustomCpuset(): Boolean {
+        val binary = shellQuote(BIN_RS_FILE)
+        val result = readRootCommandResult(
+            "if [ -x $binary ] && $binary -h 2>/dev/null | grep -q -- '--cpuset-name'; " +
+                "then printf 1; else printf 0; fi"
+        )
+        return result.success && result.output.trim() == "1"
+    }
+
+    fun restartRustDaemon(): RustDaemonRestartStatus {
+        val binary = shellQuote(BIN_RS_FILE)
+        val restartFlag = shellQuote(RS_RESTART_FILE)
+        val command = """
+            bin=$binary
+            flag=$restartFlag
+            [ -x "${'$'}bin" ] || { printf failed; exit 0; }
+            pids="${'$'}("${'$'}bin" --find-pid AppOptRs 2>/dev/null)"
+            [ -n "${'$'}pids" ] || pids="${'$'}(pidof AppOptRs 2>/dev/null) ${'$'}(pgrep -x AppOptRs 2>/dev/null)"
+            targets=""
+            for pid in ${'$'}pids; do
+                [ -n "${'$'}pid" ] || continue
+                [ "${'$'}(readlink "/proc/${'$'}pid/exe" 2>/dev/null)" = "${'$'}bin" ] || continue
+                case " ${'$'}targets " in *" ${'$'}pid "*) ;; *) targets="${'$'}targets ${'$'}pid" ;; esac
+            done
+            if [ -z "${'$'}targets" ]; then
+                rm -f "${'$'}flag" 2>/dev/null || true
+                printf not_running
+                exit 0
+            fi
+            : > "${'$'}flag" || { printf failed; exit 0; }
+            for pid in ${'$'}targets; do
+                if ! kill "${'$'}pid" 2>/dev/null; then
+                    rm -f "${'$'}flag"
+                    printf failed
+                    exit 0
+                fi
+            done
+            printf requested
+        """.trimIndent()
+        val result = readRootCommandResult(command)
+        if (!result.success) return RustDaemonRestartStatus.FAILED
+        return when (result.output.trim()) {
+            "requested" -> RustDaemonRestartStatus.REQUESTED
+            "not_running" -> RustDaemonRestartStatus.NOT_RUNNING
+            else -> RustDaemonRestartStatus.FAILED
+        }
+    }
+
     /**
      * 读取自动校准策略文件。
      * 如果 /data/adb/modules_update/AppOpt/config/calib_policy.conf 存在，说明模块更新已刷入但未重启，
@@ -876,7 +897,7 @@ object DaemonBridge {
 
     /**
      * 在配置锁内转换现有规则并保存策略。策略写入失败时恢复原始 applist.conf，
-     * 避免现有规则格式与后续 C/Rust 校准生成格式不一致。
+     * 避免现有规则格式与后续 Rust 校准生成格式不一致。
      */
     fun applyRuleOutputFormat(
         format: CalibPolicy.RuleOutputFormat,
@@ -1495,13 +1516,6 @@ object DaemonBridge {
     private fun cleanCommandArg(value: String, allowColon: Boolean): String {
         val allowed = if (allowColon) Regex("[^A-Za-z0-9._:-]") else Regex("[^A-Za-z0-9._-]")
         return value.trim().replace("'", "").replace(allowed, "")
-    }
-
-    private fun daemonBinarySelectShell(): String {
-        val rs = shellQuote(BIN_RS_FILE)
-        val c = shellQuote(BIN_FILE)
-        val fallback = shellQuote(RS_FALLBACK_FILE)
-        return "[ -x $rs ] && [ ! -f $fallback ] && printf '%s' $rs || printf '%s' $c"
     }
 
     private fun shellQuote(value: String): String {

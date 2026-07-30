@@ -683,6 +683,7 @@ class MainActivity : AppCompatActivity() {
             UsageGuide.Target.SIMILAR_THREADS,
             UsageGuide.Target.PERFORMANCE_TIERS,
             UsageGuide.Target.PROCESS_FALLBACK,
+            UsageGuide.Target.CPUSET_RUNTIME,
             UsageGuide.Target.HELP_BUTTON -> selectTopLevelPage(R.id.navSettings)
         }
         if (!supportFragmentManager.isStateSaved) {
@@ -715,6 +716,7 @@ class MainActivity : AppCompatActivity() {
             UsageGuide.Target.SIMILAR_THREADS,
             UsageGuide.Target.PERFORMANCE_TIERS,
             UsageGuide.Target.PROCESS_FALLBACK,
+            UsageGuide.Target.CPUSET_RUNTIME,
             UsageGuide.Target.HELP_BUTTON ->
                 (supportFragmentManager.findFragmentByTag(topLevelFragmentTag(R.id.navSettings)) as? SettingsFragment)
                     ?.prepareUsageGuideTarget(target)
@@ -727,7 +729,8 @@ class MainActivity : AppCompatActivity() {
                     target == UsageGuide.Target.RULE_GENERATION_LIMIT ||
                     target == UsageGuide.Target.SIMILAR_THREADS ||
                     target == UsageGuide.Target.PERFORMANCE_TIERS ||
-                    target == UsageGuide.Target.PROCESS_FALLBACK -> 160
+                    target == UsageGuide.Target.PROCESS_FALLBACK ||
+                    target == UsageGuide.Target.CPUSET_RUNTIME -> 160
                 else -> 16
             }
             if (attempt < maxAttempts) {
@@ -1299,13 +1302,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun daemonRuntimeLabel(): String {
-        val kind = daemonRuntime.kindLabel
         val version = daemonRuntime.versionName?.takeIf { it.isNotBlank() }
         return when {
-            kind != null && version != null -> "$kind $version"
-            kind != null -> kind
-            version != null -> "运行中 $version"
-            else -> "运行中"
+            version != null -> "Rust 版 $version"
+            else -> "Rust 版"
         }
     }
 

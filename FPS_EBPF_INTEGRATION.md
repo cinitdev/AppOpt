@@ -2,38 +2,27 @@
 
 ## 当前架构
 
-AppOpt 的 FPS 监测现在由 Rust 守护进程、C 兼容接口层、Rust/aya bridge 和
-SurfaceFlinger fallback 组成。默认运行的 `AppOptRs` 会直接通过 FFI 调用
-Rust/aya bridge；C 版 `AppOpt` 作为 fallback 时，则通过 `ebpf_fps.c` 这层 C shim
-调用同一套 Rust/aya bridge。
+AppOpt 的 FPS 监测由 Rust 守护进程、Rust/aya bridge 和 Rust 实现的
+SurfaceFlinger fallback 组成。`AppOptRs` 直接链接并调用 `appopt_ebpf_bridge`。
 
 ```text
-native_daemon/AppOpt.c
-  C fallback daemon, 调用 native_daemon/fps_monitor/ebpf_fps.h 暴露的 C API
-
 native_daemon/daemon_rs/
-  Rust daemon, 直接调用 appopt_ebpf_bridge FFI
+  Rust daemon, 负责 FPS 命令、前台 PID 确认、eBPF 生命周期和 SurfaceFlinger fallback
 
 native_daemon/fps_monitor/
-  ebpf_fps.h                    native_daemon/AppOpt.c 使用的 C API
-  ebpf_fps.c                    C shim, 通过 FFI 调用 Rust/aya bridge
   bpf/queuebuffer_probe.bpf.c        RingBuf 内核侧 BPF 程序
   bpf/queuebuffer_probe_perf.bpf.c   PerfEvent 备用内核侧 BPF 程序
-  appopt_ebpf_bridge/                Rust staticlib, 负责 BPF 加载、uprobe attach、事件通道读取
+  appopt_ebpf_bridge/                Rust crate, 负责 BPF 加载、uprobe attach、事件通道读取
   aya/                          精简后的本地 vendored aya
-  fps_fallback.h/.c             SurfaceFlinger fallback
 ```
 
-旧的纯 C eBPF loader 已移除。`ebpf_fps.c` 不再直接读
-`/sys/bus/event_source/devices/uprobe/type`, 也不再自己用
-`perf_event_open` 绑定 uprobe。uprobe attach 由 Rust/aya 封装完成。
+旧 C 守护及其 C shim 已移除。uprobe 加载和 attach 统一由 Rust/aya 完成。
 
 ## eBPF 路径
 
 1. App 写入 `fps.cmd` 请求开始监测某个包名。
 2. 当前守护进程优先通过 ActivityTaskManager helper / cgroup 前台组 / 包名进程查找目标 PID。
-3. 找到具体 PID 后，Rust daemon 调用 `appopt_ebpf_start_for_package(pid, bpf_obj, pkg)`；
-   C fallback daemon 调用 `ebpf_fps_start(bpf_obj, pid, pkg)`。
+3. 找到具体 PID 后，Rust daemon 调用 `appopt_ebpf_start_for_package(pid, bpf_obj, pkg)`。
 4. 如果暂时找不到 PID，不再启动全局 uprobe；守护进程会等待后续拿到真实 PID 后再尝试 eBPF，
    期间可由 SurfaceFlinger fallback 兜底输出。
 5. Rust/aya 优先加载 `queuebuffer_probe.bpf.o` 并初始化 RingBuf 事件通道。
@@ -103,8 +92,8 @@ eBPF uprobe
 
 ## 与 auto 规则生成的关系
 
-本文件描述 FPS/eBPF 监测链路。CPU 亲和性 `auto` 规则生成在 Rust daemon 和 C fallback
-daemon 中实现，不在 `native_daemon/fps_monitor` 或 Rust/aya bridge 中完成。
+本文件描述 FPS/eBPF 监测链路。CPU 亲和性 `auto` 规则生成在 Rust daemon 中实现，
+不在 `native_daemon/fps_monitor` 或 Rust/aya bridge 中完成。
 
 当前 `auto` 规则不依赖线程名白名单/黑名单, 也不特殊识别 `UnityMain`、`MainThread`、
 `RenderThread`、`worker`、`Audio` 等名字。算法只看采样负载:
@@ -222,8 +211,7 @@ RingBuf 不可用, 自动切换 PerfEvent:
 ```text
 queuebuffer_probe.bpf.o
 queuebuffer_probe_perf.bpf.o
-appopt_ebpf_bridge staticlib
-AppOpt C fallback 二进制
+appopt_ebpf_bridge Rust crate
 AppOptRs Rust 守护进程
 Magisk 模块 zip
 ```
@@ -240,7 +228,6 @@ x86
 ## 相关文件
 
 - `native_daemon/fps_monitor/README.md`
-- `native_daemon/fps_monitor/ebpf_fps.c`
 - `native_daemon/fps_monitor/appopt_ebpf_bridge/src/lib.rs`
 - `native_daemon/fps_monitor/bpf/queuebuffer_probe.bpf.c`
 - `native_daemon/fps_monitor/bpf/queuebuffer_probe_perf.bpf.c`

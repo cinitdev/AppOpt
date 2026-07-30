@@ -4,7 +4,7 @@
 // 1. 进程层：先用 /proc/<pid> 目录 owner UID 和 cmdline 判断是否属于目标包。
 // 2. 线程层：只有进程命中后，才进入 /proc/<pid>/task 读取 comm 并匹配线程规则。
 //
-// 这样保留了 C 版基于 /proc 的兼容性，同时避免无意义地读取全系统所有线程。
+// 这样保留基于 /proc 的通用兼容路径，同时避免无意义地读取全系统所有线程。
 // 这里不要引入 cmd/pm/dumpsys 这类外部命令，守护进程长期运行时 fork 成本太高。
 enum ProcessScanOutcome {
     Hit(ProcHit),
@@ -32,18 +32,17 @@ fn enumerate_proc_pids() -> io::Result<BTreeSet<i32>> {
 
 fn scan_candidate_pids(
     rules: &[Rule],
-    plan: &ScanPlan,
+    index: &RuntimeRuleIndex,
     candidates: &BTreeSet<i32>,
 ) -> CandidateScanResult {
-    if plan.is_empty() || candidates.is_empty() {
+    if index.plan.is_empty() || candidates.is_empty() {
         return CandidateScanResult::default();
     }
 
-    let rules_by_owner = build_rules_by_owner(rules);
     let mut result = CandidateScanResult::default();
     for pid in candidates.iter().copied() {
         let proc_path = PathBuf::from(format!("/proc/{pid}"));
-        match scan_process_path(pid, &proc_path, &rules_by_owner, plan) {
+        match scan_process_path(pid, &proc_path, rules, index) {
             ProcessScanOutcome::Hit(hit) => result.hits.push(hit),
             ProcessScanOutcome::Gone => {
                 result.gone_pids.insert(pid);
@@ -58,10 +57,10 @@ fn scan_candidate_pids(
 
 fn scan_proc(
     rules: &[Rule],
-    plan: &ScanPlan,
+    index: &RuntimeRuleIndex,
     known_pids: &BTreeSet<i32>,
 ) -> io::Result<ProcScanResult> {
-    if plan.is_empty() {
+    if index.plan.is_empty() {
         return Ok(ProcScanResult {
             hits: Vec::new(),
             complete: true,
@@ -70,7 +69,6 @@ fn scan_proc(
     }
     // 全量扫描只枚举 /proc/<pid> 目录，不会直接扫全系统线程。
     // 只有 PID 通过 appId 快路径或严格 cmdline 包名兜底后，才进入 /proc/<pid>/task 扫线程。
-    let rules_by_owner = build_rules_by_owner(rules);
     let mut hits = Vec::new();
     let mut complete = true;
     let mut health_incomplete_packages = BTreeSet::new();
@@ -87,7 +85,7 @@ fn scan_proc(
         let Some(pid) = parse_pid(&file_name) else {
             continue;
         };
-        match scan_process_path(pid, &entry.path(), &rules_by_owner, plan) {
+        match scan_process_path(pid, &entry.path(), rules, index) {
             ProcessScanOutcome::Hit(hit) => {
                 if !hit.health_scan_complete {
                     if let Some(pkg) = base_package(&hit.cmdline) {
@@ -116,12 +114,11 @@ fn scan_proc(
 
 fn scan_known_pids(
     rules: &[Rule],
-    plan: &ScanPlan,
+    index: &RuntimeRuleIndex,
     known_pids: &mut BTreeSet<i32>,
 ) -> ProcScanResult {
     // 缓存扫描只访问上轮已经命中过的 PID，主要降低常驻 daemon 的 open/read 次数。
     // 如果进程退出或规则不再匹配，会从 known_pids 里剔除。
-    let rules_by_owner = build_rules_by_owner(rules);
     let mut hits = Vec::new();
     let mut alive = BTreeSet::new();
     let mut complete = true;
@@ -129,7 +126,7 @@ fn scan_known_pids(
 
     for pid in known_pids.iter().copied() {
         let proc_path = PathBuf::from(format!("/proc/{pid}"));
-        match scan_process_path(pid, &proc_path, &rules_by_owner, plan) {
+        match scan_process_path(pid, &proc_path, rules, index) {
             ProcessScanOutcome::Hit(hit) => {
                 alive.insert(pid);
                 if !hit.health_scan_complete {
@@ -160,8 +157,8 @@ fn scan_known_pids(
 fn scan_process_path(
     pid: i32,
     proc_path: &Path,
-    rules_by_owner: &HashMap<&str, Vec<&Rule>>,
-    plan: &ScanPlan,
+    rules: &[Rule],
+    index: &RuntimeRuleIndex,
 ) -> ProcessScanOutcome {
     // UID 的 appId 用于优先缩小候选包集合；厂商分身/isolated UID 仍可走严格包名兜底。
     // Linux/Android 内核没有“包名”概念，最终必须读取 cmdline 确认主进程/子进程名。
@@ -178,7 +175,7 @@ fn scan_process_path(
         Err(_) => return ProcessScanOutcome::Unreadable,
     };
 
-    let Some(matched_base) = matched_plan_package(uid, &cmdline, plan) else {
+    let Some(matched_base) = matched_plan_package(uid, &cmdline, &index.plan) else {
         return ProcessScanOutcome::NotTarget;
     };
     let pid_starttime = read_proc_starttime(proc_path).ok();
@@ -190,23 +187,26 @@ fn scan_process_path(
     //
     // 这么做是为了避免 com.app{RenderThread}=7 错绑到 com.app:push 里的同名线程；
     // 同时也保留“没有单独子进程规则时，子进程至少跟随主包兜底核心”的旧行为。
-    let exact_owner_rules = rules_by_owner
+    let exact_owner_rule_indices = index
+        .rules_by_owner
         .get(cmdline.as_str())
-        .map(|rules| rules.as_slice())
+        .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let exact_process_rules = exact_owner_rules
+    let exact_process_rules = exact_owner_rule_indices
         .iter()
-        .copied()
+        .filter_map(|rule_index| rules.get(*rule_index))
         .filter(|rule| rule.thread.is_none())
         .collect::<Vec<_>>();
     // 子进程只有在没有精确进程级规则时才继承基础主包的进程级规则。即使精确
     // owner 只有线程规则，也仍保留主包兜底；多级子进程不会继承中间 owner。
     let inherited_base_process_rules = if exact_process_rules.is_empty() && cmdline != matched_base
     {
-        rules_by_owner
+        index
+            .rules_by_owner
             .get(matched_base)
             .into_iter()
-            .flat_map(|rules| rules.iter().copied())
+            .flat_map(|rule_indices| rule_indices.iter())
+            .filter_map(|rule_index| rules.get(*rule_index))
             .filter(|rule| rule.thread.is_none())
             .collect::<Vec<_>>()
     } else {
@@ -217,18 +217,13 @@ fn scan_process_path(
         .into_iter()
         .chain(inherited_base_process_rules.iter().copied())
         .collect();
-    let thread_rules: Vec<&Rule> = exact_owner_rules
+    let thread_rules: Vec<&Rule> = exact_owner_rule_indices
         .iter()
-        .copied()
+        .filter_map(|rule_index| rules.get(*rule_index))
         .filter(|rule| rule.thread.is_some())
         .collect();
 
-    let has_app_health_rules = rules_by_owner.iter().any(|(owner, owner_rules)| {
-        base_package(owner) == Some(matched_base)
-            && owner_rules
-                .iter()
-                .any(|rule| rule.thread.is_some() || rule.owner.contains(':'))
-    });
+    let has_app_health_rules = index.health_rule_packages.contains(matched_base);
     let needs_thread_scan = !process_rules.is_empty() || !thread_rules.is_empty();
     let (actions, scanned_threads, threads_complete) = if needs_thread_scan {
         scan_threads(proc_path, &process_rules, &thread_rules)

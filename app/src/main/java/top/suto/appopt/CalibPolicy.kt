@@ -14,6 +14,7 @@ data class CalibPolicy(
     val wildcardGroup: WildcardGroup = WildcardGroup.MAX_MEMBER,
     val ruleOutputFormat: RuleOutputFormat = RuleOutputFormat.LEGACY,
     val fallbackCores: String = DEFAULT_FALLBACK_CORES,
+    val cpusetName: String = DEFAULT_CPUSET_NAME,
     val detectedTopologyBlock: String = ""
 ) {
     enum class WildcardGroup(val wire: String) {
@@ -77,7 +78,8 @@ data class CalibPolicy(
             bestCores = normalizeCoresOrDefault(bestCores, bestDefault),
             highCores = normalizeCoresOrDefault(highCores, highDefault),
             midCores = normalizeCoresOrDefault(midCores, midDefault),
-            fallbackCores = normalizeCoresOrDefault(fallbackCores, fallbackDefault)
+            fallbackCores = normalizeCoresOrDefault(fallbackCores, fallbackDefault),
+            cpusetName = normalizeCpusetNameOrNull(cpusetName) ?: DEFAULT_CPUSET_NAME
         )
     }
 
@@ -101,6 +103,7 @@ data class CalibPolicy(
             appendLine("rule_output_format=${p.ruleOutputFormat.generationTarget().wire}")
             appendLine("max_thread_rules=${p.maxThreadRules}")
             appendLine("fallback=cores:${p.fallbackCores}")
+            appendLine("cpuset_name=${p.cpusetName}")
             if (p.detectedTopologyBlock.isNotBlank()) {
                 appendLine()
                 appendLine(p.detectedTopologyBlock.trimEnd())
@@ -113,6 +116,8 @@ data class CalibPolicy(
         const val DEFAULT_HIGH_CORES = "5-6"
         const val DEFAULT_MID_CORES = "4-6"
         const val DEFAULT_FALLBACK_CORES = "0-6"
+        const val DEFAULT_CPUSET_NAME = "AppOptRs"
+        const val MAX_CPUSET_NAME_LENGTH = 48
         val DEFAULT = CalibPolicy()
 
         fun parse(raw: String): CalibPolicy {
@@ -184,6 +189,11 @@ data class CalibPolicy(
                             policy = policy.copy(fallbackCores = value)
                         }
                     }
+                    "cpuset_name" -> {
+                        policy = policy.copy(
+                            cpusetName = normalizeCpusetNameOrNull(value) ?: DEFAULT_CPUSET_NAME
+                        )
+                    }
                 }
             }
             val topologyBlock = topologyLines.joinToString("\n")
@@ -231,6 +241,19 @@ data class CalibPolicy(
             val compact = value.trim().replace(" ", "")
             if (compact.isBlank()) return null
             return parseCores(compact)?.let { formatContinuousRange(it) }
+        }
+
+        fun normalizeCpusetNameOrNull(value: String): String? {
+            val name = value.trim()
+            if (name.isEmpty() || name.length > MAX_CPUSET_NAME_LENGTH || name.startsWith('.')) {
+                return null
+            }
+            return name.takeIf { candidate ->
+                candidate.all { char ->
+                    char in 'a'..'z' || char in 'A'..'Z' || char in '0'..'9' ||
+                        char == '_' || char == '-' || char == '.'
+                }
+            }
         }
 
         private fun parseCores(value: String): Set<Int>? {

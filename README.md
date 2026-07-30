@@ -5,8 +5,7 @@ AppOpt 是一个面向 Root Android 设备的 CPU 线程绑核优化模块，并
 历史负载记录和游戏内悬浮控制能力。
 
 模块兼容 Magisk / KernelSU / APatch，规则可热重载，通常不需要重启设备即可生效。
-模块内置 Rust 守护进程 `AppOptRs` 和 C 版守护进程 `AppOpt`，当前默认优先启动
-`AppOptRs`，连续异常退出时自动回退到 C 版。
+模块只维护 Rust 守护进程 `AppOptRs`；异常退出时由看门狗继续拉起 Rust 守护进程。
 
 ## 主要功能
 
@@ -18,13 +17,13 @@ AppOpt 是一个面向 Root Android 设备的 CPU 线程绑核优化模块，并
 - 配套 Android App：悬浮窗、环境自检、规则管理、历史/日志查看和自动校准策略设置。
 - ActivityTaskManager 前台助手：`appopt_foreground_helper.jar` 常驻监听前台任务，并生成
   `package_uid.map` 供 Rust 守护进程做 UID 预过滤。
-- 守护进程看门狗：Native daemon 异常退出后自动拉起。
+- 守护进程看门狗：Rust daemon 异常退出后自动拉起。
 
 ## 工作原理
 
-`service.sh` 会优先启动 Rust 守护进程 `AppOptRs`。Rust 版读取 `applist.conf`
+`service.sh` 会启动 Rust 守护进程 `AppOptRs`。Rust 版读取 `applist.conf`
 和 `package_uid.map`，先用 UID 缩小候选进程范围，再缓存已命中的 PID/TID，减少长期运行时
-对 `/proc` 的全量遍历。C 版 `AppOpt` 保留为兼容兜底，Rust 版连续快速崩溃时看门狗会在本次开机内切回 C 版。
+对 `/proc` 的全量遍历。守护进程异常退出后，看门狗会在短暂延迟后重新启动 `AppOptRs`。
 
 守护进程读取配置文件后，持续扫描目标进程和线程，并按规则设置 CPU affinity
 与 cpuset。`auto` 校准会采样线程 CPU 使用率，将相似线程名归组，按 `avg/max/score`
@@ -39,7 +38,7 @@ queueBuffer 候选符号。Android 侧不再启用全局 uprobe；启动时如�
 会等待后续前台进程确认后再启动 eBPF，避免把其它应用的帧算进去。设备内核、ROM 策略、
 符号或目标 ABI 不满足条件时，会自动降级到
 SurfaceFlinger `--latency` 路径，再按运行时探测结果兜底到 `--timestats`。FPS 数据优先由
-Native 守护进程推送到 App 创建的 Android 本地 socket，socket 不可用时再写入 App 私有目录
+Rust 守护进程推送到 App 创建的 Android 本地 socket，socket 不可用时再写入 App 私有目录
 `fps` 文件作为兜底。
 
 前台识别优先使用 root `app_process` 启动的 `appopt_foreground_helper.jar`，它通过
@@ -53,11 +52,11 @@ ActivityTaskManager/TaskStackListener 写入 `foreground_task.state`。App 侧�
 
 ```text
 app/                             Android App
-native_daemon/                   Native 守护进程源码、前台检测和 FPS 监测
+native_daemon/                   Rust 守护进程和 FPS/eBPF 监测源码
 native_daemon/daemon_rs/         Rust 守护进程 AppOptRs
 tools/appopt_foreground_helper/  ActivityTaskManager 前台助手源码
 magisk_module/                   模块基础文件
-build_module.sh                  Native / Magisk 模块构建脚本
+build_module.sh                  Rust / Magisk 模块构建脚本
 FPS_EBPF_INTEGRATION.md          eBPF 集成说明
 AppOpt工作原理.svg                工作原理图
 AppOpt改版特色.md                 功能特色说明
@@ -324,17 +323,12 @@ Release tag 会自动读取当前模块版本，优先使用 `magisk_module/modu
 
 - 编译 `native_daemon/fps_monitor/bpf/queuebuffer_probe.bpf.c` 为 RingBuf BPF 对象。
 - 编译 `native_daemon/fps_monitor/bpf/queuebuffer_probe_perf.bpf.c` 为 PerfEvent 备用 BPF 对象。
-- 编译 Rust/aya bridge 静态库。
-- 编译 Rust 守护进程 `AppOptRs`，并打包 4 个 ABI 产物。
+- 通过 Cargo 编译 Rust/aya bridge 与 Rust 守护进程 `AppOptRs`。
+- 打包 `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` 四个 ABI 产物。
 - 按参数编译 release/debug APK，并复制到模块的 `config/app/`。
 - 编译 App 安装辅助工具，并打包到模块的 `config/app/tools/`。
 - 编译 ActivityTaskManager 前台助手 `appopt_foreground_helper.jar`，并打包到模块的
   `config/tools/`。
-- 编译 4 个 ABI 的 `AppOpt` native 二进制：
-  - `arm64-v8a`
-  - `armeabi-v7a`
-  - `x86_64`
-  - `x86`
 - 复制 `magisk_module/` 基础文件。
 - 打包 Magisk 模块 zip。
 
@@ -342,7 +336,6 @@ Release tag 会自动读取当前模块版本，优先使用 `magisk_module/modu
 
 ```text
 build/module/                         模块工作目录
-build/module/config/bin/<abi>/AppOpt   各 ABI native 二进制
 build/module/config/bin/<abi>/AppOptRs 各 ABI Rust 守护进程
 build/module/config/tools/appopt_foreground_helper.jar
 build/module/config/ebpf/queuebuffer_probe.bpf.o   eBPF 对象

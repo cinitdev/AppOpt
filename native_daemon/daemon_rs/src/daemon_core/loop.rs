@@ -13,6 +13,7 @@ fn daemon_loop(args: &Args) -> io::Result<()> {
     println!("[RS] 配置文件: {}", args.config.display());
     println!("[RS] 包名 UID 映射: {}", args.uid_map.display());
     println!("[RS] 检查间隔: {} 秒", args.interval_secs);
+    println!("[RS] cpuset 运行组: /dev/cpuset/{}", args.cpuset_name);
     println!(
         "[RS] 目标范围: {}",
         args.target_pkg.as_deref().unwrap_or("全部配置应用")
@@ -20,7 +21,15 @@ fn daemon_loop(args: &Args) -> io::Result<()> {
     print_startup_device_info();
     calibration::print_version_diagnostics(VERSION);
 
-    println!("[RS] 配置文件监控模式: 守护主循环轮询");
+    let mut file_monitor = RuntimeFileMonitor::new(&args.config, &args.uid_map).ok();
+    println!(
+        "[RS] 配置文件监控模式: {}",
+        if file_monitor.is_some() {
+            "inotify 事件通知 + 60 秒内容校验"
+        } else {
+            "元数据变化轮询 + 内容指纹校验"
+        }
+    );
     if start_daemon_socket_thread() {
         println!("[RS] 启用守护进程验证 socket");
     }
@@ -31,16 +40,57 @@ fn daemon_loop(args: &Args) -> io::Result<()> {
         println!("[RS] 启用真实帧率监测线程 (eBPF/SF fallback)");
     }
     let mut state = DaemonState::default();
+    let mut runtime = RuntimeInputsCache::default();
+    let mut process_discovery = ProcessDiscovery::default();
+    let mut file_changes = RuntimeFileChanges::all();
+    let mut process_events = ProcessEventBatch::default();
 
     loop {
-        if let Err(err) = run_daemon_round(args, &mut state) {
+        if let Err(err) = run_daemon_round(
+            args,
+            &mut state,
+            &mut runtime,
+            file_changes,
+            file_monitor.is_some(),
+            &process_events,
+        ) {
             eprintln!("[RS] 守护轮询失败: {err}");
         }
-        thread::sleep(Duration::from_secs(args.interval_secs));
+        let now_elapsed = elapsed_realtime_ms();
+        process_discovery.ensure_started_and_sync(
+            runtime.index.plan.package_count(),
+            &state.known_pids,
+            &state.managed_tids,
+            now_elapsed,
+        );
+        if let Err(err) = wait_for_daemon_wake(
+            file_monitor.as_ref(),
+            &process_discovery,
+            Duration::from_secs(args.interval_secs),
+        ) {
+            eprintln!("[RS] 守护事件等待失败，本轮退回定时检查: {err}");
+            thread::sleep(Duration::from_secs(args.interval_secs));
+        }
+        file_changes = match file_monitor.as_mut().map(RuntimeFileMonitor::drain) {
+            Some(Ok(changes)) => changes,
+            Some(Err(err)) => {
+                eprintln!("[RS] inotify 读取失败，已转为元数据轮询: {err}");
+                file_monitor = None;
+                RuntimeFileChanges::all()
+            }
+            None => RuntimeFileChanges::default(),
+        };
+        if file_changes.monitor_invalidated {
+            file_monitor = RuntimeFileMonitor::new(&args.config, &args.uid_map).ok();
+            if file_monitor.is_none() {
+                eprintln!("[RS] inotify 监听已失效，后续使用元数据轮询");
+            }
+        }
+        process_events = process_discovery.drain(elapsed_realtime_ms());
     }
 }
 
-// 启动时输出与 C 版一致的设备诊断，便于用户反馈日志时确认运行环境。
+// 启动时输出设备诊断，便于用户反馈日志时确认运行环境。
 fn print_startup_device_info() {
     let properties = read_android_properties();
     let android_version = first_property(
@@ -251,27 +301,115 @@ fn merge_candidate_hits(
     }
 }
 
-fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
-    let round_start = Instant::now();
-    let (rules, config_key) = parse_config_with_key(&args.config)?;
-    let (uid_map, uid_key) = parse_uid_map_with_key(&args.uid_map)?;
-    if let Err(err) = ensure_rule_health_loaded(state) {
-        eprintln!("[RS] 规则健康状态读取失败，本轮不禁用任何规则: {err}");
+fn apply_process_exit_events(state: &mut DaemonState, events: &ProcessEventBatch) {
+    for tid in &events.exited_tids {
+        state.managed_tids.remove(tid);
     }
-    let runtime_rules = runtime_rule_health_rules(&rules, state);
-    let plan = build_scan_plan(&runtime_rules, &uid_map, args.target_pkg.as_deref());
-    let rule_config_changed = state.last_config_key != Some(config_key);
-    let config_changed = rule_config_changed || state.last_uid_map_key != uid_key;
-    if config_changed {
-        log_config_summary(&rules, &uid_map, &plan);
+    for tgid in &events.exited_tgids {
+        // 线程组 leader 退出时其余线程可能仍短暂存活，PID 也可能已经被复用。
+        // 只有 /proc/TGID 已确认消失时才立即清空；仍存在则交给本轮候选复扫重验身份。
+        match fs::metadata(format!("/proc/{tgid}")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                state.known_pids.remove(tgid);
+                state
+                    .managed_tids
+                    .retain(|_, entry| entry.tgid != *tgid);
+            }
+            Ok(_) | Err(_) => {}
+        }
     }
-    if rule_config_changed {
-        for rule_line in disabled_rule_health_lines(&rules, state) {
-            println!("[RS] 规则健康已停用: {rule_line}");
+}
+
+fn refresh_managed_tid_cache(state: &mut DaemonState, hits: &[ProcHit]) {
+    let seen_round = state.round_index.saturating_add(1);
+    let known_pids = &state.known_pids;
+    let managed_tids = &mut state.managed_tids;
+    managed_tids.retain(|_, entry| known_pids.contains(&entry.tgid));
+
+    for hit in hits {
+        // 完整线程扫描可以替换该 TGID 的旧集合；瞬时读取不完整时只合并正向结果，
+        // 避免短暂 /proc 缺口把仍存活的受控线程从事件 map 中误删。
+        if hit.health_scan_complete {
+            let observed = hit.actions.iter().map(|action| action.tid).collect::<HashSet<_>>();
+            managed_tids.retain(|tid, entry| entry.tgid != hit.pid || observed.contains(tid));
+        }
+        for action in &hit.actions {
+            let cpuset_synced = managed_tids.get(&action.tid).is_some_and(|current| {
+                current.tgid == hit.pid && current.starttime == action.tid_starttime &&
+                    current.cpuset_synced
+            });
+            let next = ManagedTidEntry {
+                tgid: hit.pid,
+                starttime: action.tid_starttime,
+                last_seen_round: seen_round,
+                cpuset_synced,
+            };
+            let should_update = managed_tids
+                .get(&action.tid)
+                .is_none_or(|current| {
+                    current.tgid != next.tgid || current.starttime != next.starttime
+                });
+            if should_update {
+                managed_tids.insert(action.tid, next);
+            } else if let Some(current) = managed_tids.get_mut(&action.tid) {
+                current.last_seen_round = seen_round;
+            }
         }
     }
 
+    if managed_tids.len() > MAX_MANAGED_TIDS {
+        let remove_count = managed_tids.len() - MAX_MANAGED_TIDS;
+        let mut oldest = managed_tids
+            .iter()
+            .map(|(tid, entry)| (*tid, entry.last_seen_round))
+            .collect::<Vec<_>>();
+        oldest.sort_unstable_by_key(|(tid, last_seen)| (*last_seen, *tid));
+        for (tid, _) in oldest.into_iter().take(remove_count) {
+            managed_tids.remove(&tid);
+        }
+    }
+}
+
+fn run_daemon_round(
+    args: &Args,
+    state: &mut DaemonState,
+    runtime: &mut RuntimeInputsCache,
+    file_changes: RuntimeFileChanges,
+    monitor_active: bool,
+    process_events: &ProcessEventBatch,
+) -> io::Result<()> {
+    let round_start = Instant::now();
+    if let Err(err) = ensure_rule_health_loaded(state) {
+        eprintln!("[RS] 规则健康状态读取失败，本轮不禁用任何规则: {err}");
+    }
     let scan_clock = elapsed_realtime_ms();
+    let _refresh = runtime.refresh(
+        args,
+        state,
+        file_changes,
+        monitor_active,
+        scan_clock,
+    )?;
+    let rules = &runtime.rules;
+    let uid_map = &runtime.uid_map;
+    let index = &runtime.index;
+    let plan = &index.plan;
+    let config_key = runtime.config_key.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "配置文件没有可用内容指纹")
+    })?;
+    let uid_key = runtime.uid_map_key;
+    let rule_config_changed = state.last_config_key != Some(config_key);
+    let config_changed = rule_config_changed || state.last_uid_map_key != uid_key;
+    if config_changed {
+        log_config_summary(rules, uid_map, plan);
+    }
+    if rule_config_changed {
+        for rule_line in disabled_rule_health_lines(rules, state) {
+            println!("[RS] 规则健康已停用: {rule_line}");
+        }
+    }
+    apply_process_exit_events(state, process_events);
+
     let proc_total = system_process_count();
     let proc_count_grew = matches!(
         (state.last_proc_total, proc_total),
@@ -304,12 +442,21 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     // - 系统进程数增长只要求立即刷新轻量 PID 快照，不再因此全量读取 cmdline。
     // - 缓存连续跑一段时间后周期性全量扫，补捉极端情况下漏掉的子进程。
     // - 已确认空结果不会每轮重扫；新进程由 PID 快照差集和短期复查发现。
+    let process_event_loss = process_events.dropped > 0;
+    if process_event_loss {
+        state.process_event_rescan_pending = true;
+        eprintln!(
+            "[RS] eBPF进程事件发生丢失: 本轮提交={} 丢失={}，立即执行完整校验",
+            process_events.submitted, process_events.dropped
+        );
+    }
     let full_scan_requested = config_changed
         || cache_uninitialized
         || full_scan_retry_pending
         || periodic_rescan
         || health_due
-        || foreground_discovery_due;
+        || foreground_discovery_due
+        || state.process_event_rescan_pending;
     let full_scan = full_scan_requested && full_scan_retry_allowed;
     let mut scan_reason = if config_changed {
         "配置变更"
@@ -323,6 +470,8 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
         "健康观察到期"
     } else if foreground_discovery_due {
         "前台生命周期进程发现"
+    } else if state.process_event_rescan_pending {
+        "eBPF事件丢失校验"
     } else {
         "PID缓存"
     };
@@ -369,7 +518,7 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
         scan_reason = "进程索引发现";
     }
     let mut scan_result = if full_scan {
-        match scan_proc(&runtime_rules, &plan, &state.known_pids) {
+        match scan_proc(rules, index, &state.known_pids) {
             Ok(result) => result,
             Err(err) => {
                 eprintln!("[RS] 全量扫描失败，本轮仅保留正向结果并等待冷却重试: {err}");
@@ -377,7 +526,7 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
             }
         }
     } else {
-        scan_known_pids(&runtime_rules, &plan, &mut state.known_pids)
+        scan_known_pids(rules, index, &mut state.known_pids)
     };
 
     if !full_scan {
@@ -407,9 +556,26 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
         !state.known_pids.contains(pid) && !already_scanned.contains(pid)
     });
 
+    // exec/fork/rename 都只提供“需要复查”的提示；它们必须再次经过
+    // scan_process_path 校验 UID、cmdline、TGID 与 starttime。
+    let mut event_rescan_pids = process_events
+        .process_pids
+        .iter()
+        .filter_map(|pid| read_tgid(*pid))
+        .collect::<BTreeSet<_>>();
+    event_rescan_pids.extend(process_events.thread_tgids.iter().copied());
+    event_rescan_pids.extend(process_events.renamed_tgids.iter().copied());
+    event_rescan_pids.extend(process_events.exited_tgids.iter().copied());
+    event_rescan_pids.retain(|pid| !already_scanned.contains(pid));
+    if !event_rescan_pids.is_empty() && !full_scan {
+        scan_reason = "eBPF进程事件";
+        let event_result = scan_candidate_pids(rules, index, &event_rescan_pids);
+        merge_candidate_hits(&mut scan_result, event_result, state);
+    }
+
     let candidate_result = scan_candidate_pids(
-        &runtime_rules,
-        &plan,
+        rules,
+        index,
         &process_index_round.view.candidate_pids,
     );
     merge_candidate_hits(&mut scan_result, candidate_result, state);
@@ -442,10 +608,12 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
         if scan_complete {
             state.last_full_scan_elapsed_ms = Some(scan_finished_at);
             state.proc_growth_scan_pending = false;
+            state.process_event_rescan_pending = false;
         }
         state.last_config_key = Some(config_key);
         state.last_uid_map_key = uid_key;
     }
+    refresh_managed_tid_cache(state, &hits);
 
     let known_pids = state.known_pids.len();
     let processes = hits.len();
@@ -472,7 +640,7 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     let hit_preview_log = config_changed || first_summary;
 
     if let Err(err) = update_rule_health(
-        &rules,
+        rules,
         &hits,
         full_scan_evidence.as_ref(),
         args.target_pkg.as_deref(),
@@ -482,7 +650,12 @@ fn run_daemon_round(args: &Args, state: &mut DaemonState) -> io::Result<()> {
     }
 
     let apply_started = Instant::now();
-    let stats = apply_hits(&hits, detail_log);
+    let stats = apply_hits(
+        &hits,
+        detail_log,
+        &args.cpuset_name,
+        &mut state.managed_tids,
+    );
     let apply_elapsed = apply_started.elapsed();
     state.round_index = state.round_index.saturating_add(1);
     let scanned_threads = hits.iter().map(|hit| hit.scanned_threads).sum::<usize>();
