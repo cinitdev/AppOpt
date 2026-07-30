@@ -57,16 +57,11 @@ fn daemon_loop(args: &Args) -> io::Result<()> {
             eprintln!("[RS] 守护轮询失败: {err}");
         }
         let now_elapsed = elapsed_realtime_ms();
-        process_discovery.ensure_started_and_sync(
-            runtime.index.plan.package_count(),
-            &state.known_pids,
-            &state.managed_tids,
-            now_elapsed,
-        );
+        process_discovery.ensure_started_and_sync(now_elapsed);
         if let Err(err) = wait_for_daemon_wake(
             file_monitor.as_ref(),
             &process_discovery,
-            Duration::from_secs(args.interval_secs),
+            regular_scan_wait_timeout(args.interval_secs, &state),
         ) {
             eprintln!("[RS] 守护事件等待失败，本轮退回定时检查: {err}");
             thread::sleep(Duration::from_secs(args.interval_secs));
@@ -211,6 +206,35 @@ fn pid_snapshot_interval_ms(state: &DaemonState) -> u64 {
     }
 }
 
+fn regular_scan_interval_ms(interval_secs: u64, interactive: bool) -> u64 {
+    if interactive {
+        interval_secs.max(1).saturating_mul(1000)
+    } else {
+        SCREEN_OFF_SCAN_INTERVAL_MS
+    }
+}
+
+fn regular_scan_due(interval_secs: u64, state: &DaemonState, now_elapsed: u64) -> bool {
+    let interval = regular_scan_interval_ms(interval_secs, state.interactive);
+    state.last_regular_scan_elapsed_ms.is_none_or(|last| {
+        now_elapsed < last || now_elapsed.saturating_sub(last) >= interval
+    })
+}
+
+fn regular_scan_wait_timeout(interval_secs: u64, state: &DaemonState) -> Duration {
+    let interval = regular_scan_interval_ms(interval_secs, state.interactive);
+    let now_elapsed = elapsed_realtime_ms();
+    // 首轮尚未建立扫描截止时间时仍保留配置间隔，避免配置读取失败后立即忙循环重试。
+    let remaining = state.last_regular_scan_elapsed_ms.map_or(interval, |last| {
+        if now_elapsed < last {
+            0
+        } else {
+            interval.saturating_sub(now_elapsed.saturating_sub(last))
+        }
+    });
+    Duration::from_millis(remaining)
+}
+
 fn pid_snapshot_log_due(state: &mut DaemonState, now_elapsed: u64) -> bool {
     let due = state.last_pid_snapshot_log_elapsed_ms.is_none_or(|last| {
         now_elapsed >= last
@@ -282,6 +306,7 @@ fn merge_candidate_hits(
 ) {
     for pid in candidate_result.gone_pids {
         state.known_pids.remove(&pid);
+        state.process_scan_stamps.remove(&pid);
     }
     for hit in candidate_result.hits {
         let pid = hit.pid;
@@ -311,6 +336,7 @@ fn apply_process_exit_events(state: &mut DaemonState, events: &ProcessEventBatch
         match fs::metadata(format!("/proc/{tgid}")) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 state.known_pids.remove(tgid);
+                state.process_scan_stamps.remove(tgid);
                 state
                     .managed_tids
                     .retain(|_, entry| entry.tgid != *tgid);
@@ -318,6 +344,32 @@ fn apply_process_exit_events(state: &mut DaemonState, events: &ProcessEventBatch
             Ok(_) | Err(_) => {}
         }
     }
+}
+
+fn process_event_candidate_pids(events: &ProcessEventBatch) -> BTreeSet<i32> {
+    let mut candidates = events
+        .process_pids
+        .iter()
+        .filter_map(|pid| read_tgid(*pid))
+        .collect::<BTreeSet<_>>();
+
+    // sched_process_fork 的 child_pid 既可能是新进程，也可能只是新线程。
+    // 只有 /proc 确认 child 自己就是 TGID 时才做进程扫描；普通线程交给固定
+    // 2 秒轮次处理，避免线程密集应用把每个 fork 放大成一次全进程 task 扫描。
+    for (_, child_pid) in &events.forked_tasks {
+        if read_tgid(*child_pid) == Some(*child_pid) {
+            candidates.insert(*child_pid);
+        }
+    }
+    // 主线程重命名可能是 zygote 派生进程完成初始化的信号；非 leader 线程改名
+    // 同样由固定轮次捕获，不需要立即重扫整个线程组。
+    for (tgid, tid) in &events.renamed_tasks {
+        if tgid == tid && read_tgid(*tid) == Some(*tgid) {
+            candidates.insert(*tgid);
+        }
+    }
+    candidates.extend(events.exited_tgids.iter().copied());
+    candidates
 }
 
 fn refresh_managed_tid_cache(state: &mut DaemonState, hits: &[ProcHit]) {
@@ -383,6 +435,8 @@ fn run_daemon_round(
         eprintln!("[RS] 规则健康状态读取失败，本轮不禁用任何规则: {err}");
     }
     let scan_clock = elapsed_realtime_ms();
+    state.interactive = read_foreground_interactive(scan_clock).unwrap_or(true);
+    let regular_scan_due = regular_scan_due(args.interval_secs, state, scan_clock);
     let _refresh = runtime.refresh(
         args,
         state,
@@ -409,6 +463,43 @@ fn run_daemon_round(
         }
     }
     apply_process_exit_events(state, process_events);
+    let event_rescan_pids = process_event_candidate_pids(process_events);
+
+    let cache_uninitialized = !state.proc_scan_initialized;
+    let process_event_loss = process_events.dropped > 0;
+    if process_event_loss {
+        state.process_event_rescan_pending = true;
+        eprintln!(
+            "[RS] eBPF进程事件发生丢失: 本轮提交={} 丢失={}，立即执行完整校验",
+            process_events.submitted, process_events.dropped
+        );
+    }
+
+    // eBPF 只负责缩短发现延迟。常规扫描尚未到期时，仅复查事件对应的 PID/TGID，
+    // 不能因为系统任意 exec/fork 就重扫全部已知进程和线程。
+    if !regular_scan_due && !config_changed && !cache_uninitialized && !process_event_loss {
+        if event_rescan_pids.is_empty() {
+            return Ok(());
+        }
+
+        let mut event_scan = ProcScanResult::default();
+        let event_result = scan_candidate_pids(rules, index, &event_rescan_pids);
+        merge_candidate_hits(&mut event_scan, event_result, state);
+        for hit in &event_scan.hits {
+            update_process_scan_stamp(&mut state.process_scan_stamps, hit, scan_clock);
+        }
+        refresh_managed_tid_cache(state, &event_scan.hits);
+        apply_hits(
+            &event_scan.hits,
+            false,
+            &args.cpuset_name,
+            &mut state.managed_tids,
+        );
+        return Ok(());
+    }
+
+    // 配置变化、事件丢失或固定周期到期都算一次常规轮次；事件增量轮次不会更新它。
+    state.last_regular_scan_elapsed_ms = Some(scan_clock);
 
     let proc_total = system_process_count();
     let proc_count_grew = matches!(
@@ -421,7 +512,6 @@ fn run_daemon_round(
     if proc_count_grew && growth_hint_allowed {
         state.proc_growth_scan_pending = true;
     }
-    let cache_uninitialized = !state.proc_scan_initialized;
     let periodic_rescan = state.last_full_scan_elapsed_ms.is_some_and(|last| {
         scan_clock >= last && scan_clock.saturating_sub(last) >= FULL_RESCAN_MAX_MS
     });
@@ -442,14 +532,6 @@ fn run_daemon_round(
     // - 系统进程数增长只要求立即刷新轻量 PID 快照，不再因此全量读取 cmdline。
     // - 缓存连续跑一段时间后周期性全量扫，补捉极端情况下漏掉的子进程。
     // - 已确认空结果不会每轮重扫；新进程由 PID 快照差集和短期复查发现。
-    let process_event_loss = process_events.dropped > 0;
-    if process_event_loss {
-        state.process_event_rescan_pending = true;
-        eprintln!(
-            "[RS] eBPF进程事件发生丢失: 本轮提交={} 丢失={}，立即执行完整校验",
-            process_events.submitted, process_events.dropped
-        );
-    }
     let full_scan_requested = config_changed
         || cache_uninitialized
         || full_scan_retry_pending
@@ -526,7 +608,19 @@ fn run_daemon_round(
             }
         }
     } else {
-        scan_known_pids(rules, index, &mut state.known_pids)
+        let deep_scan_interval_ms = if state.interactive {
+            ACTIVE_PROCESS_DEEP_SCAN_MS
+        } else {
+            SCREEN_OFF_PROCESS_DEEP_SCAN_MS
+        };
+        scan_known_pids(
+            rules,
+            index,
+            &mut state.known_pids,
+            &mut state.process_scan_stamps,
+            scan_clock,
+            deep_scan_interval_ms,
+        )
     };
 
     if !full_scan {
@@ -558,14 +652,7 @@ fn run_daemon_round(
 
     // exec/fork/rename 都只提供“需要复查”的提示；它们必须再次经过
     // scan_process_path 校验 UID、cmdline、TGID 与 starttime。
-    let mut event_rescan_pids = process_events
-        .process_pids
-        .iter()
-        .filter_map(|pid| read_tgid(*pid))
-        .collect::<BTreeSet<_>>();
-    event_rescan_pids.extend(process_events.thread_tgids.iter().copied());
-    event_rescan_pids.extend(process_events.renamed_tgids.iter().copied());
-    event_rescan_pids.extend(process_events.exited_tgids.iter().copied());
+    let mut event_rescan_pids = event_rescan_pids;
     event_rescan_pids.retain(|pid| !already_scanned.contains(pid));
     if !event_rescan_pids.is_empty() && !full_scan {
         scan_reason = "eBPF进程事件";
@@ -613,10 +700,16 @@ fn run_daemon_round(
         state.last_config_key = Some(config_key);
         state.last_uid_map_key = uid_key;
     }
+    for hit in &hits {
+        update_process_scan_stamp(&mut state.process_scan_stamps, hit, scan_finished_at);
+    }
+    state
+        .process_scan_stamps
+        .retain(|pid, _| state.known_pids.contains(pid));
     refresh_managed_tid_cache(state, &hits);
 
     let known_pids = state.known_pids.len();
-    let processes = hits.len();
+    let processes = state.known_pids.len();
     let has_new_hit_pid = hits
         .iter()
         .any(|hit| !previous_known_pids.contains(&hit.pid));

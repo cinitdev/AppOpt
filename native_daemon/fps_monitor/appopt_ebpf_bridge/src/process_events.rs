@@ -63,8 +63,8 @@ mod platform {
     #[derive(Debug, Default)]
     pub struct ProcessEventBatch {
         pub process_pids: BTreeSet<i32>,
-        pub thread_tgids: BTreeSet<i32>,
-        pub renamed_tgids: BTreeSet<i32>,
+        pub forked_tasks: BTreeSet<(i32, i32)>,
+        pub renamed_tasks: BTreeSet<(i32, i32)>,
         pub exited_tids: BTreeSet<i32>,
         pub exited_tgids: BTreeSet<i32>,
         pub submitted: u64,
@@ -358,18 +358,18 @@ mod platform {
             BackendKind::PerfEvent => "PerfEvent per-CPU".to_string(),
         };
         let attach_label = match (exec_error, fork_error) {
-            (None, None) => "exec+目标TGID fork".to_string(),
-            (Some(error), None) => format!("仅目标TGID fork；exec 不可用={error}"),
+            (None, None) => "全局exec+发现源fork".to_string(),
+            (Some(error), None) => format!("仅发现源fork；exec 不可用={error}"),
             (None, Some(error)) => format!("仅全局 exec；fork 不可用={error}"),
             (Some(_), Some(_)) => unreachable!(),
         };
         let mut optional_events = Vec::with_capacity(2);
         match rename_error {
-            None => optional_events.push("rename".to_string()),
+            None => optional_events.push("发现源rename".to_string()),
             Some(error) => optional_events.push(format!("rename不可用={error}")),
         }
         match exit_error {
-            None => optional_events.push("exit".to_string()),
+            None => optional_events.push("发现源exit".to_string()),
             Some(error) => optional_events.push(format!("exit不可用={error}")),
         }
         Ok(ProcessEventMonitor {
@@ -468,18 +468,19 @@ mod platform {
                 }
             }
             EVENT_FORK if event.tgid > 0 => {
-                if let Ok(tgid) = i32::try_from(event.tgid) {
-                    batch.thread_tgids.insert(tgid);
-                }
-                // child_pid 可能是新进程，也可能只是线程 TID；daemon 会先读取
-                // /proc/<pid>/status 的 Tgid 规范化，不能直接写入 PID 缓存。
-                if let Ok(pid) = i32::try_from(event.pid) {
-                    batch.process_pids.insert(pid);
+                // child_pid 可能是新进程 PID，也可能是同进程的新线程 TID；保留
+                // parent TGID 与 child PID，让 daemon 通过 /proc/status 最终分类。
+                if let (Ok(tgid), Ok(pid)) =
+                    (i32::try_from(event.tgid), i32::try_from(event.pid))
+                {
+                    batch.forked_tasks.insert((tgid, pid));
                 }
             }
             EVENT_RENAME if event.tgid > 0 => {
-                if let Ok(tgid) = i32::try_from(event.tgid) {
-                    batch.renamed_tgids.insert(tgid);
+                if let (Ok(tgid), Ok(pid)) =
+                    (i32::try_from(event.tgid), i32::try_from(event.pid))
+                {
+                    batch.renamed_tasks.insert((tgid, pid));
                 }
             }
             EVENT_EXIT if event.tgid > 0 && event.pid > 0 => {
@@ -602,8 +603,8 @@ mod platform {
     #[derive(Debug, Default)]
     pub struct ProcessEventBatch {
         pub process_pids: BTreeSet<i32>,
-        pub thread_tgids: BTreeSet<i32>,
-        pub renamed_tgids: BTreeSet<i32>,
+        pub forked_tasks: BTreeSet<(i32, i32)>,
+        pub renamed_tasks: BTreeSet<(i32, i32)>,
         pub exited_tids: BTreeSet<i32>,
         pub exited_tgids: BTreeSet<i32>,
         pub submitted: u64,

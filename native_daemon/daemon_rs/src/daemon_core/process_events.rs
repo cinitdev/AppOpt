@@ -11,20 +11,19 @@ struct ProcessDiscovery {
     last_error_log_elapsed_ms: Option<u64>,
     discovery_sources: BTreeSet<i32>,
     last_source_refresh_elapsed_ms: Option<u64>,
+    sources_synced: bool,
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 impl ProcessDiscovery {
     fn ensure_started_and_sync(
         &mut self,
-        package_count: usize,
-        known_pids: &BTreeSet<i32>,
-        managed_tids: &HashMap<i32, ManagedTidEntry>,
         now_elapsed: u64,
     ) {
         let source_refresh_due = self.last_source_refresh_elapsed_ms.is_none_or(|last| {
             now_elapsed < last || now_elapsed.saturating_sub(last) >= FULL_RESCAN_MAX_MS
         });
+        let mut source_changed = false;
         if source_refresh_due {
             let mut sources = BTreeSet::new();
             for name in ["zygote", "zygote64", "usap32", "usap64"] {
@@ -32,21 +31,23 @@ impl ProcessDiscovery {
                     sources.extend(pids);
                 }
             }
+            source_changed = sources != self.discovery_sources;
             self.discovery_sources = sources;
             self.last_source_refresh_elapsed_ms = Some(now_elapsed);
         }
-        let mut monitored_tgids = known_pids.clone();
-        monitored_tgids.extend(self.discovery_sources.iter().copied());
-        let requested_targets = package_count
-            .saturating_mul(4)
-            .saturating_add(monitored_tgids.len());
-        let requested_tracked_tids = managed_tids.len();
+        // eBPF 只作为进程发现加速层：监听 zygote/USAP fork 与全局 exec。
+        // 已知应用内部的线程 fork/rename/exit 由固定扫描处理，避免线程密集应用
+        // 持续唤醒 PerfEvent 并反过来增加前台负载。
+        let monitored_tgids = self.discovery_sources.clone();
+        let requested_targets = monitored_tgids.len();
+        let requested_tracked_tids = 0;
         let needs_resize = self.monitor.as_ref().is_some_and(|monitor| {
             monitored_tgids.len() > monitor.target_capacity()
                 || requested_tracked_tids > monitor.tracked_capacity()
         });
         if needs_resize {
             self.monitor = None;
+            self.sources_synced = false;
         }
         if self.monitor.is_none() && now_elapsed >= self.next_retry_elapsed_ms {
             match ProcessEventMonitor::start(
@@ -56,10 +57,11 @@ impl ProcessDiscovery {
             ) {
                 Ok(monitor) => {
                     println!(
-                        "[RS] eBPF进程/线程事件发现已启用: {}",
+                        "[RS] eBPF进程事件发现已启用: {}",
                         monitor.startup_note()
                     );
                     self.monitor = Some(monitor);
+                    self.sources_synced = false;
                     self.last_error_log_elapsed_ms = None;
                 }
                 Err(err) => {
@@ -73,18 +75,30 @@ impl ProcessDiscovery {
             }
         }
 
-        let sync_result = self.monitor.as_mut().map(|monitor| {
-            monitor
-                .sync_target_tgids(monitored_tgids.iter().copied())
-                .and_then(|()| monitor.sync_tracked_tids(managed_tids.keys().copied()))
-        });
-        if let Some(Err(err)) = sync_result {
-            self.monitor = None;
-            self.next_retry_elapsed_ms = now_elapsed.saturating_add(PROCESS_EVENT_RETRY_MS);
-            self.report_error(
-                now_elapsed,
-                &format!("eBPF目标TGID/TID同步失败，已回退 /proc: {err}"),
-            );
+        let sync_due = source_changed || !self.sources_synced;
+        let sync_result = if sync_due {
+            self.monitor.as_mut().map(|monitor| {
+                monitor.sync_target_tgids(monitored_tgids.iter().copied())?;
+                monitor.sync_tracked_tids(std::iter::empty::<i32>())?;
+                Ok::<(), String>(())
+            })
+        } else {
+            None
+        };
+        match sync_result {
+            Some(Err(err)) => {
+                self.monitor = None;
+                self.sources_synced = false;
+                self.next_retry_elapsed_ms = now_elapsed.saturating_add(PROCESS_EVENT_RETRY_MS);
+                self.report_error(
+                    now_elapsed,
+                    &format!("eBPF目标TGID/TID同步失败，已回退 /proc: {err}"),
+                );
+            }
+            Some(Ok(())) => {
+                self.sources_synced = true;
+            }
+            None => {}
         }
     }
 
@@ -103,6 +117,7 @@ impl ProcessDiscovery {
             Ok(batch) => batch,
             Err(err) => {
                 self.monitor = None;
+                self.sources_synced = false;
                 self.next_retry_elapsed_ms = now_elapsed.saturating_add(PROCESS_EVENT_RETRY_MS);
                 self.report_error(
                     now_elapsed,
@@ -132,8 +147,8 @@ impl ProcessDiscovery {
 #[derive(Debug, Default)]
 struct ProcessEventBatch {
     process_pids: BTreeSet<i32>,
-    thread_tgids: BTreeSet<i32>,
-    renamed_tgids: BTreeSet<i32>,
+    forked_tasks: BTreeSet<(i32, i32)>,
+    renamed_tasks: BTreeSet<(i32, i32)>,
     exited_tids: BTreeSet<i32>,
     exited_tgids: BTreeSet<i32>,
     submitted: u64,
@@ -148,9 +163,6 @@ struct ProcessDiscovery;
 impl ProcessDiscovery {
     fn ensure_started_and_sync(
         &mut self,
-        _package_count: usize,
-        _known_pids: &BTreeSet<i32>,
-        _managed_tids: &HashMap<i32, ManagedTidEntry>,
         _now_elapsed: u64,
     ) {
     }

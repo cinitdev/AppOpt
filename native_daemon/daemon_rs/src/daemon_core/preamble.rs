@@ -26,7 +26,7 @@ use std::os::unix::fs::MetadataExt;
 // 3. 日常只比较数字 PID 目录快照，并复查新增 PID；命中后缓存 PID 和线程结果。
 // 4. 写 affinity 前先读当前 Cpus_allowed_list，相同则跳过，避免重复抢系统调度配置。
 // 5. 写入后再读回一次，用于发现移植系统/厂商服务把线程绑核抢写回去的情况。
-const VERSION: &str = "1.8.2";
+const VERSION: &str = "1.8.3";
 const DEFAULT_CONFIG: &str = "/data/adb/modules/AppOpt/config/applist.conf";
 const STATE_DIR: &str = "/data/adb/modules/AppOpt/config/state";
 const DEFAULT_UID_MAP: &str = "/data/adb/modules/AppOpt/config/state/package_uid.map";
@@ -47,6 +47,9 @@ const PID_SNAPSHOT_IDLE_MS: u64 = 10_000;
 const PID_DISCOVERY_RETRY_MS: u64 = 6_000;
 const PID_GROWTH_HINT_MIN_MS: u64 = 10_000;
 const PID_SNAPSHOT_LOG_INTERVAL_MS: u64 = 30_000;
+const SCREEN_OFF_SCAN_INTERVAL_MS: u64 = 10_000;
+const ACTIVE_PROCESS_DEEP_SCAN_MS: u64 = 10_000;
+const SCREEN_OFF_PROCESS_DEEP_SCAN_MS: u64 = 30_000;
 const RUNTIME_CHANGE_LOG_INTERVAL_MS: u64 = 30_000;
 const RUNTIME_SUMMARY_LOG_INTERVAL_MS: u64 = 5 * 60_000;
 const RULE_HEALTH_FULL_SCAN_RETRY_MS: u64 = 5_000;
@@ -116,6 +119,21 @@ struct ProcHit {
     // false 表示目标进程的 task/comm/starttime 扫描有缺口。正向命中仍可使用，
     // 但包含此命中的全量扫描不能作为规则健康的负向证据。
     health_scan_complete: bool,
+    thread_fingerprint: Option<ThreadSetFingerprint>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ThreadSetFingerprint {
+    count: usize,
+    xor_hash: u64,
+    sum_hash: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessScanStamp {
+    pid_starttime: u64,
+    thread_fingerprint: ThreadSetFingerprint,
+    last_deep_scan_elapsed_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -197,6 +215,9 @@ struct DaemonState {
     // 已确认属于规则目标的 PID 缓存。
     // 只在配置变化、健康观察或周期到达时全量扫 /proc；平时优先复用已知 PID。
     known_pids: BTreeSet<i32>,
+    // 每个已知 PID 只保留轻量身份与 TID 集合指纹，不缓存线程名或完整规则动作。
+    // 稳定轮次先枚举数字 TID；集合未变时跳过数千次 comm/stat/affinity 文件读取。
+    process_scan_stamps: HashMap<i32, ProcessScanStamp>,
     // 只缓存已经通过 UID、cmdline、TGID 和 starttime 复查后产生动作的线程。
     // 它用于缩短 fork/rename 后的发现延迟，不作为规则命中或线程身份的最终依据。
     managed_tids: HashMap<i32, ManagedTidEntry>,
@@ -229,6 +250,9 @@ struct DaemonState {
     // 每个配置应用的可靠前台生命周期只触发一次进程发现全扫。
     foreground_scan_lifecycles: HashMap<String, u64>,
     last_foreground_discovery_scan_elapsed_ms: Option<u64>,
+    // eBPF/inotify 事件只能插入增量复查，不能重置固定的常规扫描节奏。
+    last_regular_scan_elapsed_ms: Option<u64>,
+    interactive: bool,
     round_index: u64,
     logged_round_once: bool,
     last_runtime_summary_log_elapsed_ms: Option<u64>,

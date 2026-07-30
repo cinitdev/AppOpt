@@ -782,6 +782,40 @@ fn read_rule_health_foreground_state(now_elapsed: u64) -> RuleHealthForegroundSt
     }
 }
 
+fn read_foreground_interactive(now_elapsed: u64) -> Option<bool> {
+    let raw = fs::read_to_string(FOREGROUND_TASK_STATE_FILE).ok()?;
+    let mut version = 0u32;
+    let mut boot_id = String::new();
+    let mut updated_elapsed_ms = 0u64;
+    let mut interactive = None;
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "version" => version = value.trim().parse().unwrap_or(0),
+            "boot_id" => boot_id = value.trim().to_string(),
+            "updated_elapsed_ms" => updated_elapsed_ms = value.trim().parse().unwrap_or(0),
+            "interactive" => {
+                interactive = match value.trim() {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+    let fresh = updated_elapsed_ms > 0
+        && now_elapsed >= updated_elapsed_ms
+        && now_elapsed.saturating_sub(updated_elapsed_ms) <= FOREGROUND_TASK_MAX_AGE_MS;
+    (version >= 2
+        && fresh
+        && rule_health_current_boot_id(now_elapsed) == Some(boot_id.as_str()))
+    .then_some(interactive)
+    .flatten()
+}
+
 fn rule_health_current_boot_id(now_elapsed: u64) -> Option<&'static str> {
     if let Some(value) = CURRENT_BOOT_ID.get() {
         return Some(value.as_str());

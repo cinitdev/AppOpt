@@ -116,6 +116,9 @@ fn scan_known_pids(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     known_pids: &mut BTreeSet<i32>,
+    process_scan_stamps: &mut HashMap<i32, ProcessScanStamp>,
+    now_elapsed: u64,
+    deep_scan_interval_ms: u64,
 ) -> ProcScanResult {
     // 缓存扫描只访问上轮已经命中过的 PID，主要降低常驻 daemon 的 open/read 次数。
     // 如果进程退出或规则不再匹配，会从 known_pids 里剔除。
@@ -126,9 +129,27 @@ fn scan_known_pids(
 
     for pid in known_pids.iter().copied() {
         let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        let lightweight_identity = read_proc_starttime(&proc_path)
+            .ok()
+            .zip(read_thread_set_fingerprint(&proc_path).ok());
+        let can_skip_deep_scan = lightweight_identity.is_some_and(|(pid_starttime, fingerprint)| {
+            process_scan_stamps.get(&pid).is_some_and(|stamp| {
+                stamp.pid_starttime == pid_starttime
+                    && stamp.thread_fingerprint == fingerprint
+                    && now_elapsed >= stamp.last_deep_scan_elapsed_ms
+                    && now_elapsed.saturating_sub(stamp.last_deep_scan_elapsed_ms)
+                        < deep_scan_interval_ms
+            })
+        });
+        if can_skip_deep_scan {
+            alive.insert(pid);
+            continue;
+        }
+
         match scan_process_path(pid, &proc_path, rules, index) {
             ProcessScanOutcome::Hit(hit) => {
                 alive.insert(pid);
+                update_process_scan_stamp(process_scan_stamps, &hit, now_elapsed);
                 if !hit.health_scan_complete {
                     if let Some(pkg) = base_package(&hit.cmdline) {
                         health_incomplete_packages.insert(pkg.to_string());
@@ -142,7 +163,9 @@ fn scan_known_pids(
                 alive.insert(pid);
                 complete = false;
             }
-            ProcessScanOutcome::Gone | ProcessScanOutcome::NotTarget => {}
+            ProcessScanOutcome::Gone | ProcessScanOutcome::NotTarget => {
+                process_scan_stamps.remove(&pid);
+            }
         }
     }
 
@@ -151,6 +174,53 @@ fn scan_known_pids(
         hits,
         complete,
         health_incomplete_packages,
+    }
+}
+
+fn update_process_scan_stamp(
+    process_scan_stamps: &mut HashMap<i32, ProcessScanStamp>,
+    hit: &ProcHit,
+    now_elapsed: u64,
+) {
+    let Some(pid_starttime) = hit.pid_starttime else {
+        process_scan_stamps.remove(&hit.pid);
+        return;
+    };
+    let Some(thread_fingerprint) = hit.thread_fingerprint else {
+        process_scan_stamps.remove(&hit.pid);
+        return;
+    };
+    process_scan_stamps.insert(
+        hit.pid,
+        ProcessScanStamp {
+            pid_starttime,
+            thread_fingerprint,
+            last_deep_scan_elapsed_ms: now_elapsed,
+        },
+    );
+}
+
+fn read_thread_set_fingerprint(proc_path: &Path) -> io::Result<ThreadSetFingerprint> {
+    let mut fingerprint = ThreadSetFingerprint::default();
+    for task in fs::read_dir(proc_path.join("task"))? {
+        let task = task?;
+        if let Some(tid) = parse_pid(&task.file_name()) {
+            fingerprint.add_tid(tid);
+        }
+    }
+    Ok(fingerprint)
+}
+
+impl ThreadSetFingerprint {
+    fn add_tid(&mut self, tid: i32) {
+        let mut value = tid as u64;
+        value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        self.count = self.count.saturating_add(1);
+        self.xor_hash ^= value;
+        self.sum_hash = self.sum_hash.wrapping_add(value);
     }
 }
 
@@ -225,10 +295,10 @@ fn scan_process_path(
 
     let has_app_health_rules = index.health_rule_packages.contains(matched_base);
     let needs_thread_scan = !process_rules.is_empty() || !thread_rules.is_empty();
-    let (actions, scanned_threads, threads_complete) = if needs_thread_scan {
+    let (actions, scanned_threads, threads_complete, thread_fingerprint) = if needs_thread_scan {
         scan_threads(proc_path, &process_rules, &thread_rules)
     } else {
-        (Vec::new(), 0, true)
+        (Vec::new(), 0, true, None)
     };
     // 缓存基础主进程可避免“只有尚未出现的健康目标”时每轮全量扫 /proc；缓存含线程
     // 规则的精确 owner，则能继续复用 task 扫描捕获稍后才出现的目标线程。
@@ -252,6 +322,7 @@ fn scan_process_path(
         actions,
         scanned_threads,
         health_scan_complete: pid_starttime.is_some() && threads_complete,
+        thread_fingerprint: threads_complete.then_some(thread_fingerprint).flatten(),
     })
 }
 
@@ -276,18 +347,19 @@ fn scan_threads(
     proc_path: &Path,
     process_rules: &[&Rule],
     thread_rules: &[&Rule],
-) -> (Vec<ThreadAction>, usize, bool) {
+) -> (Vec<ThreadAction>, usize, bool, Option<ThreadSetFingerprint>) {
     // Linux 线程名来自 /proc/<pid>/task/<tid>/comm，最多 15 字节，会被内核截断。
     // 因此规则匹配必须接受用户写的截断名或通配符，例如 Thread-*、binder:*。
     let task_dir = proc_path.join("task");
     let tasks = match fs::read_dir(task_dir) {
         Ok(tasks) => tasks,
-        Err(_) => return (Vec::new(), 0, false),
+        Err(_) => return (Vec::new(), 0, false, None),
     };
 
     let mut actions = Vec::new();
     let mut scanned = 0;
     let mut complete = true;
+    let mut fingerprint = ThreadSetFingerprint::default();
     let process_rule = combine_rules(process_rules);
 
     for task in tasks {
@@ -301,6 +373,7 @@ fn scan_threads(
         let Some(tid) = parse_pid(&task.file_name()) else {
             continue;
         };
+        fingerprint.add_tid(tid);
         let name = match read_comm(&task.path()) {
             Ok(name) if !name.is_empty() => name,
             _ => {
@@ -359,7 +432,7 @@ fn scan_threads(
         }
     }
 
-    (actions, scanned, complete)
+    (actions, scanned, complete, Some(fingerprint))
 }
 
 #[derive(Debug, Clone)]

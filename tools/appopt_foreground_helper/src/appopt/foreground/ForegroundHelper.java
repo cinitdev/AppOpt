@@ -60,9 +60,11 @@ public final class ForegroundHelper {
     private static File uidMapFile;
     private static Object activityTaskManager;
     private static Object packageManager;
+    private static Object powerManager;
     private static Method getTasksMethod;
     private static Method registerMethod;
     private static Method unregisterMethod;
+    private static Method isInteractiveMethod;
     private static Listener listener;
     private static boolean listenerRegistered;
     private static long lastListenerRegisterAttemptElapsed;
@@ -454,6 +456,7 @@ public final class ForegroundHelper {
             line(out, "generation", String.valueOf(currentGeneration));
             line(out, "updated_elapsed_ms", String.valueOf(snapshotElapsed));
             line(out, "updated_wall_ms", String.valueOf(snapshotWall));
+            line(out, "interactive", interactiveState());
             line(out, "reason", reason);
             line(out, "selection", selection);
             line(out, "focused_package", result == null ? "" : result.component.getPackageName());
@@ -485,6 +488,7 @@ public final class ForegroundHelper {
             line(out, "generation", String.valueOf(currentGeneration));
             line(out, "updated_elapsed_ms", String.valueOf(SystemClock.elapsedRealtime()));
             line(out, "updated_wall_ms", String.valueOf(System.currentTimeMillis()));
+            line(out, "interactive", interactiveState());
             line(out, "reason", reason);
             line(out, "selection", "none");
             line(out, "focused_package", "");
@@ -534,6 +538,35 @@ public final class ForegroundHelper {
         }
         syncPackageUidMap("loop");
         handler.postDelayed(ForegroundHelper::uidMapLoop, UID_MAP_RECONCILE_MS);
+    }
+
+    private static String interactiveState() {
+        try {
+            if (powerManager == null || isInteractiveMethod == null) {
+                Class<?> serviceManagerClass = Class.forName("android.os.ServiceManager");
+                Object binder = serviceManagerClass
+                    .getMethod("getService", String.class)
+                    .invoke(null, "power");
+                if (binder == null) {
+                    return "unknown";
+                }
+                Class<?> binderClass = Class.forName("android.os.IBinder");
+                Class<?> stubClass = Class.forName("android.os.IPowerManager$Stub");
+                powerManager = stubClass
+                    .getMethod("asInterface", binderClass)
+                    .invoke(null, binder);
+                if (powerManager == null) {
+                    return "unknown";
+                }
+                isInteractiveMethod = powerManager.getClass().getMethod("isInteractive");
+            }
+            Object value = isInteractiveMethod.invoke(powerManager);
+            return Boolean.TRUE.equals(value) ? "1" : "0";
+        } catch (Throwable error) {
+            powerManager = null;
+            isInteractiveMethod = null;
+            return "unknown";
+        }
     }
 
     private static void syncPackageUidMap(String reason) {
