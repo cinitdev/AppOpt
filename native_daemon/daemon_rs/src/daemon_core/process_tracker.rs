@@ -49,7 +49,7 @@ fn refresh_process_index(now_elapsed: u64, rebuild_all: bool) -> io::Result<Proc
                 Err(_) => continue,
             }
         } else if let Some(old) = old {
-            // 稳定缓存仍需读取一次 starttime，防止 PID 被快速复用后继续沿用旧身份。
+            // 稳定缓存仍读取一次 starttime，防止 PID 被快速复用后沿用旧身份。
             let proc_path = PathBuf::from(format!("/proc/{pid}"));
             match read_proc_starttime(&proc_path) {
                 Ok(starttime) if starttime == old.starttime => old.clone(),

@@ -795,17 +795,11 @@ build_and_embed_app
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"
 BPF_PERF_SRC="$FPS_MON/bpf/queuebuffer_probe_perf.bpf.c"
 BPF_CPU_UTIL_SRC="$FPS_MON/bpf/cpu_util_monitor.bpf.c"
-BPF_PROCESS_EVENTS_SRC="$FPS_MON/bpf/process_events.bpf.c"
-BPF_PROCESS_EVENTS_PERF_SRC="$FPS_MON/bpf/process_events_perf.bpf.c"
 mkdir -p "$WORK/config/ebpf"
 BPF_CPU_UTIL_OBJ="$WORK/config/ebpf/cpu_util_monitor.bpf.o"
-BPF_PROCESS_EVENTS_OBJ="$WORK/config/ebpf/process_events.bpf.o"
-BPF_PROCESS_EVENTS_PERF_OBJ="$WORK/config/ebpf/process_events_perf.bpf.o"
 [ -f "$BPF_SRC" ] || { echo "! 找不到 BPF 源码: $BPF_SRC"; exit 1; }
 [ -f "$BPF_PERF_SRC" ] || { echo "! 找不到 PerfEvent BPF 源码: $BPF_PERF_SRC"; exit 1; }
 [ -f "$BPF_CPU_UTIL_SRC" ] || { echo "! 找不到 CPU 利用率 BPF 源码: $BPF_CPU_UTIL_SRC"; exit 1; }
-[ -f "$BPF_PROCESS_EVENTS_SRC" ] || { echo "! 找不到进程事件 BPF 源码: $BPF_PROCESS_EVENTS_SRC"; exit 1; }
-[ -f "$BPF_PROCESS_EVENTS_PERF_SRC" ] || { echo "! 找不到进程事件 PerfEvent BPF 源码: $BPF_PROCESS_EVENTS_PERF_SRC"; exit 1; }
 
 CLANG="$BIN/clang"
 [ ! -f "$CLANG" ] && CLANG="$BIN/clang.exe"
@@ -861,8 +855,6 @@ build_bpf_pair_for_abi armeabi-v7a __TARGET_ARCH_arm   arm-linux-androideabi  AP
 build_bpf_pair_for_abi x86_64      __TARGET_ARCH_x86   x86_64-linux-android   APPOPT_BPF_X86_64
 build_bpf_pair_for_abi x86         __TARGET_ARCH_x86   i686-linux-android      APPOPT_BPF_I386
 build_common_bpf_obj "$BPF_CPU_UTIL_SRC" "$BPF_CPU_UTIL_OBJ" "cpu_util_monitor.bpf.c"
-build_common_bpf_obj "$BPF_PROCESS_EVENTS_SRC" "$BPF_PROCESS_EVENTS_OBJ" "process_events.bpf.c"
-build_common_bpf_obj "$BPF_PROCESS_EVENTS_PERF_SRC" "$BPF_PROCESS_EVENTS_PERF_OBJ" "process_events_perf.bpf.c"
 
 build_abi() {
     local triple="$1" abidir="$2" rust_target="$3"

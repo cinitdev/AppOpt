@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -25,9 +26,15 @@ object ModuleUpdater {
     private const val PENDING_MODULE_PROP = "/data/adb/modules_update/AppOpt/module.prop"
     private const val CONNECT_TIMEOUT_MS = 10000
     private const val READ_TIMEOUT_MS = 15000
+    private const val DOWNLOAD_CONNECT_TIMEOUT_MS = 15000
+    private const val DOWNLOAD_READ_TIMEOUT_MS = 30000
     private const val INSTALL_TIMEOUT_SECONDS = 180L
     private const val DOWNLOAD_TIMEOUT_MS = 30L * 60L * 1000L
     private const val DOWNLOAD_MISSING_LIMIT = 6
+    private const val DOWNLOAD_PROVIDER_AUTHORITY = "downloads"
+    private const val MAX_DOWNLOAD_REDIRECTS = 5
+    private const val DOWNLOAD_BUFFER_SIZE = 64 * 1024
+    private const val TAG = "AppOpt"
     private const val IN_APP_UPDATE_ENV = "APPOPT_IN_APP_UPDATE"
     private const val IN_APP_UPDATE_MARKER_ENTRY = "config/app/.appopt_in_app_update"
     private const val IN_APP_UPDATE_FLAG_PATH = "/data/adb/appopt_in_app_update"
@@ -217,8 +224,16 @@ object ModuleUpdater {
             try {
                 if (handle.isCancelled) throw DownloadCancelledException()
                 progress("准备下载模块", 0)
-                val zip = downloadWithManager(appContext, update, handle) { message, percent ->
-                    progress(message, percent)
+                val zip = try {
+                    downloadWithManager(appContext, update, handle) { message, percent ->
+                        progress(message, percent)
+                    }
+                } catch (e: SystemDownloadException) {
+                    Log.w(TAG, "系统下载服务不可用，切换到内置下载", e)
+                    progress("系统下载服务不可用，已切换内置下载", 0)
+                    downloadDirect(appContext, update, handle) { message, percent ->
+                        progress(message, percent)
+                    }
                 }
                 handle.track(zip)
                 if (handle.isCancelled) throw DownloadCancelledException()
@@ -232,6 +247,7 @@ object ModuleUpdater {
             } catch (_: DownloadCancelledException) {
                 handle.cancel()
             } catch (e: UpdateException) {
+                Log.e(TAG, "模块更新下载失败", e)
                 if (!handle.isCancelled) {
                     mainHandler.post {
                         if (!handle.isCancelled) {
@@ -239,7 +255,8 @@ object ModuleUpdater {
                         }
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.e(TAG, "模块更新下载失败", e)
                 if (!handle.isCancelled) {
                     mainHandler.post {
                         if (!handle.isCancelled) {
@@ -384,17 +401,17 @@ object ModuleUpdater {
         handle: DownloadHandle,
         onProgress: (String, Int?) -> Unit
     ): File {
-        val manager = context.getSystemService(DownloadManager::class.java)
-            ?: throw UpdateException("系统下载服务不可用")
-        val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
-        if (!dir.exists() && !dir.mkdirs()) {
-            throw UpdateException("下载目录不可用")
+        val provider = try {
+            context.packageManager.resolveContentProvider(DOWNLOAD_PROVIDER_AUTHORITY, 0)
+        } catch (_: RuntimeException) {
+            null
         }
-
-        val target = File(
-            dir,
-            "AppOpt-${safeFilePart(update.remoteVersion)}-${update.remoteVersionCode}-${System.currentTimeMillis()}.zip"
-        )
+        if (provider == null) {
+            throw SystemDownloadException("未找到系统 downloads 提供程序")
+        }
+        val manager = context.getSystemService(DownloadManager::class.java)
+            ?: throw SystemDownloadException("系统下载服务不可用")
+        val target = createDownloadTarget(context, update)
         val request = DownloadManager.Request(Uri.parse(update.zipUrl))
             .setTitle("AppOpt ${update.remoteVersion}")
             .setDescription("正在下载模块更新")
@@ -404,7 +421,12 @@ object ModuleUpdater {
             .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
             .setDestinationUri(Uri.fromFile(target))
 
-        val id = manager.enqueue(request)
+        val id = try {
+            manager.enqueue(request)
+        } catch (e: RuntimeException) {
+            target.delete()
+            throw SystemDownloadException("系统下载服务无法创建任务", e)
+        }
         val query = DownloadManager.Query().setFilterById(id)
         val startedAt = SystemClock.elapsedRealtime()
         var missingCount = 0
@@ -415,7 +437,12 @@ object ModuleUpdater {
                     throw UpdateException("下载超时，请检查网络后重试")
                 }
                 var found = false
-                manager.query(query)?.use { cursor ->
+                val cursor = try {
+                    manager.query(query)
+                } catch (e: RuntimeException) {
+                    throw SystemDownloadException("系统下载任务查询失败", e)
+                }
+                cursor?.use {
                     if (cursor.moveToFirst()) {
                         found = true
                         when (cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))) {
@@ -427,7 +454,7 @@ object ModuleUpdater {
                             }
                             DownloadManager.STATUS_FAILED -> {
                                 val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
-                                throw UpdateException("下载失败：${downloadReason(reason)}")
+                                throw SystemDownloadException("系统下载失败：${downloadReason(reason)}")
                             }
                             DownloadManager.STATUS_PAUSED -> {
                                 val percent = downloadPercent(cursor)
@@ -443,7 +470,7 @@ object ModuleUpdater {
                 }
                 missingCount = if (found) 0 else missingCount + 1
                 if (missingCount >= DOWNLOAD_MISSING_LIMIT) {
-                    throw UpdateException("系统下载任务已被移除，请重新下载")
+                    throw SystemDownloadException("系统下载任务已被移除")
                 }
                 try {
                     Thread.sleep(500L)
@@ -453,10 +480,130 @@ object ModuleUpdater {
                 }
             }
         } catch (e: Exception) {
-            manager.remove(id)
+            runCatching { manager.remove(id) }
             target.delete()
             throw e
         }
+    }
+
+    private fun downloadDirect(
+        context: Context,
+        update: UpdateInfo,
+        handle: DownloadHandle,
+        onProgress: (String, Int?) -> Unit
+    ): File {
+        val target = createDownloadTarget(context, update)
+        val partial = File(target.parentFile, "${target.name}.part")
+        var connection: HttpURLConnection? = null
+        val startedAt = SystemClock.elapsedRealtime()
+
+        try {
+            connection = openDownloadConnection(update.zipUrl)
+            val total = connection.contentLengthLong.takeIf { it > 0L }
+            var downloaded = 0L
+            var lastPercent = -1
+            var lastProgressAt = 0L
+            onProgress("内置下载中", if (total != null) 0 else null)
+
+            connection.inputStream.buffered().use { input ->
+                partial.outputStream().buffered().use { output ->
+                    val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+                    while (true) {
+                        if (handle.isCancelled) throw DownloadCancelledException()
+                        if (SystemClock.elapsedRealtime() - startedAt > DOWNLOAD_TIMEOUT_MS) {
+                            throw UpdateException("下载超时，请检查网络后重试")
+                        }
+
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        if (count == 0) continue
+                        output.write(buffer, 0, count)
+                        downloaded += count
+
+                        val now = SystemClock.elapsedRealtime()
+                        val percent = total?.let {
+                            ((downloaded * 100L) / it).toInt().coerceIn(0, 99)
+                        }
+                        if ((percent != null && percent != lastPercent) || now - lastProgressAt >= 1000L) {
+                            onProgress(
+                                if (percent != null) "内置下载中 $percent%" else "内置下载中",
+                                percent
+                            )
+                            if (percent != null) lastPercent = percent
+                            lastProgressAt = now
+                        }
+                    }
+                }
+            }
+
+            if (!partial.exists() || partial.length() <= 0L) {
+                throw UpdateException("下载完成，但模块文件为空")
+            }
+            if (!partial.renameTo(target)) {
+                partial.copyTo(target, overwrite = true)
+                partial.delete()
+            }
+            return target.takeIf { it.exists() && it.length() > 0L }
+                ?: throw UpdateException("下载完成，但未找到模块文件")
+        } catch (e: DownloadCancelledException) {
+            throw e
+        } catch (e: UpdateException) {
+            throw e
+        } catch (e: Exception) {
+            throw UpdateException("内置下载失败：${e.message ?: "网络连接异常"}", e)
+        } finally {
+            connection?.disconnect()
+            partial.delete()
+            if (!target.exists() || target.length() <= 0L) target.delete()
+        }
+    }
+
+    private fun openDownloadConnection(url: String): HttpURLConnection {
+        var currentUrl = URL(url)
+        for (redirectCount in 0..MAX_DOWNLOAD_REDIRECTS) {
+            val connection = (currentUrl.openConnection() as HttpURLConnection).apply {
+                connectTimeout = DOWNLOAD_CONNECT_TIMEOUT_MS
+                readTimeout = DOWNLOAD_READ_TIMEOUT_MS
+                instanceFollowRedirects = false
+                setRequestProperty("User-Agent", "AppOpt/${DaemonBridge.REQUIRED_MODULE_VERSION_NAME}")
+                setRequestProperty("Accept", "application/zip, application/octet-stream, */*")
+            }
+            val code = try {
+                connection.responseCode
+            } catch (e: Exception) {
+                connection.disconnect()
+                throw e
+            }
+            if (code in listOf(301, 302, 303, 307, 308)) {
+                val location = connection.getHeaderField("Location")
+                connection.disconnect()
+                if (location.isNullOrBlank()) {
+                    throw UpdateException("下载重定向缺少目标地址")
+                }
+                if (redirectCount >= MAX_DOWNLOAD_REDIRECTS) {
+                    throw UpdateException("下载重定向次数过多")
+                }
+                currentUrl = URL(currentUrl, location)
+                continue
+            }
+            if (code !in 200..299) {
+                connection.disconnect()
+                throw UpdateException("下载失败：HTTP $code")
+            }
+            return connection
+        }
+        throw UpdateException("下载重定向次数过多")
+    }
+
+    private fun createDownloadTarget(context: Context, update: UpdateInfo): File {
+        val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw UpdateException("下载目录不可用")
+        }
+        return File(
+            dir,
+            "AppOpt-${safeFilePart(update.remoteVersion)}-${update.remoteVersionCode}-${System.currentTimeMillis()}.zip"
+        )
     }
 
     private fun downloadPercent(cursor: android.database.Cursor): Int? {
@@ -795,6 +942,7 @@ object ModuleUpdater {
             .ifBlank { "update" }
     }
 
-    private class UpdateException(message: String) : Exception(message)
+    private class UpdateException(message: String, cause: Throwable? = null) : Exception(message, cause)
+    private class SystemDownloadException(message: String, cause: Throwable? = null) : Exception(message, cause)
     private class DownloadCancelledException : Exception()
 }

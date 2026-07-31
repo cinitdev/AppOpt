@@ -10,7 +10,6 @@ include!("daemon_core/preamble.rs");
 mod rule_syntax;
 include!("daemon_core/entry.rs");
 include!("daemon_core/runtime_cache.rs");
-include!("daemon_core/process_events.rs");
 include!("daemon_core/loop.rs");
 include!("daemon_core/cli.rs");
 include!("daemon_core/config.rs");

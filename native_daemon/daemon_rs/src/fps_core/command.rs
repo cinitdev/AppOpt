@@ -165,22 +165,32 @@
         Some(base.to_string())
     }
 
+    enum JankForegroundState {
+        Reliable(String),
+        Unavailable,
+    }
+
     fn selected_jank_foreground(selected: &[String]) -> Option<String> {
         if selected.is_empty() {
             return None;
         }
-        read_jank_foreground()
-            .filter(|pkg| selected.iter().any(|item| item == pkg))
-            .or_else(|| {
+        match read_jank_foreground() {
+            JankForegroundState::Reliable(pkg) => {
+                selected.iter().any(|item| item == &pkg).then_some(pkg)
+            }
+            JankForegroundState::Unavailable => {
                 selected
                     .iter()
                     .find(|pkg| app_top_state_check(pkg).target_top_app)
                     .cloned()
-            })
+            }
+        }
     }
 
-    fn read_jank_foreground() -> Option<String> {
-        let raw = fs::read_to_string(FOREGROUND_TASK_STATE_FILE).ok()?;
+    fn read_jank_foreground() -> JankForegroundState {
+        let Ok(raw) = fs::read_to_string(FOREGROUND_TASK_STATE_FILE) else {
+            return JankForegroundState::Unavailable;
+        };
         let mut status = "";
         let mut focused = "";
         let mut updated = 0u64;
@@ -195,17 +205,20 @@
         }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_millis() as u64;
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
         if status != "ok"
             || focused.is_empty()
             || updated == 0
+            || now == 0
             || now < updated
             || now - updated > FOREGROUND_TASK_MAX_AGE_MS
         {
-            return None;
+            return JankForegroundState::Unavailable;
         }
         normalize_jank_package(focused)
+            .map(JankForegroundState::Reliable)
+            .unwrap_or(JankForegroundState::Unavailable)
     }
 
     fn read_command() -> io::Result<Option<String>> {

@@ -126,24 +126,34 @@ fn scan_known_pids(
     let mut alive = BTreeSet::new();
     let mut complete = true;
     let mut health_incomplete_packages = BTreeSet::new();
-
     for pid in known_pids.iter().copied() {
         let proc_path = PathBuf::from(format!("/proc/{pid}"));
-        let lightweight_identity = read_proc_starttime(&proc_path)
-            .ok()
-            .zip(read_thread_set_fingerprint(&proc_path).ok());
-        let can_skip_deep_scan = lightweight_identity.is_some_and(|(pid_starttime, fingerprint)| {
-            process_scan_stamps.get(&pid).is_some_and(|stamp| {
-                stamp.pid_starttime == pid_starttime
-                    && stamp.thread_fingerprint == fingerprint
-                    && now_elapsed >= stamp.last_deep_scan_elapsed_ms
-                    && now_elapsed.saturating_sub(stamp.last_deep_scan_elapsed_ms)
-                        < deep_scan_interval_ms
-            })
+        let pid_starttime = read_proc_starttime(&proc_path).ok();
+        let stamp = process_scan_stamps.get(&pid).copied();
+        let identity_matches = stamp.is_some_and(|stamp| {
+            pid_starttime.is_some_and(|pid_starttime| stamp.pid_starttime == pid_starttime)
         });
-        if can_skip_deep_scan {
+        let deep_scan_due = stamp.is_none_or(|stamp| {
+            now_elapsed < stamp.last_deep_scan_elapsed_ms
+                || now_elapsed.saturating_sub(stamp.last_deep_scan_elapsed_ms)
+                    >= deep_scan_interval_ms
+        });
+        if identity_matches && !deep_scan_due {
             alive.insert(pid);
             continue;
+        }
+        if identity_matches {
+            let fingerprint_unchanged = stamp.is_some_and(|stamp| {
+                read_thread_set_fingerprint(&proc_path)
+                    .is_ok_and(|fingerprint| stamp.thread_fingerprint == fingerprint)
+            });
+            if fingerprint_unchanged {
+                if let Some(stamp) = process_scan_stamps.get_mut(&pid) {
+                    stamp.last_deep_scan_elapsed_ms = now_elapsed;
+                }
+                alive.insert(pid);
+                continue;
+            }
         }
 
         match scan_process_path(pid, &proc_path, rules, index) {

@@ -26,14 +26,13 @@ use std::os::unix::fs::MetadataExt;
 // 3. 日常只比较数字 PID 目录快照，并复查新增 PID；命中后缓存 PID 和线程结果。
 // 4. 写 affinity 前先读当前 Cpus_allowed_list，相同则跳过，避免重复抢系统调度配置。
 // 5. 写入后再读回一次，用于发现移植系统/厂商服务把线程绑核抢写回去的情况。
-const VERSION: &str = "1.8.3";
+const VERSION: &str = "1.8.4";
 const DEFAULT_CONFIG: &str = "/data/adb/modules/AppOpt/config/applist.conf";
 const STATE_DIR: &str = "/data/adb/modules/AppOpt/config/state";
 const DEFAULT_UID_MAP: &str = "/data/adb/modules/AppOpt/config/state/package_uid.map";
 const RULE_HEALTH_FILE: &str = "/data/adb/modules/AppOpt/config/state/rule_health.tsv";
 const FOREGROUND_TASK_STATE_FILE: &str = "/data/adb/modules/AppOpt/config/foreground_task.state";
 const PROCESS_CACHE_FILE: &str = "/data/adb/modules/AppOpt/config/state/pid_cache.tsv";
-const PROCESS_EVENTS_BPF_FILE: &str = "/data/adb/modules/AppOpt/config/ebpf/process_events.bpf.o";
 const PROCESS_INDEX_MAGIC: &str = "APPOPT_PROCESS_INDEX_V1";
 const BOOT_ID_FILE: &str = "/proc/sys/kernel/random/boot_id";
 const FOREGROUND_TASK_MAX_AGE_MS: u64 = 12_000;
@@ -41,7 +40,6 @@ const RULE_HEALTH_OBSERVE_SECS: u64 = 30;
 const ANDROID_UID_USER_RANGE: u32 = 100_000;
 const DEFAULT_CPUSET_NAME: &str = "AppOptRs";
 const DEFAULT_INTERVAL_SECS: u64 = 2;
-const FULL_RESCAN_MAX_MS: u64 = 60_000;
 const PID_SNAPSHOT_ACTIVE_MS: u64 = 2_000;
 const PID_SNAPSHOT_IDLE_MS: u64 = 10_000;
 const PID_DISCOVERY_RETRY_MS: u64 = 6_000;
@@ -56,8 +54,6 @@ const RULE_HEALTH_FULL_SCAN_RETRY_MS: u64 = 5_000;
 const FOREGROUND_DISCOVERY_DELAY_MS: u64 = 2_000;
 const FOREGROUND_DISCOVERY_COOLDOWN_MS: u64 = 10_000;
 const BOOT_ID_READ_RETRY_MS: u64 = 60_000;
-const PROCESS_EVENT_RETRY_MS: u64 = 60_000;
-const PROCESS_EVENT_ERROR_LOG_MS: u64 = 5 * 60_000;
 const MAX_MANAGED_TIDS: usize = 32_768;
 const MAX_ERROR_DETAILS_PER_ROUND: usize = 3;
 const CPU_MASK_WORDS: usize = 16;
@@ -215,11 +211,11 @@ struct DaemonState {
     // 已确认属于规则目标的 PID 缓存。
     // 只在配置变化、健康观察或周期到达时全量扫 /proc；平时优先复用已知 PID。
     known_pids: BTreeSet<i32>,
-    // 每个已知 PID 只保留轻量身份与 TID 集合指纹，不缓存线程名或完整规则动作。
-    // 稳定轮次先枚举数字 TID；集合未变时跳过数千次 comm/stat/affinity 文件读取。
+    // 每个已知 PID 只保留轻量身份与最近一次 TID 集合指纹，不缓存线程名或完整规则动作。
+    // 亮屏每 10 秒、息屏每 30 秒校验一次指纹，集合不变时跳过完整线程扫描。
     process_scan_stamps: HashMap<i32, ProcessScanStamp>,
     // 只缓存已经通过 UID、cmdline、TGID 和 starttime 复查后产生动作的线程。
-    // 它用于缩短 fork/rename 后的发现延迟，不作为规则命中或线程身份的最终依据。
+    // 它用于避免重复写入 cpuset，不作为规则命中或线程身份的最终依据。
     managed_tids: HashMap<i32, ManagedTidEntry>,
     // 进程发现状态保存在共享 TSV，内存只记录调度节奏，不长期保存全量 PID 快照。
     process_index_initialized: bool,
@@ -227,8 +223,6 @@ struct DaemonState {
     last_pid_snapshot_elapsed_ms: Option<u64>,
     last_pid_snapshot_log_elapsed_ms: Option<u64>,
     last_proc_growth_scan_elapsed_ms: Option<u64>,
-    stable_pid_snapshot_rounds: u32,
-    pid_idle_backoff_logged: bool,
     // 区分“尚未做过初始全扫”和“已经全扫但当前没有目标进程”。
     // known_pids 为空并不代表缓存未初始化，否则无目标进程时会每轮全扫 /proc。
     proc_scan_initialized: bool,
@@ -244,13 +238,11 @@ struct DaemonState {
     last_health_full_scan_attempt_elapsed_ms: Option<u64>,
     // sysinfo 增长只要求尽快刷新数字 PID 快照，不再触发 cmdline 全量扫描。
     proc_growth_scan_pending: bool,
-    // RingBuf 丢事件或读取异常后保持到一次完整扫描成功，不能被单轮冷却跳过吞掉。
-    process_event_rescan_pending: bool,
     last_proc_total: Option<u64>,
     // 每个配置应用的可靠前台生命周期只触发一次进程发现全扫。
     foreground_scan_lifecycles: HashMap<String, u64>,
     last_foreground_discovery_scan_elapsed_ms: Option<u64>,
-    // eBPF/inotify 事件只能插入增量复查，不能重置固定的常规扫描节奏。
+    // inotify 事件只能提前检查配置，不能重置固定的常规扫描节奏。
     last_regular_scan_elapsed_ms: Option<u64>,
     interactive: bool,
     round_index: u64,
