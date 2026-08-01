@@ -94,7 +94,7 @@ data class CalibPolicy(
         return buildString {
             appendLine("# AppOpt 自动校准策略")
             appendLine("# App 内可视化编辑；手动改动时请保持 key=value 格式。")
-            appendLine("# 分配核心为连续 CPU 编号范围, 例如 7、5-6、0-6。")
+            appendLine("# 分配核心支持单个核心、连续范围和逗号组合, 例如 7、5-6、0-3,5,7。")
             appendLine("version=1")
             appendLine("best_thread=avg:${fmt(p.bestAvg)},max:${fmt(p.bestMax)},cores:${p.bestCores}")
             appendLine("group_high=avg:${fmt(p.highAvg)},max:${fmt(p.highMax)},cores:${p.highCores}")
@@ -240,7 +240,9 @@ data class CalibPolicy(
         fun normalizeCoresOrNull(value: String): String? {
             val compact = value.trim().replace(" ", "")
             if (compact.isBlank()) return null
-            return parseCores(compact)?.let { formatContinuousRange(it) }
+            return RuleConfigLogic.parseCpuRangeList(compact)
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(RuleConfigLogic::formatCpuRangeList)
         }
 
         fun normalizeCpusetNameOrNull(value: String): String? {
@@ -254,40 +256,6 @@ data class CalibPolicy(
                         char == '_' || char == '-' || char == '.'
                 }
             }
-        }
-
-        private fun parseCores(value: String): Set<Int>? {
-            val out = linkedSetOf<Int>()
-            for (raw in value.split(',')) {
-                val part = raw.trim()
-                if (part.isEmpty()) return null
-                val dash = part.indexOf('-')
-                if (dash >= 0) {
-                    val start = part.substring(0, dash).toIntOrNull() ?: return null
-                    val end = part.substring(dash + 1).toIntOrNull() ?: return null
-                    if (start < 0 || end < start) return null
-                    for (cpu in start..end) out.add(cpu)
-                } else {
-                    val cpu = part.toIntOrNull() ?: return null
-                    if (cpu < 0) return null
-                    out.add(cpu)
-                }
-            }
-            return out.takeIf { it.isNotEmpty() }
-        }
-
-        private fun isContinuous(cpus: Set<Int>): Boolean {
-            if (cpus.isEmpty()) return false
-            val sorted = cpus.sorted()
-            return sorted.last() - sorted.first() + 1 == sorted.size
-        }
-
-        private fun formatContinuousRange(cpus: Set<Int>): String? {
-            if (!isContinuous(cpus)) return null
-            val sorted = cpus.sorted()
-            val start = sorted.first()
-            val end = sorted.last()
-            return if (start == end) start.toString() else "$start-$end"
         }
 
         private fun fmt(value: Double): String {

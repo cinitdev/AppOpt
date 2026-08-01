@@ -1063,13 +1063,6 @@ class SettingsFragment : TopLevelFragment() {
                     } else {
                         next.remove(cpu)
                     }
-                    if (!isContinuousSelection(next)) {
-                        suppressPolicyChange = true
-                        button.isChecked = !checked
-                        suppressPolicyChange = false
-                        showCoreWarning(warning, "核心范围必须连续，例如 0-3、4-7，不能跳选")
-                        return@setOnCheckedChangeListener
-                    }
                     selected.clear()
                     selected.addAll(next.sorted())
                     warning.visibility = View.GONE
@@ -1100,7 +1093,6 @@ class SettingsFragment : TopLevelFragment() {
         if (target.isEmpty()) {
             target.add(availableCpus.lastOrNull() ?: 0)
         }
-        makeSelectionContinuous(target)
     }
 
     private fun resolveCores(cores: String, defaultCores: String): String {
@@ -1169,30 +1161,7 @@ class SettingsFragment : TopLevelFragment() {
     }
 
     private fun formatCpuSet(cpus: Set<Int>): String {
-        val sorted = cpus.sorted()
-        if (sorted.isEmpty()) return ""
-        val start = sorted.first()
-        val end = sorted.last()
-        return if (start == end) start.toString() else "$start-$end"
-    }
-
-    private fun isContinuousSelection(cpus: Set<Int>): Boolean {
-        if (cpus.isEmpty()) return false
-        val sorted = cpus.sorted()
-        return sorted.last() - sorted.first() + 1 == sorted.size
-    }
-
-    private fun makeSelectionContinuous(target: MutableSet<Int>) {
-        if (isContinuousSelection(target)) return
-        val sorted = target.sorted()
-        if (sorted.isEmpty()) return
-        val min = sorted.first()
-        val max = sorted.last()
-        val available = availableCpus.toSet()
-        target.clear()
-        for (cpu in min..max) {
-            if (cpu in available) target.add(cpu)
-        }
+        return RuleConfigLogic.formatCpuRangeList(cpus)
     }
 
     private fun Double.formatOne(): String {

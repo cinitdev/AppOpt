@@ -53,6 +53,26 @@ internal object RuleConfigLogic {
         return cpus
     }
 
+    fun formatCpuRangeList(cpus: Set<Int>): String {
+        val sorted = cpus.sorted()
+        if (sorted.isEmpty()) return ""
+
+        val ranges = mutableListOf<String>()
+        var start = sorted.first()
+        var end = start
+        for (cpu in sorted.drop(1)) {
+            if (cpu == end + 1) {
+                end = cpu
+            } else {
+                ranges += if (start == end) "$start" else "$start-$end"
+                start = cpu
+                end = cpu
+            }
+        }
+        ranges += if (start == end) "$start" else "$start-$end"
+        return ranges.joinToString(",")
+    }
+
     /** C parse_cpu_ranges_strict / Rust CpuMask::parse 共用的运行时语义。 */
     fun parseNativeCpuRangeList(value: String): Set<Int>? {
         if (value.length > MAX_CPU_TEXT_LENGTH) return null

@@ -163,8 +163,6 @@ class MainActivity : AppCompatActivity() {
         const val PREFS_NAME = "appopt_prefs"
         const val PREF_HIDE_MISSING_CONFIGURED = "hide_missing_configured"
         const val PREF_AUTO_START_CALIBRATION = "auto_start_calibration"
-        const val PREF_AUTO_START_CALIBRATION_WARNING_ACKNOWLEDGED =
-            "auto_start_calibration_warning_acknowledged"
         const val AUTO_START_CALIBRATION_WARNING_MS = 5_000L
         const val MIN_ENV_LOADING_MS = 1800L
         const val RULE_TOOLS_THRESHOLD = 9
@@ -1549,7 +1547,7 @@ class MainActivity : AppCompatActivity() {
         setAutoStartCalibrationSwitchChecked(autoStartCalibrationEnabled)
         section.autoStartCalibrationSwitch.setOnCheckedChangeListener { _, checked ->
             if (autoStartCalibrationSwitchUpdating) return@setOnCheckedChangeListener
-            if (checked && !hasAcknowledgedAutoStartCalibrationWarning()) {
+            if (checked) {
                 setAutoStartCalibrationSwitchChecked(false)
                 showAutoStartCalibrationWarning()
                 return@setOnCheckedChangeListener
@@ -1569,21 +1567,12 @@ class MainActivity : AppCompatActivity() {
         autoStartCalibrationSwitchUpdating = false
     }
 
-    private fun hasAcknowledgedAutoStartCalibrationWarning(): Boolean =
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(PREF_AUTO_START_CALIBRATION_WARNING_ACKNOWLEDGED, false)
-
-    private fun saveAutoStartCalibrationEnabled(enabled: Boolean, acknowledgeWarning: Boolean = false) {
+    private fun saveAutoStartCalibrationEnabled(enabled: Boolean) {
         autoStartCalibrationEnabled = enabled
         setAutoStartCalibrationSwitchChecked(enabled)
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(PREF_AUTO_START_CALIBRATION, enabled)
-            .apply {
-                if (acknowledgeWarning) {
-                    putBoolean(PREF_AUTO_START_CALIBRATION_WARNING_ACKNOWLEDGED, true)
-                }
-            }
             .apply()
     }
 
@@ -1614,7 +1603,7 @@ class MainActivity : AppCompatActivity() {
             view.autoCalibrationWarningConfirm.isEnabled = false
             view.autoCalibrationWarningCancel.isEnabled = false
             view.autoCalibrationWarningConfirm.setOnClickListener {
-                saveAutoStartCalibrationEnabled(enabled = true, acknowledgeWarning = true)
+                saveAutoStartCalibrationEnabled(true)
                 dialog.dismiss()
             }
             view.autoCalibrationWarningCancel.setOnClickListener {
@@ -3645,13 +3634,6 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         next.remove(cpu)
                     }
-                    if (!isContinuousCpuSelection(next)) {
-                        suppressCpuChange = true
-                        button.isChecked = !checked
-                        suppressCpuChange = false
-                        showCpuWarning("核心范围必须连续，例如 0-3、4-7，不能跳选")
-                        return@setOnCheckedChangeListener
-                    }
                     selectedCpus.clear()
                     selectedCpus.addAll(next.sorted())
                     view.ruleCpuSummary.text = formatCpuSet(selectedCpus)
@@ -4057,32 +4039,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun formatCpuSet(cpus: Set<Int>): String {
-        val sorted = cpus.sorted()
-        if (sorted.isEmpty()) return "未知"
-        val ranges = mutableListOf<String>()
-        var start = sorted.first()
-        var end = start
-        for (cpu in sorted.drop(1)) {
-            if (cpu == end + 1) {
-                end = cpu
-            } else {
-                ranges += if (start == end) "$start" else "$start-$end"
-                start = cpu
-                end = cpu
-            }
-        }
-        ranges += if (start == end) "$start" else "$start-$end"
-        return ranges.joinToString(",")
+        return RuleConfigLogic.formatCpuRangeList(cpus).ifEmpty { "未知" }
     }
 
     private fun parseCpuSet(ranges: String): Set<Int> {
         return RuleConfigLogic.parseCpuRangeList(ranges).orEmpty()
-    }
-
-    private fun isContinuousCpuSelection(cpus: Set<Int>): Boolean {
-        if (cpus.isEmpty()) return false
-        val sorted = cpus.sorted()
-        return sorted.last() - sorted.first() + 1 == sorted.size
     }
 
     private fun showRulesError(view: DialogConfigRulesBinding, message: String?) {

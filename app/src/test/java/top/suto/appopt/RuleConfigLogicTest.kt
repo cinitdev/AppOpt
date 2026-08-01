@@ -37,6 +37,15 @@ class RuleConfigLogicTest {
             RuleConfigLogic.CpuBounds(0, 7),
             RuleConfigLogic.cpuBoundsFromRuleLine("com.example{RenderThread}=0-3,7")
         )
+        assertEquals(
+            "0-3,5,7",
+            RuleConfigLogic.formatCpuRangeList(linkedSetOf(0, 1, 2, 3, 5, 7))
+        )
+        assertEquals(
+            "0-3,5-7",
+            RuleConfigLogic.formatCpuRangeList(linkedSetOf(0, 1, 2, 3, 5, 6, 7))
+        )
+        assertEquals("4-5,7", CalibPolicy.normalizeCoresOrNull("7,4-5"))
     }
 
     @Test
@@ -140,6 +149,27 @@ class RuleConfigLogicTest {
         assertEquals("GameThreads", parsed.cpusetName)
         assertTrue(parsed.toConfigText().lineSequence().any { it == "cpuset_name=GameThreads" })
         assertEquals("GameThreads", CalibPolicy.parse(parsed.toConfigText()).cpusetName)
+    }
+
+    @Test
+    fun calibrationPolicyPreservesNonContiguousCpuRanges() {
+        val parsed = CalibPolicy.parse(
+            """
+            version=1
+            best_thread=avg:18,max:30,cores:4-5,7
+            group_high=avg:13,max:22,cores:0-3,5-7
+            fallback=cores:0-3,5,7
+            """.trimIndent()
+        )
+
+        assertEquals("4-5,7", parsed.bestCores)
+        assertEquals("0-3,5-7", parsed.highCores)
+        assertEquals("0-3,5,7", parsed.fallbackCores)
+
+        val reparsed = CalibPolicy.parse(parsed.toConfigText())
+        assertEquals(parsed.bestCores, reparsed.bestCores)
+        assertEquals(parsed.highCores, reparsed.highCores)
+        assertEquals(parsed.fallbackCores, reparsed.fallbackCores)
     }
 
     @Test
