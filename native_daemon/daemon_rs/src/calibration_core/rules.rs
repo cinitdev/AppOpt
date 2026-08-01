@@ -149,16 +149,15 @@ fn generate_rules(pkg: &str, records: &[LoadRecord]) -> Vec<String> {
     let group_coverages = observed_group_coverages(&groups, &prepared_threads);
     normalize_overlapping_group_tiers(&mut groups, &group_coverages);
 
-    let best = prepared_threads.first().and_then(|prepared| {
+    let best = prepared_threads.iter().find(|prepared| {
         let record = prepared.record;
-        (record.avg() >= policy.best_avg
+        record.avg() >= policy.best_avg
             && record.max_pct >= policy.best_max
             && !best_group_is_ambiguous(
                 &prepared.canonical_base,
                 &groups,
                 &group_coverages,
-            ))
-        .then_some(prepared)
+            )
     });
     let best_overlapping_bases = best
         .map(|best| {

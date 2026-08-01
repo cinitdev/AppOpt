@@ -72,9 +72,14 @@ object DatabaseMigrator {
                 if (parsed is HistoryParseResult.Invalid) {
                     android.util.Log.w(
                         "AppOpt",
-                        "migrate: $pkg 认领文件格式无效，保留文件等待排查: ${parsed.reason}"
+                        "migrate: $pkg 认领文件格式无效，隔离文件等待排查: ${parsed.reason}"
                     )
                     invalidClaim = true
+                    if (DaemonBridge.quarantineInvalidHistoryImport(pkg)) {
+                        processedClaims++
+                        continue
+                    }
+                    completionFailed = true
                     break
                 }
 

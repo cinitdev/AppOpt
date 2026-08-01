@@ -244,6 +244,17 @@ fn regular_scan_due(interval_secs: u64, state: &DaemonState, now_elapsed: u64) -
     })
 }
 
+fn periodic_full_scan_due(state: &DaemonState, now_elapsed: u64) -> bool {
+    let interval = if state.interactive {
+        ACTIVE_FULL_SCAN_INTERVAL_MS
+    } else {
+        SCREEN_OFF_FULL_SCAN_INTERVAL_MS
+    };
+    state.last_full_scan_elapsed_ms.is_none_or(|last| {
+        now_elapsed < last || now_elapsed.saturating_sub(last) >= interval
+    })
+}
+
 fn regular_scan_wait_timeout(interval_secs: u64, state: &DaemonState) -> Duration {
     let interval = regular_scan_interval_ms(interval_secs, state.interactive);
     let now_elapsed = elapsed_realtime_ms();
@@ -332,6 +343,25 @@ fn merge_candidate_hits(
     }
 }
 
+fn merge_proc_scan_result(
+    target: &mut ProcScanResult,
+    incoming: ProcScanResult,
+    state: &mut DaemonState,
+) {
+    target.complete &= incoming.complete;
+    target
+        .health_incomplete_packages
+        .extend(incoming.health_incomplete_packages);
+    for hit in incoming.hits {
+        state.known_pids.insert(hit.pid);
+        if let Some(existing) = target.hits.iter_mut().find(|item| item.pid == hit.pid) {
+            *existing = hit;
+        } else {
+            target.hits.push(hit);
+        }
+    }
+}
+
 fn refresh_managed_tid_cache(state: &mut DaemonState, hits: &[ProcHit]) {
     let seen_round = state.round_index.saturating_add(1);
     let known_pids = &state.known_pids;
@@ -346,20 +376,37 @@ fn refresh_managed_tid_cache(state: &mut DaemonState, hits: &[ProcHit]) {
             managed_tids.retain(|tid, entry| entry.tgid != hit.pid || observed.contains(tid));
         }
         for action in &hit.actions {
-            let cpuset_synced = managed_tids.get(&action.tid).is_some_and(|current| {
+            let cached = managed_tids.get(&action.tid).copied().filter(|current| {
+                current.tgid == hit.pid
+                    && current.tgid_starttime == hit.pid_starttime
+                    && current.starttime == action.tid_starttime
+            });
+            let cpuset_synced = cached.is_some_and(|current| {
                 current.tgid == hit.pid && current.starttime == action.tid_starttime &&
                     current.cpuset_synced
             });
             let next = ManagedTidEntry {
                 tgid: hit.pid,
+                tgid_starttime: hit.pid_starttime,
                 starttime: action.tid_starttime,
                 last_seen_round: seen_round,
                 cpuset_synced,
+                cpuset_failure_count: cached.map_or(0, |current| current.cpuset_failure_count),
+                cpuset_retry_after_elapsed_ms: cached
+                    .map_or(0, |current| current.cpuset_retry_after_elapsed_ms),
+                desired_mask_low64: cached.and_then(|current| current.desired_mask_low64),
+                verified_mask_low64: cached.and_then(|current| current.verified_mask_low64),
+                last_affinity_check_elapsed_ms: cached
+                    .map_or(0, |current| current.last_affinity_check_elapsed_ms),
+                next_affinity_check_elapsed_ms: cached
+                    .map_or(0, |current| current.next_affinity_check_elapsed_ms),
             };
             let should_update = managed_tids
                 .get(&action.tid)
                 .is_none_or(|current| {
-                    current.tgid != next.tgid || current.starttime != next.starttime
+                    current.tgid != next.tgid
+                        || current.tgid_starttime != next.tgid_starttime
+                        || current.starttime != next.starttime
                 });
             if should_update {
                 managed_tids.insert(action.tid, next);
@@ -395,6 +442,12 @@ fn run_daemon_round(
     }
     let scan_clock = elapsed_realtime_ms();
     state.interactive = read_foreground_interactive(scan_clock).unwrap_or(true);
+    let foreground_state = read_rule_health_foreground_state(scan_clock);
+    let focused_package = (state.interactive
+        && foreground_state.reliable
+        && foreground_state.observable
+        && !foreground_state.focused_package.is_empty())
+        .then(|| foreground_state.focused_package.clone());
     let regular_scan_due = regular_scan_due(args.interval_secs, state, scan_clock);
     let _refresh = runtime.refresh(
         args,
@@ -447,33 +500,45 @@ fn run_daemon_round(
             scan_clock >= last
                 && scan_clock.saturating_sub(last) >= RULE_HEALTH_FULL_SCAN_RETRY_MS
         });
-    let health_due = rule_health_full_scan_due(state);
-    let foreground_discovery_due =
-        foreground_discovery_scan_due(args.target_pkg.as_deref(), state);
+    let health_scan_packages = rule_health_scan_due_packages(state);
+    let foreground_discovery_pkg = foreground_discovery_scan_due(
+        args.target_pkg.as_deref(),
+        &plan.all_pkgs,
+        state,
+    );
+    let mut targeted_scan_packages = health_scan_packages.clone();
+    if let Some(pkg) = &foreground_discovery_pkg {
+        targeted_scan_packages.insert(pkg.clone());
+    }
+    let periodic_full_scan_due = periodic_full_scan_due(state, scan_clock);
 
     // Rust 版的核心优化点：
     // - 配置刚变化时必须全量扫，因为规则目标可能完全变了。
     // - 第一次启动时必须全量扫；全扫结果为空后也视为缓存已经初始化。
     // - 系统进程数增长只要求立即刷新轻量 PID 快照，不再因此全量读取 cmdline。
-    // - PID 快照和短期候选复查覆盖日常进程变化；已知进程按 10/30 秒节奏校验
+    // - 规则健康和前台生命周期只扫描对应包；PID 快照和短期候选复查覆盖日常进程变化。
+    // - 已知进程按 10/30 秒节奏校验
     //   TID 指纹，集合未变化时不读取全部线程名和 affinity。
     // - 已确认空结果不会每轮重扫；新进程由 PID 快照差集和短期复查发现。
-    let full_scan_requested = config_changed
+    let full_scan = config_changed
         || cache_uninitialized
-        || full_scan_retry_pending
-        || health_due
-        || foreground_discovery_due;
-    let full_scan = full_scan_requested && full_scan_retry_allowed;
+        || ((full_scan_retry_pending || periodic_full_scan_due) && full_scan_retry_allowed);
     let mut scan_reason = if config_changed {
         "配置变更"
     } else if cache_uninitialized {
         "初始扫描"
-    } else if full_scan_retry_pending {
+    } else if full_scan_retry_pending && full_scan {
         "不完整全扫重试"
-    } else if health_due {
-        "健康观察到期"
-    } else if foreground_discovery_due {
-        "前台生命周期进程发现"
+    } else if periodic_full_scan_due && full_scan {
+        if state.interactive {
+            "亮屏周期恢复扫描"
+        } else {
+            "息屏周期恢复扫描"
+        }
+    } else if !health_scan_packages.is_empty() {
+        "健康观察包级复核"
+    } else if foreground_discovery_pkg.is_some() {
+        "前台生命周期包级发现"
     } else {
         "PID缓存"
     };
@@ -515,6 +580,15 @@ fn run_daemon_round(
     if !full_scan && process_index_round.view.added > 0 {
         scan_reason = "进程索引发现";
     }
+    let mut priority_pids = focused_package
+        .as_deref()
+        .and_then(|pkg| process_index_find_package_pids(pkg).ok())
+        .unwrap_or_default();
+    let deep_scan_interval_ms = if state.interactive {
+        ACTIVE_PROCESS_DEEP_SCAN_MS
+    } else {
+        SCREEN_OFF_PROCESS_DEEP_SCAN_MS
+    };
     let mut scan_result = if full_scan {
         match scan_proc(rules, index, &state.known_pids) {
             Ok(result) => result,
@@ -524,20 +598,42 @@ fn run_daemon_round(
             }
         }
     } else {
-        let deep_scan_interval_ms = if state.interactive {
-            ACTIVE_PROCESS_DEEP_SCAN_MS
-        } else {
-            SCREEN_OFF_PROCESS_DEEP_SCAN_MS
-        };
         scan_known_pids(
             rules,
             index,
             &mut state.known_pids,
             &mut state.process_scan_stamps,
-            scan_clock,
-            deep_scan_interval_ms,
+            KnownPidScanPolicy {
+                now_elapsed: scan_clock,
+                deep_scan_interval_ms,
+                priority_pids: &priority_pids,
+                background_budget: Duration::from_millis(BACKGROUND_SCAN_BUDGET_MS),
+            },
         )
     };
+
+    let mut scoped_scan_evidence = None;
+    if !full_scan && !targeted_scan_packages.is_empty() {
+        match scan_proc_packages(
+            rules,
+            index,
+            &state.known_pids,
+            &targeted_scan_packages,
+        ) {
+            Ok(scoped_result) => {
+                scoped_scan_evidence = Some((
+                    scoped_result.complete,
+                    scoped_result.health_incomplete_packages.clone(),
+                ));
+                merge_proc_scan_result(&mut scan_result, scoped_result, state);
+            }
+            Err(err) => {
+                eprintln!("[RS] 包级扫描失败，本轮不产生规则健康负向证据: {err}");
+                scoped_scan_evidence = Some((false, BTreeSet::new()));
+                scan_result.complete = false;
+            }
+        }
+    }
 
     if !full_scan {
         let dropped_pids = previous_known_pids
@@ -572,18 +668,37 @@ fn run_daemon_round(
         &process_index_round.view.candidate_pids,
     );
     merge_candidate_hits(&mut scan_result, candidate_result, state);
+    if let Some(pkg) = focused_package.as_deref() {
+        priority_pids.extend(
+            scan_result
+                .hits
+                .iter()
+                .filter(|hit| process_belongs_to_uid_package(&hit.cmdline, pkg))
+                .map(|hit| hit.pid),
+        );
+    }
     let scan_finished_at = elapsed_realtime_ms();
     let ProcScanResult {
         hits,
         complete: scan_complete,
         health_incomplete_packages,
     } = scan_result;
-    let full_scan_evidence = full_scan.then_some(FullScanEvidence {
-        completed_at: scan_finished_at,
-        global_complete: scan_complete,
-        incomplete_packages: health_incomplete_packages,
-    });
-    if full_scan {
+    let full_scan_evidence = if full_scan {
+        Some(FullScanEvidence {
+            completed_at: scan_finished_at,
+            global_complete: scan_complete,
+            incomplete_packages: health_incomplete_packages.clone(),
+            scanned_packages: None,
+        })
+    } else {
+        scoped_scan_evidence.map(|(complete, incomplete_packages)| FullScanEvidence {
+            completed_at: scan_finished_at,
+            global_complete: complete,
+            incomplete_packages,
+            scanned_packages: Some(targeted_scan_packages.clone()),
+        })
+    };
+    if full_scan || !health_scan_packages.is_empty() {
         state.last_health_full_scan_attempt_elapsed_ms = Some(scan_finished_at);
     }
     let scan_elapsed = scan_started.elapsed();
@@ -606,7 +721,12 @@ fn run_daemon_round(
         state.last_uid_map_key = uid_key;
     }
     for hit in &hits {
-        update_process_scan_stamp(&mut state.process_scan_stamps, hit, scan_finished_at);
+        update_process_scan_stamp(
+            &mut state.process_scan_stamps,
+            hit,
+            scan_finished_at,
+            deep_scan_interval_ms,
+        );
     }
     state
         .process_scan_stamps
@@ -623,7 +743,7 @@ fn run_daemon_round(
     let runtime_state_changed = has_new_hit_pid
         || known_pids != state.last_logged_known_pids
         || processes != state.last_logged_processes;
-    let scan_incomplete = full_scan && !scan_complete;
+    let scan_incomplete = (full_scan || !targeted_scan_packages.is_empty()) && !scan_complete;
     let last_summary = state.last_runtime_summary_log_elapsed_ms;
     let state_change_summary_due = (runtime_state_changed || scan_incomplete)
         && last_summary.is_none_or(|last| {
@@ -648,12 +768,26 @@ fn run_daemon_round(
     }
 
     let apply_started = Instant::now();
-    let stats = apply_hits(
+    let base_cpuset = Path::new("/dev/cpuset").join(&args.cpuset_name);
+    let interactive = state.interactive;
+    let mut stats = apply_hits(
         &hits,
         detail_log,
         &args.cpuset_name,
         &mut state.managed_tids,
+        scan_finished_at,
+        &priority_pids,
+        interactive,
     );
+    stats.merge(verify_managed_affinity(
+        &mut state.managed_tids,
+        &priority_pids,
+        interactive,
+        scan_finished_at,
+        detail_log,
+        &base_cpuset,
+        &args.cpuset_name,
+    ));
     let apply_elapsed = apply_started.elapsed();
     state.round_index = state.round_index.saturating_add(1);
     let scanned_threads = hits.iter().map(|hit| hit.scanned_threads).sum::<usize>();
@@ -673,7 +807,13 @@ fn run_daemon_round(
         println!(
             "[RS] 运行摘要: 轮次={} 模式={} 扫描完整={} 原因={} 配置变更={} 目标包={} 已知PID={} 命中进程={} 扫描线程={} 进程规则={} 线程规则命中={} 进程规则应用={} 已应用={} 已跳过={} 系统限制={} 失败={} 无效规则={} 抢写={} 扫描耗时={}ms 应用耗时={}ms 总耗时={}ms",
             state.round_index,
-            if full_scan { "全量扫描" } else { "PID缓存" },
+            if full_scan {
+                "全量扫描"
+            } else if !targeted_scan_packages.is_empty() {
+                "包级扫描"
+            } else {
+                "PID缓存"
+            },
             if scan_complete { "是" } else { "否" },
             scan_reason,
             if config_changed { "是" } else { "否" },

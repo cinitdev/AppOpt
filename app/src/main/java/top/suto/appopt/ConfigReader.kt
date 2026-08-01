@@ -39,7 +39,6 @@ object ConfigReader {
         for (segment in RuleSyntax.parse(text).segments) {
             if (!segment.valid || segment.rules.isEmpty()) continue
             val validRules = segment.rules.filter(::isNativeCompatibleRule)
-            if (segment.block && validRules.size != segment.rules.size) continue
             for (rule in validRules) {
                 if (!rule.cpus.equals("auto", ignoreCase = true) && presentCpus != null) {
                     val requested = RuleConfigLogic.parseNativeCpuRangeList(rule.cpus).orEmpty()

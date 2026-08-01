@@ -418,15 +418,14 @@
         }
 
         fn write_str16(&mut self, value: &str) {
-            let bytes = value.as_bytes();
-            if bytes.len() > i32::MAX as usize {
+            let units = value.encode_utf16().collect::<Vec<_>>();
+            if units.len() > i32::MAX as usize {
                 self.bad = true;
                 return;
             }
-            self.write_i32(bytes.len() as i32);
-            for byte in bytes {
-                let ch = *byte as u16;
-                self.buf.extend_from_slice(&ch.to_ne_bytes());
+            self.write_i32(units.len() as i32);
+            for unit in units {
+                self.buf.extend_from_slice(&unit.to_ne_bytes());
             }
             self.buf.extend_from_slice(&0u16.to_ne_bytes());
             self.pad4();

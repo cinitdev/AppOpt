@@ -45,6 +45,7 @@ class FloatingBallService : Service() {
     private var calibrating = false
     private var targetPkg: String? = null
     private var launchPkg: String? = null
+    private var autoStartCalibrationPending = false
     // FileObserver 回调线程写、主线程读, 需 @Volatile 保证可见性(否则主线程可能读到陈旧值)
     @Volatile private var currentFps = 0f
 
@@ -98,9 +99,11 @@ class FloatingBallService : Service() {
         private const val DRAG_THRESHOLD_DP = 12f
         const val EXTRA_TARGET_PKG = "target_pkg"
         const val EXTRA_LAUNCH_PKG = "launch_pkg"
+        const val EXTRA_AUTO_START_CALIBRATION = "auto_start_calibration"
 
         // 前台监测周期与离开阈值
         private const val FG_CHECK_INTERVAL = 3000L   // 每 3s 检查一次目标应用是否在前台
+        private const val AUTO_START_FIRST_CHECK_DELAY = 1000L
         private const val FG_ABSENT_LIMIT = 2         // 连续 2 次(约6s)不在前台才判定离开, 避免下拉通知栏等短暂切换误关
         private const val FG_APPEAR_GRACE = 15        // 启动后等待应用出现的宽限次数(约45s)
         private const val FG_LAUNCH_PROCESS_MISS_LIMIT = 3
@@ -313,7 +316,7 @@ class FloatingBallService : Service() {
         }
         return false
     }
-    private fun onCapsuleClick() {
+    private fun onCapsuleClick(automatic: Boolean = false) {
         if (!calibrating) {
             // 黄 -> 红: 开始校准。目标包名由启动 App 时通过 Intent 指定。
             val pkg = targetPkg
@@ -322,7 +325,11 @@ class FloatingBallService : Service() {
                 toast("未指定目标应用, 请从优化 App 内启动")
                 return
             }
-            android.util.Log.d("AppOpt", "calibration start: pkg=$pkg")
+            autoStartCalibrationPending = false
+            android.util.Log.d(
+                "AppOpt",
+                "calibration start: pkg=$pkg trigger=${if (automatic) "automatic" else "manual"}"
+            )
             calibrating = true
             FloatingBallSessionState.setCalibrating(this, true)
             capsuleContainer.contentDescription = "AppOpt 正在校准，点击停止校准，拖动可移动"
@@ -333,7 +340,12 @@ class FloatingBallService : Service() {
             launchProcessMissingCount = 0
             capsule.setBackgroundResource(R.drawable.capsule_red)
             updateCapsuleText()
-            showBanner("● 开始记录应用负载\n请正常操作游戏, 完成后再次点击胶囊结束", durationMs = 3500)
+            val startMessage = if (automatic) {
+                "● 已自动开始记录应用负载\n完成后点击胶囊结束校准"
+            } else {
+                "● 开始记录应用负载\n请正常操作游戏, 完成后再次点击胶囊结束"
+            }
+            showBanner(startMessage, durationMs = 3500)
             thread {
                 val ok = DaemonBridge.startCalibration(pkg)
                 android.util.Log.d("AppOpt", "calibration start command result: pkg=$pkg ok=$ok")
@@ -701,7 +713,15 @@ class FloatingBallService : Service() {
             hasAppearedForeground = true
             absentCount = 0
             launchProcessMissingCount = 0
-            logForegroundCheck(snapshot, action = "foreground")
+            val shouldAutoStart = autoStartCalibrationPending && !calibrating
+            logForegroundCheck(
+                snapshot,
+                action = if (shouldAutoStart) "foreground_auto_start" else "foreground"
+            )
+            if (shouldAutoStart) {
+                autoStartCalibrationPending = false
+                onCapsuleClick(automatic = true)
+            }
             return
         }
         // 不在前台
@@ -842,6 +862,7 @@ class FloatingBallService : Service() {
         )
         val pkgToStop = targetPkg?.takeIf { it.isNotBlank() && wasCalibrating }
         calibrating = false
+        autoStartCalibrationPending = false
         serviceDestroyed = true
         runningInProcess = false
         if (unexpectedStop) {
@@ -888,6 +909,7 @@ class FloatingBallService : Service() {
         }
         val requestedLaunch = intent?.getStringExtra(EXTRA_LAUNCH_PKG)
             ?.takeIf { it.isNotBlank() } ?: requestedTarget
+        val requestedAutoStart = intent?.getBooleanExtra(EXTRA_AUTO_START_CALIBRATION, false) == true
         val previousTarget = targetPkg
         val targetChanged = !previousTarget.isNullOrBlank() && previousTarget != requestedTarget
         if (targetChanged && calibrating) {
@@ -917,6 +939,7 @@ class FloatingBallService : Service() {
         foregroundClosing = false
         targetPkg = requestedTarget
         launchPkg = requestedLaunch
+        autoStartCalibrationPending = requestedAutoStart && !calibrating
         expectedStopReason = null
         FloatingBallSessionState.begin(this, requestedTarget, calibrating)
         hasAppearedForeground = false
@@ -927,12 +950,18 @@ class FloatingBallService : Service() {
         foregroundTracker = ForegroundDetector.Tracker()
         currentFps = 0f
         if (capsuleAdded && ::capsule.isInitialized) {
-            capsuleContainer.contentDescription = "AppOpt 悬浮球，点击开始校准，拖动可移动"
             capsule.setBackgroundResource(R.drawable.capsule_yellow)
             updateCapsuleText()
         }
 
         addCapsule()
+        if (::capsuleContainer.isInitialized) {
+            capsuleContainer.contentDescription = if (autoStartCalibrationPending) {
+                "AppOpt 悬浮球，检测到目标应用后将自动开始校准，拖动可移动"
+            } else {
+                "AppOpt 悬浮球，点击开始校准，拖动可移动"
+            }
+        }
         // 初始化真实帧率接收器: 优先本地 socket, 文件监听仅作兜底
         if (!::fpsMonitor.isInitialized) {
             fpsMonitor = FrameRateMonitor(this) { fps ->
@@ -964,7 +993,12 @@ class FloatingBallService : Service() {
                     }
                 }
             }
-            mainHandler.postDelayed(foregroundWatcher, FG_CHECK_INTERVAL)
+            val firstCheckDelay = if (autoStartCalibrationPending) {
+                AUTO_START_FIRST_CHECK_DELAY
+            } else {
+                FG_CHECK_INTERVAL
+            }
+            mainHandler.postDelayed(foregroundWatcher, firstCheckDelay)
         }
         return START_NOT_STICKY
     }

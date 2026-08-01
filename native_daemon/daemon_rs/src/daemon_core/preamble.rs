@@ -26,7 +26,7 @@ use std::os::unix::fs::MetadataExt;
 // 3. 日常只比较数字 PID 目录快照，并复查新增 PID；命中后缓存 PID 和线程结果。
 // 4. 写 affinity 前先读当前 Cpus_allowed_list，相同则跳过，避免重复抢系统调度配置。
 // 5. 写入后再读回一次，用于发现移植系统/厂商服务把线程绑核抢写回去的情况。
-const VERSION: &str = "1.8.4";
+const VERSION: &str = "1.8.5";
 const DEFAULT_CONFIG: &str = "/data/adb/modules/AppOpt/config/applist.conf";
 const STATE_DIR: &str = "/data/adb/modules/AppOpt/config/state";
 const DEFAULT_UID_MAP: &str = "/data/adb/modules/AppOpt/config/state/package_uid.map";
@@ -46,8 +46,17 @@ const PID_DISCOVERY_RETRY_MS: u64 = 6_000;
 const PID_GROWTH_HINT_MIN_MS: u64 = 10_000;
 const PID_SNAPSHOT_LOG_INTERVAL_MS: u64 = 30_000;
 const SCREEN_OFF_SCAN_INTERVAL_MS: u64 = 10_000;
+const ACTIVE_FULL_SCAN_INTERVAL_MS: u64 = 60_000;
+const SCREEN_OFF_FULL_SCAN_INTERVAL_MS: u64 = 5 * 60_000;
 const ACTIVE_PROCESS_DEEP_SCAN_MS: u64 = 10_000;
 const SCREEN_OFF_PROCESS_DEEP_SCAN_MS: u64 = 30_000;
+const BACKGROUND_SCAN_BUDGET_MS: u64 = 35;
+const BACKGROUND_AFFINITY_BUDGET_MS: u64 = 15;
+const FOREGROUND_AFFINITY_VERIFY_MS: u64 = 2_000;
+const ACTIVE_BACKGROUND_AFFINITY_VERIFY_MS: u64 = 2_000;
+const SCREEN_OFF_BACKGROUND_AFFINITY_VERIFY_MS: u64 = 10_000;
+const CPUSET_RETRY_INITIAL_MS: u64 = 10_000;
+const CPUSET_RETRY_MAX_MS: u64 = 5 * 60_000;
 const RUNTIME_CHANGE_LOG_INTERVAL_MS: u64 = 30_000;
 const RUNTIME_SUMMARY_LOG_INTERVAL_MS: u64 = 5 * 60_000;
 const RULE_HEALTH_FULL_SCAN_RETRY_MS: u64 = 5_000;
@@ -130,6 +139,7 @@ struct ProcessScanStamp {
     pid_starttime: u64,
     thread_fingerprint: ThreadSetFingerprint,
     last_deep_scan_elapsed_ms: u64,
+    next_deep_scan_elapsed_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -146,6 +156,8 @@ struct FullScanEvidence {
     completed_at: u64,
     global_complete: bool,
     incomplete_packages: BTreeSet<String>,
+    // None 表示覆盖全部配置包；Some 只允许对应包消费这次负向证据。
+    scanned_packages: Option<BTreeSet<String>>,
 }
 
 #[derive(Debug)]
@@ -163,9 +175,18 @@ struct ThreadAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManagedTidEntry {
     tgid: i32,
+    tgid_starttime: Option<u64>,
     starttime: Option<u64>,
     last_seen_round: u64,
     cpuset_synced: bool,
+    cpuset_failure_count: u8,
+    cpuset_retry_after_elapsed_ms: u64,
+    // Android 设备通常少于 64 核；超出 64 核时保持 None 并走完整验证路径。
+    desired_mask_low64: Option<u64>,
+    // 上次写入后内核实际返回的有效 mask；cpuset 收窄时可能是 desired 的子集。
+    verified_mask_low64: Option<u64>,
+    last_affinity_check_elapsed_ms: u64,
+    next_affinity_check_elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,8 +250,8 @@ struct DaemonState {
     // 使用同一次文件读取所得的内容指纹判断配置是否变化。
     last_config_key: Option<FileKey>,
     last_uid_map_key: Option<FileKey>,
-    // 即使快照和缓存一直有效，也每 60 秒至多补一次全量扫，校验极端竞态或
-    // PID 快照读取缺口，同时避免恢复成每轮完整读取 /proc。
+    // 即使快照和缓存一直有效，亮屏每 60 秒、息屏每 5 分钟补一次恢复全扫，
+    // 校验极端竞态或 PID 快照读取缺口，同时避免恢复成每轮完整读取 /proc。
     last_full_scan_elapsed_ms: Option<u64>,
     // 不完整全扫只保留正向结果，并在冷却后重试；不能把缺口当作完整缓存等待 60 秒。
     last_full_scan_attempt_elapsed_ms: Option<u64>,

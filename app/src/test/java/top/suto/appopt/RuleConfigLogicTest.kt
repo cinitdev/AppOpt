@@ -153,4 +153,41 @@ class RuleConfigLogicTest {
         assertNull(CalibPolicy.normalizeCpusetNameOrNull("a".repeat(49)))
         assertEquals("game-threads.v2", CalibPolicy.normalizeCpusetNameOrNull("game-threads.v2"))
     }
+
+    @Test
+    fun functionBlocksKeepCommaSeparatedCpuMasks() {
+        val rules = RuleSyntax.parse(
+            """
+            app(com.example, 0-3,6-7) {
+                thread(RenderThread, 0-3,6-7)
+                process(worker, 4-7)
+            }
+            """.trimIndent()
+        ).rules.map { it.canonicalLine }
+
+        assertEquals(
+            listOf(
+                "com.example{RenderThread}=0-3,6-7",
+                "com.example:worker=4-7",
+                "com.example=0-3,6-7"
+            ),
+            rules
+        )
+    }
+
+    @Test
+    fun invalidCpuMemberDoesNotHideValidRulesInTheSameBlock() {
+        val parsed = ConfigReader.parsePackages(
+            """
+            com.example=0-3 {
+                RenderThread=6-7
+                Worker=abc
+            }
+            """.trimIndent(),
+            (0..7).toSet()
+        )
+
+        assertEquals(listOf("com.example"), parsed.configuredPackages)
+        assertEquals(2, parsed.configuredRuleCounts["com.example"])
+    }
 }

@@ -162,12 +162,10 @@ class AppOptDbHelper(context: Context) : SQLiteOpenHelper(
             cursor.use {
                 while (it.moveToNext()) {
                     val id = it.getLong(0)
-                    val oldSeries = it.getString(1)
-                    // 旧格式包含逗号; 新格式是 Base64 压缩串。
-                    if (oldSeries.contains(',')) {
-                        val values = ContentValues().apply { put(COL_SERIES, compressSeries(oldSeries)) }
-                        db.update(TABLE_THREADS, values, "$COL_THREAD_ID = ?", arrayOf(id.toString()))
-                    }
+                    val oldSeries = it.getString(1).orEmpty()
+                    // 数据库版本已经明确这是 V1 明文；单样本没有逗号，也必须一并压缩。
+                    val values = ContentValues().apply { put(COL_SERIES, compressSeries(oldSeries)) }
+                    db.update(TABLE_THREADS, values, "$COL_THREAD_ID = ?", arrayOf(id.toString()))
                 }
             }
             android.util.Log.d("AppOpt", "db upgrade complete")

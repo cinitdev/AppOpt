@@ -1,8 +1,8 @@
 // CPU affinity 写入与读回验证。
 //
 // daemon 最终只做一件事：把命中的 TID 写到目标 CPU mask。
-// 写入前先读取 /proc/<pid>/task/<tid>/status 里的 Cpus_allowed_list，已经一致就跳过；
-// 写入后再读回一次，如果 expected != actual，就把它计为 mismatched。
+// 写入前优先通过 sched_getaffinity 读取当前 mask，系统不支持时才回退 /proc status；
+// 写入后再读回一次，区分 cpuset 合法收窄与厂商服务抢写。
 //
 // mismatched 对移植系统很关键：有些 ROM/厂商服务会反复把线程绑回 4-7、6-7 之类的范围，
 // 这时不是 AppOpt 规则没命中，而是外部调度服务在抢写。
@@ -11,6 +11,9 @@ fn apply_hits(
     detail_log: bool,
     cpuset_name: &str,
     managed_tids: &mut HashMap<i32, ManagedTidEntry>,
+    now_elapsed: u64,
+    foreground_pids: &BTreeSet<i32>,
+    interactive: bool,
 ) -> ApplyStats {
     let mut stats = ApplyStats::default();
     let mut invalid_details = 0usize;
@@ -74,10 +77,22 @@ fn apply_hits(
                 requested_mask
             };
             let effective_cpus = mask.to_list();
+            let desired_mask_low64 = mask.to_low64();
+            let verify_interval_ms = if foreground_pids.contains(&hit.pid) {
+                FOREGROUND_AFFINITY_VERIFY_MS
+            } else if interactive {
+                ACTIVE_BACKGROUND_AFFINITY_VERIFY_MS
+            } else {
+                SCREEN_OFF_BACKGROUND_AFFINITY_VERIFY_MS
+            };
 
-            let needs_cpuset_sync = managed_tids.get(&action.tid).is_none_or(|entry| {
-                entry.tgid != hit.pid || entry.starttime != action.tid_starttime ||
-                    !entry.cpuset_synced
+            let cached = managed_tids.get(&action.tid).copied().filter(|entry| {
+                entry.tgid == hit.pid
+                    && entry.tgid_starttime == hit.pid_starttime
+                    && entry.starttime == action.tid_starttime
+            });
+            let needs_cpuset_sync = cached.is_none_or(|entry| {
+                !entry.cpuset_synced && cpuset_retry_due(&entry, now_elapsed)
             });
             if needs_cpuset_sync {
                 if !action_identity_is_current(
@@ -90,13 +105,13 @@ fn apply_hits(
                     stats.skipped += 1;
                     continue;
                 }
-                let cpuset_synced = match move_tid_to_cpuset(
-                    action.tid,
-                    &mask,
-                    &base_cpuset,
-                    cpuset_name,
-                ) {
-                    Ok(()) => true,
+                let previous_cpuset_failure_count =
+                    cached.map_or(0, |entry| entry.cpuset_failure_count);
+                let cpuset_move =
+                    move_tid_to_cpuset(action.tid, &mask, &base_cpuset, cpuset_name);
+                let (cpuset_synced, cpuset_failure_count, cpuset_retry_after_elapsed_ms) =
+                    match cpuset_move {
+                    Ok(()) => (true, 0, 0),
                     Err(err) if is_thread_gone_error(&err) => {
                         stats.skipped += 1;
                         continue;
@@ -119,7 +134,9 @@ fn apply_hits(
                                 error_text_zh(&err)
                             );
                         }
-                        expected_reject
+                        let (failure_count, retry_after) =
+                            next_cpuset_retry(previous_cpuset_failure_count, now_elapsed);
+                        (false, failure_count, retry_after)
                     }
                 };
                 let last_seen_round = managed_tids
@@ -129,20 +146,57 @@ fn apply_hits(
                     action.tid,
                     ManagedTidEntry {
                         tgid: hit.pid,
+                        tgid_starttime: hit.pid_starttime,
                         starttime: action.tid_starttime,
                         last_seen_round,
                         cpuset_synced,
+                        cpuset_failure_count,
+                        cpuset_retry_after_elapsed_ms,
+                        desired_mask_low64: cached
+                            .and_then(|entry| entry.desired_mask_low64),
+                        verified_mask_low64: cached
+                            .and_then(|entry| entry.verified_mask_low64),
+                        last_affinity_check_elapsed_ms: cached
+                            .map_or(0, |entry| entry.last_affinity_check_elapsed_ms),
+                        next_affinity_check_elapsed_ms: cached
+                            .map_or(0, |entry| entry.next_affinity_check_elapsed_ms),
                     },
                 );
             }
 
+            let affinity_cache_fresh = desired_mask_low64.is_some_and(|desired| {
+                managed_tids.get(&action.tid).is_some_and(|entry| {
+                    entry.tgid == hit.pid
+                        && entry.tgid_starttime == hit.pid_starttime
+                        && entry.starttime == action.tid_starttime
+                        && entry.desired_mask_low64 == Some(desired)
+                        && now_elapsed >= entry.last_affinity_check_elapsed_ms
+                        && now_elapsed.saturating_sub(entry.last_affinity_check_elapsed_ms)
+                            < verify_interval_ms
+                })
+            });
+            if affinity_cache_fresh {
+                stats.skipped += 1;
+                continue;
+            }
+
             // 已经在目标核心上就不重复写 affinity，减少长期守护进程对系统的打扰。
+            let mut observed_mask_low64 = None;
             match read_allowed_mask(hit.pid, action.tid) {
-                Ok(Some(current)) if current == mask => {
+                Ok(Some(current)) if current == mask || current.is_subset_of(&mask) => {
+                    mark_managed_affinity_checked(
+                        managed_tids,
+                        action.tid,
+                        desired_mask_low64,
+                        current.to_low64(),
+                        now_elapsed,
+                        verify_interval_ms,
+                    );
                     stats.skipped += 1;
                     continue;
                 }
-                Ok(_) => {}
+                Ok(Some(current)) => observed_mask_low64 = current.to_low64(),
+                Ok(None) => {}
                 Err(err) if is_thread_gone_error(&err) => {
                     stats.skipped += 1;
                     continue;
@@ -176,23 +230,29 @@ fn apply_hits(
                     stats.applied += 1;
                     // 写入后读回一次，用于发现移植系统或厂商服务把线程核心抢写回去的情况。
                     match read_allowed_mask(hit.pid, action.tid) {
-                        Ok(Some(current)) if current != mask => {
-                            if current.is_subset_of(&mask) {
-                                // Android cpuset/cgroup 可能会把有效核心收窄成规则的子集。
-                                // 这种读回差异不计为异常，避免厂商调度短暂抢写造成误报。
-                            } else {
-                                stats.mismatched += 1;
-                                if should_log_detail(detail_log, &mut mismatch_details) {
-                                    eprintln!(
-                                        "[RS] 绑核被系统改写 进程={} 线程={} 线程名={} 规则={} 期望={} 实际={}",
-                                        hit.pid,
-                                        action.tid,
-                                        action.name,
-                                        action.rule,
-                                        effective_cpus,
-                                        current.to_list()
-                                    );
-                                }
+                        Ok(Some(current)) if current == mask || current.is_subset_of(&mask) => {
+                            // Android cpuset/cgroup 可能会把有效核心收窄成规则的子集。
+                            mark_managed_affinity_checked(
+                                managed_tids,
+                                action.tid,
+                                desired_mask_low64,
+                                current.to_low64(),
+                                now_elapsed,
+                                verify_interval_ms,
+                            );
+                        }
+                        Ok(Some(current)) => {
+                            stats.mismatched += 1;
+                            if should_log_detail(detail_log, &mut mismatch_details) {
+                                eprintln!(
+                                    "[RS] 绑核被系统改写 进程={} 线程={} 线程名={} 规则={} 期望={} 实际={}",
+                                    hit.pid,
+                                    action.tid,
+                                    action.name,
+                                    action.rule,
+                                    effective_cpus,
+                                    current.to_list()
+                                );
                             }
                         }
                         _ => {}
@@ -203,8 +263,24 @@ fn apply_hits(
                         stats.skipped += 1;
                     } else if is_affinity_restricted_error(&err) {
                         stats.restricted += 1;
+                        mark_managed_affinity_checked(
+                            managed_tids,
+                            action.tid,
+                            desired_mask_low64,
+                            observed_mask_low64,
+                            now_elapsed,
+                            verify_interval_ms,
+                        );
                     } else {
                         stats.failed += 1;
+                        mark_managed_affinity_checked(
+                            managed_tids,
+                            action.tid,
+                            desired_mask_low64,
+                            observed_mask_low64,
+                            now_elapsed,
+                            verify_interval_ms,
+                        );
                         if should_log_detail(detail_log, &mut affinity_failed_details) {
                             eprintln!(
                                 "[RS] 绑核失败 进程={} 线程={} 线程名={} 规则={} 错误={}",
@@ -232,6 +308,341 @@ fn apply_hits(
     }
 
     stats
+}
+
+fn verify_managed_affinity(
+    managed_tids: &mut HashMap<i32, ManagedTidEntry>,
+    foreground_pids: &BTreeSet<i32>,
+    interactive: bool,
+    now_elapsed: u64,
+    detail_log: bool,
+    base_cpuset: &Path,
+    cpuset_name: &str,
+) -> ApplyStats {
+    let mut stats = ApplyStats::default();
+    let mut mismatch_details = 0usize;
+    let mut failed_details = 0usize;
+    let background_started = Instant::now();
+    let snapshot = managed_tids
+        .iter()
+        .map(|(tid, entry)| (*tid, *entry))
+        .collect::<Vec<_>>();
+    let mut stale_tids = Vec::new();
+
+    for (tid, entry) in snapshot {
+        let Some(expected_low64) = entry.desired_mask_low64 else {
+            continue;
+        };
+        let foreground = foreground_pids.contains(&entry.tgid);
+        let interval_ms = if foreground {
+            FOREGROUND_AFFINITY_VERIFY_MS
+        } else if interactive {
+            ACTIVE_BACKGROUND_AFFINITY_VERIFY_MS
+        } else {
+            SCREEN_OFF_BACKGROUND_AFFINITY_VERIFY_MS
+        };
+        let due = entry.next_affinity_check_elapsed_ms == 0
+            || now_elapsed < entry.last_affinity_check_elapsed_ms
+            || now_elapsed >= entry.next_affinity_check_elapsed_ms;
+        if !due {
+            continue;
+        }
+        let hard_deadline = entry.last_affinity_check_elapsed_ms == 0
+            || now_elapsed < entry.last_affinity_check_elapsed_ms
+            || now_elapsed.saturating_sub(entry.last_affinity_check_elapsed_ms) >= interval_ms;
+        if !foreground
+            && !hard_deadline
+            && background_started.elapsed()
+                >= Duration::from_millis(BACKGROUND_AFFINITY_BUDGET_MS)
+        {
+            continue;
+        }
+
+        let expected = CpuMask::from_low64(expected_low64);
+        match read_allowed_mask(entry.tgid, tid) {
+            Ok(Some(current)) if current == expected || current.is_subset_of(&expected) => {
+                mark_managed_affinity_checked(
+                    managed_tids,
+                    tid,
+                    Some(expected_low64),
+                    current.to_low64(),
+                    now_elapsed,
+                    interval_ms,
+                );
+            }
+            Ok(Some(current)) => {
+                if !managed_tid_identity_is_current(tid, &entry) {
+                    stale_tids.push(tid);
+                    continue;
+                }
+                // mask 漂移通常意味着 Android task profile/cpuset 已重新接管线程。
+                // 不依赖前台助手是否识别成功：和原版 affinity_sync 一样，先把
+                // TID 迁回目标 cpuset，再写 sched_setaffinity。
+                let should_retry_cpuset = entry.cpuset_synced || cpuset_retry_due(&entry, now_elapsed);
+                set_managed_cpuset_synced(managed_tids, tid, false);
+                if should_retry_cpuset {
+                    match move_tid_to_cpuset(tid, &expected, base_cpuset, cpuset_name) {
+                        Ok(()) => mark_managed_cpuset_success(managed_tids, tid),
+                        Err(err) if is_thread_gone_error(&err) => {
+                            stale_tids.push(tid);
+                            continue;
+                        }
+                        Err(err) => {
+                            mark_managed_cpuset_failure(managed_tids, tid, now_elapsed);
+                            if !is_cpuset_expected_reject(&err)
+                                && should_log_detail(detail_log, &mut failed_details)
+                            {
+                                eprintln!(
+                                    "[RS] cpuset 重新同步失败 进程={} 线程={} 期望={} 错误={}",
+                                    entry.tgid,
+                                    tid,
+                                    expected.to_list(),
+                                    error_text_zh(&err)
+                                );
+                            }
+                        }
+                    }
+                }
+                match set_affinity(tid, &expected) {
+                    Ok(()) => {
+                        stats.applied += 1;
+                        match read_allowed_mask(entry.tgid, tid) {
+                            Ok(Some(restored))
+                                if restored == expected || restored.is_subset_of(&expected) =>
+                            {
+                                mark_managed_affinity_checked(
+                                    managed_tids,
+                                    tid,
+                                    Some(expected_low64),
+                                    restored.to_low64(),
+                                    now_elapsed,
+                                    interval_ms,
+                                );
+                                let recovered = current != restored
+                                    || !current.is_subset_of(&expected);
+                                if recovered {
+                                    stats.mismatched += 1;
+                                }
+                                if recovered
+                                    && should_log_detail(detail_log, &mut mismatch_details)
+                                {
+                                    println!(
+                                        "[RS] 绑核抢写已恢复 进程={} 线程={} 期望={} 原值={}",
+                                        entry.tgid,
+                                        tid,
+                                        expected.to_list(),
+                                        current.to_list()
+                                    );
+                                }
+                            }
+                            Ok(Some(restored)) => {
+                                stats.mismatched += 1;
+                                mark_managed_affinity_checked(
+                                    managed_tids,
+                                    tid,
+                                    Some(expected_low64),
+                                    restored.to_low64(),
+                                    now_elapsed,
+                                    interval_ms,
+                                );
+                                if should_log_detail(detail_log, &mut mismatch_details) {
+                                    eprintln!(
+                                        "[RS] 绑核抢写恢复后仍不一致 进程={} 线程={} 期望={} 实际={}",
+                                        entry.tgid,
+                                        tid,
+                                        expected.to_list(),
+                                        restored.to_list()
+                                    );
+                                }
+                            }
+                            Ok(None) | Err(_) => {
+                                mark_managed_affinity_checked(
+                                    managed_tids,
+                                    tid,
+                                    Some(expected_low64),
+                                    entry.verified_mask_low64,
+                                    now_elapsed,
+                                    interval_ms,
+                                );
+                            }
+                        }
+                    }
+                    Err(err) if is_thread_gone_error(&err) => stale_tids.push(tid),
+                    Err(err) if is_affinity_restricted_error(&err) => {
+                        stats.restricted += 1;
+                        set_managed_cpuset_synced(managed_tids, tid, false);
+                        mark_managed_affinity_checked(
+                            managed_tids,
+                            tid,
+                            Some(expected_low64),
+                            current.to_low64(),
+                            now_elapsed,
+                            interval_ms,
+                        );
+                    }
+                    Err(err) => {
+                        stats.failed += 1;
+                        mark_managed_affinity_checked(
+                            managed_tids,
+                            tid,
+                            Some(expected_low64),
+                            current.to_low64(),
+                            now_elapsed,
+                            interval_ms,
+                        );
+                        if should_log_detail(detail_log, &mut failed_details) {
+                            eprintln!(
+                                "[RS] 绑核抢写恢复失败 进程={} 线程={} 期望={} 错误={}",
+                                entry.tgid,
+                                tid,
+                                expected.to_list(),
+                                error_text_zh(&err)
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) if is_thread_gone_error(&err) => stale_tids.push(tid),
+            Err(_) => {
+                mark_managed_affinity_checked(
+                    managed_tids,
+                    tid,
+                    Some(expected_low64),
+                    entry.verified_mask_low64,
+                    now_elapsed,
+                    interval_ms,
+                );
+            }
+        }
+    }
+
+    for tid in stale_tids {
+        managed_tids.remove(&tid);
+    }
+    if detail_log {
+        log_limited_detail_count("绑核抢写恢复", mismatch_details);
+        log_limited_detail_count("绑核抢写恢复失败", failed_details);
+    }
+    stats
+}
+
+fn managed_tid_identity_is_current(tid: i32, entry: &ManagedTidEntry) -> bool {
+    let (Some(expected_tgid_start), Some(expected_tid_start)) =
+        (entry.tgid_starttime, entry.starttime)
+    else {
+        return false;
+    };
+    let process_path = PathBuf::from(format!("/proc/{}", entry.tgid));
+    if !read_proc_starttime(&process_path).is_ok_and(|value| value == expected_tgid_start) {
+        return false;
+    }
+    let task_path = process_path.join("task").join(tid.to_string());
+    read_proc_starttime(&task_path).is_ok_and(|value| value == expected_tid_start)
+}
+
+fn mark_managed_affinity_checked(
+    managed_tids: &mut HashMap<i32, ManagedTidEntry>,
+    tid: i32,
+    desired_mask_low64: Option<u64>,
+    verified_mask_low64: Option<u64>,
+    now_elapsed: u64,
+    interval_ms: u64,
+) {
+    let Some(entry) = managed_tids.get_mut(&tid) else {
+        return;
+    };
+    entry.desired_mask_low64 = desired_mask_low64;
+    entry.verified_mask_low64 = verified_mask_low64;
+    entry.last_affinity_check_elapsed_ms = now_elapsed;
+    entry.next_affinity_check_elapsed_ms = next_affinity_check_slot(
+        tid,
+        entry.starttime.unwrap_or(0),
+        now_elapsed,
+        interval_ms,
+    );
+}
+
+fn set_managed_cpuset_synced(
+    managed_tids: &mut HashMap<i32, ManagedTidEntry>,
+    tid: i32,
+    synced: bool,
+) {
+    if let Some(entry) = managed_tids.get_mut(&tid) {
+        entry.cpuset_synced = synced;
+    }
+}
+
+fn cpuset_retry_due(entry: &ManagedTidEntry, now_elapsed: u64) -> bool {
+    entry.cpuset_retry_after_elapsed_ms == 0
+        || now_elapsed >= entry.cpuset_retry_after_elapsed_ms
+}
+
+fn next_cpuset_retry(failure_count: u8, now_elapsed: u64) -> (u8, u64) {
+    let next_count = failure_count.saturating_add(1);
+    let exponent = next_count.saturating_sub(1).min(5) as u32;
+    let delay = CPUSET_RETRY_INITIAL_MS
+        .saturating_mul(1u64 << exponent)
+        .min(CPUSET_RETRY_MAX_MS);
+    (next_count, now_elapsed.saturating_add(delay))
+}
+
+fn mark_managed_cpuset_success(
+    managed_tids: &mut HashMap<i32, ManagedTidEntry>,
+    tid: i32,
+) {
+    if let Some(entry) = managed_tids.get_mut(&tid) {
+        entry.cpuset_synced = true;
+        entry.cpuset_failure_count = 0;
+        entry.cpuset_retry_after_elapsed_ms = 0;
+    }
+}
+
+fn mark_managed_cpuset_failure(
+    managed_tids: &mut HashMap<i32, ManagedTidEntry>,
+    tid: i32,
+    now_elapsed: u64,
+) {
+    if let Some(entry) = managed_tids.get_mut(&tid) {
+        entry.cpuset_synced = false;
+        (entry.cpuset_failure_count, entry.cpuset_retry_after_elapsed_ms) =
+            next_cpuset_retry(entry.cpuset_failure_count, now_elapsed);
+    }
+}
+
+fn next_affinity_check_slot(
+    tid: i32,
+    starttime: u64,
+    now_elapsed: u64,
+    interval_ms: u64,
+) -> u64 {
+    if interval_ms <= FOREGROUND_AFFINITY_VERIFY_MS {
+        return now_elapsed.saturating_add(interval_ms);
+    }
+    let mut value = (tid as u64) ^ starttime.rotate_left(13);
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    let phase = value % interval_ms;
+    let base = now_elapsed - (now_elapsed % interval_ms);
+    let candidate = base.saturating_add(phase);
+    if candidate > now_elapsed {
+        candidate
+    } else {
+        candidate.saturating_add(interval_ms)
+    }
+}
+
+impl ApplyStats {
+    fn merge(&mut self, other: ApplyStats) {
+        self.applied = self.applied.saturating_add(other.applied);
+        self.skipped = self.skipped.saturating_add(other.skipped);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.restricted = self.restricted.saturating_add(other.restricted);
+        self.invalid_rules = self.invalid_rules.saturating_add(other.invalid_rules);
+        self.mismatched = self.mismatched.saturating_add(other.mismatched);
+        self.cpuset_failed = self.cpuset_failed.saturating_add(other.cpuset_failed);
+    }
 }
 
 fn action_identity_is_current(
@@ -444,9 +855,31 @@ impl CpuMask {
             .zip(other.words.iter())
             .all(|(left, right)| (left & !right) == 0)
     }
+
+    fn to_low64(&self) -> Option<u64> {
+        self.words[1..].iter().all(|word| *word == 0).then_some(self.words[0])
+    }
+
+    fn from_low64(value: u64) -> Self {
+        let mut mask = Self::empty();
+        mask.words[0] = value;
+        mask
+    }
 }
 
 fn read_allowed_mask(pid: i32, tid: i32) -> io::Result<Option<CpuMask>> {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        match read_allowed_mask_syscall(tid) {
+            Ok(mask) => return Ok(Some(mask)),
+            Err(err) if matches!(err.raw_os_error(), Some(22 | 38)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    read_allowed_mask_proc(pid, tid)
+}
+
+fn read_allowed_mask_proc(pid: i32, tid: i32) -> io::Result<Option<CpuMask>> {
     let status = fs::read_to_string(format!("/proc/{pid}/task/{tid}/status"))?;
     for line in status.lines() {
         let Some(value) = line.strip_prefix("Cpus_allowed_list:") else {
@@ -525,6 +958,24 @@ fn set_cpuset_dir_owner_mode(_path: &Path) {}
 #[cfg(any(target_os = "android", target_os = "linux"))]
 unsafe extern "C" {
     fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
+    fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> i32;
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn read_allowed_mask_syscall(tid: i32) -> io::Result<CpuMask> {
+    let mut mask = CpuMask::empty();
+    let rc = unsafe {
+        sched_getaffinity(
+            tid,
+            std::mem::size_of_val(&mask.words),
+            mask.words.as_mut_ptr().cast::<u8>(),
+        )
+    };
+    if rc == 0 {
+        Ok(mask)
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]

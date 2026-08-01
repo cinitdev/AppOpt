@@ -171,7 +171,7 @@ fn parse_brace_header(code: &str) -> Option<Header> {
                 valid: false,
             });
         };
-        let values = args.split(',').map(str::trim).collect::<Vec<_>>();
+        let values = split_function_header_args(args);
         let owner = values.first()?.trim().to_string();
         let fallback = values.get(1).map(|v| v.trim().to_string());
         return Some(Header {
@@ -457,8 +457,22 @@ fn split_assignment(code: &str) -> Option<(&str, &str)> {
 }
 
 fn split_function_args(args: &str) -> Vec<&str> {
+    for (comma, _) in args.match_indices(',') {
+        let name = args[..comma].trim();
+        let cpus = args[comma + 1..].trim();
+        if valid_member_name(name) && super::CpuMask::parse(cpus).is_some() {
+            return vec![name, cpus];
+        }
+    }
     match args.rsplit_once(',') {
         Some((left, right)) => vec![left.trim(), right.trim()],
+        None => vec![args.trim()],
+    }
+}
+
+fn split_function_header_args(args: &str) -> Vec<&str> {
+    match args.split_once(',') {
+        Some((owner, fallback)) => vec![owner.trim(), fallback.trim()],
         None => vec![args.trim()],
     }
 }
@@ -482,6 +496,35 @@ fn canonical(key: &str, cpus: &str) -> CanonicalRule {
     CanonicalRule {
         key: key.to_string(),
         cpus: cpus.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn function_blocks_keep_comma_separated_cpu_masks() {
+        let groups = parse_config_groups(
+            "app(com.example, 0-3,6-7) {\n  thread(RenderThread, 0-3,6-7)\n}\n",
+        );
+        let rules = &groups[0].rules;
+        assert_eq!(rules[0].key, "com.example{RenderThread}");
+        assert_eq!(rules[0].cpus, "0-3,6-7");
+        assert_eq!(rules[1].key, "com.example");
+        assert_eq!(rules[1].cpus, "0-3,6-7");
+    }
+
+    #[test]
+    fn invalid_cpu_member_does_not_drop_the_surrounding_block() {
+        let groups =
+            parse_config_groups("com.example=0-3 {\n  RenderThread=6-7\n  Worker=abc\n}\n");
+        let rules = &groups[0].rules;
+        assert!(rules
+            .iter()
+            .any(|rule| rule.key == "com.example{RenderThread}"));
+        assert!(rules.iter().any(|rule| rule.key == "com.example{Worker}"));
+        assert!(rules.iter().any(|rule| rule.key == "com.example"));
     }
 }
 

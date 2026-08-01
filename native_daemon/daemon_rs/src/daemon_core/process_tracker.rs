@@ -222,6 +222,38 @@ fn process_index_find_pids(name: &str) -> io::Result<Vec<i32>> {
     Ok(pids)
 }
 
+fn process_index_find_package_pids(pkg: &str) -> io::Result<BTreeSet<i32>> {
+    let mut pids = BTreeSet::new();
+    for entry in load_process_index()?.values() {
+        if !process_belongs_to_uid_package(&entry.cmdline, pkg) {
+            continue;
+        }
+        let proc_path = PathBuf::from(format!("/proc/{}", entry.pid));
+        if !read_proc_starttime(&proc_path).is_ok_and(|starttime| starttime == entry.starttime) {
+            continue;
+        }
+        let Ok(current_cmdline) = read_cmdline(entry.pid) else {
+            continue;
+        };
+        if process_belongs_to_uid_package(&current_cmdline, pkg) {
+            pids.insert(entry.pid);
+        }
+    }
+    Ok(pids)
+}
+
+fn process_index_cached_package_pids(packages: &BTreeSet<String>) -> io::Result<BTreeSet<i32>> {
+    Ok(load_process_index()?
+        .values()
+        .filter(|entry| {
+            packages
+                .iter()
+                .any(|pkg| process_belongs_to_uid_package(&entry.cmdline, pkg))
+        })
+        .map(|entry| entry.pid)
+        .collect())
+}
+
 fn process_index_mark_candidate(pid: i32, now_elapsed: u64) -> io::Result<()> {
     let mut entries = load_process_index()?;
     if let Some(entry) = entries.get_mut(&pid) {

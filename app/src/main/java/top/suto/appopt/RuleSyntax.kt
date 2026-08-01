@@ -153,7 +153,7 @@ object RuleSyntax {
         if (prefix.startsWith("app(")) {
             val args = prefix.removePrefix("app(").removeSuffix(")")
             if (!prefix.endsWith(')')) return Header("", null, Format.FUNCTION, valid = false)
-            val values = args.split(',').map(String::trim)
+            val values = splitFunctionHeaderArgs(args)
             val owner = values.firstOrNull().orEmpty()
             val fallback = values.getOrNull(1)
             return Header(
@@ -363,12 +363,27 @@ object RuleSyntax {
     }
 
     private fun splitFunctionArgs(args: String): List<String> {
-        val comma = args.lastIndexOf(',')
-        return if (comma < 0) {
-            listOf(args.trim())
-        } else {
-            listOf(args.substring(0, comma).trim(), args.substring(comma + 1).trim())
+        for (comma in args.indices) {
+            if (args[comma] != ',') continue
+            val name = args.substring(0, comma).trim()
+            val cpus = args.substring(comma + 1).trim()
+            if (validMemberName(name) && RuleConfigLogic.parseNativeCpuRangeList(cpus) != null) {
+                return listOf(name, cpus)
+            }
         }
+        val comma = args.lastIndexOf(',')
+        return if (comma < 0) listOf(args.trim()) else listOf(
+            args.substring(0, comma).trim(),
+            args.substring(comma + 1).trim()
+        )
+    }
+
+    private fun splitFunctionHeaderArgs(args: String): List<String> {
+        val comma = args.indexOf(',')
+        return if (comma < 0) listOf(args.trim()) else listOf(
+            args.substring(0, comma).trim(),
+            args.substring(comma + 1).trim()
+        )
     }
 
     private fun braceBlockEnd(lines: List<String>, start: Int): Int? {

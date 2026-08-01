@@ -278,7 +278,7 @@ fn update_rule_health(
         }
     }
 
-    // 只有观察截止点之后完成的全量扫描才能作为负向结论的证据。证据与本次
+    // 只有观察截止点之后完成的全量或包级完整扫描才能作为负向结论的证据。证据与本次
     // session 绑定；helper 快照稍晚到达时可以复用，避免到期后每 2 秒全扫 /proc。
     if let Some(evidence) = full_scan_evidence {
         let scanned_at = evidence.completed_at;
@@ -292,6 +292,10 @@ fn update_rule_health(
                 || already_complete
                 || !pending_packages.contains(pkg)
                 || state.health_session_checked.contains(pkg)
+                || evidence
+                    .scanned_packages
+                    .as_ref()
+                    .is_some_and(|packages| !packages.contains(pkg))
             {
                 continue;
             }
@@ -467,7 +471,7 @@ fn update_rule_health(
     finish_rule_health_update(changed, state)
 }
 
-fn rule_health_full_scan_due(state: &DaemonState) -> bool {
+fn rule_health_scan_due_packages(state: &DaemonState) -> BTreeSet<String> {
     let now_elapsed = elapsed_realtime_ms();
     let retry_allowed = state
         .last_health_full_scan_attempt_elapsed_ms
@@ -476,22 +480,30 @@ fn rule_health_full_scan_due(state: &DaemonState) -> bool {
                 && now_elapsed.saturating_sub(last) >= RULE_HEALTH_FULL_SCAN_RETRY_MS
         });
     if !retry_allowed {
-        return false;
+        return BTreeSet::new();
     }
-    rule_health_full_scan_pending_at(state, now_elapsed)
+    rule_health_scan_pending_packages_at(state, now_elapsed)
 }
 
-fn rule_health_full_scan_pending_at(state: &DaemonState, now_elapsed: u64) -> bool {
-    state.health_session_started.iter().any(|(pkg, started)| {
-        let deadline = rule_health_observation_deadline(*started);
-        now_elapsed >= deadline
-            && !state.health_session_checked.contains(pkg)
-            && !state.health_session_full_scan_attempted.contains(pkg)
-            && state
-                .health_session_full_scan_at
-                .get(pkg)
-                .is_none_or(|scanned_at| *scanned_at < deadline)
-    })
+fn rule_health_scan_pending_packages_at(
+    state: &DaemonState,
+    now_elapsed: u64,
+) -> BTreeSet<String> {
+    state
+        .health_session_started
+        .iter()
+        .filter(|(pkg, started)| {
+            let deadline = rule_health_observation_deadline(**started);
+            now_elapsed >= deadline
+                && !state.health_session_checked.contains(*pkg)
+                && !state.health_session_full_scan_attempted.contains(*pkg)
+                && state
+                    .health_session_full_scan_at
+                    .get(*pkg)
+                    .is_none_or(|scanned_at| *scanned_at < deadline)
+        })
+        .map(|(pkg, _)| pkg.clone())
+        .collect()
 }
 
 fn rule_health_observation_deadline(started_elapsed: u64) -> u64 {
@@ -541,25 +553,20 @@ fn finish_rule_health_observation(
     (first_miss, confirmed_miss)
 }
 
-/* 待观察规则所属应用进入新的可靠前台生命周期时只补一次全量发现扫描。
- * 这覆盖 sysinfo 进程总数净值不变的进程替换，又不会按 2 秒轮次重复遍历 /proc。 */
+/* 已配置应用进入新的可靠前台生命周期时只补一次包级发现扫描。
+ * 这覆盖 PID 快照瞬时缺口、进程数净值不变的进程替换，以及新进程 cmdline
+ * 尚未就绪导致的短期漏检，又不会按 2 秒轮次重复遍历 /proc。 */
 fn foreground_discovery_scan_due(
     scope_pkg: Option<&str>,
+    configured_packages: &BTreeSet<String>,
     state: &mut DaemonState,
-) -> bool {
-    let pending_packages = state
-        .rule_health
-        .values()
-        .filter(|entry| entry.status == RuleHealthStatus::Pending)
-        .filter_map(|entry| base_package(&entry.owner))
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
+) -> Option<String> {
     state.foreground_scan_lifecycles.retain(|pkg, _| {
         scope_pkg.is_none_or(|scope| scope == pkg)
-            && pending_packages.contains(pkg)
+            && configured_packages.contains(pkg)
     });
-    if pending_packages.is_empty() {
-        return false;
+    if configured_packages.is_empty() {
+        return None;
     }
     let now_elapsed = elapsed_realtime_ms();
     let foreground = read_rule_health_foreground_state(now_elapsed);
@@ -567,26 +574,24 @@ fn foreground_discovery_scan_due(
     if pkg.is_empty()
         || !foreground.can_start(pkg)
         || scope_pkg.is_some_and(|scope| scope != pkg)
-        || !pending_packages.contains(pkg)
+        || !configured_packages.contains(pkg)
     {
-        return false;
+        return None;
     }
-    let Some(lifecycle) = foreground.lifecycle(pkg) else {
-        return false;
-    };
+    let lifecycle = foreground.lifecycle(pkg)?;
     let pkg = pkg.to_string();
     if state
         .foreground_scan_lifecycles
         .get(&pkg)
         .is_some_and(|previous| *previous == lifecycle.entered_elapsed_ms)
     {
-        return false;
+        return None;
     }
     let discovery_deadline = lifecycle
         .entered_elapsed_ms
         .saturating_add(FOREGROUND_DISCOVERY_DELAY_MS);
     if now_elapsed < discovery_deadline {
-        return false;
+        return None;
     }
     if state
         .last_full_scan_elapsed_ms
@@ -595,7 +600,7 @@ fn foreground_discovery_scan_due(
         state
             .foreground_scan_lifecycles
             .insert(pkg, lifecycle.entered_elapsed_ms);
-        return false;
+        return None;
     }
     if state
         .last_foreground_discovery_scan_elapsed_ms
@@ -604,13 +609,13 @@ fn foreground_discovery_scan_due(
                 && now_elapsed.saturating_sub(last) < FOREGROUND_DISCOVERY_COOLDOWN_MS
         })
     {
-        return false;
+        return None;
     }
     state
         .foreground_scan_lifecycles
-        .insert(pkg, lifecycle.entered_elapsed_ms);
+        .insert(pkg.clone(), lifecycle.entered_elapsed_ms);
     state.last_foreground_discovery_scan_elapsed_ms = Some(now_elapsed);
-    true
+    Some(pkg)
 }
 
 fn start_rule_health_observation(

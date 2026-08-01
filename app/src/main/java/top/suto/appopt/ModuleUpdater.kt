@@ -448,9 +448,10 @@ object ModuleUpdater {
                         when (cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))) {
                             DownloadManager.STATUS_SUCCESSFUL -> {
                                 onProgress("下载完成，准备刷入", 100)
-                                return target.takeIf { it.exists() }
+                                val completed = target.takeIf { it.exists() }
                                     ?: downloadedFile(cursor)
                                     ?: throw UpdateException("下载完成，但未找到模块文件")
+                                return preserveSuccessfulDownload(manager, id, completed)
                             }
                             DownloadManager.STATUS_FAILED -> {
                                 val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
@@ -619,6 +620,35 @@ object ModuleUpdater {
         val uri = cursor.getString(index)?.takeIf { it.isNotBlank() } ?: return null
         val path = Uri.parse(uri).path ?: return null
         return File(path).takeIf { it.exists() }
+    }
+
+    /** DownloadManager.remove 会连同目标文件一起删除，先复制出 App 自己接管的 ZIP 再清理任务记录。 */
+    private fun preserveSuccessfulDownload(
+        manager: DownloadManager,
+        id: Long,
+        source: File
+    ): File {
+        val parent = source.parentFile ?: throw UpdateException("下载目录不可用")
+        val preserved = File(parent, "${source.nameWithoutExtension}-ready.zip")
+        if (preserved.exists() && !preserved.delete()) {
+            throw UpdateException("无法准备模块文件")
+        }
+        try {
+            source.inputStream().buffered().use { input ->
+                preserved.outputStream().buffered().use { output ->
+                    input.copyTo(output)
+                }
+            }
+        } catch (e: Exception) {
+            preserved.delete()
+            throw UpdateException("保存下载的模块文件失败", e)
+        }
+        runCatching { manager.remove(id) }
+            .onFailure { Log.w(TAG, "清理系统下载任务失败，保留任务记录", it) }
+            .onSuccess { removed ->
+                if (removed == 0) Log.w(TAG, "系统下载任务已完成但未能清理记录: $id")
+            }
+        return preserved
     }
 
     private fun markZipForInAppUpdate(zip: File): File {

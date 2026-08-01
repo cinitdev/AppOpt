@@ -60,6 +60,42 @@ fn scan_proc(
     index: &RuntimeRuleIndex,
     known_pids: &BTreeSet<i32>,
 ) -> io::Result<ProcScanResult> {
+    scan_proc_scoped(rules, index, known_pids, None)
+}
+
+fn scan_proc_packages(
+    rules: &[Rule],
+    index: &RuntimeRuleIndex,
+    known_pids: &BTreeSet<i32>,
+    packages: &BTreeSet<String>,
+) -> io::Result<ProcScanResult> {
+    if packages.is_empty() {
+        return Ok(ProcScanResult {
+            hits: Vec::new(),
+            complete: true,
+            health_incomplete_packages: BTreeSet::new(),
+        });
+    }
+    // 包级扫描的完整性只受该包已知 PID 影响。否则一个无关系统进程的瞬时
+    // /proc 读取失败也会让当前应用无法生成健康负向证据。
+    let scoped_known_pids = match process_index_cached_package_pids(packages) {
+        Ok(cached_package_pids) => known_pids
+            .intersection(&cached_package_pids)
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        // 缓存只负责缩小“不完整”的影响范围；缓存损坏时仍执行包级正向扫描，
+        // 并让全部已知 PID 保守参与完整性判断，绝不据此误停规则。
+        Err(_) => known_pids.clone(),
+    };
+    scan_proc_scoped(rules, index, &scoped_known_pids, Some(packages))
+}
+
+fn scan_proc_scoped(
+    rules: &[Rule],
+    index: &RuntimeRuleIndex,
+    known_pids: &BTreeSet<i32>,
+    scope_packages: Option<&BTreeSet<String>>,
+) -> io::Result<ProcScanResult> {
     if index.plan.is_empty() {
         return Ok(ProcScanResult {
             hits: Vec::new(),
@@ -85,7 +121,13 @@ fn scan_proc(
         let Some(pid) = parse_pid(&file_name) else {
             continue;
         };
-        match scan_process_path(pid, &entry.path(), rules, index) {
+        match scan_process_path_scoped(
+            pid,
+            &entry.path(),
+            rules,
+            index,
+            scope_packages,
+        ) {
             ProcessScanOutcome::Hit(hit) => {
                 if !hit.health_scan_complete {
                     if let Some(pkg) = base_package(&hit.cmdline) {
@@ -112,13 +154,19 @@ fn scan_proc(
     })
 }
 
+struct KnownPidScanPolicy<'a> {
+    now_elapsed: u64,
+    deep_scan_interval_ms: u64,
+    priority_pids: &'a BTreeSet<i32>,
+    background_budget: Duration,
+}
+
 fn scan_known_pids(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     known_pids: &mut BTreeSet<i32>,
     process_scan_stamps: &mut HashMap<i32, ProcessScanStamp>,
-    now_elapsed: u64,
-    deep_scan_interval_ms: u64,
+    policy: KnownPidScanPolicy<'_>,
 ) -> ProcScanResult {
     // 缓存扫描只访问上轮已经命中过的 PID，主要降低常驻 daemon 的 open/read 次数。
     // 如果进程退出或规则不再匹配，会从 known_pids 里剔除。
@@ -126,6 +174,7 @@ fn scan_known_pids(
     let mut alive = BTreeSet::new();
     let mut complete = true;
     let mut health_incomplete_packages = BTreeSet::new();
+    let background_started = Instant::now();
     for pid in known_pids.iter().copied() {
         let proc_path = PathBuf::from(format!("/proc/{pid}"));
         let pid_starttime = read_proc_starttime(&proc_path).ok();
@@ -134,11 +183,25 @@ fn scan_known_pids(
             pid_starttime.is_some_and(|pid_starttime| stamp.pid_starttime == pid_starttime)
         });
         let deep_scan_due = stamp.is_none_or(|stamp| {
-            now_elapsed < stamp.last_deep_scan_elapsed_ms
-                || now_elapsed.saturating_sub(stamp.last_deep_scan_elapsed_ms)
-                    >= deep_scan_interval_ms
+            policy.now_elapsed < stamp.last_deep_scan_elapsed_ms
+                || policy.now_elapsed >= stamp.next_deep_scan_elapsed_ms
         });
         if identity_matches && !deep_scan_due {
+            alive.insert(pid);
+            continue;
+        }
+        let reached_hard_deadline = stamp.is_none_or(|stamp| {
+            policy.now_elapsed < stamp.last_deep_scan_elapsed_ms
+                || policy
+                    .now_elapsed
+                    .saturating_sub(stamp.last_deep_scan_elapsed_ms)
+                    >= policy.deep_scan_interval_ms
+        });
+        if identity_matches
+            && !policy.priority_pids.contains(&pid)
+            && !reached_hard_deadline
+            && background_started.elapsed() >= policy.background_budget
+        {
             alive.insert(pid);
             continue;
         }
@@ -149,7 +212,13 @@ fn scan_known_pids(
             });
             if fingerprint_unchanged {
                 if let Some(stamp) = process_scan_stamps.get_mut(&pid) {
-                    stamp.last_deep_scan_elapsed_ms = now_elapsed;
+                    stamp.last_deep_scan_elapsed_ms = policy.now_elapsed;
+                    stamp.next_deep_scan_elapsed_ms = next_deep_scan_slot(
+                        pid,
+                        stamp.pid_starttime,
+                        policy.now_elapsed,
+                        policy.deep_scan_interval_ms,
+                    );
                 }
                 alive.insert(pid);
                 continue;
@@ -159,7 +228,12 @@ fn scan_known_pids(
         match scan_process_path(pid, &proc_path, rules, index) {
             ProcessScanOutcome::Hit(hit) => {
                 alive.insert(pid);
-                update_process_scan_stamp(process_scan_stamps, &hit, now_elapsed);
+                update_process_scan_stamp(
+                    process_scan_stamps,
+                    &hit,
+                    policy.now_elapsed,
+                    policy.deep_scan_interval_ms,
+                );
                 if !hit.health_scan_complete {
                     if let Some(pkg) = base_package(&hit.cmdline) {
                         health_incomplete_packages.insert(pkg.to_string());
@@ -191,6 +265,7 @@ fn update_process_scan_stamp(
     process_scan_stamps: &mut HashMap<i32, ProcessScanStamp>,
     hit: &ProcHit,
     now_elapsed: u64,
+    deep_scan_interval_ms: u64,
 ) {
     let Some(pid_starttime) = hit.pid_starttime else {
         process_scan_stamps.remove(&hit.pid);
@@ -206,8 +281,38 @@ fn update_process_scan_stamp(
             pid_starttime,
             thread_fingerprint,
             last_deep_scan_elapsed_ms: now_elapsed,
+            next_deep_scan_elapsed_ms: next_deep_scan_slot(
+                hit.pid,
+                pid_starttime,
+                now_elapsed,
+                deep_scan_interval_ms,
+            ),
         },
     );
+}
+
+fn next_deep_scan_slot(
+    pid: i32,
+    starttime: u64,
+    now_elapsed: u64,
+    interval_ms: u64,
+) -> u64 {
+    if interval_ms == 0 {
+        return now_elapsed;
+    }
+    let mut value = (pid as u64) ^ starttime.rotate_left(17);
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    let phase = value % interval_ms;
+    let base = now_elapsed - (now_elapsed % interval_ms);
+    let candidate = base.saturating_add(phase);
+    if candidate > now_elapsed {
+        candidate
+    } else {
+        candidate.saturating_add(interval_ms)
+    }
 }
 
 fn read_thread_set_fingerprint(proc_path: &Path) -> io::Result<ThreadSetFingerprint> {
@@ -240,6 +345,16 @@ fn scan_process_path(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
 ) -> ProcessScanOutcome {
+    scan_process_path_scoped(pid, proc_path, rules, index, None)
+}
+
+fn scan_process_path_scoped(
+    pid: i32,
+    proc_path: &Path,
+    rules: &[Rule],
+    index: &RuntimeRuleIndex,
+    scope_packages: Option<&BTreeSet<String>>,
+) -> ProcessScanOutcome {
     // UID 的 appId 用于优先缩小候选包集合；厂商分身/isolated UID 仍可走严格包名兜底。
     // Linux/Android 内核没有“包名”概念，最终必须读取 cmdline 确认主进程/子进程名。
     let uid = match metadata_uid(proc_path) {
@@ -258,6 +373,9 @@ fn scan_process_path(
     let Some(matched_base) = matched_plan_package(uid, &cmdline, &index.plan) else {
         return ProcessScanOutcome::NotTarget;
     };
+    if scope_packages.is_some_and(|packages| !packages.contains(matched_base)) {
+        return ProcessScanOutcome::NotTarget;
+    }
     let pid_starttime = read_proc_starttime(proc_path).ok();
 
     // 规则匹配分三层：

@@ -16,6 +16,7 @@ import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
+import android.os.CountDownTimer
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -50,6 +51,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.tabs.TabLayout
 import kotlin.concurrent.thread
 import top.suto.appopt.databinding.ActivityMainBinding
+import top.suto.appopt.databinding.DialogAutoStartCalibrationWarningBinding
 import top.suto.appopt.databinding.DialogConfigRuleEditBinding
 import top.suto.appopt.databinding.DialogConfigRulesBinding
 import top.suto.appopt.databinding.DialogConfiguredAppManageBinding
@@ -107,6 +109,9 @@ class MainActivity : AppCompatActivity() {
     private var appListsLoading = true
     private var addableAppsLoading = true
     private var hideMissingConfigured = false
+    private var autoStartCalibrationEnabled = false
+    private var autoStartCalibrationSwitchUpdating = false
+    private var autoStartCalibrationWarningTimer: CountDownTimer? = null
     private var environmentLoadingShownAt = 0L
     private var appSearchRender: Runnable? = null
     private var emptyIconAnimator: ObjectAnimator? = null
@@ -157,6 +162,10 @@ class MainActivity : AppCompatActivity() {
     private companion object {
         const val PREFS_NAME = "appopt_prefs"
         const val PREF_HIDE_MISSING_CONFIGURED = "hide_missing_configured"
+        const val PREF_AUTO_START_CALIBRATION = "auto_start_calibration"
+        const val PREF_AUTO_START_CALIBRATION_WARNING_ACKNOWLEDGED =
+            "auto_start_calibration_warning_acknowledged"
+        const val AUTO_START_CALIBRATION_WARNING_MS = 5_000L
         const val MIN_ENV_LOADING_MS = 1800L
         const val RULE_TOOLS_THRESHOLD = 9
         const val RULE_HEALTH_SETTLE_MS = 2600L
@@ -258,8 +267,9 @@ class MainActivity : AppCompatActivity() {
         setupTopLevelNavigation(savedInstanceState)
         setupTopLevelBackNavigation()
         environmentLoadingShownAt = SystemClock.uptimeMillis()
-        hideMissingConfigured = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(PREF_HIDE_MISSING_CONFIGURED, false)
+        val preferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        hideMissingConfigured = preferences.getBoolean(PREF_HIDE_MISSING_CONFIGURED, false)
+        autoStartCalibrationEnabled = preferences.getBoolean(PREF_AUTO_START_CALIBRATION, false)
 
         binding.statusSection.root.setOnClickListener {
             selectTopLevelPage(R.id.navEnvironment)
@@ -269,6 +279,7 @@ class MainActivity : AppCompatActivity() {
         }
         setupAppTabs()
         setupAppSearch()
+        setupAutoStartCalibration()
         setupConfiguredFilter()
         setupAppRecycler()
         renderEnvironmentOverview()
@@ -1170,6 +1181,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         activityDestroyed = true
+        autoStartCalibrationWarningTimer?.cancel()
+        autoStartCalibrationWarningTimer = null
         usageGuideBackCallback?.remove()
         usageGuideBackCallback = null
         usageGuideBinding = null
@@ -1531,6 +1544,106 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    private fun setupAutoStartCalibration() {
+        val section = binding.appSection
+        setAutoStartCalibrationSwitchChecked(autoStartCalibrationEnabled)
+        section.autoStartCalibrationSwitch.setOnCheckedChangeListener { _, checked ->
+            if (autoStartCalibrationSwitchUpdating) return@setOnCheckedChangeListener
+            if (checked && !hasAcknowledgedAutoStartCalibrationWarning()) {
+                setAutoStartCalibrationSwitchChecked(false)
+                showAutoStartCalibrationWarning()
+                return@setOnCheckedChangeListener
+            }
+            saveAutoStartCalibrationEnabled(checked)
+        }
+        section.autoStartCalibrationRow.setOnClickListener {
+            if (section.autoStartCalibrationSwitch.isEnabled) {
+                section.autoStartCalibrationSwitch.toggle()
+            }
+        }
+    }
+
+    private fun setAutoStartCalibrationSwitchChecked(checked: Boolean) {
+        autoStartCalibrationSwitchUpdating = true
+        binding.appSection.autoStartCalibrationSwitch.isChecked = checked
+        autoStartCalibrationSwitchUpdating = false
+    }
+
+    private fun hasAcknowledgedAutoStartCalibrationWarning(): Boolean =
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(PREF_AUTO_START_CALIBRATION_WARNING_ACKNOWLEDGED, false)
+
+    private fun saveAutoStartCalibrationEnabled(enabled: Boolean, acknowledgeWarning: Boolean = false) {
+        autoStartCalibrationEnabled = enabled
+        setAutoStartCalibrationSwitchChecked(enabled)
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_AUTO_START_CALIBRATION, enabled)
+            .apply {
+                if (acknowledgeWarning) {
+                    putBoolean(PREF_AUTO_START_CALIBRATION_WARNING_ACKNOWLEDGED, true)
+                }
+            }
+            .apply()
+    }
+
+    private fun showAutoStartCalibrationWarning() {
+        autoStartCalibrationWarningTimer?.cancel()
+        val view = DialogAutoStartCalibrationWarningBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(this)
+        dialog.setCancelable(false)
+        dialog.setCanceledOnTouchOutside(false)
+        dialog.setContentView(view.root)
+        dialog.setOnShowListener {
+            dialog.behavior.apply {
+                state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+                skipCollapsed = true
+                isHideable = false
+                isDraggable = false
+            }
+            dialog.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)?.let { sheet ->
+                if (resources.configuration.smallestScreenWidthDp >= 600) {
+                    val params = sheet.layoutParams
+                    params.width = minOf(dp(560f), resources.displayMetrics.widthPixels - dp(32f))
+                    if (params is androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams) {
+                        params.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                    }
+                    sheet.layoutParams = params
+                }
+            }
+            view.autoCalibrationWarningConfirm.isEnabled = false
+            view.autoCalibrationWarningCancel.isEnabled = false
+            view.autoCalibrationWarningConfirm.setOnClickListener {
+                saveAutoStartCalibrationEnabled(enabled = true, acknowledgeWarning = true)
+                dialog.dismiss()
+            }
+            view.autoCalibrationWarningCancel.setOnClickListener {
+                saveAutoStartCalibrationEnabled(false)
+                dialog.dismiss()
+            }
+            autoStartCalibrationWarningTimer = object : CountDownTimer(
+                AUTO_START_CALIBRATION_WARNING_MS,
+                1_000L
+            ) {
+                override fun onTick(millisUntilFinished: Long) {
+                    val seconds = ((millisUntilFinished + 999L) / 1_000L).coerceAtLeast(1L)
+                    view.autoCalibrationWarningConfirm.text = "继续开启（${seconds} 秒）"
+                }
+
+                override fun onFinish() {
+                    view.autoCalibrationWarningConfirm.text = "继续开启"
+                    view.autoCalibrationWarningConfirm.isEnabled = true
+                    view.autoCalibrationWarningCancel.isEnabled = true
+                }
+            }.also { it.start() }
+        }
+        dialog.setOnDismissListener {
+            autoStartCalibrationWarningTimer?.cancel()
+            autoStartCalibrationWarningTimer = null
+        }
+        dialog.show()
+    }
+
     private fun setupConfiguredFilter() {
         val section = binding.appSection
         section.hideMissingConfiguredSwitch.isChecked = hideMissingConfigured
@@ -1648,6 +1761,7 @@ class MainActivity : AppCompatActivity() {
             a.appTitle.visibility = View.VISIBLE
             a.appCount.text = ""
             a.appTabs.visibility = View.GONE
+            a.autoStartCalibrationRow.visibility = View.GONE
             a.appSearchBox.visibility = View.GONE
             a.configuredFilterRow.visibility = View.GONE
             a.appRecycler.visibility = View.GONE
@@ -1663,6 +1777,7 @@ class MainActivity : AppCompatActivity() {
         val entries = entriesForCurrentTab()
         a.appTitle.visibility = View.GONE
         a.appTabs.visibility = View.VISIBLE
+        a.autoStartCalibrationRow.visibility = if (appTab == AppTab.PENDING) View.VISIBLE else View.GONE
         a.appSearchBox.visibility = if (supportsAppSearch()) View.VISIBLE else View.GONE
         a.configuredFilterRow.visibility = if (appTab == AppTab.CONFIGURED) View.VISIBLE else View.GONE
         a.appCount.text = ""
@@ -1898,8 +2013,17 @@ class MainActivity : AppCompatActivity() {
         }
         view.configuredManageClose.setOnClickListener { dialog.dismiss() }
         dialog.setOnShowListener {
-            if (resources.configuration.smallestScreenWidthDp >= 600) {
-                dialog.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)?.let { sheet ->
+            dialog.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)?.let { sheet ->
+                sheet.post {
+                    runCatching {
+                        com.google.android.material.bottomsheet.BottomSheetBehavior.from(sheet)
+                    }.getOrNull()?.apply {
+                        isFitToContents = true
+                        skipCollapsed = true
+                        state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+                    }
+                }
+                if (resources.configuration.smallestScreenWidthDp >= 600) {
                     val params = sheet.layoutParams
                     params.width = minOf(dp(560f), resources.displayMetrics.widthPixels - dp(32f))
                     if (params is androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams) {
@@ -2679,6 +2803,10 @@ class MainActivity : AppCompatActivity() {
                 val svc = Intent(this, FloatingBallService::class.java)
                     .putExtra(FloatingBallService.EXTRA_TARGET_PKG, pkg)
                     .putExtra(FloatingBallService.EXTRA_LAUNCH_PKG, launchPkg)
+                    .putExtra(
+                        FloatingBallService.EXTRA_AUTO_START_CALIBRATION,
+                        autoStartCalibrationEnabled
+                    )
                 android.util.Log.d("AppOpt", "startAppWithBall start floating service: pkg=$pkg")
                 startForegroundService(svc)
                 android.util.Log.d("AppOpt", "startAppWithBall launch: launchPkg=$launchPkg configPkg=$pkg")

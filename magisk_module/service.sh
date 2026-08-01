@@ -1,9 +1,9 @@
 #!/system/bin/sh
-# service.sh —— late_start service 阶段执行 (系统基本启动完成后)
+# service.sh —— 后期启动服务阶段执行（系统基本启动完成后）
 # 在原版基础上改进:
 #   1) 用看门狗拉起 AppOpt 守护进程, 异常退出自动重启 (单实例)
-#   2) 把守护进程 stdout/stderr 写入 AppOpt.log, 便于在 App 内查看
-# 其余 (等开机、core_ctl 锁定在线核数、厂商性能调度开关) 保留原版行为。
+#   2) 把守护进程标准输出和标准错误写入 AppOpt.log，便于在 App 内查看
+# 其余（等待开机、core_ctl 锁定在线核心数、厂商性能调度开关）保留原版行为。
 
 wait_sys_boot_completed() {
 	local i=9
@@ -138,9 +138,7 @@ start_foreground_helper() {
 	sh "$FOREGROUND_HELPER" start
 }
 
-start_foreground_helper || echo "- 前台助手启动失败：App 使用 UsageStats/cgroup/焦点检测降级，规则健康负向观察暂停" >> "$LOG"
-
-# Check only the daemon started from this module path.
+# 只检查由本模块路径启动的守护进程，避免误判其他同名进程。
 is_our_daemon_running() {
     INDEX_PIDS=""
     if [ -x "$BIN" ]; then
@@ -157,28 +155,55 @@ is_our_daemon_running() {
     return 1
 }
 
-# Watchdog: keep the Rust daemon alive and preserve explicit configuration restarts.
-(
+# 一个看门狗统一管理两个长期运行的子进程，避免留下两个 service.sh shell，
+# 同时仍然可以独立重启前台助手和 Rust 守护进程。
+watch_services() {
+    local failure_logged=0 helper_tick=0 daemon_pid="" daemon_start_ts=""
     while true; do
-        start_foreground_helper >/dev/null 2>&1 || true
-        if ! is_our_daemon_running; then
-            CPUSET_NAME="$(read_cpuset_name)"
-            echo "- 启动 Rust 守护进程: $BIN cpuset=/dev/cpuset/$CPUSET_NAME" >>"$LOG"
-            START_TS="$(date +%s 2>/dev/null || echo 0)"
-            "$BIN" -c "$CONF" -s 2 -b "$CPUSET_NAME" >>"$LOG" 2>&1
-            EXIT_CODE=$?
+        if [ "$helper_tick" -eq 0 ]; then
+            if start_foreground_helper >/dev/null 2>&1; then
+                failure_logged=0
+            elif [ "$failure_logged" -eq 0 ]; then
+                echo "- 前台助手启动失败：App 使用 UsageStats/cgroup/焦点检测降级，规则健康负向观察暂停" >> "$LOG"
+                failure_logged=1
+            fi
+            helper_tick=1
+        else
+            helper_tick=0
+        fi
+
+        daemon_alive=0
+        if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+            daemon_alive=1
+        elif [ -n "$daemon_pid" ]; then
+            EXIT_CODE=0
+            wait "$daemon_pid" 2>/dev/null || EXIT_CODE=$?
             END_TS="$(date +%s 2>/dev/null || echo 0)"
-            RUNTIME=$((END_TS - START_TS))
+            RUNTIME=$((END_TS - daemon_start_ts))
             [ "$RUNTIME" -lt 0 ] && RUNTIME=0
             if [ -f "$RS_RESTART_FLAG" ]; then
                 rm -f "$RS_RESTART_FLAG"
-                echo "- Rust daemon configuration restart requested" >>"$LOG"
+                echo "- Rust daemon configuration restart requested" >> "$LOG"
             fi
-            echo "- Rust daemon exited: code=$EXIT_CODE runtime=${RUNTIME}s" >>"$LOG"
+            echo "- Rust daemon exited: code=$EXIT_CODE runtime=${RUNTIME}s" >> "$LOG"
+            daemon_pid=""
+            daemon_start_ts=""
+        fi
+
+        if [ "$daemon_alive" -eq 0 ] && ! is_our_daemon_running; then
+            CPUSET_NAME="$(read_cpuset_name)"
+            echo "- 启动 Rust 守护进程: $BIN cpuset=/dev/cpuset/$CPUSET_NAME" >>"$LOG"
+            daemon_start_ts="$(date +%s 2>/dev/null || echo 0)"
+            "$BIN" -c "$CONF" -s 2 -b "$CPUSET_NAME" >>"$LOG" 2>&1 &
+            daemon_pid=$!
         fi
         sleep 5
     done
-) &
+}
+
+# 看门狗：在同一个 shell 中保持 Rust 守护进程和前台助手运行。
+(watch_services) &
+
 
 # --- 以下为原版行为: 把可在线核数锁定到最大, 避免核心被离线 ---
 for MAX_CPUS in /sys/devices/system/cpu/cpu*/core_ctl/max_cpus; do

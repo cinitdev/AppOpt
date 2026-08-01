@@ -57,8 +57,8 @@ object DaemonBridge {
     private const val FOREGROUND_TASK_MAX_AGE_MS = 12_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "appopt.callback top.suto.appopt v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 184
-    const val REQUIRED_MODULE_VERSION_NAME = "1.8.4"
+    const val REQUIRED_MODULE_VERSION_CODE = 185
+    const val REQUIRED_MODULE_VERSION_NAME = "1.8.5"
     private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
@@ -1452,13 +1452,29 @@ object DaemonBridge {
         return out.isNotErrored() && out.substringBefore(ERR_MARK).trim() == "1"
     }
 
+    /** 将解析失败的认领文件隔离为 .invalid，避免它阻塞后续新 .log，同时保留现场供诊断。 */
+    fun quarantineInvalidHistoryImport(pkg: String): Boolean {
+        val safe = safeHistoryPackage(pkg)
+        if (safe.isBlank()) return false
+        val claim = shellQuote("$HISTORY_DIR/$safe.log$HISTORY_IMPORT_SUFFIX")
+        val out = runAsRoot(
+            "if [ ! -f $claim ]; then printf 1; " +
+                "else stamp=\$(date +%s 2>/dev/null || printf 0); " +
+                "target=\"$HISTORY_DIR/$safe.log.invalid.\${stamp}\"; " +
+                "n=0; while [ -e \"\${target}\" ]; do n=\$((n + 1)); target=\"$HISTORY_DIR/$safe.log.invalid.\${stamp}.\${n}\"; done; " +
+                "if mv $claim \"\${target}\" 2>/dev/null; then printf 1; else printf 0; fi; fi"
+        )
+        return out.isNotErrored() && out.substringBefore(ERR_MARK).trim() == "1"
+    }
+
     /** 删除某包名的整份历史 .log 文件。 */
     fun deleteHistory(pkg: String): Boolean {
         val safe = safeHistoryPackage(pkg)
         if (safe.isBlank()) return false
         val source = shellQuote("$HISTORY_DIR/$safe.log")
         val claim = shellQuote("$HISTORY_DIR/$safe.log$HISTORY_IMPORT_SUFFIX")
-        return runAsRoot("rm -f $source $claim; rmdir '$HISTORY_DIR' 2>/dev/null; true").isNotErrored()
+        val invalidPrefix = shellQuote("$HISTORY_DIR/$safe.log.invalid.")
+        return runAsRoot("rm -f $source $claim ${invalidPrefix}*; rmdir '$HISTORY_DIR' 2>/dev/null; true").isNotErrored()
     }
 
     /** history 目录下的一份历史记录文件概要。 */

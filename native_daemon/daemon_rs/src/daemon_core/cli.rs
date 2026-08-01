@@ -54,7 +54,15 @@ fn run_once(args: &Args, apply: bool) -> io::Result<()> {
 
     if apply {
         let mut managed_tids = HashMap::new();
-        let stats = apply_hits(&hits, true, &args.cpuset_name, &mut managed_tids);
+        let stats = apply_hits(
+            &hits,
+            true,
+            &args.cpuset_name,
+            &mut managed_tids,
+            elapsed_realtime_ms(),
+            &BTreeSet::new(),
+            true,
+        );
         println!(
             "[RS] 执行汇总: 命中进程={} 已应用={} 已跳过={} 系统限制={} 失败={} 无效规则={} 被系统改写={}",
             hits.len(),
