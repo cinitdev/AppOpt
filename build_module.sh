@@ -519,8 +519,9 @@ publish_update_json() (
         exit 0
     fi
 
-    git -C "$worktree" -c commit.gpgsign=false commit \
-        -m "发布：更新 $tag 远程更新信息与日志" >/dev/null
+    # 中文通过输入流传递，避免 Windows 原生命令按系统代码页转换参数。
+    printf '发布：更新 %s 远程更新信息与日志\n' "$tag" | \
+        git -C "$worktree" -c commit.gpgsign=false commit -F - >/dev/null
 
     # 推送前再次抓取。网页端若在发布过程中产生新提交，拒绝非快进推送。
     git -C "$repo_root" fetch --no-tags "$PUBLISH_REMOTE_URL" "$UPDATE_BRANCH"
@@ -616,19 +617,22 @@ publish_gitee_release() {
     if [ -n "$release_id" ]; then
         echo "- Gitee Release 已存在: $tag"
         echo "- 更新 Release 说明并重新上传资产"
-        curl --fail-with-body -sS -X PATCH "$GITEE_API_BASE/releases/$release_id" \
+        # Bash 内建 printf 保留脚本的 UTF-8 字节，curl 从 stdin 读取后再做 URL 编码。
+        printf '%s' "$release_notes" | curl --fail-with-body -sS -X PATCH "$GITEE_API_BASE/releases/$release_id" \
+            -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
             --data-urlencode "access_token=$GITEE_TOKEN" \
             --data-urlencode "tag_name=$tag" \
             --data-urlencode "name=$title" \
-            --data-urlencode "body=$release_notes" >/dev/null
+            --data-urlencode 'body@-' >/dev/null
     else
         echo "- 创建 Gitee Release: $tag（基于 $target_commitish）"
         response="$(mktemp "$ROOT/build/gitee-release.XXXXXX")"
-        if ! curl --fail-with-body -sS -o "$response" -X POST "$GITEE_API_BASE/releases" \
+        if ! printf '%s' "$release_notes" | curl --fail-with-body -sS -o "$response" -X POST "$GITEE_API_BASE/releases" \
+            -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
             --data-urlencode "access_token=$GITEE_TOKEN" \
             --data-urlencode "tag_name=$tag" \
             --data-urlencode "name=$title" \
-            --data-urlencode "body=$release_notes" \
+            --data-urlencode 'body@-' \
             --data-urlencode "target_commitish=$target_commitish"; then
             echo "! Gitee 创建 Release 失败，接口返回：" >&2
             cat "$response" >&2
@@ -699,13 +703,13 @@ publish_github_release() {
     if "$gh_bin" release view "$tag" >/dev/null 2>&1; then
         echo "- GitHub Release 已存在: $tag"
         echo "- 更新 Release 说明并覆盖上传资产"
-        "$gh_bin" release edit "$tag" --title "$title" --notes "$release_notes"
+        printf '%s' "$release_notes" | "$gh_bin" release edit "$tag" --title "$title" --notes-file -
         "$gh_bin" release upload "$tag" "$ZIP" --clobber
     else
         echo "- 创建 GitHub Release: $tag"
-        "$gh_bin" release create "$tag" "$ZIP" \
+        printf '%s' "$release_notes" | "$gh_bin" release create "$tag" "$ZIP" \
             --title "$title" \
-            --notes "$release_notes"
+            --notes-file -
     fi
 
     publish_update_json "$tag" 0
