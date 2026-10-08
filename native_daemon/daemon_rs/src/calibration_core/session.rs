@@ -1,16 +1,19 @@
+use super::*;
 // 单次校准采样会话。
 //
 // 采样单位是 /proc 的 utime+stime delta：
 // - 主进程：按线程名聚合 delta，生成线程级 LoadRecord。
 // - 子进程：把所有线程 delta 汇总成一个进程级 LoadRecord。
-// - 子进程线程明细：单独保存在 child_threads，只写历史，不参与规则生成。
+// - 子进程线程明细：保存在 child_threads，用于历史和待确认规则建议。
 //
 // 注意：comm 线程名最多 15 字节，Android 会截断，所以这里按读取到的 comm 聚合，
 // App 侧展示和规则生成都必须接受这个截断现实。
 impl CalibSession {
-    fn new(pkg: String, processes: Vec<ProcInfo>) -> Self {
+    pub(super) fn new(pkg: String, processes: Vec<ProcInfo>) -> Self {
         Self {
             pkg,
+            storage: None,
+            analyzer: crate::auto_affinity::calibration::Analyzer::new(),
             processes: processes
                 .into_iter()
                 .map(|proc_info| (proc_info.pid, proc_info.owner))
@@ -25,13 +28,15 @@ impl CalibSession {
             rounds: 0,
             started_at: Instant::now(),
             last_sample: None,
+            last_process_scan: None,
             active_duration: Duration::ZERO,
             main_active_since: None,
             main_missing_since: None,
         }
     }
 
-    fn sample_once(&mut self) -> bool {
+    pub(super) fn sample_once(&mut self) -> bool {
+        self.analyzer.begin_round(self.rounds);
         // 目标 App 运行过程中可能拉起新的子进程，每隔 PROCESS_REFRESH_ROUNDS 轮补扫一次。
         if self.rounds.is_multiple_of(PROCESS_REFRESH_ROUNDS) {
             self.refresh_processes();
@@ -75,6 +80,7 @@ impl CalibSession {
         self.scratch_processes = current_processes;
         self.prev_ticks.retain(|key, _| observed_tids.contains(key));
         self.scratch_observed_tids = observed_tids;
+        self.analyzer.finish_round();
 
         // 常驻子进程只参与负载统计，不能单独维持校准会话。主进程热重启或
         // /proc 瞬时不可读时保留一个短暂窗口，避免把一次重建误判为最终退出。
@@ -92,13 +98,14 @@ impl CalibSession {
         if elapsed > 0.0 {
             self.record_child_thread_summaries(&mut child_round_deltas, elapsed);
             self.fill_missing_record_samples();
+            self.analyzer.finish_window(elapsed);
             self.rounds += 1;
         }
         self.scratch_child_round_deltas = child_round_deltas;
         true
     }
 
-    fn sampled_duration(&self) -> Duration {
+    pub(super) fn sampled_duration(&self) -> Duration {
         self.active_duration
             + self
                 .main_active_since
@@ -106,13 +113,13 @@ impl CalibSession {
                 .unwrap_or_default()
     }
 
-    fn refresh_processes(&mut self) {
-        for proc_info in collect_pkg_processes(&self.pkg) {
-            self.processes.insert(proc_info.pid, proc_info.owner);
-        }
+    pub(super) fn refresh_processes(&mut self) {
+        let full = self.last_process_scan.is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+        self.processes.extend(crate::package_processes::discover(&self.pkg, self.processes.keys().copied(), full));
+        if full { self.last_process_scan = Some(Instant::now()); }
     }
 
-    fn sample_main_threads(
+    pub(super) fn sample_main_threads(
         &mut self,
         pid: i32,
         owner: &str,
@@ -144,11 +151,19 @@ impl CalibSession {
             };
             observed_tids.insert(tid_key);
             let delta = self.tid_delta(tid_key, ticks).unwrap_or(0);
-            *grouped_delta.entry(name).or_default() += delta;
+            if self.analyzer.wants_detail() {
+                self.analyzer.observe(crate::auto_affinity::calibration::Observation {
+                    pid, tid, start: starttime, ticks, delta, owner: owner.to_string(), name: name.clone(),
+                });
+            }
+            if delta > 0 {
+                *grouped_delta.entry(name).or_default() += delta;
+            }
         }
 
         if elapsed > 0.0 {
             for (name, delta) in grouped_delta.drain() {
+                self.analyzer.observe_load(owner, &name, delta_to_pct(delta, elapsed));
                 let key = TrackKey {
                     owner: owner.to_string(),
                     name,
@@ -162,7 +177,7 @@ impl CalibSession {
         self.scratch_grouped_delta = grouped_delta;
     }
 
-    fn sample_child_process(
+    pub(super) fn sample_child_process(
         &mut self,
         pid: i32,
         owner: &str,
@@ -171,7 +186,7 @@ impl CalibSession {
         observed_tids: &mut HashSet<TidKey>,
     ) {
         // 子进程只累计总 delta 生成进程级负载，同时保留线程 delta 给 history 展示。
-        // 不把子进程线程放入 records，是为了避免自动生成大量生命周期短、名称易变的规则。
+        // 子进程线程单独存入 child_threads；活跃与 5% 门槛在各自使用边界判断。
         let task_dir = PathBuf::from(format!("/proc/{pid}/task"));
         let tasks = match fs::read_dir(task_dir) {
             Ok(tasks) => tasks,
@@ -195,7 +210,16 @@ impl CalibSession {
             observed_tids.insert(tid_key);
             let delta = self.tid_delta(tid_key, ticks).unwrap_or(0);
             total_delta += delta;
+            if self.analyzer.wants_detail() {
+                self.analyzer.observe(crate::auto_affinity::calibration::Observation {
+                    pid, tid, start: starttime, ticks, delta,
+                    owner: owner.to_string(), name: name.clone(),
+                });
+            }
             if delta > 0 {
+                if elapsed > 0.0 {
+                    self.analyzer.observe_load(owner, &name, delta_to_pct(delta, elapsed));
+                }
                 let key = ChildThreadKey {
                     owner: owner.to_string(),
                     name,
@@ -215,7 +239,7 @@ impl CalibSession {
         self.record_pct(key, delta_to_pct(total_delta, elapsed));
     }
 
-    fn tid_delta(&mut self, key: TidKey, ticks: u64) -> Option<u64> {
+    pub(super) fn tid_delta(&mut self, key: TidKey, ticks: u64) -> Option<u64> {
         // 首次看到某个 TID 时没有前一帧数据，必须等下一轮才有有效 delta。
         let prev_ticks = self.prev_ticks.insert(key, ticks)?;
         if ticks < prev_ticks {
@@ -224,11 +248,19 @@ impl CalibSession {
         Some(ticks - prev_ticks)
     }
 
-    fn record_pct(&mut self, key: TrackKey, pct: f64) {
+    pub(super) fn record_pct(&mut self, key: TrackKey, pct: f64) {
+        if !pct.is_finite() {
+            return;
+        }
         let current_round = self.rounds;
         if let Some(record) = self.records.get_mut(&key) {
             record.last_seen_round = current_round;
             record.push(pct);
+            return;
+        }
+        // 休眠或新建线程仅保留少量按 TID 索引的时钟计数基线。
+        // 已有记录仍计入零负载轮次，以保持整个会话的平均值准确。
+        if pct <= 0.0 {
             return;
         }
         if !self.reserve_record_slot(&key, pct) {
@@ -240,7 +272,7 @@ impl CalibSession {
         self.records.insert(key, record);
     }
 
-    fn reserve_record_slot(&mut self, key: &TrackKey, pct: f64) -> bool {
+    pub(super) fn reserve_record_slot(&mut self, key: &TrackKey, pct: f64) -> bool {
         if self.records.len() < CALIB_MAX_TRACKED_RECORDS {
             return true;
         }
@@ -272,7 +304,7 @@ impl CalibSession {
         true
     }
 
-    fn fill_missing_record_samples(&mut self) {
+    pub(super) fn fill_missing_record_samples(&mut self) {
         let current_round = self.rounds;
         for record in self.records.values_mut() {
             if record.last_seen_round != current_round {
@@ -281,7 +313,7 @@ impl CalibSession {
         }
     }
 
-    fn record_child_thread_summaries(
+    pub(super) fn record_child_thread_summaries(
         &mut self,
         child_round_deltas: &mut HashMap<ChildThreadKey, u64>,
         elapsed: f64,
@@ -308,7 +340,7 @@ impl CalibSession {
         }
     }
 
-    fn reserve_child_thread_slot(&mut self, pct: f64, total_samples: usize) -> bool {
+    pub(super) fn reserve_child_thread_slot(&mut self, pct: f64, total_samples: usize) -> bool {
         if self.child_threads.len() < CALIB_MAX_CHILD_THREAD_SUMMARIES {
             return true;
         }
@@ -339,7 +371,7 @@ impl CalibSession {
     }
 }
 
-fn delta_to_pct(delta: u64, elapsed: f64) -> f64 {
+pub(super) fn delta_to_pct(delta: u64, elapsed: f64) -> f64 {
     if elapsed <= 0.0 {
         0.0
     } else {
@@ -347,7 +379,7 @@ fn delta_to_pct(delta: u64, elapsed: f64) -> f64 {
     }
 }
 
-fn clock_ticks_per_second() -> f64 {
+pub(super) fn clock_ticks_per_second() -> f64 {
     static CLK_TCK: OnceLock<f64> = OnceLock::new();
     *CLK_TCK.get_or_init(|| {
         #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -372,7 +404,14 @@ mod session_capacity_tests {
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
-    fn live_proc_sampler_reads_the_current_process() {
+    pub(super) fn live_proc_sampler_reads_the_current_process() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let sleeper = thread::Builder::new().name("CalibIdleProbe".into()).spawn(move || {
+            ready_tx.send(()).unwrap();
+            let _ = stop_rx.recv();
+        }).unwrap();
+        ready_rx.recv().unwrap();
         let pid = std::process::id() as i32;
         let owner = read_cmdline(pid).expect("current process cmdline");
         let mut session = CalibSession::new(
@@ -384,16 +423,22 @@ mod session_capacity_tests {
         );
 
         assert!(session.sample_once());
-        std::thread::sleep(Duration::from_millis(550));
+        let busy_since = Instant::now();
+        while busy_since.elapsed() < Duration::from_millis(550) {
+            std::hint::black_box(12345u64.wrapping_mul(6789));
+        }
         assert!(session.sample_once());
         assert_eq!(session.rounds, 1);
         assert!(!session.prev_ticks.is_empty());
         assert!(!session.records.is_empty());
         assert!(session.records.values().all(|record| record.owner == owner));
+        assert!(session.records.values().all(|record| record.name != "CalibIdleProbe"));
+        stop_tx.send(()).unwrap();
+        sleeper.join().unwrap();
     }
 
     #[test]
-    fn active_round_cannot_exceed_record_limits() {
+    pub(super) fn active_round_cannot_exceed_record_limits() {
         let mut session = CalibSession::new("com.example".to_string(), Vec::new());
         for index in 0..(CALIB_MAX_TRACKED_RECORDS + 300) {
             session.record_pct(
@@ -430,7 +475,7 @@ mod session_capacity_tests {
     }
 
     #[test]
-    fn missing_record_round_appends_one_zero_without_a_seen_key_set() {
+    pub(super) fn missing_record_round_appends_one_zero_without_a_seen_key_set() {
         let mut session = CalibSession::new("com.example".to_string(), Vec::new());
         let key = TrackKey {
             owner: "com.example".to_string(),
@@ -451,7 +496,7 @@ mod session_capacity_tests {
     }
 
     #[test]
-    fn child_summary_average_keeps_implicit_zero_rounds() {
+    pub(super) fn child_summary_average_keeps_implicit_zero_rounds() {
         let key = ChildThreadKey {
             owner: "com.example:worker".to_string(),
             name: "worker".to_string(),

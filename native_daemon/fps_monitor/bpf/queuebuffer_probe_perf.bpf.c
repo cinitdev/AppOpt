@@ -10,10 +10,10 @@
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_ARRAY 2
 #define BPF_ANY 0
-#if !defined(APPOPT_FRAME_STATS_MAX_ENTRIES)
-#define APPOPT_FRAME_STATS_MAX_ENTRIES 4096
+#if !defined(QIXIA_FRAME_STATS_MAX_ENTRIES)
+#define QIXIA_FRAME_STATS_MAX_ENTRIES 4096
 #endif
-#if !defined(APPOPT_STATS_ONLY_BPF)
+#if !defined(QIXIA_STATS_ONLY_BPF)
 #define BPF_MAP_TYPE_PERF_EVENT_ARRAY 4
 #define BPF_F_CURRENT_CPU 0xffffffffULL
 #endif
@@ -30,7 +30,7 @@ static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, unsigned long long flags) = (void *)2;
 
 /* PerfEvent 输出；StatsMap 对象不声明事件通道及其 helper。 */
-#if !defined(APPOPT_STATS_ONLY_BPF)
+#if !defined(QIXIA_STATS_ONLY_BPF)
 static long (*bpf_perf_event_output)(void *ctx, void *map, unsigned long long flags, void *data, unsigned long long size) = (void *)25;
 #endif
 /* helper 4 兼容 Android 旧内核；只在 32 位 x86 参数读取分支使用。 */
@@ -44,26 +44,26 @@ static long (*bpf_probe_read_compat)(void *dst, unsigned long long size, const v
  * - x86: 用户栈 esp + 4，esp 指向返回地址
  */
 #if defined(__TARGET_ARCH_arm64)
-struct appopt_pt_regs {
+struct qixia_pt_regs {
     unsigned long long regs[31];
     unsigned long long sp;
     unsigned long long pc;
     unsigned long long pstate;
 };
 
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
-    return ((struct appopt_pt_regs *)ctx)->regs[0];
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
+    return ((struct qixia_pt_regs *)ctx)->regs[0];
 }
 #elif defined(__TARGET_ARCH_arm)
-struct appopt_pt_regs {
+struct qixia_pt_regs {
     unsigned int uregs[18];
 };
 
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
-    return (unsigned long long)((struct appopt_pt_regs *)ctx)->uregs[0];
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
+    return (unsigned long long)((struct qixia_pt_regs *)ctx)->uregs[0];
 }
-#elif defined(APPOPT_BPF_X86_64)
-struct appopt_pt_regs {
+#elif defined(QIXIA_BPF_X86_64)
+struct qixia_pt_regs {
     unsigned long long r15;
     unsigned long long r14;
     unsigned long long r13;
@@ -87,11 +87,11 @@ struct appopt_pt_regs {
     unsigned long long ss;
 };
 
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
-    return ((struct appopt_pt_regs *)ctx)->di;
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
+    return ((struct qixia_pt_regs *)ctx)->di;
 }
-#elif defined(APPOPT_BPF_I386)
-struct appopt_pt_regs {
+#elif defined(QIXIA_BPF_I386)
+struct qixia_pt_regs {
     unsigned int bx;
     unsigned int cx;
     unsigned int dx;
@@ -111,9 +111,9 @@ struct appopt_pt_regs {
     unsigned int ss;
 };
 
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
     unsigned int value = 0;
-    unsigned int sp = ((struct appopt_pt_regs *)ctx)->sp;
+    unsigned int sp = ((struct qixia_pt_regs *)ctx)->sp;
     if (sp == 0) {
         return 0;
     }
@@ -123,7 +123,7 @@ static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
     return (unsigned long long)value;
 }
 #else
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
     (void)ctx;
     return 0;
 }
@@ -148,6 +148,52 @@ struct frame_stats_value {
     unsigned long long total_frames;
 };
 
+/* Optional report map, kept separate to preserve the existing FPS map ABI.
+ * One maximum per second; no extra events or userspace per-frame wakeups. */
+struct frame_report_value {
+    unsigned long long interval_ts;
+    unsigned long long max_interval_ns;
+    unsigned long long window_ts;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(struct frame_stats_key));
+    __uint(value_size, sizeof(struct frame_report_value));
+    __uint(max_entries, QIXIA_FRAME_STATS_MAX_ENTRIES);
+} frame_report SEC(".maps");
+
+/* Retain the completed window across userspace's 250ms polling boundary.
+ * Both maps preserve the existing 24-byte report ABI. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(key_size, sizeof(struct frame_stats_key));
+    __uint(value_size, sizeof(struct frame_report_value));
+    __uint(max_entries, QIXIA_FRAME_STATS_MAX_ENTRIES);
+} frame_report_prev SEC(".maps");
+
+static __always_inline void record_frame_report(struct frame_stats_key *key, unsigned long long timestamp, unsigned long long interval) {
+    if (interval < 1000000ULL || interval > 5000000000ULL) return;
+    struct frame_report_value *report = bpf_map_lookup_elem(&frame_report, key);
+    if (report) {
+        struct frame_report_value next = *report;
+        if (timestamp - next.window_ts >= 1000000000ULL) {
+            bpf_map_update_elem(&frame_report_prev, key, &next, BPF_ANY);
+            next.window_ts = timestamp;
+            next.max_interval_ns = 0;
+        }
+        if (interval >= next.max_interval_ns) {
+            next.max_interval_ns = interval;
+            next.interval_ts = timestamp;
+            /* Replace the complete snapshot rather than exposing separately
+             * updated interval/timestamp fields to a concurrent lookup. */
+            bpf_map_update_elem(&frame_report, key, &next, BPF_ANY);
+        }
+    } else {
+        struct frame_report_value initial = {timestamp, interval, timestamp};
+        bpf_map_update_elem(&frame_report, key, &initial, BPF_ANY);
+    }
+}
+
 /* 目标线程 uprobe 的 TGID 白名单，由 Rust bridge 随进程变化增量更新。 */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -157,7 +203,7 @@ struct {
 } target_tgids SEC(".maps");
 
 /* --- PerfEvent map --- */
-#if !defined(APPOPT_STATS_ONLY_BPF)
+#if !defined(QIXIA_STATS_ONLY_BPF)
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(key_size, sizeof(unsigned int));
@@ -174,7 +220,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(key_size, sizeof(struct frame_stats_key));
     __uint(value_size, sizeof(struct frame_stats_value));
-    __uint(max_entries, APPOPT_FRAME_STATS_MAX_ENTRIES);
+    __uint(max_entries, QIXIA_FRAME_STATS_MAX_ENTRIES);
 } frame_stats SEC(".maps");
 
 /* frame_stats 满时保留累计失败次数；事件后端仍会发送逐帧事件。 */
@@ -186,7 +232,7 @@ struct {
 } frame_stats_drops SEC(".maps");
 
 /* 用户态确认 frame_stats 可读后写 1。默认值 0 保留逐帧 PerfEvent 兼容路径。 */
-#if !defined(APPOPT_STATS_ONLY_BPF)
+#if !defined(QIXIA_STATS_ONLY_BPF)
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(key_size, sizeof(unsigned int));
@@ -210,6 +256,7 @@ static __always_inline int record_frame_stats(struct frame_event *event) {
         if (event->timestamp_ns - value->last_ts < 1000000ULL) {
             return 0;
         }
+        record_frame_report(&key, event->timestamp_ns, event->timestamp_ns - value->last_ts);
         value->last_ts = event->timestamp_ns;
         value->total_frames += 1;
         return 1;
@@ -242,7 +289,7 @@ int on_queue_buffer(void *ctx) {
 
     event.timestamp_ns = bpf_ktime_get_ns();
     event.tid = (unsigned int)pid_tgid;
-    event.surface_ptr = appopt_read_parm1(ctx);
+    event.surface_ptr = qixia_read_parm1(ctx);
 
     int stats_result = record_frame_stats(&event);
     if (stats_result == 0) {
@@ -250,7 +297,7 @@ int on_queue_buffer(void *ctx) {
     }
 
     /* StatsMap 后端只更新计数 map，不创建任何事件传输通道。 */
-#if !defined(APPOPT_STATS_ONLY_BPF)
+#if !defined(QIXIA_STATS_ONLY_BPF)
     unsigned int config_key = 0;
     unsigned int *stats_only = bpf_map_lookup_elem(&perf_stats_only, &config_key);
     if (stats_only && *stats_only) {

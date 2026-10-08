@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="64dp" android:height="64dp"
+    android:viewportWidth="64" android:viewportHeight="64">
+    <!-- An open A with two thread lanes. No bitmap scaling or fine circuit detail. -->
+    <path android:fillColor="@android:color/transparent" android:strokeColor="#356FE5"
+        android:strokeWidth="7" android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M12,51 L28.6,15.5 Q32,8.8 35.4,15.5 L52,51" />
+    <path android:fillColor="@android:color/transparent" android:strokeColor="#356FE5"
+        android:strokeWidth="6" android:strokeLineCap="round"
+        android:pathData="M25,37 L41,37" />
+    <path android:fillColor="@android:color/transparent" android:strokeColor="#356FE5"
+        android:strokeWidth="4.5" android:strokeLineCap="round"
+        android:pathData="M22,47 L32,47" />
+</vector>

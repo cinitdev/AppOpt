@@ -1,0 +1,19 @@
+[package]
+name = "qixia-ebpf-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+aya = { path = "../aya/aya" }
+libc = "0.2"
+object = { version = "0.39.1", default-features = false, features = ["elf", "read_core", "std"] }
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = true

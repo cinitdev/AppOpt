@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Padding is inside the adaptive layer; the launcher supplies its own outer mask. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/qixia_launcher_affinity_day"
+    android:inset="8%" />

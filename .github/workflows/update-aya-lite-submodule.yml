@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       AYA_SUBMODULE_PATH: native_daemon/fps_monitor/aya
-      AYA_BRIDGE_LOCK: native_daemon/fps_monitor/appopt_ebpf_bridge/Cargo.lock
+      AYA_BRIDGE_LOCK: native_daemon/fps_monitor/qixia_ebpf_bridge/Cargo.lock
       TARGET_BRANCH: master
 
     steps:
@@ -79,7 +79,7 @@ jobs:
       - name: Build module
         if: steps.update.outputs.changed == 'true'
         env:
-          APPOPT_SKIP_SUBMODULE_UPDATE: "1"
+          QIXIA_SKIP_SUBMODULE_UPDATE: "1"
         run: |
           if ! command -v python >/dev/null 2>&1; then
             sudo ln -s "$(command -v python3)" /usr/local/bin/python

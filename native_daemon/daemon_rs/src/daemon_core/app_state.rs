@@ -1,11 +1,12 @@
+use super::*;
 // 前台 cgroup 检测辅助。
 //
-// App 侧前台识别主路径是 ActivityTaskManager helper + UsageStats，Rust/C 里的 --app-state
+// App 侧前台识别主路径是 ActivityTaskManager 助手与 UsageStats，Rust/C 里的 --app-state
 // 是兜底：扫描 top-app / foreground_window cgroup，输出当前前台组里的包名列表。
 //
 // 这个结果不直接决定守护绑核，只给悬浮球判断“目标是否还在前台”时使用。
 // Android/ROM cgroup 路径不完全一致，所以路径列表定义在 preamble.rs 里集中维护。
-fn app_state_print_cli(pkg: &str) -> io::Result<()> {
+pub(super) fn app_state_print_cli(pkg: &str) -> io::Result<()> {
     let state = app_top_state_check(pkg);
     println!("ok={}", if state.ok { 1 } else { 0 });
     println!(
@@ -20,7 +21,7 @@ fn app_state_print_cli(pkg: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn app_top_state_check(target_pkg: &str) -> AppTopState {
+pub(super) fn app_top_state_check(target_pkg: &str) -> AppTopState {
     let mut state = AppTopState::default();
     let mut seen_pids = BTreeSet::new();
     let mut seen_packages = BTreeSet::new();
@@ -39,7 +40,7 @@ fn app_top_state_check(target_pkg: &str) -> AppTopState {
     state
 }
 
-fn scan_top_app_path(
+pub(super) fn scan_top_app_path(
     path: &str,
     target_pkg: &str,
     state: &mut AppTopState,
@@ -95,7 +96,7 @@ fn scan_top_app_path(
     }
 }
 
-fn parse_pid_text(text: &str) -> Option<i32> {
+pub(super) fn parse_pid_text(text: &str) -> Option<i32> {
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -107,7 +108,7 @@ fn parse_pid_text(text: &str) -> Option<i32> {
     }
 }
 
-fn read_tgid(tid: i32) -> Option<i32> {
+pub(super) fn read_tgid(tid: i32) -> Option<i32> {
     let status = fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
     for line in status.lines() {
         let Some(value) = line.strip_prefix("Tgid:") else {
@@ -118,7 +119,7 @@ fn read_tgid(tid: i32) -> Option<i32> {
     None
 }
 
-fn proc_matches_target(proc_name: &str, target_pkg: &str) -> bool {
+pub(super) fn proc_matches_target(proc_name: &str, target_pkg: &str) -> bool {
     if target_pkg.is_empty() {
         return false;
     }
@@ -128,7 +129,7 @@ fn proc_matches_target(proc_name: &str, target_pkg: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(':'))
 }
 
-fn normalize_package(proc_name: &str) -> Option<String> {
+pub(super) fn normalize_package(proc_name: &str) -> Option<String> {
     if proc_name.is_empty() || proc_name.contains('/') || !proc_name.contains('.') {
         return None;
     }

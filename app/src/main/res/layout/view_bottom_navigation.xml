@@ -9,7 +9,7 @@
     android:paddingStart="@dimen/bottom_navigation_horizontal_padding"
     android:paddingEnd="@dimen/bottom_navigation_horizontal_padding">
 
-    <top.suto.appopt.BackdropBlurLayout
+    <top.qixia.threads.BackdropBlurLayout
         android:id="@+id/bottomNavigationBlur"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -29,7 +29,7 @@
             android:background="@drawable/bg_bottom_navigation_floating"
             android:importantForAccessibility="no" />
 
-        <top.suto.appopt.ResponsiveBottomNavigationView
+        <top.qixia.threads.ResponsiveBottomNavigationView
             android:id="@+id/bottomNavigation"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -39,6 +39,6 @@
             android:elevation="0dp"
             android:translationY="@dimen/bottom_navigation_content_translation_y" />
 
-    </top.suto.appopt.BackdropBlurLayout>
+    </top.qixia.threads.BackdropBlurLayout>
 
 </FrameLayout>

@@ -67,7 +67,7 @@
                 android:layout_below="@id/cpusetDefaultTitle"
                 android:layout_marginTop="4dp"
                 android:layout_toStartOf="@id/cpusetDefaultSelected"
-                android:text="/dev/cpuset/AppOptRs"
+                android:text="/dev/cpuset/QiXiaRs"
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
 
@@ -156,7 +156,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:fontFamily="monospace"
-            android:text="/dev/cpuset/AppOptRs"
+            android:text="/dev/cpuset/QiXiaRs"
             android:textColor="@color/text_secondary"
             android:textSize="12sp" />
 

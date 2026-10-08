@@ -1,4 +1,4 @@
-# AppOpt SurfaceFlinger 渲染优化
+# QixiaThreads SurfaceFlinger 渲染优化
 #
 # 用途: 优化 SurfaceFlinger 帧渲染行为,配合 binder 直连降低延迟
 #

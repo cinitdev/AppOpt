@@ -1,5 +1,5 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Theme.AppOpt" parent="Theme.Material3.Light.NoActionBar">
+    <style name="Theme.QixiaThreads" parent="Theme.Material3.Light.NoActionBar">
         <item name="colorPrimary">@color/brand_primary</item>
         <item name="colorPrimaryDark">@color/brand_primary_dark</item>
         <item name="colorOnPrimary">@color/brand_on_primary</item>
@@ -20,9 +20,9 @@
         <item name="android:windowLightNavigationBar">true</item>
     </style>
 
-    <style name="Theme.AppOpt.Starting" parent="Theme.AppOpt">
+    <style name="Theme.QixiaThreads.Starting" parent="Theme.QixiaThreads">
         <item name="android:windowSplashScreenBackground">@color/surface_app</item>
-        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_splash_logo</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
         <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
     </style>
 
@@ -33,6 +33,35 @@
         <item name="strokeColor">@color/outline_soft</item>
         <item name="strokeWidth">1dp</item>
         <item name="contentPadding">16dp</item>
+    </style>
+
+    <style name="Theme.QixiaThreads.Compose" parent="Theme.Material3.Light.NoActionBar">
+        <item name="colorPrimary">@color/compose_primary</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+        <item name="colorSecondary">@color/compose_success</item>
+        <item name="colorSurface">@color/compose_surface</item>
+        <item name="colorSurfaceVariant">@color/compose_surface_high</item>
+        <item name="android:colorAccent">@color/compose_primary</item>
+        <item name="android:windowBackground">@color/compose_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@color/compose_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+
+    <style name="Theme.QixiaThreads.Compose.Starting" parent="Theme.SplashScreen">
+        <!-- 保留系统启动窗口的同色背景，品牌内容由应用首帧接管。 -->
+        <item name="android:windowBackground">@color/compose_background</item>
+        <item name="android:windowSplashScreenBackground">@color/compose_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_splash_empty</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:navigationBarColor">@color/compose_background</item>
+        <item name="windowSplashScreenBackground">@color/compose_background</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash_empty</item>
+        <item name="postSplashScreenTheme">@style/Theme.QixiaThreads.Compose</item>
     </style>
 
     <style name="AppTopBarTitle" parent="TextAppearance.Material3.TitleLarge">

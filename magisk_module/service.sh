@@ -1,9 +1,9 @@
 #!/system/bin/sh
 # service.sh —— 后期启动服务阶段执行（系统基本启动完成后）
 # 在原版基础上改进:
-#   1) 用看门狗拉起 AppOpt 守护进程, 异常退出自动重启 (单实例)
-#   2) 把守护进程标准输出和标准错误写入 AppOpt.log，便于在 App 内查看
-# 其余（等待开机、core_ctl 锁定在线核心数、厂商性能调度开关）保留原版行为。
+#   1) 用看门狗拉起 QixiaThreads 守护进程, 异常退出自动重启 (单实例)
+#   2) 把守护进程标准输出和标准错误写入 QixiaThreads.log，便于在 App 内查看
+# 其余启动兼容和厂商性能调度开关保留；core_ctl 锁核改为显式可选。
 
 MODDIR=${0%/*}
 WATCHDOG_STATE_DIR="$MODDIR/config/state"
@@ -14,8 +14,8 @@ WATCHDOG_RECOVERY_HELD=0
 WATCHDOG_DAEMON_PID=""
 WATCHDOG_DAEMON_STARTTIME=""
 WATCHDOG_STOPPING=0
-FOREGROUND_HELPER="$MODDIR/config/tools/appopt_foreground_helper.sh"
-LOG="$MODDIR/logs/AppOpt.log"
+FOREGROUND_HELPER="$MODDIR/config/tools/qixia_foreground_helper.sh"
+LOG="$MODDIR/logs/QixiaThreads.log"
 
 service_watchdog_starttime() {
 	local pid="$1"
@@ -246,15 +246,15 @@ wait_sys_boot_completed() {
 wait_sys_boot_completed
 
 cd "$MODDIR"
-BIN="$MODDIR/config/bin/AppOptRs"
-DAEMON_PROC_NAME="AppOptRs"
-RS_RESTART_FLAG="$MODDIR/config/.appopt_restart_rs_daemon"
+BIN="$MODDIR/config/bin/QiXiaRs"
+DAEMON_PROC_NAME="QiXiaRs"
+RS_RESTART_FLAG="$MODDIR/config/.qixia_restart_rs_daemon"
 CONF="$MODDIR/config/applist.conf"
 CALIB_POLICY="$MODDIR/config/calib_policy.conf"
-LOG="$MODDIR/logs/AppOpt.log"
-FOREGROUND_HELPER="$MODDIR/config/tools/appopt_foreground_helper.sh"
+LOG="$MODDIR/logs/QixiaThreads.log"
+FOREGROUND_HELPER="$MODDIR/config/tools/qixia_foreground_helper.sh"
 FOREGROUND_HELPER_LOG="$MODDIR/logs/ForegroundHelper.log"
-APPOPT_IN_APP_UPDATE_FLAG="/data/adb/appopt_in_app_update"
+QIXIA_IN_APP_UPDATE_FLAG="/data/adb/qixia_in_app_update"
 
 mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" \
 	"$MODDIR/config/state" "$MODDIR/logs"
@@ -264,7 +264,7 @@ rm -f "$RS_RESTART_FLAG" 2>/dev/null || true
 [ -f "$BIN" ] || exit 0
 chmod 0755 "$BIN"
 
-# 同一 boot 只清空一次。看门狗在本次开机内重启时保留前一次崩溃现场。
+# 同一次系统启动只清空一次。看门狗在本次开机内重启时保留前一次崩溃现场。
 LOG_BOOT_MARKER="$WATCHDOG_STATE_DIR/service_log.boot_id"
 CURRENT_BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 LOG_BOOT_ID="$(cat "$LOG_BOOT_MARKER" 2>/dev/null)"
@@ -286,12 +286,12 @@ read_app_prop() {
 read_cpuset_name() {
 	local name
 	name="$(sed -n 's/^[[:space:]]*cpuset_name[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*$/\1/p' "$CALIB_POLICY" 2>/dev/null | tail -n 1)"
-	[ -n "$name" ] || name="AppOptRs"
+	[ -n "$name" ] || name="QiXiaRs"
 	if [ "${#name}" -gt 48 ]; then
-		name="AppOptRs"
+		name="QiXiaRs"
 	fi
 	case "$name" in
-		.*|*[!A-Za-z0-9_.-]*) name="AppOptRs" ;;
+		.*|*[!A-Za-z0-9_.-]*) name="QiXiaRs" ;;
 	esac
 	printf '%s' "$name"
 }
@@ -300,10 +300,10 @@ run_app_helper() {
 	local out="$1"
 	shift
 	local helper_pid helper_state waited=0 result
-	APP_OPT_HELPER_DIR="$APP_HELPER_DIR" \
-	APP_OPT_PACKAGE="$APP_PKG" \
-	APP_OPT_VERSION_CODE="$APP_VERSION_CODE" \
-	APP_OPT_VERSION_NAME="$APP_VERSION_NAME" \
+	QIXIA_HELPER_DIR="$APP_HELPER_DIR" \
+	QIXIA_PACKAGE="$APP_PKG" \
+	QIXIA_VERSION_CODE="$APP_VERSION_CODE" \
+	QIXIA_VERSION_NAME="$APP_VERSION_NAME" \
 	sh "$APP_HELPER" "$@" > "$out" 2>&1 &
 	helper_pid=$!
 	while [ -r "/proc/$helper_pid/stat" ]; do
@@ -325,9 +325,24 @@ run_app_helper() {
 	return "$result"
 }
 
-install_deferred_app_update() {
+cleanup_deferred_app_files() {
+	if rm -rf "$MODDIR/config/app" && rm -f \
+		"$MODDIR/config/tools/qixia_pkg_helper.jar" \
+		"$MODDIR/config/tools/qixia_pkg_helper.sh"; then
+		return 0
+	fi
+	echo "- 临时 App 安装文件或安装助手清理失败，下次启动重试" >> "$LOG"
+	return 1
+}
+
+# App 内刷入模块时，随包 APK 留到重启后安装，避免终止当前刷入界面。
+install_deferred_embedded_app() {
 	local APP_DIR="$MODDIR/config/app"
 	local APP_META="$APP_DIR/app.prop"
+	if [ ! -d "$APP_DIR" ]; then
+		cleanup_deferred_app_files
+		return
+	fi
 	[ -f "$APP_META" ] || return
 
 	APP_PKG="$(read_app_prop package "$APP_META")"
@@ -336,10 +351,10 @@ install_deferred_app_update() {
 	APP_VERSION_CODE="$(read_app_prop versionCode "$APP_META")"
 	APP_VERSION_NAME="$(read_app_prop versionName "$APP_META")"
 	APP_VARIANT="$(read_app_prop variant "$APP_META")"
-	APP_HELPER_DIR="$APP_DIR/tools"
-	APP_HELPER="$APP_HELPER_DIR/appopt_pkg_helper.sh"
-	[ -n "$APP_PKG" ] || APP_PKG="top.suto.appopt"
-	[ -n "$APP_NAME" ] || APP_NAME="AppOpt"
+	APP_HELPER_DIR="$MODDIR/config/tools"
+	APP_HELPER="$APP_HELPER_DIR/qixia_pkg_helper.sh"
+	[ -n "$APP_PKG" ] || APP_PKG="top.qixia.threads"
+	[ -n "$APP_NAME" ] || APP_NAME="柒夏线程"
 
 	if [ ! -f "$APP_APK" ] || [ -z "$APP_VERSION_CODE" ] || [ ! -f "$APP_HELPER" ]; then
 		echo "- 延后 App 更新文件不完整，保留 config/app 等待手动处理" >> "$LOG"
@@ -349,8 +364,8 @@ install_deferred_app_update() {
 	chmod 0644 "$APP_APK" 2>/dev/null || true
 	chmod 0755 "$APP_HELPER_DIR" "$APP_HELPER_DIR"/*.sh 2>/dev/null || true
 
-	local APP_INFO="$MODDIR/logs/AppOpt_app_info.prop"
-	local INSTALL_INFO="$MODDIR/logs/AppOpt_app_install.prop"
+	local APP_INFO="$MODDIR/logs/QixiaThreads_app_info.prop"
+	local INSTALL_INFO="$MODDIR/logs/QixiaThreads_app_install.prop"
 	local INSTALLED_VERSION_CODE INSTALLED_VERSION_NAME
 
 	echo "- 检测到延后 App 更新：$APP_NAME $APP_VERSION_NAME ($APP_VERSION_CODE)" >> "$LOG"
@@ -363,12 +378,12 @@ install_deferred_app_update() {
 				[ "$INSTALLED_VERSION_CODE" = "$APP_VERSION_CODE" ] &&
 				{ [ -z "$INSTALLED_VERSION_NAME" ] || [ "$INSTALLED_VERSION_NAME" = "$APP_VERSION_NAME" ]; }; then
 				echo "- App 已是随附版本，清理延后安装文件" >> "$LOG"
-				rm -rf "$APP_DIR"
+				cleanup_deferred_app_files
 				return
 			fi
 			if [ "$INSTALLED_VERSION_CODE" -gt "$APP_VERSION_CODE" ] 2>/dev/null; then
 				echo "- 已安装 App 版本高于随附版本，清理延后安装文件" >> "$LOG"
-				rm -rf "$APP_DIR"
+				cleanup_deferred_app_files
 				return
 			fi
 		fi
@@ -378,16 +393,16 @@ install_deferred_app_update() {
 
 	if run_app_helper "$INSTALL_INFO" install "$APP_APK" && [ "$(read_app_prop ok "$INSTALL_INFO")" = "1" ]; then
 		echo "- 延后 App 更新完成，清理临时安装文件" >> "$LOG"
-		rm -rf "$APP_DIR"
+		cleanup_deferred_app_files
 	else
 		echo "- 延后 App 更新失败，保留 config/app 以便下次开机重试" >> "$LOG"
 		[ -f "$INSTALL_INFO" ] && sed -n '1,6p' "$INSTALL_INFO" >> "$LOG"
 	fi
 }
 
-install_deferred_app_update
-rm -f "$MODDIR/logs/AppOpt_app_info.prop" "$MODDIR/logs/AppOpt_app_install.prop" 2>/dev/null || true
-rm -f "$APPOPT_IN_APP_UPDATE_FLAG" 2>/dev/null || true
+install_deferred_embedded_app
+rm -f "$MODDIR/logs/QixiaThreads_app_info.prop" "$MODDIR/logs/QixiaThreads_app_install.prop" 2>/dev/null || true
+rm -f "$QIXIA_IN_APP_UPDATE_FLAG" 2>/dev/null || true
 
 start_foreground_helper() {
 	[ -f "$FOREGROUND_HELPER" ] || return 1
@@ -413,7 +428,7 @@ is_our_daemon_running() {
         [ -n "$PID" ] || continue
         EXE="$(readlink "/proc/$PID/exe" 2>/dev/null)"
         if [ "$EXE" = "$BIN" ]; then
-            # 接管升级/并发启动前留下的同路径 daemon，不能只把它当作
+            # 接管升级/并发启动前留下的同路径守护进程，不能只把它当作
             # “已运行”而失去看门狗监控。
             if [ -z "$WATCHDOG_DAEMON_PID" ]; then
                 WATCHDOG_DAEMON_PID="$PID"
@@ -507,14 +522,21 @@ watch_services() {
     done
 }
 
-# --- 以下为原版行为: 把可在线核数锁定到最大, 避免核心被离线 ---
-for MAX_CPUS in /sys/devices/system/cpu/cpu*/core_ctl/max_cpus; do
-	if [ -e "$MAX_CPUS" ] && [ "$(cat $MAX_CPUS)" != "$(cat ${MAX_CPUS%/*}/min_cpus)" ]; then
-		chmod a+w "${MAX_CPUS%/*}/min_cpus"
-		echo "$(cat $MAX_CPUS)" > "${MAX_CPUS%/*}/min_cpus"
-		chmod a-w "${MAX_CPUS%/*}/min_cpus"
-	fi
-done
+# 默认允许 core_ctl 正常下线空闲核心，避免长期常驻功耗。确有低延迟需求时可在
+# calib_policy.conf 显式设置 keep_all_cores_online=1 恢复旧行为。
+KEEP_ALL_CORES_ONLINE="$(sed -n 's/^[[:space:]]*keep_all_cores_online[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*$/\1/p' "$CALIB_POLICY" 2>/dev/null | tail -n 1)"
+if [ "$KEEP_ALL_CORES_ONLINE" = "1" ]; then
+	for MAX_CPUS in /sys/devices/system/cpu/cpu*/core_ctl/max_cpus; do
+		if [ -e "$MAX_CPUS" ] && [ "$(cat "$MAX_CPUS")" != "$(cat "${MAX_CPUS%/*}/min_cpus")" ]; then
+			chmod a+w "${MAX_CPUS%/*}/min_cpus"
+			cat "$MAX_CPUS" > "${MAX_CPUS%/*}/min_cpus"
+			chmod a-w "${MAX_CPUS%/*}/min_cpus"
+		fi
+	done
+	echo "- 已按策略保持全部核心在线" >> "$LOG"
+else
+	echo "- 低功耗策略：允许 core_ctl 下线空闲核心" >> "$LOG"
+fi
 
 # 如需暂停绿厂oiface请将下面这行的#号注释删掉，恢复则将0改成1
 # [ -n "$(getprop persist.sys.oiface.enable)" ] && setprop persist.sys.oiface.enable 0

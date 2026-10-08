@@ -75,7 +75,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="3dp"
-                android:text="保存负载记录、采样时间和曲线数据到 Download/AppOpt"
+                android:text="保存负载记录、采样时间和曲线数据到 Download/QixiaThreads"
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp" />
         </LinearLayout>

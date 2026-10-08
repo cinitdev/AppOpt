@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# 从本地源码构建 AppOpt Magisk 模块。
-# eBPF 用户态加载和 attach 由 appopt_ebpf_bridge (Rust/aya) 提供。
+# 从本地源码构建 QixiaThreads Magisk 模块。
+# eBPF 用户态加载和挂载由 qixia_ebpf_bridge (Rust/aya) 提供。
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 NATIVE_DIR="$ROOT/native_daemon"
 FPS_MON="$NATIVE_DIR/fps_monitor"
-RUST_BRIDGE="$FPS_MON/appopt_ebpf_bridge"
+RUST_BRIDGE="$FPS_MON/qixia_ebpf_bridge"
 RUST_DAEMON="$NATIVE_DIR/daemon_rs"
 RUST_DAEMON_MAIN="$RUST_DAEMON/src/main.rs"
 RUST_DAEMON_VERSION_SRC="$RUST_DAEMON/src/daemon_core/preamble.rs"
-FOREGROUND_HELPER="$ROOT/tools/appopt_foreground_helper"
+FOREGROUND_HELPER="$ROOT/tools/qixia_foreground_helper"
 AYA_SUBMODULE="$FPS_MON/aya"
 AYA_SUBMODULE_REL="native_daemon/fps_monitor/aya"
 BASE_DIR="$ROOT/magisk_module"
 MODULE_PROP="$BASE_DIR/module.prop"
 WORK="$ROOT/build/module"
-APP_NAME="AppOpt 线程优化"
+APP_NAME="柒夏线程"
 APP_GRADLE="$ROOT/app/build.gradle.kts"
-DAEMON_BRIDGE="$ROOT/app/src/main/java/top/suto/appopt/DaemonBridge.kt"
-UPDATE_JSON="$ROOT/modules_update/AppOpt.json"
+DAEMON_BRIDGE="$ROOT/app/src/main/java/top/qixia/threads/DaemonBridge.kt"
+UPDATE_JSON="$ROOT/modules_update/QixiaThreads.json"
 UPDATE_BRANCH="modules-update"
 GITHUB_OWNER="cinitdev"
 GITHUB_REPO="AppOpt"
-GITHUB_REMOTE_URL="${APPOPT_GITHUB_REMOTE_URL:-https://github.com/$GITHUB_OWNER/$GITHUB_REPO.git}"
+GITHUB_REMOTE_URL="${QIXIA_GITHUB_REMOTE_URL:-https://github.com/$GITHUB_OWNER/$GITHUB_REPO.git}"
 GITEE_OWNER="cinitdev"
 GITEE_REPO="AppOpt"
-GITEE_REMOTE_URL="${APPOPT_GITEE_REMOTE_URL:-https://gitee.com/$GITEE_OWNER/$GITEE_REPO.git}"
+GITEE_REMOTE_URL="${QIXIA_GITEE_REMOTE_URL:-https://gitee.com/$GITEE_OWNER/$GITEE_REPO.git}"
 GITEE_API_BASE="https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO"
-PUBLISH_UPDATE_JSON="$ROOT/build/AppOpt.publish.json"
+PUBLISH_UPDATE_JSON="$ROOT/build/QixiaThreads.publish.json"
 
 usage() {
     cat <<EOF
@@ -51,7 +51,7 @@ EOF
 APP_VARIANT="${1:-release}"
 PUBLISH_RELEASE=0
 PUBLISH_DRY_RUN=0
-PUBLISH_TARGET="${APPOPT_PUBLISH_TARGET:-gitee}"
+PUBLISH_TARGET="${QIXIA_PUBLISH_TARGET:-gitee}"
 if [ "$#" -gt 0 ]; then
     shift
 fi
@@ -81,13 +81,15 @@ case "$PUBLISH_TARGET" in
     github)
         PUBLISH_REMOTE_URL="$GITHUB_REMOTE_URL"
         PUBLISH_REMOTE_LABEL="GitHub"
-        PUBLISH_UPDATE_URL="https://raw.githubusercontent.com/$GITHUB_OWNER/$GITHUB_REPO/$UPDATE_BRANCH/modules_update/AppOpt.json"
+        PUBLISH_UPDATE_URL="https://raw.githubusercontent.com/$GITHUB_OWNER/$GITHUB_REPO/$UPDATE_BRANCH/modules_update/QixiaThreads.json"
+        PUBLISH_CHANGELOG_PAGE="https://github.com/$GITHUB_OWNER/$GITHUB_REPO/blob/$UPDATE_BRANCH/modules_update/changelog.md"
         PUBLISH_RELEASE_BASE="https://github.com/$GITHUB_OWNER/$GITHUB_REPO/releases/download"
         ;;
     gitee)
         PUBLISH_REMOTE_URL="$GITEE_REMOTE_URL"
         PUBLISH_REMOTE_LABEL="Gitee"
-        PUBLISH_UPDATE_URL="https://raw.giteeusercontent.com/$GITEE_OWNER/$GITEE_REPO/raw/$UPDATE_BRANCH/modules_update/AppOpt.json"
+        PUBLISH_UPDATE_URL="https://raw.giteeusercontent.com/$GITEE_OWNER/$GITEE_REPO/raw/$UPDATE_BRANCH/modules_update/QixiaThreads.json"
+        PUBLISH_CHANGELOG_PAGE="https://gitee.com/$GITEE_OWNER/$GITEE_REPO/blob/$UPDATE_BRANCH/modules_update/changelog.md"
         PUBLISH_RELEASE_BASE="https://gitee.com/$GITEE_OWNER/$GITEE_REPO/releases/download"
         ;;
     *)
@@ -96,12 +98,14 @@ case "$PUBLISH_TARGET" in
         ;;
 esac
 
+PUBLISH_CHANGELOG_URL="${PUBLISH_UPDATE_URL%/*}/changelog.md"
+
 if [ "$PUBLISH_RELEASE" = "1" ] && [ "$APP_VARIANT" != "release" ]; then
     echo "! Release 发布只支持 release 模块构建"
     exit 1
 fi
 
-ZIP="$ROOT/build/AppOpt.zip"
+ZIP="$ROOT/build/QixiaThreads.zip"
 
 [ -d "$BASE_DIR" ] || { echo "! 找不到模块基底目录: $BASE_DIR"; exit 1; }
 [ -f "$MODULE_PROP" ] || { echo "! 找不到模块属性文件: $MODULE_PROP"; exit 1; }
@@ -122,7 +126,7 @@ ensure_aya_submodule() {
     }
 
     echo "- 检查子模块: $AYA_SUBMODULE_REL"
-    if [ "${APPOPT_SKIP_SUBMODULE_UPDATE:-0}" = "1" ]; then
+    if [ "${QIXIA_SKIP_SUBMODULE_UPDATE:-0}" = "1" ]; then
         echo "- 跳过子模块远端更新，使用当前 $AYA_SUBMODULE_REL 工作区"
     else
         local BEFORE_COMMIT AFTER_COMMIT
@@ -219,9 +223,9 @@ latest_dir() {
 run_gradle_task() {
     local task="$1"
     if [ -x "$ROOT/gradlew" ]; then
-        (cd "$ROOT" && ./gradlew --no-daemon "-Dkotlin.incremental=false" "$task")
+        (cd "$ROOT" && ./gradlew --no-daemon "-Pkotlin.incremental=false" "$task")
     elif [ -f "$ROOT/gradlew.bat" ]; then
-        (cd "$ROOT" && ./gradlew.bat --no-daemon "-Dkotlin.incremental=false" "$task")
+        (cd "$ROOT" && ./gradlew.bat --no-daemon "-Pkotlin.incremental=false" "$task")
     else
         echo "! Gradle Wrapper not found"
         exit 1
@@ -234,11 +238,11 @@ build_pkg_helper() {
     android_jar="$android_platform/android.jar"
     build_tools="$(latest_dir "$SDK_DIR/build-tools")"
     d8_jar="$build_tools/lib/d8.jar"
-    helper_src="$ROOT/tools/appopt_pkg_helper/src"
+    helper_src="$ROOT/tools/qixia_pkg_helper/src"
     helper_build="$ROOT/build/pkg-helper"
     helper_classes="$helper_build/classes"
     helper_dex="$helper_build/dex"
-    tools_dir="$WORK/config/app/tools"
+    tools_dir="$WORK/config/tools"
 
     [ -f "$android_jar" ] || { echo "! android.jar not found: $android_jar"; exit 1; }
     [ -f "$d8_jar" ] || { echo "! d8.jar not found: $d8_jar"; exit 1; }
@@ -259,8 +263,8 @@ build_pkg_helper() {
         --output "$helper_dex" \
         $(find "$helper_classes" -name '*.class' | sort)
 
-    (cd "$helper_dex" && jar cf "$tools_dir/appopt_pkg_helper.jar" classes.dex)
-    [ -s "$tools_dir/appopt_pkg_helper.jar" ] || { echo "! package helper jar build failed"; exit 1; }
+    (cd "$helper_dex" && jar cf "$tools_dir/qixia_pkg_helper.jar" classes.dex)
+    [ -s "$tools_dir/qixia_pkg_helper.jar" ] || { echo "! package helper jar build failed"; exit 1; }
 }
 
 build_foreground_helper() {
@@ -298,10 +302,10 @@ build_foreground_helper() {
         --lib "$android_jar" \
         --lib "$stub_jar" \
         --output "$helper_dex" \
-        $(find "$helper_classes/appopt" -name '*.class' | sort)
+        $(find "$helper_classes/qixia" -name '*.class' | sort)
 
-    (cd "$helper_dex" && jar cf "$tools_dir/appopt_foreground_helper.jar" classes.dex)
-    [ -s "$tools_dir/appopt_foreground_helper.jar" ] || {
+    (cd "$helper_dex" && jar cf "$tools_dir/qixia_foreground_helper.jar" classes.dex)
+    [ -s "$tools_dir/qixia_foreground_helper.jar" ] || {
         echo "! foreground helper jar build failed"
         exit 1
     }
@@ -315,54 +319,60 @@ read_app_version_name() {
     grep -E 'versionName[[:space:]]*=' "$APP_GRADLE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
+read_module_version_code() {
+    sed -n 's/^versionCode=//p' "$MODULE_PROP" | head -n1 | tr -d '\r'
+}
+
 read_app_package() {
     grep -E 'applicationId[[:space:]]*=' "$APP_GRADLE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
 sync_source_versions() {
-    local version_code version_name source_version_name current_code current_name current_rs_version
+    local app_version_code app_version_name
+    local source_version_name
+    local current_code current_name current_rs_version
     local current_module_version current_module_code
     local synced_code synced_name synced_rs_version synced_module_version synced_module_code
-    version_code="$(read_app_version_code)"
-    version_name="$(read_app_version_name)"
-    [ -n "$version_code" ] || { echo "! 无法读取 App versionCode"; exit 1; }
-    [ -n "$version_name" ] || { echo "! 无法读取 App versionName"; exit 1; }
+    app_version_code="$(read_app_version_code)"
+    app_version_name="$(read_app_version_name)"
+    [ -n "$app_version_code" ] || { echo "! 无法读取 App versionCode"; exit 1; }
+    [ -n "$app_version_name" ] || { echo "! 无法读取 App versionName"; exit 1; }
 
-    source_version_name="${version_name#v}"
+    # App 与模块联合发布时直接使用 APK 版本号，不再换算。
+    source_version_name="${app_version_name#v}"
     source_version_name="${source_version_name#V}"
     current_code="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
     current_name="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
-    current_rs_version="$(sed -n -E 's/^const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)"
+    current_rs_version="$(sed -n -E 's/^pub\(super\)[[:space:]]+const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)"
     current_module_version="$(sed -n 's/^version=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
     current_module_code="$(sed -n 's/^versionCode=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
 
-    if [ "$current_code" != "$version_code" ]; then
-        echo "- 同步 REQUIRED_MODULE_VERSION_CODE: ${current_code:-缺失} -> $version_code"
-        sed -E -i "s/(REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*)[0-9]+/\1$version_code/" "$DAEMON_BRIDGE"
+    if [ "$current_code" != "$app_version_code" ]; then
+        echo "- 同步 REQUIRED_MODULE_VERSION_CODE: ${current_code:-缺失} -> $app_version_code"
+        sed -E -i "s/(REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*)[0-9]+/\1$app_version_code/" "$DAEMON_BRIDGE"
     fi
     if [ "$current_name" != "$source_version_name" ]; then
         echo "- 同步 REQUIRED_MODULE_VERSION_NAME: ${current_name:-缺失} -> $source_version_name"
         sed -E -i "s/(REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*)\"[^\"]*\"/\1\"$source_version_name\"/" "$DAEMON_BRIDGE"
     fi
     if [ "$current_rs_version" != "$source_version_name" ]; then
-        echo "- 同步 AppOptRs VERSION: ${current_rs_version:-缺失} -> $source_version_name"
-        sed -E -i "s/(^const[[:space:]]+VERSION:[[:space:]]*\&str[[:space:]]*=[[:space:]]*)\"[^\"]*\"/\1\"$source_version_name\"/" "$RUST_DAEMON_VERSION_SRC"
+        echo "- 同步 QiXiaRs VERSION: ${current_rs_version:-缺失} -> $source_version_name"
+        sed -E -i "s/(^pub\(super\)[[:space:]]+const[[:space:]]+VERSION:[[:space:]]*\&str[[:space:]]*=[[:space:]]*)\"[^\"]*\"/\1\"$source_version_name\"/" "$RUST_DAEMON_VERSION_SRC"
     fi
-    if [ "$current_module_version" != "$version_name" ]; then
-        echo "- 同步 module.prop version: ${current_module_version:-缺失} -> $version_name"
-        sed -E -i "s/^version=.*/version=$version_name/" "$MODULE_PROP"
+    if [ "$current_module_version" != "$app_version_name" ]; then
+        echo "- 同步 module.prop version: ${current_module_version:-缺失} -> $app_version_name"
+        sed -E -i "s/^version=.*/version=$app_version_name/" "$MODULE_PROP"
     fi
-    if [ "$current_module_code" != "$version_code" ]; then
-        echo "- 同步 module.prop versionCode: ${current_module_code:-缺失} -> $version_code"
-        sed -E -i "s/^versionCode=.*/versionCode=$version_code/" "$MODULE_PROP"
+    if [ "$current_module_code" != "$app_version_code" ]; then
+        echo "- 同步 module.prop versionCode: ${current_module_code:-缺失} -> $app_version_code"
+        sed -E -i "s/^versionCode=.*/versionCode=$app_version_code/" "$MODULE_PROP"
     fi
-
     synced_code="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_CODE[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
     synced_name="$(sed -n -E 's/.*REQUIRED_MODULE_VERSION_NAME[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$DAEMON_BRIDGE" | head -n1)"
-    synced_rs_version="$(sed -n -E 's/^const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)"
+    synced_rs_version="$(sed -n -E 's/^pub\(super\)[[:space:]]+const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)"
     synced_module_version="$(sed -n 's/^version=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
     synced_module_code="$(sed -n 's/^versionCode=//p' "$MODULE_PROP" | head -n1 | tr -d '\r')"
-    [ "$synced_code" = "$version_code" ] || {
+    [ "$synced_code" = "$app_version_code" ] || {
         echo "! REQUIRED_MODULE_VERSION_CODE 同步失败"
         exit 1
     }
@@ -371,18 +381,18 @@ sync_source_versions() {
         exit 1
     }
     [ "$synced_rs_version" = "$source_version_name" ] || {
-        echo "! AppOptRs VERSION 同步失败"
+        echo "! QiXiaRs VERSION 同步失败"
         exit 1
     }
-    [ "$synced_module_version" = "$version_name" ] || {
+    [ "$synced_module_version" = "$app_version_name" ] || {
         echo "! module.prop version 同步失败"
         exit 1
     }
-    [ "$synced_module_code" = "$version_code" ] || {
+    [ "$synced_module_code" = "$app_version_code" ] || {
         echo "! module.prop versionCode 同步失败"
         exit 1
     }
-    echo "- App、模块与守护进程版本已对齐: $version_name ($version_code)"
+    echo "- 版本已对齐: App/模块 $app_version_name ($app_version_code)"
 }
 
 read_module_version_name() {
@@ -427,7 +437,7 @@ find_github_cli() {
 
 validate_update_json() {
     local tag="$1" version_code
-    version_code="$(read_app_version_code)"
+    version_code="$(read_module_version_code)"
     [ -s "$UPDATE_JSON" ] || { echo "! 找不到远程更新配置: $UPDATE_JSON"; exit 1; }
 
     python - "$UPDATE_JSON" "$tag" "$version_code" <<'PY'
@@ -439,27 +449,27 @@ with open(path, encoding="utf-8") as f:
     data = json.load(f)
 
 if data.get("version") != expected_tag:
-    raise SystemExit(f"! AppOpt.json version={data.get('version')!r}, 预期 {expected_tag!r}")
+    raise SystemExit(f"! QixiaThreads.json version={data.get('version')!r}, 预期 {expected_tag!r}")
 if data.get("versionCode") != expected_code:
-    raise SystemExit(f"! AppOpt.json versionCode={data.get('versionCode')!r}, 预期 {expected_code}")
+    raise SystemExit(f"! QixiaThreads.json versionCode={data.get('versionCode')!r}, 预期 {expected_code}")
 
 PY
 }
 
 prepare_publish_update_json() {
     local tag="$1" version_code
-    version_code="$(read_app_version_code)"
-    python - "$UPDATE_JSON" "$PUBLISH_UPDATE_JSON" "$tag" "$version_code" "$PUBLISH_RELEASE_BASE" <<'PY'
+    version_code="$(read_module_version_code)"
+    python - "$UPDATE_JSON" "$PUBLISH_UPDATE_JSON" "$tag" "$version_code" "$PUBLISH_RELEASE_BASE" "$PUBLISH_CHANGELOG_URL" <<'PY'
 import json
 import sys
 
-source, target, tag, version_code, release_base = sys.argv[1:]
+source, target, tag, version_code, release_base, changelog_url = sys.argv[1:]
 with open(source, encoding="utf-8") as f:
     data = json.load(f)
 data["version"] = tag
 data["versionCode"] = int(version_code)
-data["zipUrl"] = f"{release_base}/{tag}/AppOpt.zip"
-data["changelog"] = f"{release_base}/{tag}/changelog.md"
+data["zipUrl"] = f"{release_base}/{tag}/QixiaThreads.zip"
+data["changelog"] = changelog_url
 with open(target, "w", encoding="utf-8", newline="\n") as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
     f.write("\n")
@@ -492,24 +502,25 @@ publish_update_json() (
 
     git -C "$repo_root" worktree add --detach "$worktree" "$base_commit" >/dev/null
     mkdir -p "$worktree/modules_update"
-    cp -f "$PUBLISH_UPDATE_JSON" "$worktree/modules_update/AppOpt.json"
-    git -C "$worktree" add -- modules_update/AppOpt.json
+    cp -f "$PUBLISH_UPDATE_JSON" "$worktree/modules_update/QixiaThreads.json"
+    cp -f "$ROOT/modules_update/changelog.md" "$worktree/modules_update/changelog.md"
+    git -C "$worktree" add -- modules_update/QixiaThreads.json modules_update/changelog.md
 
     if git -C "$worktree" diff --cached --quiet; then
-        echo "- $PUBLISH_REMOTE_LABEL/$UPDATE_BRANCH 的 AppOpt.json 已是 $tag"
+        echo "- $PUBLISH_REMOTE_LABEL/$UPDATE_BRANCH 的更新配置和日志均已同步"
         exit 0
     fi
 
     if [ "$dry_run" = "1" ]; then
-        echo "- [预演] 将基于 $PUBLISH_REMOTE_LABEL 远端提交 $base_commit 更新 modules_update/AppOpt.json"
+        echo "- [预演] 将基于 $PUBLISH_REMOTE_LABEL 远端提交 $base_commit 更新 QixiaThreads.json 和 changelog.md"
         git -C "$worktree" diff --cached --stat
-        git -C "$worktree" diff --cached -- modules_update/AppOpt.json
+        git -C "$worktree" diff --cached -- modules_update/QixiaThreads.json modules_update/changelog.md
         echo "- [预演] 未提交、未推送 $PUBLISH_REMOTE_LABEL modules-update 分支"
         exit 0
     fi
 
     git -C "$worktree" -c commit.gpgsign=false commit \
-        -m "发布：更新 $tag 远程更新信息" >/dev/null
+        -m "发布：更新 $tag 远程更新信息与日志" >/dev/null
 
     # 推送前再次抓取。网页端若在发布过程中产生新提交，拒绝非快进推送。
     git -C "$repo_root" fetch --no-tags "$PUBLISH_REMOTE_URL" "$UPDATE_BRANCH"
@@ -520,7 +531,7 @@ publish_update_json() (
     fi
 
     git -C "$worktree" push "$PUBLISH_REMOTE_URL" "HEAD:refs/heads/$UPDATE_BRANCH"
-    echo "- 已更新 $PUBLISH_REMOTE_LABEL/$UPDATE_BRANCH: modules_update/AppOpt.json -> $tag"
+    echo "- 已更新 $PUBLISH_REMOTE_LABEL/$UPDATE_BRANCH: $tag 更新配置与完整日志"
 )
 
 gitee_release_id() {
@@ -561,7 +572,7 @@ load_gitee_token() {
 }
 
 publish_gitee_release() {
-    local tag title changelog release_id response zip_upload changelog_upload target_commitish
+    local tag title changelog release_id response zip_upload release_notes target_commitish
     command -v curl >/dev/null 2>&1 || {
         echo "! 找不到 curl，无法发布 Gitee Release"
         exit 1
@@ -574,7 +585,7 @@ publish_gitee_release() {
     }
 
     tag="$(read_release_tag)"
-    title="AppOpt $tag"
+    title="QixiaThreads $tag"
     changelog="$ROOT/modules_update/changelog.md"
     # Gitee 仓库只维护 modules-update 分支，不能使用不存在的 master 创建标签。
     target_commitish="$UPDATE_BRANCH"
@@ -582,7 +593,7 @@ publish_gitee_release() {
     [ -s "$ZIP" ] || { echo "! 找不到模块 zip: $ZIP"; exit 1; }
     [ -s "$changelog" ] || { echo "! 找不到更新日志: $changelog"; exit 1; }
     zip_upload="$(path_for_cargo "$ZIP")"
-    changelog_upload="$(path_for_cargo "$changelog")"
+    release_notes="新版及历史更新日志：[查看完整日志]($PUBLISH_CHANGELOG_PAGE)"
     validate_update_json "$tag"
     prepare_publish_update_json "$tag"
 
@@ -592,7 +603,7 @@ publish_gitee_release() {
         else
             echo "- [预演] 将创建 Gitee Release: $tag（基于 $target_commitish）"
         fi
-        echo "- [预演] 将上传: $ZIP 和 $changelog"
+        echo "- [预演] Release 仅上传: $ZIP；完整日志同步到 $UPDATE_BRANCH 分支"
         publish_update_json "$tag" 1
         echo "- 发布预演完成: $tag（未写入 Gitee）"
         return 0
@@ -609,7 +620,7 @@ publish_gitee_release() {
             --data-urlencode "access_token=$GITEE_TOKEN" \
             --data-urlencode "tag_name=$tag" \
             --data-urlencode "name=$title" \
-            --data-urlencode "body@$changelog_upload" >/dev/null
+            --data-urlencode "body=$release_notes" >/dev/null
     else
         echo "- 创建 Gitee Release: $tag（基于 $target_commitish）"
         response="$(mktemp "$ROOT/build/gitee-release.XXXXXX")"
@@ -617,7 +628,7 @@ publish_gitee_release() {
             --data-urlencode "access_token=$GITEE_TOKEN" \
             --data-urlencode "tag_name=$tag" \
             --data-urlencode "name=$title" \
-            --data-urlencode "body@$changelog_upload" \
+            --data-urlencode "body=$release_notes" \
             --data-urlencode "target_commitish=$target_commitish"; then
             echo "! Gitee 创建 Release 失败，接口返回：" >&2
             cat "$response" >&2
@@ -645,17 +656,13 @@ PY
     [ -n "$release_id" ] || { echo "! 无法确定 Gitee Release ID: $tag"; exit 1; }
     curl --fail-with-body -sS -X POST "$GITEE_API_BASE/releases/$release_id/attach_files" \
         --form "access_token=$GITEE_TOKEN" \
-        --form "file=@$zip_upload;filename=AppOpt.zip" >/dev/null
-    curl --fail-with-body -sS -X POST "$GITEE_API_BASE/releases/$release_id/attach_files" \
-        --form "access_token=$GITEE_TOKEN" \
-        --form "file=@$changelog_upload;filename=changelog.md" >/dev/null
-
+        --form "file=@$zip_upload;filename=QixiaThreads.zip" >/dev/null
     publish_update_json "$tag" 0
     echo "- Gitee 发布完成: $tag"
 }
 
 publish_github_release() {
-    local gh_bin tag title changelog
+    local gh_bin tag title changelog release_notes
     gh_bin="$(find_github_cli)" || {
         echo "! 找不到 GitHub CLI: gh"
         echo "! 请确认已安装 GitHub CLI 并加入 PATH"
@@ -663,8 +670,9 @@ publish_github_release() {
     }
 
     tag="$(read_release_tag)"
-    title="AppOpt $tag"
+    title="QixiaThreads $tag"
     changelog="$ROOT/modules_update/changelog.md"
+    release_notes="新版及历史更新日志：[查看完整日志]($PUBLISH_CHANGELOG_PAGE)"
 
     [ -s "$ZIP" ] || { echo "! 找不到模块 zip: $ZIP"; exit 1; }
     [ -s "$changelog" ] || { echo "! 找不到更新日志: $changelog"; exit 1; }
@@ -682,7 +690,7 @@ publish_github_release() {
         else
             echo "- [预演] 将创建 GitHub Release: $tag"
         fi
-        echo "- [预演] 将上传: $ZIP 和 $changelog"
+        echo "- [预演] Release 仅上传: $ZIP；完整日志同步到 $UPDATE_BRANCH 分支"
         publish_update_json "$tag" 1
         echo "- 发布预演完成: $tag（未写入 GitHub）"
         return 0
@@ -691,13 +699,13 @@ publish_github_release() {
     if "$gh_bin" release view "$tag" >/dev/null 2>&1; then
         echo "- GitHub Release 已存在: $tag"
         echo "- 更新 Release 说明并覆盖上传资产"
-        "$gh_bin" release edit "$tag" --title "$title" --notes-file "$changelog"
-        "$gh_bin" release upload "$tag" "$ZIP" "$changelog" --clobber
+        "$gh_bin" release edit "$tag" --title "$title" --notes "$release_notes"
+        "$gh_bin" release upload "$tag" "$ZIP" --clobber
     else
         echo "- 创建 GitHub Release: $tag"
-        "$gh_bin" release create "$tag" "$ZIP" "$changelog" \
+        "$gh_bin" release create "$tag" "$ZIP" \
             --title "$title" \
-            --notes-file "$changelog"
+            --notes "$release_notes"
     fi
 
     publish_update_json "$tag" 0
@@ -719,7 +727,7 @@ build_and_embed_app() {
 
     app_dir="$WORK/config/app"
     mkdir -p "$app_dir"
-    cp -f "$apk" "$app_dir/AppOpt.apk"
+    cp -f "$apk" "$app_dir/QixiaThreads.apk"
 
     app_package="$(read_app_package)"
     version_code="$(read_app_version_code)"
@@ -734,7 +742,7 @@ name=$APP_NAME
 variant=$APP_VARIANT
 versionCode=$version_code
 versionName=$version_name
-apk=AppOpt.apk
+apk=QixiaThreads.apk
 EOF
     echo "- Embedded App: $APP_VARIANT $version_name ($version_code)"
 }
@@ -748,7 +756,9 @@ build_rust_daemon() {
         exit 1
     }
 
-    local ar="$BIN/llvm-ar${EXT}"
+    local ar="$BIN/llvm-ar"
+    [ -f "$ar" ] || ar="$BIN/llvm-ar.exe"
+    [ -f "$ar" ] || ar="$BIN/llvm-ar.cmd"
     [ -f "$cc" ] || { echo "! 找不到 NDK clang: $cc"; exit 1; }
     [ -f "$ar" ] || ar=""
 
@@ -767,8 +777,8 @@ build_rust_daemon() {
         cargo build --manifest-path "$RUST_DAEMON/Cargo.toml" \
             --release --target "$rust_target" --target-dir "$target_dir"
 
-    local bin="$target_dir/$rust_target/release/appopt_daemon_rs"
-    local dst="$WORK/config/bin/$abidir/AppOptRs"
+    local bin="$target_dir/$rust_target/release/qixia_daemon_rs"
+    local dst="$WORK/config/bin/$abidir/QiXiaRs"
     [ -f "$bin" ] || { echo "! 找不到 Rust daemon 产物: $bin"; exit 1; }
     cp "$bin" "$dst"
     [ -f "$LLVM_STRIP" ] && "$LLVM_STRIP" --strip-all "$dst" || true
@@ -795,13 +805,10 @@ build_and_embed_app
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"
 BPF_STATS_SRC="$FPS_MON/bpf/queuebuffer_probe_stats.bpf.c"
 BPF_PERF_SRC="$FPS_MON/bpf/queuebuffer_probe_perf.bpf.c"
-BPF_CPU_UTIL_SRC="$FPS_MON/bpf/cpu_util_monitor.bpf.c"
 mkdir -p "$WORK/config/ebpf"
-BPF_CPU_UTIL_OBJ="$WORK/config/ebpf/cpu_util_monitor.bpf.o"
 [ -f "$BPF_SRC" ] || { echo "! 找不到 BPF 源码: $BPF_SRC"; exit 1; }
 [ -f "$BPF_STATS_SRC" ] || { echo "! 找不到 StatsMap BPF 源码: $BPF_STATS_SRC"; exit 1; }
 [ -f "$BPF_PERF_SRC" ] || { echo "! 找不到 PerfEvent BPF 源码: $BPF_PERF_SRC"; exit 1; }
-[ -f "$BPF_CPU_UTIL_SRC" ] || { echo "! 找不到 CPU 利用率 BPF 源码: $BPF_CPU_UTIL_SRC"; exit 1; }
 
 CLANG="$BIN/clang"
 [ ! -f "$CLANG" ] && CLANG="$BIN/clang.exe"
@@ -831,19 +838,6 @@ build_bpf_obj() {
     [ -s "$obj" ] || { echo "! BPF 对象构建失败: $label"; exit 1; }
 }
 
-build_common_bpf_obj() {
-    local src="$1" obj="$2" label="$3"
-    echo "- 构建通用 BPF 对象: $label"
-    (
-        cd "$(dirname "$src")"
-        "$CLANG" -target bpf -g -O2 -c "$(basename "$src")" -o "$obj" \
-            -fdebug-compilation-dir=. \
-            -ffile-prefix-map="$ROOT=." \
-            -Wno-unused-value
-    )
-    [ -s "$obj" ] || { echo "! BPF 对象构建失败: $label"; exit 1; }
-}
-
 build_bpf_pair_for_abi() {
     local abidir="$1" target_arch="$2" include_arch="$3" abi_define="$4"
     local ebpf_dir="$WORK/config/ebpf/$abidir"
@@ -853,11 +847,10 @@ build_bpf_pair_for_abi() {
     build_bpf_obj "$BPF_PERF_SRC" "$ebpf_dir/queuebuffer_probe_perf.bpf.o" "queuebuffer_probe_perf.bpf.c ($abidir)" "$target_arch" "$include_arch" "$abi_define"
 }
 
-build_bpf_pair_for_abi arm64-v8a   __TARGET_ARCH_arm64 aarch64-linux-android  APPOPT_BPF_ARM64
-build_bpf_pair_for_abi armeabi-v7a __TARGET_ARCH_arm   arm-linux-androideabi  APPOPT_BPF_ARM
-build_bpf_pair_for_abi x86_64      __TARGET_ARCH_x86   x86_64-linux-android   APPOPT_BPF_X86_64
-build_bpf_pair_for_abi x86         __TARGET_ARCH_x86   i686-linux-android      APPOPT_BPF_I386
-build_common_bpf_obj "$BPF_CPU_UTIL_SRC" "$BPF_CPU_UTIL_OBJ" "cpu_util_monitor.bpf.c"
+build_bpf_pair_for_abi arm64-v8a   __TARGET_ARCH_arm64 aarch64-linux-android  QIXIA_BPF_ARM64
+build_bpf_pair_for_abi armeabi-v7a __TARGET_ARCH_arm   arm-linux-androideabi  QIXIA_BPF_ARM
+build_bpf_pair_for_abi x86_64      __TARGET_ARCH_x86   x86_64-linux-android   QIXIA_BPF_X86_64
+build_bpf_pair_for_abi x86         __TARGET_ARCH_x86   i686-linux-android      QIXIA_BPF_I386
 
 build_abi() {
     local triple="$1" abidir="$2" rust_target="$3"
@@ -874,7 +867,7 @@ build_abi armv7a-linux-androideabi armeabi-v7a   armv7-linux-androideabi
 build_abi x86_64-linux-android     x86_64        x86_64-linux-android
 build_abi i686-linux-android       x86           i686-linux-android
 
-VER=$(sed -n -E 's/^const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)
+VER=$(sed -n -E 's/^pub\(super\)[[:space:]]+const[[:space:]]+VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$RUST_DAEMON_VERSION_SRC" | head -n1)
 if [ -n "$VER" ] && [ -f "$WORK/module.prop" ]; then
     #sed -i -E "s/^version=.*/version=${VER}-增强版/" "$WORK/module.prop"
     echo "- module.prop 版本: ${VER}"

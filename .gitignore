@@ -20,3 +20,32 @@ local.properties
 *.zip
 __pycache__/
 app/build/
+
+# 本地工具、编辑器状态与设计验证材料不进入源码提交。
+/.codex/
+/.claude/
+/.idea/
+/design/
+
+# 更新清单和累积日志单独维护，本分支的 GitHub 源码推送不包含它们。
+/modules_update/
+
+# Rust、Android 与 Windows 构建缓存及临时产物。
+target/
+**/bin/Debug/
+**/bin/Release/
+**/obj/
+*.apk
+*.aab
+*.exe
+*.dll
+*.pdb
+*.tmp
+*.bak
+*.log.*
+
+# 仅纳入项目文档；本地交接记录仍由上面的 *.md 规则忽略。
+!/README.md
+!/FPS_EBPF_INTEGRATION.md
+!/SOURCE_ATTRIBUTION.md
+!/native_daemon/fps_monitor/README.md

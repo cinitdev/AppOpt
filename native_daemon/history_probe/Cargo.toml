@@ -1,0 +1,16 @@
+[package]
+name = "qixia-history-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+qixia-kernel-info = { path = "../kernel_info" }
+
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+libc = "=0.2.186"
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = "thin"
+codegen-units = 1

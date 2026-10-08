@@ -1,12 +1,30 @@
 SKIPUNZIP=0
-APPOPT_IN_APP_UPDATE_MARKER="config/app/.appopt_in_app_update"
-APPOPT_IN_APP_UPDATE_FLAG="/data/adb/appopt_in_app_update"
+QIXIA_IN_APP_UPDATE_MARKER="config/app/.qixia_in_app_update"
+QIXIA_IN_APP_UPDATE_FLAG="/data/adb/qixia_in_app_update"
 EMBEDDED_APP_CLEANUP_ALLOWED=1
-is_appopt_in_app_update() {
-	[ "$APPOPT_IN_APP_UPDATE" = "1" ] && return 0
-	[ -n "$MODPATH" ] && [ -f "$MODPATH/$APPOPT_IN_APP_UPDATE_MARKER" ] && return 0
-	[ -f "$APPOPT_IN_APP_UPDATE_FLAG" ] && return 0
+# 更新时保留当前柒夏线程模块的配置和待处理数据。
+QIXIA_UPGRADE_SOURCE=""
+if [ "$(sed -n 's/^id=//p' /data/adb/modules/QixiaThreads/module.prop 2>/dev/null)" = "QixiaThreads" ] &&
+	[ "$(readlink -f "$MODPATH")" != "$(readlink -f /data/adb/modules/QixiaThreads)" ]; then
+	QIXIA_UPGRADE_SOURCE="/data/adb/modules/QixiaThreads"
+fi
+is_qixia_in_app_update() {
+	[ "$QIXIA_IN_APP_UPDATE" = "1" ] && return 0
+	[ -n "$MODPATH" ] && [ -f "$MODPATH/$QIXIA_IN_APP_UPDATE_MARKER" ] && return 0
+	[ -f "$QIXIA_IN_APP_UPDATE_FLAG" ] && return 0
 	return 1
+}
+print_manual_migration_notice() {
+	ui_print "********************************************"
+	ui_print "旧版迁移提醒（从 AppOpt 切换到柒夏线程）"
+	ui_print "! 请先手动备份旧版 applist.conf，再处理旧版 APK 和模块。"
+	ui_print "! 旧版 APK 请自行卸载，旧模块请自行停用或卸载。"
+	ui_print "! 请勿同时启用旧版与新版模块，以免调度冲突。"
+	ui_print "! 本安装器不自动迁移旧版 AppOpt 的规则和数据。"
+	ui_print "! 新模块生效后，请将备份的 applist.conf 手动复制到："
+	ui_print "/data/adb/modules/QixiaThreads/config/applist.conf"
+	ui_print "! 复制后重新打开柒夏线程，按当前设置同步规则格式。"
+	ui_print "********************************************"
 }
 check_magisk_version() {
 	ui_print "- Magisk version: $MAGISK_VER_CODE"
@@ -46,9 +64,9 @@ extract_bin() {
 	else
 		abort "! Unsupported platform: $ARCH"
 	fi
-	[ -f $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs ] \
-		|| abort "! 缺少 Rust 守护进程: $BIN_ABI_DIR/AppOptRs"
-	cp $MODPATH/config/bin/$BIN_ABI_DIR/AppOptRs $MODPATH/config/bin/AppOptRs \
+	[ -f $MODPATH/config/bin/$BIN_ABI_DIR/QiXiaRs ] \
+		|| abort "! 缺少 Rust 守护进程: $BIN_ABI_DIR/QiXiaRs"
+	cp $MODPATH/config/bin/$BIN_ABI_DIR/QiXiaRs $MODPATH/config/bin/QiXiaRs \
 		|| abort "! 安装 Rust 守护进程失败"
 	[ -d "$MODPATH/config/ebpf/$BIN_ABI_DIR" ] || abort "! 缺少 eBPF ABI 目录: $BIN_ABI_DIR"
 	cp "$MODPATH/config/ebpf/$BIN_ABI_DIR/queuebuffer_probe.bpf.o" "$MODPATH/config/ebpf/queuebuffer_probe.bpf.o" 2>/dev/null \
@@ -57,32 +75,30 @@ extract_bin() {
 		|| abort "! 安装 queueBuffer StatsMap eBPF 对象失败"
 	cp "$MODPATH/config/ebpf/$BIN_ABI_DIR/queuebuffer_probe_perf.bpf.o" "$MODPATH/config/ebpf/queuebuffer_probe_perf.bpf.o" 2>/dev/null \
 		|| abort "! 安装 queueBuffer PerfEvent eBPF 对象失败"
-	[ -f "$MODPATH/config/ebpf/cpu_util_monitor.bpf.o" ] \
-		|| abort "! 缺少 CPU 利用率 eBPF 对象"
 	ui_print "- Device platform: $ARCH"
 	rm -rf $MODPATH/config/bin/armeabi-v7a $MODPATH/config/bin/arm64-v8a $MODPATH/config/bin/x86 $MODPATH/config/bin/x86_64
 	rm -rf $MODPATH/config/ebpf/armeabi-v7a $MODPATH/config/ebpf/arm64-v8a $MODPATH/config/ebpf/x86 $MODPATH/config/ebpf/x86_64
-	chmod a+x $MODPATH/config/bin/AppOptRs
-	if ! $MODPATH/config/bin/AppOptRs -v; then
+	chmod a+x $MODPATH/config/bin/QiXiaRs
+	if ! $MODPATH/config/bin/QiXiaRs -v; then
 		abort "! Rust 守护验证失败，请检查模块 zip 文件或设备架构"
 	fi
-	ui_print "- Rust 守护验证通过: AppOptRs"
+	ui_print "- Rust 守护验证通过: QiXiaRs"
 }
 
 run_pkg_helper() {
 	local OUT="$1"
 	shift
-	local HELPER="$MODPATH/config/app/tools/appopt_pkg_helper.sh"
-	local HELPER_DIR="$MODPATH/config/app/tools"
+	local HELPER="$MODPATH/config/tools/qixia_pkg_helper.sh"
+	local HELPER_DIR="$MODPATH/config/tools"
 	if [ ! -f "$HELPER" ]; then
 		echo "ok=0" > "$OUT"
 		echo "error=找不到内置安装器脚本" >> "$OUT"
 		return 1
 	fi
-	APP_OPT_HELPER_DIR="$HELPER_DIR" \
-	APP_OPT_PACKAGE="${APP_OPT_PACKAGE:-}" \
-	APP_OPT_VERSION_CODE="${APP_OPT_VERSION_CODE:-}" \
-	APP_OPT_VERSION_NAME="${APP_OPT_VERSION_NAME:-}" \
+	QIXIA_HELPER_DIR="$HELPER_DIR" \
+	QIXIA_PACKAGE="${QIXIA_PACKAGE:-}" \
+	QIXIA_VERSION_CODE="${QIXIA_VERSION_CODE:-}" \
+	QIXIA_VERSION_NAME="${QIXIA_VERSION_NAME:-}" \
 	sh "$HELPER" "$@" > "$OUT" 2>&1
 	return $?
 }
@@ -92,7 +108,13 @@ print_helper_error() {
 	local OUT="$2"
 	ui_print "- $TITLE"
 	[ -f "$OUT" ] || return
-	sed -n '1,4p' "$OUT" | while IFS= read -r line; do
+	# 厂商框架的警告可能先于安装助手的真实错误输出。
+	# 优先展示结构化结果，避免主题警告掩盖 error= 中的失败原因。
+	if grep -q '^error=' "$OUT"; then
+		grep -E '^(error|where|command|exit|output)=' "$OUT"
+	else
+		tail -n 8 "$OUT"
+	fi | while IFS= read -r line; do
 		[ -n "$line" ] && ui_print "  $line"
 	done
 }
@@ -102,7 +124,7 @@ install_or_update_app() {
 	[ -f "$APP_META" ] || return
 	EMBEDDED_APP_CLEANUP_ALLOWED=0
 
-	if is_appopt_in_app_update; then
+	if is_qixia_in_app_update; then
 		ui_print "- App 内刷入模块：跳过当前会话内安装 App"
 		ui_print "- 已保留随附 App，重启后将自动更新 App"
 		return
@@ -117,10 +139,10 @@ install_or_update_app() {
 	APP_VERSION_CODE="$(grep_prop versionCode "$APP_META")"
 	APP_VERSION_NAME="$(grep_prop versionName "$APP_META")"
 	APP_VARIANT="$(grep_prop variant "$APP_META")"
-	[ -n "$APP_NAME" ] || APP_NAME="AppOpt"
+	[ -n "$APP_NAME" ] || APP_NAME="柒夏线程"
 	APP_DISPLAY="$APP_NAME $APP_VERSION_NAME ($APP_VERSION_CODE)"
 
-	[ -n "$APP_PKG" ] || APP_PKG="top.suto.appopt"
+	[ -n "$APP_PKG" ] || APP_PKG="top.qixia.threads"
 	if [ ! -f "$APP_APK" ]; then
 		ui_print "- 未找到随附应用，跳过安装"
 		return
@@ -132,8 +154,8 @@ install_or_update_app() {
 
 	chmod 0644 "$APP_APK" 2>/dev/null || true
 
-	APP_INFO="${TMPDIR:-/dev/tmp}/appopt_app_info.prop"
-	INSTALL_INFO="${TMPDIR:-/dev/tmp}/appopt_install_info.prop"
+	APP_INFO="${TMPDIR:-/dev/tmp}/qixia_app_info.prop"
+	INSTALL_INFO="${TMPDIR:-/dev/tmp}/qixia_install_info.prop"
 
 	if run_pkg_helper "$APP_INFO" app-info "$APP_PKG" && [ "$(grep_prop ok "$APP_INFO")" = "1" ]; then
 		if [ "$(grep_prop installed "$APP_INFO")" = "1" ]; then
@@ -182,7 +204,7 @@ install_or_update_app() {
 		ui_print "- 安装 App：$APP_DISPLAY"
 	fi
 
-	if APP_OPT_PACKAGE="$APP_PKG" APP_OPT_VERSION_CODE="$APP_VERSION_CODE" APP_OPT_VERSION_NAME="$APP_VERSION_NAME" run_pkg_helper "$INSTALL_INFO" install "$APP_APK" && [ "$(grep_prop ok "$INSTALL_INFO")" = "1" ]; then
+	if QIXIA_PACKAGE="$APP_PKG" QIXIA_VERSION_CODE="$APP_VERSION_CODE" QIXIA_VERSION_NAME="$APP_VERSION_NAME" run_pkg_helper "$INSTALL_INFO" install "$APP_APK" && [ "$(grep_prop ok "$INSTALL_INFO")" = "1" ]; then
 		ui_print "- 应用安装完成"
 		EMBEDDED_APP_CLEANUP_ALLOWED=1
 	else
@@ -192,8 +214,7 @@ install_or_update_app() {
 }
 cleanup_embedded_app() {
 	local APP_DIR="$MODPATH/config/app"
-	[ -d "$APP_DIR" ] || return
-	if is_appopt_in_app_update && [ -f "$APP_DIR/app.prop" ]; then
+	if is_qixia_in_app_update && [ -f "$APP_DIR/app.prop" ]; then
 		ui_print "- 已保留临时 App 安装文件，重启后自动更新"
 		return
 	fi
@@ -201,8 +222,13 @@ cleanup_embedded_app() {
 		ui_print "- 已保留临时 App 安装文件，可稍后重试或手动安装"
 		return
 	fi
-	rm -rf "$APP_DIR"
-	ui_print "- 已清理临时 App 安装文件"
+	if rm -rf "$APP_DIR" && rm -f \
+		"$MODPATH/config/tools/qixia_pkg_helper.jar" \
+		"$MODPATH/config/tools/qixia_pkg_helper.sh"; then
+		ui_print "- 已清理临时 App 安装文件及安装助手"
+	else
+		ui_print "! 临时 App 安装文件或安装助手清理失败，开机后重试"
+	fi
 }
 
 configure_joyose_smartop() {
@@ -211,16 +237,15 @@ configure_joyose_smartop() {
 	MIUI_VERSION="$(getprop ro.miui.ui.version.code)"
 	[ -n "$MIUI_VERSION" ] || return
 
-	# 模块升级时继承上一次记录的恢复责任；同时兼容旧版只写 pm enable 的格式。
-	ACTIVE_UNINSTALL="/data/adb/modules/AppOpt/uninstall.sh"
-	ORIGINAL_STATE="$(sed -n 's/^# APPOPT_JOYOSE_SMARTOP_ORIGINAL=\(default\|enabled\)$/\1/p' \
-		"$ACTIVE_UNINSTALL" 2>/dev/null | head -n 1)"
-	if [ -z "$ORIGINAL_STATE" ] && grep -Fq \
-		'pm enable com.xiaomi.joyose/.smartop.SmartOpService' "$ACTIVE_UNINSTALL" 2>/dev/null; then
-		ORIGINAL_STATE=enabled
+	# 柒夏线程模块更新时继承已记录的恢复责任。
+	ACTIVE_UNINSTALL="$QIXIA_UPGRADE_SOURCE/uninstall.sh"
+	ORIGINAL_STATE=""
+	if [ -n "$QIXIA_UPGRADE_SOURCE" ]; then
+		ORIGINAL_STATE="$(sed -n 's/^# QIXIA_JOYOSE_SMARTOP_ORIGINAL=\(default\|enabled\)$/\1/p' \
+			"$ACTIVE_UNINSTALL" 2>/dev/null | head -n 1)"
 	fi
 	if [ -z "$ORIGINAL_STATE" ]; then
-		JOYOSE_INFO="${TMPDIR:-/dev/tmp}/appopt_joyose_info.prop"
+		JOYOSE_INFO="${TMPDIR:-/dev/tmp}/qixia_joyose_info.prop"
 		if ! run_pkg_helper "$JOYOSE_INFO" component-state "$JOYOSE_COMPONENT" 0 ||
 			[ "$(grep_prop ok "$JOYOSE_INFO")" != "1" ]; then
 			ui_print "! 无法读取 Joyose SmartOpService 原始状态，本次不修改"
@@ -241,7 +266,7 @@ configure_joyose_smartop() {
 	fi
 
 	UNINSTALL_FILE="$MODPATH/uninstall.sh"
-	if ! grep -q '^# APPOPT_JOYOSE_SMARTOP_ORIGINAL=' "$UNINSTALL_FILE" 2>/dev/null; then
+	if ! grep -q '^# QIXIA_JOYOSE_SMARTOP_ORIGINAL=' "$UNINSTALL_FILE" 2>/dev/null; then
 		TEMP_FILE="$MODPATH/uninstall.sh.joyose.tmp.$$"
 		if [ -f "$UNINSTALL_FILE" ]; then
 			cp -pf "$UNINSTALL_FILE" "$TEMP_FILE" || {
@@ -259,7 +284,7 @@ configure_joyose_smartop() {
 		else
 			RESTORE_COMMAND='pm enable --user 0 com.xiaomi.joyose/.smartop.SmartOpService >/dev/null 2>&1 || true'
 		fi
-		if ! printf '# APPOPT_JOYOSE_SMARTOP_ORIGINAL=%s\n%s\n' \
+		if ! printf '# QIXIA_JOYOSE_SMARTOP_ORIGINAL=%s\n%s\n' \
 			"$ORIGINAL_STATE" "$RESTORE_COMMAND" >> "$TEMP_FILE" ||
 			! mv -f "$TEMP_FILE" "$UNINSTALL_FILE"; then
 			rm -f "$TEMP_FILE"
@@ -365,7 +390,7 @@ all_core="$(cat /sys/devices/system/cpu/present)"
 module_instructions() {
 	ui_print "********************************************"
 	ui_print "线程规则配置文件路径为："
-	ui_print "/data/adb/modules/AppOpt/config/applist.conf"
+	ui_print "/data/adb/modules/QixiaThreads/config/applist.conf"
 	ui_print "------------------------------------------"
 	ui_print "修改与添加规则无需重启，即时生效"
 	ui_print "********************************************"
@@ -414,21 +439,16 @@ module_instructions() {
 add_default_rules() {
 	mkdir -p $MODPATH/config
 	local CONFIG_FILE="$MODPATH/config/applist.conf"
-	local ACTIVE_CONFIG="/data/adb/modules/AppOpt/config/applist.conf"
-	local LEGACY_CONFIG="/data/adb/modules/AppOpt/applist.conf"
-	if [ -f "$ACTIVE_CONFIG" ]; then
-		cp -f "$ACTIVE_CONFIG" "$CONFIG_FILE"
+	local ACTIVE_CONFIG="$QIXIA_UPGRADE_SOURCE/config/applist.conf"
+	if [ -n "$QIXIA_UPGRADE_SOURCE" ] && [ -f "$ACTIVE_CONFIG" ]; then
+		cp -f "$ACTIVE_CONFIG" "$CONFIG_FILE" || abort "! 线程规则迁移失败，旧文件仍保留"
 		ui_print "- 线程规则配置：已保留"
-		return
-	elif [ -f "$LEGACY_CONFIG" ]; then
-		cp -f "$LEGACY_CONFIG" "$CONFIG_FILE"
-		ui_print "- 线程规则配置：已从旧路径迁移"
 		return
 	fi
 	[ -f "$MODPATH/rules.sh" ] || abort "! 找不到默认规则文件 rules.sh"
-	APPOPT_RULES_FILE="$CONFIG_FILE"
+	QIXIA_RULES_FILE="$CONFIG_FILE"
 	. "$MODPATH/rules.sh"
-	unset APPOPT_RULES_FILE
+	unset QIXIA_RULES_FILE
 	ui_print "- 已生成默认线程规则配置"
 }
 normalize_cpuset_name() {
@@ -442,48 +462,33 @@ normalize_cpuset_name() {
 
 prepare_calib_policy() {
 	mkdir -p $MODPATH/config
-	local ACTIVE_POLICY="/data/adb/modules/AppOpt/config/calib_policy.conf"
-	local LEGACY_POLICY="/data/adb/modules/AppOpt/calib_policy.conf"
+	local ACTIVE_POLICY="$QIXIA_UPGRADE_SOURCE/config/calib_policy.conf"
 	local PENDING_POLICY="$MODPATH/config/calib_policy.conf"
-	if [ -f "$ACTIVE_POLICY" ]; then
-		cp -f "$ACTIVE_POLICY" "$PENDING_POLICY"
+	if [ -n "$QIXIA_UPGRADE_SOURCE" ] && [ -f "$ACTIVE_POLICY" ]; then
+		cp -f "$ACTIVE_POLICY" "$PENDING_POLICY" || abort "! 校准设置迁移失败，旧文件仍保留"
 		ui_print "- 自动校准策略：已保留"
-	elif [ -f "$LEGACY_POLICY" ]; then
-		cp -f "$LEGACY_POLICY" "$PENDING_POLICY"
-		ui_print "- 自动校准策略：已从旧路径迁移"
 	else
-		local BEST_CORES HIGH_CORES MID_CORES FALLBACK_CORES
-		BEST_CORES="$(format_cpu_ranges "$hp_core")"
-		[ -n "$BEST_CORES" ] || BEST_CORES="$(format_cpu_ranges "$all_core")"
-		MID_CORES="$(format_cpu_ranges "$p_core")"
-		[ -n "$MID_CORES" ] || MID_CORES="$(format_cpu_ranges "$e_core")"
-		[ -n "$MID_CORES" ] || MID_CORES="$(format_cpu_ranges "$all_core")"
-		HIGH_CORES="$(format_cpu_ranges "$p_high_core")"
-		[ -n "$HIGH_CORES" ] || HIGH_CORES="$MID_CORES"
-		FALLBACK_CORES="$(format_cpu_ranges "$e_core $p_core")"
-		[ -n "$FALLBACK_CORES" ] || FALLBACK_CORES="$(format_cpu_ranges "$all_core")"
 		cat > "$PENDING_POLICY" <<EOF
-# AppOpt 自动校准策略
+# QixiaThreads 规则格式与运行设置
 # App 内可视化编辑；手动改动时请保持 key=value 格式。
-# 分配核心为连续 CPU 编号范围, 例如 7、5-6、0-6。
-version=1
-best_thread=avg:18,max:30,cores:$BEST_CORES
-group_high=avg:13,max:22,cores:$HIGH_CORES
-group_mid=avg:8,max:18,cores:$MID_CORES
-wildcard_group=max_member
+# 校准仅生成待确认建议，旧负载档位与固定核心不参与生成。
+version=2
 rule_output_format=legacy
-max_thread_rules=6
-fallback=cores:$FALLBACK_CORES
-cpuset_name=AppOptRs
+cpuset_name=QiXiaRs
+keep_all_cores_online=0
 EOF
 		ui_print "- 已生成默认自动校准策略配置"
+	fi
+	# 升级时保留用户设置，仅补齐缺失的默认值。
+	if ! grep -q '^[[:space:]]*keep_all_cores_online[[:space:]]*=' "$PENDING_POLICY"; then
+		printf '\nkeep_all_cores_online=0\n' >> "$PENDING_POLICY" || abort "! 核心在线策略补齐失败"
 	fi
 
 	local CPUSET_NAME TMP_POLICY
 	CPUSET_NAME="$(sed -n 's/^[[:space:]]*cpuset_name[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*$/\1/p' "$PENDING_POLICY" 2>/dev/null | tail -n 1)"
 	CPUSET_NAME="$(normalize_cpuset_name "$CPUSET_NAME" 2>/dev/null)" || CPUSET_NAME=""
 	if [ -z "$CPUSET_NAME" ]; then
-		CPUSET_NAME="AppOptRs"
+		CPUSET_NAME="QiXiaRs"
 		TMP_POLICY="$PENDING_POLICY.cpuset.tmp"
 		if awk '
 		{
@@ -497,47 +502,112 @@ EOF
 			ui_print "- Rust cpuset 运行组：已写入自动校准策略"
 		else
 			rm -f "$TMP_POLICY"
-			ui_print "! Rust cpuset 运行组写入失败，将使用默认 AppOptRs"
+			ui_print "! Rust cpuset 运行组写入失败，将使用默认 QiXiaRs"
 		fi
 	fi
 }
 
-# 模块升级时保留用户在 App 中选择的卡顿自动增强应用。
-prepare_jank_boost_config() {
+# 模块升级时保留自动核心分配的应用选择。
+prepare_auto_affinity_config() {
 	mkdir -p "$MODPATH/config"
-	local ACTIVE_JANK_BOOST="/data/adb/modules/AppOpt/config/jank_boost.conf"
-	local PENDING_JANK_BOOST="$MODPATH/config/jank_boost.conf"
-	if [ -f "$ACTIVE_JANK_BOOST" ]; then
-		cp -f "$ACTIVE_JANK_BOOST" "$PENDING_JANK_BOOST"
-		ui_print "- 卡顿提速应用：已保留"
-	else
-		: > "$PENDING_JANK_BOOST"
+	[ -n "$QIXIA_UPGRADE_SOURCE" ] || return 0
+	if [ -f "$QIXIA_UPGRADE_SOURCE/config/auto_affinity.conf" ]; then
+		cp -f "$QIXIA_UPGRADE_SOURCE/config/auto_affinity.conf" "$MODPATH/config/auto_affinity.conf" \
+			|| abort "! 自动分配应用列表迁移失败，旧文件仍保留"
 	fi
-	# 恢复清单只属于当前开机周期，不带入待刷入模块。
-	rm -f "$MODPATH/config/jank_boost.restore" "$MODPATH/config/jank_boost.restore.tmp" \
-		"$MODPATH/config/boost.restore" "$MODPATH/config/boost.restore.tmp" \
-		"$MODPATH/config/adaptive_governor.restore" \
-		"$MODPATH/config/adaptive_governor.restore.tmp"
 }
 
-# 守护运行状态在开机后重新生成，不从旧模块迁移。
+# 记录设置共用策略文件，升级时保留当前模块的记录开关。
+prepare_auto_history() {
+	local POLICY="$MODPATH/config/calib_policy.conf" FALLBACK=0 TEMP
+	TEMP="$POLICY.history.tmp"
+	# 安装时一次性转存当前模块的开关，运行期间不再读取独立配置文件。
+	if [ -n "$QIXIA_UPGRADE_SOURCE" ] && [ -f "$QIXIA_UPGRADE_SOURCE/config/auto_history.conf" ]; then
+		FALLBACK="$(awk '
+		{ sub(/#.*/, ""); if ($0 ~ /^[[:space:]]*$/) next
+		  split_at=index($0, "="); if (!split_at) { invalid=1; next }
+		  key=substr($0, 1, split_at-1); value=substr($0, split_at+1)
+		  gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+		  if (key == "enabled") { count++; enabled=value } }
+		END { print (!invalid && count == 1 && enabled == "1") ? 1 : 0 }
+		' "$QIXIA_UPGRADE_SOURCE/config/auto_history.conf")" || abort "! 自动分配记录设置读取失败"
+	fi
+	if awk -v fallback="$FALLBACK" '
+	{
+		clean=$0; sub(/#.*/, "", clean); split_at=index(clean, "=")
+		key=substr(clean, 1, split_at-1); value=substr(clean, split_at+1)
+		gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+		if (split_at && key == "auto_history_version") next
+		if (split_at && key == "auto_history_enabled") { count++; enabled=value; next }
+		print
+	}
+	END {
+		print "auto_history_version=1"
+		if (count == 0) enabled=fallback
+		print "auto_history_enabled=" ((count <= 1 && enabled == "1") ? 1 : 0)
+	}' "$POLICY" > "$TEMP" && mv -f "$TEMP" "$POLICY"; then
+		rm -f "$MODPATH/config/auto_history.conf" "$MODPATH/config/auto_history.version"
+	else
+		rm -f "$TEMP"
+		abort "! 自动分配记录设置合入策略文件失败"
+	fi
+}
+
+# 重建临时进程索引，保留规则判定结果和线程恢复数据。
 prepare_runtime_state_dir() {
 	mkdir -p "$MODPATH/config/state"
 	rm -f "$MODPATH/config/state/package_uid.map" "$MODPATH/config/state/package_uid.map."*.tmp \
-		"$MODPATH/config/state/pid_cache.tsv" "$MODPATH/config/state/pid_cache.tsv."*.tmp \
-		"$MODPATH/config/state/rule_health.tsv" "$MODPATH/config/state/rule_health.tsv."*.tmp
+		"$MODPATH/config/state/pid_cache.tsv" "$MODPATH/config/state/pid_cache.tsv."*.tmp
+	[ -n "$QIXIA_UPGRADE_SOURCE" ] || return 0
+	local FILE
+	for FILE in rule_health.tsv managed_tids.tsv auto_affinity.restore app_storage.conf; do
+		[ -f "$QIXIA_UPGRADE_SOURCE/config/state/$FILE" ] || continue
+		cp -pf "$QIXIA_UPGRADE_SOURCE/config/state/$FILE" "$MODPATH/config/state/" \
+			|| abort "! 模块运行状态保留失败：$FILE"
+	done
 }
 
-# 历史记录尚未被 App 导入前仍是用户数据；升级模块时连同认领中和隔离现场一起保留。
-prepare_history_dir() {
-	local ACTIVE_HISTORY="/data/adb/modules/AppOpt/history"
-	local SOURCE
-	[ -d "$ACTIVE_HISTORY" ] || return
-	mkdir -p "$MODPATH/history"
-	for SOURCE in "$ACTIVE_HISTORY"/*.log "$ACTIVE_HISTORY"/*.importing \
-		"$ACTIVE_HISTORY"/*.appopt-importing "$ACTIVE_HISTORY"/*.invalid.*; do
-		[ -f "$SOURCE" ] || continue
-		cp -pf "$SOURCE" "$MODPATH/history/" || abort "! 历史记录迁移失败：${SOURCE##*/}"
+# 更新目录布局时，不能丢弃当前模块尚未导入的用户数据。
+# 仅在安装时转存；守护进程和应用不再读取模块目录中的待导入文件。
+relocate_current_collection_files() {
+	[ -n "$QIXIA_UPGRADE_SOURCE" ] || return 0
+	local KIND SOURCE_DIR SOURCE NAME REGISTRATION FILES UID_VALUE USER_ID DESTINATION TEMP
+	REGISTRATION="$QIXIA_UPGRADE_SOURCE/config/state/app_storage.conf"
+	for KIND in history auto_history calibration_drafts; do
+		case "$KIND" in
+			history) SOURCE_DIR="$QIXIA_UPGRADE_SOURCE/history" ;;
+			*) SOURCE_DIR="$QIXIA_UPGRADE_SOURCE/config/$KIND" ;;
+		esac
+		for SOURCE in "$SOURCE_DIR"/*.log "$SOURCE_DIR"/*.tmp "$SOURCE_DIR"/*.draft \
+			"$SOURCE_DIR"/*.qixia-importing "$SOURCE_DIR"/*.invalid.* "$SOURCE_DIR/.draft.stamp"; do
+			[ -f "$SOURCE" ] && [ ! -L "$SOURCE" ] || continue
+			FILES=$(sed -n 's/^files=//p' "$REGISTRATION" 2>/dev/null)
+			UID_VALUE=$(sed -n 's/^uid=//p' "$REGISTRATION" 2>/dev/null)
+			case "$UID_VALUE" in ''|*[!0-9]*) abort "! 请先打开新版 App 初始化私有存储，再安装模块；原采集数据已保留" ;; esac
+			USER_ID=$((UID_VALUE / 100000))
+			case "$FILES" in
+				"/data/user/$USER_ID/top.qixia.threads/files") ;;
+				/data/data/top.qixia.threads/files) [ "$USER_ID" -eq 0 ] || abort "! App 存储用户不匹配" ;;
+				/mnt/expand/*/user/"$USER_ID"/top.qixia.threads/files) ;;
+				*) abort "! App 私有存储路径无效，采集数据仍保留在原位置" ;;
+			esac
+			[ -d "$FILES" ] && [ "$(stat -c %u "$FILES")" = "$UID_VALUE" ] \
+				|| abort "! 请解锁并打开新版 App 后重试；原采集数据已保留"
+			DESTINATION="$FILES/capture/$KIND"
+			mkdir -p "$DESTINATION" || abort "! 无法准备 App 私有采集目录"
+			NAME=${SOURCE##*/}
+			if [ -e "$DESTINATION/$NAME" ]; then
+				cmp -s "$SOURCE" "$DESTINATION/$NAME" || abort "! 采集文件同名冲突，双方数据均已保留：$NAME"
+				continue
+			fi
+			TEMP="$DESTINATION/.install.$NAME"
+			cp -p "$SOURCE" "$TEMP" && cmp -s "$SOURCE" "$TEMP" && mv "$TEMP" "$DESTINATION/$NAME" \
+				|| abort "! 采集数据转存失败，原文件已保留：$NAME"
+			chown "$UID_VALUE:$UID_VALUE" "$FILES/capture" "$DESTINATION" "$DESTINATION/$NAME" \
+				|| abort "! 无法设置采集目录归属"
+			chmod 0700 "$FILES/capture" "$DESTINATION"
+			restorecon -R "$FILES/capture" || abort "! 无法设置采集目录访问标签"
+		done
 	done
 }
 
@@ -585,16 +655,17 @@ module_instructions
 add_default_rules
 rm -f "$MODPATH/rules.sh"
 prepare_calib_policy
-prepare_jank_boost_config
-prepare_history_dir
+prepare_auto_affinity_config
+prepare_auto_history
 prepare_runtime_state_dir
+relocate_current_collection_files
 normalize_calib_rule_output_format
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 for SCRIPT in "$MODPATH"/*.sh; do
 	[ -f "$SCRIPT" ] && set_perm "$SCRIPT" 0 2000 0755 u:object_r:magisk_file:s0
 done
-[ -f "$MODPATH/config/bin/AppOptRs" ] && set_perm "$MODPATH/config/bin/AppOptRs" 0 2000 0755 u:object_r:magisk_file:s0
-[ -d "$MODPATH/config/app/tools" ] && chmod 0755 "$MODPATH/config/app/tools" "$MODPATH/config/app/tools"/*.sh 2>/dev/null
+[ -f "$MODPATH/config/bin/QiXiaRs" ] && set_perm "$MODPATH/config/bin/QiXiaRs" 0 2000 0755 u:object_r:magisk_file:s0
 [ -d "$MODPATH/config/tools" ] && chmod 0755 "$MODPATH/config/tools" "$MODPATH/config/tools"/*.sh 2>/dev/null
 install_or_update_app
 cleanup_embedded_app
+print_manual_migration_notice

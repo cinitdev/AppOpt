@@ -51,26 +51,26 @@ static long (*bpf_probe_read_compat)(void *dst, unsigned long long size, const v
  * - x86: 用户栈 esp + 4，esp 指向返回地址
  */
 #if defined(__TARGET_ARCH_arm64)
-struct appopt_pt_regs {
+struct qixia_pt_regs {
     unsigned long long regs[31];
     unsigned long long sp;
     unsigned long long pc;
     unsigned long long pstate;
 };
 
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
-    return ((struct appopt_pt_regs *)ctx)->regs[0];
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
+    return ((struct qixia_pt_regs *)ctx)->regs[0];
 }
 #elif defined(__TARGET_ARCH_arm)
-struct appopt_pt_regs {
+struct qixia_pt_regs {
     unsigned int uregs[18];
 };
 
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
-    return (unsigned long long)((struct appopt_pt_regs *)ctx)->uregs[0];
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
+    return (unsigned long long)((struct qixia_pt_regs *)ctx)->uregs[0];
 }
-#elif defined(APPOPT_BPF_X86_64)
-struct appopt_pt_regs {
+#elif defined(QIXIA_BPF_X86_64)
+struct qixia_pt_regs {
     unsigned long long r15;
     unsigned long long r14;
     unsigned long long r13;
@@ -94,11 +94,11 @@ struct appopt_pt_regs {
     unsigned long long ss;
 };
 
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
-    return ((struct appopt_pt_regs *)ctx)->di;
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
+    return ((struct qixia_pt_regs *)ctx)->di;
 }
-#elif defined(APPOPT_BPF_I386)
-struct appopt_pt_regs {
+#elif defined(QIXIA_BPF_I386)
+struct qixia_pt_regs {
     unsigned int bx;
     unsigned int cx;
     unsigned int dx;
@@ -118,9 +118,9 @@ struct appopt_pt_regs {
     unsigned int ss;
 };
 
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
     unsigned int value = 0;
-    unsigned int sp = ((struct appopt_pt_regs *)ctx)->sp;
+    unsigned int sp = ((struct qixia_pt_regs *)ctx)->sp;
     if (sp == 0) {
         return 0;
     }
@@ -130,7 +130,7 @@ static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
     return (unsigned long long)value;
 }
 #else
-static __always_inline unsigned long long appopt_read_parm1(void *ctx) {
+static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
     (void)ctx;
     return 0;
 }
@@ -254,7 +254,7 @@ int on_queue_buffer(void *ctx) {
 
     /* Surface/ANativeWindow 指针用于用户态按真实 Surface 分流。
      * 如果当前 ABI 未实现参数读取，会返回 0，用户态自动退回 TID 分流。 */
-    local.surface_ptr = appopt_read_parm1(ctx);
+    local.surface_ptr = qixia_read_parm1(ctx);
 
     int stats_result = record_frame_stats(&local);
     if (stats_result == 0) {

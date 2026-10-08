@@ -8,7 +8,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 在线更新: 读取 updateJson、changelog 并交给系统 DownloadManager 下载模块 zip -->
+    <!-- 模块更新: 读取 Gitee 更新清单并下载 Root 模块 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Android 11+ 包可见性: 需要读取任意应用的名称/图标并能拉起它们 -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
@@ -19,17 +19,18 @@
         tools:ignore="ProtectedPermissions" />
 
     <application
+        android:name=".QixiaThreadsApplication"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AppOpt">
+        android:theme="@style/Theme.QixiaThreads">
 
         <activity
-            android:name=".MainActivity"
+            android:name=".QixiaThreadsComposeActivity"
             android:exported="true"
-            android:theme="@style/Theme.AppOpt.Starting">
+            android:theme="@style/Theme.QixiaThreads.Compose.Starting">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

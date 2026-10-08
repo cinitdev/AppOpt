@@ -1,10 +1,15 @@
 [package]
-name = "appopt_daemon_rs"
+name = "qixia_daemon_rs"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+qixia-kernel-info = { path = "../kernel_info" }
+qixia-history-probe = { path = "../history_probe" }
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
-appopt-ebpf-bridge = { path = "../fps_monitor/appopt_ebpf_bridge" }
+qixia-ebpf-bridge = { path = "../fps_monitor/qixia_ebpf_bridge" }
 libc = "0.2"
 
 [profile.release]

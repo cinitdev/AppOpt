@@ -41,4 +41,13 @@
     <color name="rule_hierarchy">#BBD7D2</color>
     <color name="nav_inactive">#77798B</color>
     <color name="nav_divider">#B8BAC8</color>
+
+    <!-- Clear Tech / 科技蓝 -->
+    <color name="launcher_background">#356FE5</color>
+    <color name="compose_background">#F5F8FF</color>
+    <color name="compose_surface">#FFFFFF</color>
+    <color name="compose_surface_high">#F0F5FF</color>
+    <color name="compose_primary">#356FE5</color>
+    <color name="compose_secondary">#4FCE91</color>
+    <color name="compose_success">#27704E</color>
 </resources>

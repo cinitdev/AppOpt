@@ -83,7 +83,7 @@
         android:background="@drawable/bg_history_sparkline"
         android:padding="6dp">
 
-        <top.suto.appopt.SparklineView
+        <top.qixia.threads.SparklineView
             android:id="@+id/threadSpark"
             android:layout_width="match_parent"
             android:layout_height="match_parent" />

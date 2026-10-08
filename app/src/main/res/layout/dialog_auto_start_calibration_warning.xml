@@ -66,7 +66,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="16dp"
         android:lineSpacingExtra="3dp"
-        android:text="从待校准列表启动应用后，AppOpt 会在检测到目标应用进入前台时自动开始记录，无需再次点击悬浮胶囊。"
+        android:text="从待校准列表启动应用后，QixiaThreads 会在检测到目标应用进入前台时自动开始记录，无需再次点击悬浮胶囊。"
         android:textColor="@color/text_primary"
         android:textSize="14sp" />
 

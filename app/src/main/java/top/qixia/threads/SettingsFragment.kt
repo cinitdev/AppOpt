@@ -1,0 +1,1337 @@
+package top.qixia.threads
+
+import android.graphics.Typeface
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.EditText
+import android.widget.GridLayout
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.doOnPreDraw
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.google.android.material.checkbox.MaterialCheckBox
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.tabs.TabLayout
+import com.google.android.material.textfield.TextInputLayout
+import java.util.concurrent.Executors
+import top.qixia.threads.databinding.FragmentSettingsBinding
+import top.qixia.threads.databinding.DialogCpusetNameBinding
+import top.qixia.threads.databinding.DialogPolicyModeBinding
+import top.qixia.threads.databinding.DialogRuleOutputFormatBinding
+
+class SettingsFragment : TopLevelFragment() {
+
+    private var _binding: FragmentSettingsBinding? = null
+    private val binding: FragmentSettingsBinding
+        get() = checkNotNull(_binding)
+    private var viewGeneration = 0
+    private var policyLoadGeneration = 0
+    private var policyLoadInFlight = false
+    private var policyLoaded = false
+    private var policyGuideLayoutReady = false
+    private var lastPolicyLoadFinishedAt = 0L
+    private var lockedByPendingUpdate = false
+    private var hasRoot = false
+    private var moduleVersion: DaemonBridge.ModuleVersion? = null
+    private var policyEditable = false
+    private var suppressPolicyChange = false
+    private var currentWildcardGroup = CalibPolicy.WildcardGroup.MAX_MEMBER
+    private var currentRuleOutputFormat = CalibPolicy.RuleOutputFormat.LEGACY
+    private var formatConversionBusy = false
+    private var cpusetEditable = false
+    private var cpusetBusy = false
+    private var cpusetSupported = false
+    private var currentCpusetName = CalibPolicy.DEFAULT_CPUSET_NAME
+    private var presentCpus: Set<Int> = emptySet()
+    private var currentDetectedTopologyBlock = ""
+    private var availableCpus: List<Int> = (0..7).toList()
+    private val bestCores = linkedSetOf<Int>()
+    private val highCores = linkedSetOf<Int>()
+    private val midCores = linkedSetOf<Int>()
+    private val fallbackCores = linkedSetOf<Int>()
+    private var autoSaveRunnable: Runnable? = null
+    /** cpuset 写入期间暂存的策略修改，等 cpuset 写入完成后用最新输入重新写入。 */
+    private var policySavePendingAfterCpuset = false
+    private var cpusetOperationId = 0L
+    private var coreWarningRunnable: Runnable? = null
+    private var coreWarningView: TextView? = null
+    private var saveSeq = 0
+    private var selectedSettingsTab = SettingsTab.RULES
+    private var pendingRestoredPolicyDraft: CalibPolicy? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private enum class SettingsTab(val title: String) {
+        RULES("规则生成"),
+        PERFORMANCE("性能档位")
+    }
+
+    private companion object {
+        const val MIN_MODULE_VERSION_CODE = DaemonBridge.REQUIRED_MODULE_VERSION_CODE
+        const val MIN_MODULE_VERSION_NAME = DaemonBridge.REQUIRED_MODULE_VERSION_NAME
+        const val POLICY_REFRESH_INTERVAL_MS = 3_000L
+        const val STATE_SETTINGS_TAB = "settings_tab"
+        const val STATE_RULE_SCROLL_Y = "settings_rule_scroll_y"
+        const val STATE_PERFORMANCE_SCROLL_Y = "settings_performance_scroll_y"
+        const val STATE_POLICY_DRAFT = "settings_policy_draft"
+        val POLICY_IO_EXECUTOR = Executors.newSingleThreadExecutor()
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentSettingsBinding.inflate(inflater, container, false)
+        viewGeneration++
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        prepareTopLevelPage(binding.settingsHeader)
+        applyBottomNavigationScrollClearance()
+        selectedSettingsTab = SettingsTab.entries.getOrElse(
+            savedInstanceState?.getInt(STATE_SETTINGS_TAB, selectedSettingsTab.ordinal)
+                ?: selectedSettingsTab.ordinal
+        ) { SettingsTab.RULES }
+        pendingRestoredPolicyDraft = savedInstanceState
+            ?.getString(STATE_POLICY_DRAFT)
+            ?.takeIf(String::isNotBlank)
+            ?.let { runCatching { CalibPolicy.parse(it) }.getOrNull() }
+        setupSettingsTabs()
+        if (savedInstanceState != null) {
+            val ruleScrollY = savedInstanceState.getInt(STATE_RULE_SCROLL_Y, 0)
+            val performanceScrollY = savedInstanceState.getInt(STATE_PERFORMANCE_SCROLL_Y, 0)
+            binding.root.doOnPreDraw {
+                binding.ruleSettingsPage.scrollTo(0, ruleScrollY)
+                binding.performanceSettingsPage.scrollTo(0, performanceScrollY)
+            }
+        }
+
+        binding.settingsHelpButton.setOnClickListener {
+            (activity as? MainActivity)?.showUsageGuide(showAll = true)
+        }
+        binding.wildcardModeRow.setOnClickListener {
+            if (policyEditable) showWildcardModeDialog()
+        }
+        binding.ruleOutputFormatRow.setOnClickListener {
+            if (policyEditable) showRuleOutputFormatDialog()
+        }
+        binding.cpusetNameRow.setOnClickListener {
+            if (cpusetEditable) showCpusetNameDialog()
+        }
+
+        setupAutoSave()
+        binding.resetPolicy.setOnClickListener {
+            showResetPolicyConfirm()
+        }
+
+        setPolicyInputsEnabled(false)
+        updateCpusetNameRow()
+        setPolicyStatus("正在读取策略")
+    }
+
+    private fun applyBottomNavigationScrollClearance() {
+        val root = binding.root
+        val ruleForm = binding.policyForm
+        val performanceForm = binding.performanceForm
+        val ruleBottom = ruleForm.paddingBottom
+        val performanceBottom = performanceForm.paddingBottom
+        val gap = resources.getDimensionPixelSize(R.dimen.bottom_navigation_scroll_gap)
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val navigationBottom = insets
+                .getInsets(WindowInsetsCompat.Type.navigationBars())
+                .bottom
+            ruleForm.setPadding(
+                ruleForm.paddingLeft,
+                ruleForm.paddingTop,
+                ruleForm.paddingRight,
+                ruleBottom + navigationBottom + gap
+            )
+            performanceForm.setPadding(
+                performanceForm.paddingLeft,
+                performanceForm.paddingTop,
+                performanceForm.paddingRight,
+                performanceBottom + navigationBottom + gap
+            )
+            insets
+        }
+        ViewCompat.requestApplyInsets(root)
+    }
+
+    private fun setupSettingsTabs() {
+        val tabs = binding.settingsTabs
+        tabs.removeAllTabs()
+        SettingsTab.entries.forEach { tab ->
+            tabs.addTab(tabs.newTab().setText(tab.title), false)
+        }
+        tabs.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab) {
+                showSettingsTab(SettingsTab.entries.getOrElse(tab.position) { SettingsTab.RULES })
+            }
+
+            override fun onTabUnselected(tab: TabLayout.Tab) = Unit
+
+            override fun onTabReselected(tab: TabLayout.Tab) {
+                when (selectedSettingsTab) {
+                    SettingsTab.RULES -> binding.ruleSettingsPage.smoothScrollTo(0, 0)
+                    SettingsTab.PERFORMANCE -> binding.performanceSettingsPage.smoothScrollTo(0, 0)
+                }
+            }
+        })
+        tabs.getTabAt(selectedSettingsTab.ordinal)?.select()
+        showSettingsTab(selectedSettingsTab)
+    }
+
+    private fun showSettingsTab(tab: SettingsTab) {
+        selectedSettingsTab = tab
+        binding.ruleSettingsPage.visibility = if (tab == SettingsTab.RULES) View.VISIBLE else View.GONE
+        binding.performanceSettingsPage.visibility =
+            if (tab == SettingsTab.PERFORMANCE) View.VISIBLE else View.GONE
+    }
+
+    fun prepareUsageGuideTarget(target: UsageGuide.Target): View? {
+        if (_binding == null) return null
+        if (target == UsageGuide.Target.RULE_GENERATION ||
+            target == UsageGuide.Target.RULE_GENERATION_LIMIT ||
+            target == UsageGuide.Target.SIMILAR_THREADS ||
+            target == UsageGuide.Target.PERFORMANCE_TIERS ||
+            target == UsageGuide.Target.PROCESS_FALLBACK ||
+            target == UsageGuide.Target.CPUSET_RUNTIME) {
+            if (!policyLoaded || policyLoadInFlight || !policyGuideLayoutReady) return null
+        }
+        return when (target) {
+            UsageGuide.Target.RULE_GENERATION -> {
+                selectSettingsTabForGuide(SettingsTab.RULES)
+                binding.ruleSettingsPage.scrollTo(0, 0)
+                binding.ruleOutputFormatRow
+            }
+
+            UsageGuide.Target.RULE_GENERATION_LIMIT -> {
+                selectSettingsTabForGuide(SettingsTab.RULES)
+                binding.generationLimitCard.also {
+                    scrollUsageGuideTargetToTop(binding.ruleSettingsPage, it)
+                }
+            }
+
+            UsageGuide.Target.SIMILAR_THREADS -> {
+                selectSettingsTabForGuide(SettingsTab.RULES)
+                binding.wildcardModeRow.also {
+                    scrollUsageGuideTargetToTop(binding.ruleSettingsPage, it)
+                }
+            }
+
+            UsageGuide.Target.PERFORMANCE_TIERS -> {
+                selectSettingsTabForGuide(SettingsTab.PERFORMANCE)
+                binding.performanceSettingsPage.scrollTo(0, 0)
+                binding.performanceTierBestCard
+            }
+
+            UsageGuide.Target.PROCESS_FALLBACK -> {
+                selectSettingsTabForGuide(SettingsTab.PERFORMANCE)
+                binding.processFallbackCard.also {
+                    scrollUsageGuideTargetToTop(binding.performanceSettingsPage, it)
+                }
+            }
+
+            UsageGuide.Target.CPUSET_RUNTIME -> {
+                selectSettingsTabForGuide(SettingsTab.PERFORMANCE)
+                binding.cpusetNameRow.also {
+                    scrollUsageGuideTargetToTop(binding.performanceSettingsPage, it)
+                }
+            }
+
+            UsageGuide.Target.HELP_BUTTON -> binding.settingsHelpButton
+            else -> null
+        }
+    }
+
+    private fun selectSettingsTabForGuide(tab: SettingsTab) {
+        if (selectedSettingsTab != tab) {
+            binding.settingsTabs.getTabAt(tab.ordinal)?.select()
+        } else {
+            showSettingsTab(tab)
+        }
+    }
+
+    private fun scrollUsageGuideTargetToTop(scrollView: ViewGroup, target: View) {
+        val targetTop = (target.top - 12.dp).coerceAtLeast(0)
+        when (scrollView) {
+            is androidx.core.widget.NestedScrollView -> scrollView.scrollTo(0, targetTop)
+            else -> target.requestRectangleOnScreen(
+                android.graphics.Rect(0, 0, target.width, target.height),
+                false
+            )
+        }
+    }
+
+    fun currentUsageGuideTabIndex(): Int = selectedSettingsTab.ordinal
+
+    fun restoreUsageGuideTab(index: Int) {
+        if (_binding == null) return
+        binding.settingsTabs.getTabAt(index.coerceIn(0, SettingsTab.entries.lastIndex))?.select()
+    }
+
+    override fun onTopLevelPageSelected() {
+        if (_binding == null) return
+        if (!policyLoaded ||
+            SystemClock.elapsedRealtime() - lastPolicyLoadFinishedAt >= POLICY_REFRESH_INTERVAL_MS) {
+            loadPolicy()
+        }
+    }
+
+    private fun loadPolicy() {
+        if (_binding == null) return
+        if (policyLoadInFlight) return
+        cancelAutoSave()
+        policyLoadInFlight = true
+        policyGuideLayoutReady = false
+        val generation = ++policyLoadGeneration
+        val currentViewGeneration = viewGeneration
+        policyEditable = false
+        setPolicyStatus("正在读取策略")
+        setPolicyInputsEnabled(false)
+        POLICY_IO_EXECUTOR.execute {
+            try {
+                val snapshot = DaemonBridge.readSettingsPolicySnapshot()
+                val root = snapshot.hasRoot
+                val version = snapshot.moduleVersion
+                val file = snapshot.policyFile
+                val cpusetSupported = root && snapshot.cpusetSupported
+                val presentCpus = if (root) snapshot.presentCpus else emptySet()
+                val rawPolicy = file?.takeIf { it.readSuccess }?.content?.takeIf { it.isNotBlank() }
+                val policy = rawPolicy
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { CalibPolicy.parse(it) }
+                    ?: CalibPolicy.DEFAULT
+                runOnUiThread {
+                    if (currentViewGeneration != viewGeneration || generation != policyLoadGeneration ||
+                        isFinishing || isDestroyed) return@runOnUiThread
+                    policyLoadInFlight = false
+                    policyLoaded = true
+                    lastPolicyLoadFinishedAt = SystemClock.elapsedRealtime()
+                    hasRoot = root
+                    moduleVersion = version
+                    this.presentCpus = presentCpus
+                    lockedByPendingUpdate = file?.lockedByPendingUpdate == true
+                    val moduleOk = version?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
+                    val moduleLabel = version?.let { "${it.versionName} (${it.versionCode})" }
+                    val restoredDraft = pendingRestoredPolicyDraft
+                    pendingRestoredPolicyDraft = null
+                    val canRestoreDraft = root && moduleOk && !lockedByPendingUpdate &&
+                        file?.readSuccess == true
+                    val boundPolicy = if (canRestoreDraft && restoredDraft != null) {
+                        restoredDraft.copy(
+                            cpusetName = policy.cpusetName,
+                            detectedTopologyBlock = policy.detectedTopologyBlock
+                        ).normalized()
+                    } else {
+                        policy
+                    }
+                    bindPolicy(boundPolicy)
+                    this.cpusetSupported = cpusetSupported
+                    binding.policyLockedNotice.visibility =
+                        if (lockedByPendingUpdate || (root && !moduleOk)) View.VISIBLE else View.GONE
+                    binding.policyLockedNotice.text = when {
+                        lockedByPendingUpdate ->
+                            "模块更新待重启，当前刷入的模块尚未生效，重启后才能修改自动校准策略"
+                        root && version == null ->
+                            "未检测到兼容的 QixiaThreads 模块，请刷入 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE) 或更高版本模块"
+                        root && !moduleOk ->
+                            "当前模块版本 $moduleLabel 低于 App 要求，请刷入 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE) 或更高版本模块"
+                        else -> binding.policyLockedNotice.text
+                    }
+                    setPolicyStatus(when {
+                        !root -> "需要 Root 权限读取和保存策略"
+                        version == null -> "未检测到模块版本，策略已锁定"
+                        !moduleOk -> "当前模块版本 $moduleLabel，低于要求 v$MIN_MODULE_VERSION_NAME ($MIN_MODULE_VERSION_CODE)，策略已锁定"
+                        file?.readSuccess == false -> "策略文件读取失败，请检查 Root 权限后重试"
+                        lockedByPendingUpdate -> "读取待生效更新配置：${file?.path.orEmpty()}"
+                        file?.exists == false -> "策略文件不存在，可点击恢复默认重新生成；修改任意设置也会重新创建"
+                        file?.content.isNullOrBlank() -> "策略文件为空，修改后会自动保存当前策略"
+                        else -> "当前配置：${file?.path.orEmpty()}，修改后自动保存"
+                    })
+                    policyEditable = root && moduleOk && !lockedByPendingUpdate && file?.readSuccess == true
+                    cpusetEditable = policyEditable && cpusetSupported
+                    setPolicyInputsEnabled(policyEditable)
+                    updateCpusetNameRow()
+                    if (canRestoreDraft && restoredDraft != null && boundPolicy != policy) {
+                        policySavePendingAfterCpuset = true
+                    }
+                    flushPendingPolicySaveIfReady()
+                    markPolicyGuideLayoutReady(generation, currentViewGeneration)
+                }
+            } catch (error: Exception) {
+                android.util.Log.e("QixiaThreads", "读取校准策略失败", error)
+                runOnUiThread {
+                    if (currentViewGeneration != viewGeneration || generation != policyLoadGeneration ||
+                        isFinishing || isDestroyed) return@runOnUiThread
+                    policyLoadInFlight = false
+                    policyLoaded = true
+                    lastPolicyLoadFinishedAt = SystemClock.elapsedRealtime()
+                    policyEditable = false
+                    cpusetEditable = false
+                    cpusetSupported = false
+                    setPolicyInputsEnabled(false)
+                    updateCpusetNameRow()
+                    setPolicyStatus("策略文件读取失败，请检查 Root 权限后重试")
+                    markPolicyGuideLayoutReady(generation, currentViewGeneration)
+                }
+            }
+        }
+    }
+
+    private fun markPolicyGuideLayoutReady(generation: Int, currentViewGeneration: Int) {
+        if (_binding == null) return
+        binding.root.doOnPreDraw {
+            if (_binding != null && generation == policyLoadGeneration &&
+                currentViewGeneration == viewGeneration) {
+                policyGuideLayoutReady = true
+            }
+        }
+    }
+
+    private fun bindPolicy(policy: CalibPolicy) {
+        suppressPolicyChange = true
+        try {
+            clearPolicyInputErrors()
+            currentDetectedTopologyBlock = policy.detectedTopologyBlock
+            currentWildcardGroup = policy.wildcardGroup
+            currentRuleOutputFormat = policy.ruleOutputFormat.generationTarget()
+            currentCpusetName = policy.cpusetName
+
+            val topology = parseDetectedTopology(currentDetectedTopologyBlock)
+            availableCpus = availableCpuList(policy, topology)
+            renderTopologySummary(topology)
+
+            binding.bestAvgInput.setText(policy.bestAvg.formatOne())
+            binding.bestMaxInput.setText(policy.bestMax.formatOne())
+            binding.highAvgInput.setText(policy.highAvg.formatOne())
+            binding.highMaxInput.setText(policy.highMax.formatOne())
+            binding.midAvgInput.setText(policy.midAvg.formatOne())
+            binding.midMaxInput.setText(policy.midMax.formatOne())
+            binding.maxRulesInput.setText(policy.maxThreadRules.toString())
+
+            setCoreSelection(bestCores, resolveCores(policy.bestCores, topology["big"] ?: CalibPolicy.DEFAULT_BEST_CORES))
+            setCoreSelection(highCores, resolveCores(policy.highCores, topology["middle_high"] ?: topology["middle"] ?: CalibPolicy.DEFAULT_HIGH_CORES))
+            setCoreSelection(midCores, resolveCores(policy.midCores, topology["middle"] ?: CalibPolicy.DEFAULT_MID_CORES))
+            setCoreSelection(
+                fallbackCores,
+                resolveCores(policy.fallbackCores, topology["nonbig"] ?: CalibPolicy.DEFAULT_FALLBACK_CORES)
+            )
+            renderCoreSelectors()
+            updateWildcardModeText()
+            updateRuleOutputFormatText()
+        } finally {
+            suppressPolicyChange = false
+        }
+    }
+
+    private fun clearPolicyInputErrors() {
+        listOf(
+            binding.bestAvgLayout,
+            binding.bestMaxLayout,
+            binding.highAvgLayout,
+            binding.highMaxLayout,
+            binding.midAvgLayout,
+            binding.midMaxLayout,
+            binding.maxRulesLayout
+        ).forEach {
+            it.error = null
+            it.isErrorEnabled = false
+        }
+    }
+
+    private fun percent(input: EditText, layout: TextInputLayout): Double? {
+        val v = input.text?.toString()?.trim()?.toIntOrNull()
+        setInputError(layout, if (v == null || v < 0 || v > 100) "0-100 整数" else null)
+        return if (layout.error == null) v?.toDouble() else null
+    }
+
+    private fun ruleCount(input: EditText, layout: TextInputLayout): Int? {
+        val v = input.text?.toString()?.trim()?.toIntOrNull()
+        setInputError(layout, if (v == null || v !in 1..12) "1-12" else null)
+        return if (layout.error == null) v else null
+    }
+
+    private fun setInputError(layout: TextInputLayout, message: String?) {
+        layout.error = message
+        layout.isErrorEnabled = message != null
+    }
+
+    private fun readPolicyFromInputs(): CalibPolicy? {
+        val bestAvg = percent(binding.bestAvgInput, binding.bestAvgLayout)
+        val bestMax = percent(binding.bestMaxInput, binding.bestMaxLayout)
+        val highAvg = percent(binding.highAvgInput, binding.highAvgLayout)
+        val highMax = percent(binding.highMaxInput, binding.highMaxLayout)
+        val midAvg = percent(binding.midAvgInput, binding.midAvgLayout)
+        val midMax = percent(binding.midMaxInput, binding.midMaxLayout)
+        val maxRules = ruleCount(binding.maxRulesInput, binding.maxRulesLayout)
+        if (listOf(bestAvg, bestMax, highAvg, highMax, midAvg, midMax, maxRules).any { it == null }) {
+            return null
+        }
+        if (listOf(bestCores, highCores, midCores, fallbackCores).any { it.isEmpty() }) {
+            return null
+        }
+        return CalibPolicy(
+            bestAvg = bestAvg!!,
+            bestMax = bestMax!!,
+            bestCores = formatCpuSet(bestCores),
+            highAvg = highAvg!!,
+            highMax = highMax!!,
+            highCores = formatCpuSet(highCores),
+            midAvg = midAvg!!,
+            midMax = midMax!!,
+            midCores = formatCpuSet(midCores),
+            maxThreadRules = maxRules!!,
+            wildcardGroup = currentWildcardGroup,
+            ruleOutputFormat = currentRuleOutputFormat,
+            fallbackCores = formatCpuSet(fallbackCores),
+            cpusetName = currentCpusetName,
+            detectedTopologyBlock = currentDetectedTopologyBlock
+        ).normalized()
+    }
+
+    private fun setupAutoSave() {
+        val watcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: Editable?) {
+                if (!suppressPolicyChange) schedulePolicySave()
+            }
+        }
+        listOf(
+            binding.bestAvgInput,
+            binding.bestMaxInput,
+            binding.highAvgInput,
+            binding.highMaxInput,
+            binding.midAvgInput,
+            binding.midMaxInput,
+            binding.maxRulesInput
+        ).forEach { it.addTextChangedListener(watcher) }
+    }
+
+    private fun schedulePolicySave(delayMs: Long = 650L) {
+        if (!policyEditable || suppressPolicyChange) return
+        autoSaveRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            autoSaveRunnable = null
+            if (cpusetBusy) {
+                policySavePendingAfterCpuset = true
+                return@Runnable
+            }
+            val policy = readPolicyFromInputs() ?: return@Runnable
+            savePolicy(policy, ++saveSeq)
+        }
+        autoSaveRunnable = runnable
+        mainHandler.postDelayed(runnable, delayMs)
+    }
+
+    private fun cancelAutoSave() {
+        autoSaveRunnable?.let { mainHandler.removeCallbacks(it) }
+        autoSaveRunnable = null
+    }
+
+    private fun flushPendingPolicySaveIfReady() {
+        if (!policySavePendingAfterCpuset || cpusetBusy || !policyEditable || _binding == null) {
+            return
+        }
+        policySavePendingAfterCpuset = false
+        schedulePolicySave(delayMs = 0L)
+    }
+
+    private fun flushAutoSave() {
+        val pending = autoSaveRunnable ?: return
+        mainHandler.removeCallbacks(pending)
+        autoSaveRunnable = null
+        if (!policyEditable || suppressPolicyChange) return
+        if (cpusetBusy) {
+            policySavePendingAfterCpuset = true
+            return
+        }
+        val policy = readPolicyFromInputs() ?: return
+        savePolicy(policy, ++saveSeq)
+    }
+
+    private fun showResetPolicyConfirm() {
+        if (!policyEditable) return
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle("恢复默认策略")
+            .setMessage("会把自动校准策略恢复为默认阈值和默认核心分配，并立即写入配置文件。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("恢复") { _, _ ->
+                restoreModuleDefaultPolicy()
+            }
+            .show()
+    }
+
+    private fun restoreModuleDefaultPolicy() {
+        cancelAutoSave()
+        val policy = moduleDefaultPolicy()
+        setPolicyStatus("默认策略已生成，正在保存")
+        setPolicyInputsEnabled(false)
+        bindPolicy(policy)
+        val moduleOk = moduleVersion?.versionCode?.let { it >= MIN_MODULE_VERSION_CODE } == true
+        policyEditable = hasRoot && moduleOk && !lockedByPendingUpdate
+        setPolicyInputsEnabled(policyEditable)
+        val effectivePolicy = readPolicyFromInputs() ?: policy
+        val seq = ++saveSeq
+        savePolicy(effectivePolicy, seq, successMessage = "已恢复默认策略")
+    }
+
+    private fun moduleDefaultPolicy(): CalibPolicy {
+        val topology = parseDetectedTopology(currentDetectedTopologyBlock)
+        return CalibPolicy.DEFAULT.copy(
+            bestCores = topology["big"] ?: CalibPolicy.DEFAULT_BEST_CORES,
+            highCores = topology["middle_high"] ?: topology["middle"] ?: CalibPolicy.DEFAULT_HIGH_CORES,
+            midCores = topology["middle"] ?: CalibPolicy.DEFAULT_MID_CORES,
+            fallbackCores = topology["nonbig"] ?: CalibPolicy.DEFAULT_FALLBACK_CORES,
+            cpusetName = currentCpusetName,
+            detectedTopologyBlock = currentDetectedTopologyBlock
+        ).normalized()
+    }
+
+    private fun savePolicy(policy: CalibPolicy, seq: Int, successMessage: String? = null) {
+        if (!hasRoot) {
+            toast("请先授予 Root 权限")
+            return
+        }
+        if (lockedByPendingUpdate) {
+            toast("模块更新待重启，当前不能修改策略")
+            return
+        }
+        val currentViewGeneration = viewGeneration
+        POLICY_IO_EXECUTOR.execute {
+            val ok = DaemonBridge.applyRuleOutputFormat(policy.ruleOutputFormat, policy.toConfigText()).success
+            runOnUiThread {
+                if (currentViewGeneration != viewGeneration || _binding == null ||
+                    isFinishing || isDestroyed) return@runOnUiThread
+                if (seq != saveSeq) return@runOnUiThread
+                if (ok) {
+                    successMessage?.let {
+                        setPolicyStatus("$it，修改后自动保存")
+                        toast(it)
+                    }
+                } else {
+                    toast("自动保存失败，请检查 Root 或模块状态")
+                }
+            }
+        }
+    }
+
+    private fun setPolicyInputsEnabled(enabled: Boolean) {
+        val alpha = if (enabled) 1f else 0.55f
+        val inputs = listOf(
+            binding.bestAvgInput,
+            binding.bestMaxInput,
+            binding.highAvgInput,
+            binding.highMaxInput,
+            binding.midAvgInput,
+            binding.midMaxInput,
+            binding.maxRulesInput
+        )
+        for (input in inputs) {
+            input.isEnabled = enabled
+            input.alpha = alpha
+        }
+        binding.wildcardModeRow.isEnabled = enabled
+        binding.wildcardModeRow.alpha = alpha
+        binding.ruleOutputFormatRow.isEnabled = enabled
+        binding.ruleOutputFormatRow.alpha = alpha
+        setCoreGridEnabled(binding.bestCoresGrid, enabled, alpha)
+        setCoreGridEnabled(binding.highCoresGrid, enabled, alpha)
+        setCoreGridEnabled(binding.midCoresGrid, enabled, alpha)
+        setCoreGridEnabled(binding.fallbackCoresGrid, enabled, alpha)
+        binding.resetPolicy.isEnabled = enabled
+    }
+
+    private fun updateCpusetNameRow() {
+        if (_binding == null) return
+        binding.cpusetNameValue.text = currentCpusetName
+        binding.cpusetNameDesc.text = when {
+            !policyLoaded -> "正在读取 Rust 守护运行设置"
+            !hasRoot -> "需要 Root 权限读取和保存运行设置"
+            lockedByPendingUpdate -> "模块更新待重启，当前不能修改运行设置"
+            !cpusetSupported -> "当前 Rust 守护不支持自定义 cpuset，请先更新模块"
+            else -> "受控线程使用 /dev/cpuset/$currentCpusetName，不改变规则核心分配"
+        }
+        val enabled = cpusetEditable && !cpusetBusy
+        binding.cpusetNameRow.isEnabled = enabled
+        binding.cpusetNameRow.alpha = if (enabled) 1f else 0.55f
+    }
+
+    private fun showCpusetNameDialog() {
+        if (!cpusetEditable || cpusetBusy) return
+        val view = DialogCpusetNameBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(requireContext())
+        var useCustom = currentCpusetName != CalibPolicy.DEFAULT_CPUSET_NAME
+        if (useCustom) view.cpusetCustomInput.setText(currentCpusetName)
+
+        fun updatePreview() {
+            val raw = if (useCustom) view.cpusetCustomInput.text?.toString().orEmpty().trim()
+            else CalibPolicy.DEFAULT_CPUSET_NAME
+            view.cpusetPathPreview.text = "/dev/cpuset/${raw.ifBlank { "…" }}"
+        }
+
+        fun updateSelection(focusInput: Boolean = false) {
+            view.cpusetDefaultSelected.visibility = if (useCustom) View.GONE else View.VISIBLE
+            view.cpusetCustomSelected.visibility = if (useCustom) View.VISIBLE else View.GONE
+            view.cpusetCustomInputLayout.visibility = if (useCustom) View.VISIBLE else View.GONE
+            if (!useCustom) {
+                view.cpusetCustomInputLayout.error = null
+                view.cpusetCustomInputLayout.isErrorEnabled = false
+            } else if (focusInput) {
+                view.cpusetCustomInput.post { view.cpusetCustomInput.requestFocus() }
+            }
+            updatePreview()
+        }
+
+        view.cpusetCustomInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                view.cpusetCustomInputLayout.error = null
+                view.cpusetCustomInputLayout.isErrorEnabled = false
+                updatePreview()
+            }
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+        view.cpusetDefaultOption.setOnClickListener {
+            useCustom = false
+            updateSelection()
+        }
+        view.cpusetCustomOption.setOnClickListener {
+            useCustom = true
+            updateSelection(focusInput = true)
+        }
+        view.cpusetCancel.setOnClickListener { dialog.dismiss() }
+        view.cpusetSave.setOnClickListener {
+            val requestedName = if (useCustom) {
+                CalibPolicy.normalizeCpusetNameOrNull(
+                    view.cpusetCustomInput.text?.toString().orEmpty()
+                )
+            } else {
+                CalibPolicy.DEFAULT_CPUSET_NAME
+            }
+            if (requestedName == null) {
+                view.cpusetCustomInputLayout.error = "请输入 1-48 位有效名称，且不能以点开头"
+                view.cpusetCustomInputLayout.isErrorEnabled = true
+                view.cpusetCustomInput.requestFocus()
+                return@setOnClickListener
+            }
+            if (requestedName == currentCpusetName) {
+                dialog.dismiss()
+                toast("当前已经使用此 cpuset 运行组")
+                return@setOnClickListener
+            }
+
+            cancelAutoSave()
+            val updatedPolicy = readPolicyFromInputs()?.copy(cpusetName = requestedName)?.normalized()
+            if (updatedPolicy == null) {
+                toast("当前校准策略存在无效输入，请修正后重试")
+                return@setOnClickListener
+            }
+
+            cpusetBusy = true
+            policySavePendingAfterCpuset = false
+            val operationId = ++cpusetOperationId
+            updateCpusetNameRow()
+            view.cpusetSave.isEnabled = false
+            view.cpusetSave.text = "正在保存"
+            val currentViewGeneration = viewGeneration
+            POLICY_IO_EXECUTOR.execute {
+                val saved = DaemonBridge.writeCalibPolicyRaw(updatedPolicy.toConfigText())
+                val restartStatus = if (saved) {
+                    DaemonBridge.restartRustDaemon()
+                } else {
+                    DaemonBridge.RustDaemonRestartStatus.FAILED
+                }
+                runOnUiThread {
+                    if (operationId != cpusetOperationId) return@runOnUiThread
+                    cpusetBusy = false
+                    if (saved) {
+                        currentCpusetName = requestedName
+                        if (currentViewGeneration == viewGeneration && _binding != null &&
+                            !isFinishing && !isDestroyed) {
+                            dialog.dismiss()
+                        }
+                        val message = when (restartStatus) {
+                            DaemonBridge.RustDaemonRestartStatus.REQUESTED ->
+                                "已保存，Rust 守护将在数秒内自动重启"
+                            DaemonBridge.RustDaemonRestartStatus.NOT_RUNNING ->
+                                "已保存，将在下次启动 Rust 守护时生效"
+                            DaemonBridge.RustDaemonRestartStatus.FAILED ->
+                                "已保存，自动重启失败；重启设备后生效"
+                        }
+                        if (currentViewGeneration == viewGeneration && _binding != null &&
+                            !isFinishing && !isDestroyed) {
+                            toast(message)
+                        }
+                    } else {
+                        if (currentViewGeneration == viewGeneration && _binding != null &&
+                            !isFinishing && !isDestroyed) {
+                            view.cpusetSave.isEnabled = true
+                            view.cpusetSave.text = "保存并重启守护"
+                            toast("运行设置保存失败，请检查 Root 或模块状态")
+                        }
+                    }
+                    if (_binding != null && currentViewGeneration == viewGeneration) {
+                        updateCpusetNameRow()
+                    }
+                    flushPendingPolicySaveIfReady()
+                }
+            }
+        }
+        updateSelection()
+        dialog.setContentView(view.root)
+        dialog.setOnShowListener {
+            dialog.behavior.state =
+                com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+            dialog.behavior.skipCollapsed = true
+        }
+        dialog.show()
+    }
+
+    private fun updateWildcardModeText() {
+        when (currentWildcardGroup) {
+            CalibPolicy.WildcardGroup.MAX_MEMBER -> {
+                binding.wildcardModeValue.text = "平均取最高"
+                binding.wildcardModeDesc.text = "Job.worker 1 / 2 这类相似线程合成一组，AVG 取最忙单线程，MAX 取最高峰值"
+            }
+            CalibPolicy.WildcardGroup.SUM -> {
+                binding.wildcardModeValue.text = "平均相加"
+                binding.wildcardModeDesc.text = "Job.worker 1 / 2 这类相似线程合成一组，AVG 相加，MAX 取最高峰值"
+            }
+        }
+    }
+
+    private fun showWildcardModeDialog() {
+        val view = DialogPolicyModeBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(requireContext())
+        val maxCurrent = currentWildcardGroup == CalibPolicy.WildcardGroup.MAX_MEMBER
+        view.modeMaxMemberTitle.text = "平均负载取最高"
+        view.modeSumTitle.text = "平均负载相加"
+        view.modeMaxMemberSelected.visibility = if (maxCurrent) View.VISIBLE else View.GONE
+        view.modeSumSelected.visibility = if (maxCurrent) View.GONE else View.VISIBLE
+        view.modeMaxMember.setOnClickListener {
+            dialog.dismiss()
+            setWildcardMode(CalibPolicy.WildcardGroup.MAX_MEMBER)
+        }
+        view.modeSum.setOnClickListener {
+            dialog.dismiss()
+            setWildcardMode(CalibPolicy.WildcardGroup.SUM)
+        }
+        view.modeCancel.setOnClickListener { dialog.dismiss() }
+        dialog.setContentView(view.root)
+        dialog.show()
+    }
+
+    private fun setWildcardMode(mode: CalibPolicy.WildcardGroup) {
+        if (currentWildcardGroup == mode) return
+        currentWildcardGroup = mode
+        updateWildcardModeText()
+        schedulePolicySave(delayMs = 0)
+    }
+
+    private fun updateRuleOutputFormatText() {
+        when (currentRuleOutputFormat) {
+            CalibPolicy.RuleOutputFormat.LEGACY -> {
+                binding.ruleOutputFormatValue.text = "旧版单行"
+                binding.ruleOutputFormatDesc.text = "每条线程和子进程单独一行，默认使用此格式"
+            }
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "原作者区块"
+                binding.ruleOutputFormatDesc.text = "线程写入原作者新增区块，子进程仍单独一行"
+            }
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "扩展区块格式"
+                binding.ruleOutputFormatDesc.text = "紧凑区块写线程和子进程，兜底核心放在区块尾部"
+            }
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "类型标签区块"
+                binding.ruleOutputFormatDesc.text = "用 thread、process 和 fallback 明确标记规则类型"
+            }
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "自然语句区块"
+                binding.ruleOutputFormatDesc.text = "使用接近自然语言的 thread 和 process 写法"
+            }
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "分类嵌套区块"
+                binding.ruleOutputFormatDesc.text = "线程与子进程分别写入独立子区块"
+            }
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "函数式格式"
+                binding.ruleOutputFormatDesc.text = "使用 app、thread 和 process 函数表达规则"
+            }
+            CalibPolicy.RuleOutputFormat.YAML -> {
+                binding.ruleOutputFormatValue.text = "YAML 风格"
+                binding.ruleOutputFormatDesc.text = "使用缩进分组展示线程、子进程和兜底核心"
+            }
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> {
+                binding.ruleOutputFormatValue.text = "原作者区块"
+                binding.ruleOutputFormatDesc.text = "旧区块格式将在启动时转换为原作者格式"
+            }
+        }
+    }
+
+    private fun showRuleOutputFormatDialog() {
+        val view = DialogRuleOutputFormatBinding.inflate(layoutInflater)
+        val dialog = BottomSheetDialog(requireContext())
+        val current = currentRuleOutputFormat
+        setRuleOutputFormatTitle(
+            view.formatLegacyTitle,
+            view.formatLegacySelected,
+            current,
+            CalibPolicy.RuleOutputFormat.LEGACY,
+            "旧版单行格式"
+        )
+        setRuleOutputFormatTitle(
+            view.formatAuthorBlockTitle,
+            view.formatAuthorBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK,
+            "原作者区块格式"
+        )
+        setRuleOutputFormatTitle(
+            view.formatCompactExtendedBlockTitle,
+            view.formatCompactExtendedBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK,
+            "扩展区块格式"
+        )
+        setRuleOutputFormatTitle(
+            view.formatTaggedBlockTitle,
+            view.formatTaggedBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK,
+            "类型标签区块"
+        )
+        setRuleOutputFormatTitle(
+            view.formatNaturalBlockTitle,
+            view.formatNaturalBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK,
+            "自然语句区块"
+        )
+        setRuleOutputFormatTitle(
+            view.formatNestedBlockTitle,
+            view.formatNestedBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK,
+            "分类嵌套区块"
+        )
+        setRuleOutputFormatTitle(
+            view.formatFunctionBlockTitle,
+            view.formatFunctionBlockSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK,
+            "函数式格式"
+        )
+        setRuleOutputFormatTitle(
+            view.formatYamlTitle,
+            view.formatYamlSelected,
+            current,
+            CalibPolicy.RuleOutputFormat.YAML,
+            "YAML 风格"
+        )
+        view.formatLegacy.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.LEGACY)
+        }
+        view.formatAuthorBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK)
+        }
+        view.formatCompactExtendedBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK)
+        }
+        view.formatTaggedBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.TAGGED_BLOCK)
+        }
+        view.formatNaturalBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.NATURAL_BLOCK)
+        }
+        view.formatNestedBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.NESTED_BLOCK)
+        }
+        view.formatFunctionBlock.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK)
+        }
+        view.formatYaml.setOnClickListener {
+            dialog.dismiss()
+            setRuleOutputFormat(CalibPolicy.RuleOutputFormat.YAML)
+        }
+        view.formatCancel.setOnClickListener { dialog.dismiss() }
+        dialog.setContentView(view.root)
+        dialog.setOnShowListener {
+            dialog.behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+            dialog.behavior.skipCollapsed = true
+        }
+        dialog.show()
+    }
+
+    private fun setRuleOutputFormatTitle(
+        title: TextView,
+        selectedIndicator: View,
+        current: CalibPolicy.RuleOutputFormat,
+        option: CalibPolicy.RuleOutputFormat,
+        label: String
+    ) {
+        title.text = label
+        selectedIndicator.visibility = if (current == option) View.VISIBLE else View.GONE
+    }
+
+    private fun setRuleOutputFormat(format: CalibPolicy.RuleOutputFormat) {
+        if (formatConversionBusy) return
+        val outputFormat = format.generationTarget()
+        cancelAutoSave()
+        val previous = currentRuleOutputFormat
+        currentRuleOutputFormat = outputFormat
+        updateRuleOutputFormatText()
+        val policy = readPolicyFromInputs()
+        if (policy == null) {
+            currentRuleOutputFormat = previous
+            updateRuleOutputFormatText()
+            toast("请先修正校准策略中的无效参数")
+            return
+        }
+
+        formatConversionBusy = true
+        setPolicyInputsEnabled(false)
+        val formatName = ruleOutputFormatName(outputFormat)
+        setPolicyStatus("正在把现有规则转换为$formatName")
+        ++saveSeq
+        val currentViewGeneration = viewGeneration
+        POLICY_IO_EXECUTOR.execute {
+            val result = DaemonBridge.applyRuleOutputFormat(outputFormat, policy.toConfigText())
+            runOnUiThread {
+                if (currentViewGeneration != viewGeneration || _binding == null ||
+                    isFinishing || isDestroyed) return@runOnUiThread
+                formatConversionBusy = false
+                if (result.success) {
+                    val message = if (result.ruleCount == 0) {
+                        "已切换为$formatName，当前没有需要转换的规则"
+                    } else if (result.changed) {
+                        "已转换为$formatName，共 ${result.ruleCount} 条规则"
+                    } else {
+                        "现有规则已经是$formatName"
+                    }
+                    setPolicyStatus("$message，修改后自动保存")
+                    toast(message)
+                } else {
+                    currentRuleOutputFormat = previous
+                    updateRuleOutputFormatText()
+                    val message = when (result.status) {
+                        DaemonBridge.RuleOutputFormatApplyStatus.INVALID_CONFIG ->
+                            "规则格式转换失败：${result.detail ?: "配置中存在无法解析的规则"}"
+                        DaemonBridge.RuleOutputFormatApplyStatus.CONFIG_WRITE_FAILED ->
+                            "规则格式转换失败：${result.detail ?: "无法写入规则配置"}"
+                        DaemonBridge.RuleOutputFormatApplyStatus.POLICY_WRITE_FAILED ->
+                            result.detail ?: "策略保存失败，现有规则已恢复"
+                        DaemonBridge.RuleOutputFormatApplyStatus.ROLLBACK_FAILED ->
+                            result.detail ?: "转换失败且恢复原规则失败，请立即检查 applist.conf"
+                        DaemonBridge.RuleOutputFormatApplyStatus.SUCCESS -> "规则格式转换失败"
+                    }
+                    setPolicyStatus(message)
+                    toast(message)
+                }
+                setPolicyInputsEnabled(policyEditable)
+            }
+        }
+    }
+
+    private fun ruleOutputFormatName(format: CalibPolicy.RuleOutputFormat): String {
+        return when (format) {
+            CalibPolicy.RuleOutputFormat.LEGACY -> "旧版单行格式"
+            CalibPolicy.RuleOutputFormat.AUTHOR_BLOCK -> "原作者区块格式"
+            CalibPolicy.RuleOutputFormat.COMPACT_EXTENDED_BLOCK -> "扩展区块格式"
+            CalibPolicy.RuleOutputFormat.TAGGED_BLOCK -> "类型标签区块"
+            CalibPolicy.RuleOutputFormat.NATURAL_BLOCK -> "自然语句区块"
+            CalibPolicy.RuleOutputFormat.NESTED_BLOCK -> "分类嵌套区块"
+            CalibPolicy.RuleOutputFormat.FUNCTION_BLOCK -> "函数式格式"
+            CalibPolicy.RuleOutputFormat.YAML -> "YAML 风格"
+            CalibPolicy.RuleOutputFormat.COMPACT_HEADER_BLOCK,
+            CalibPolicy.RuleOutputFormat.SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.COMPACT_SEPARATE_FALLBACK_BLOCK,
+            CalibPolicy.RuleOutputFormat.EXTENDED_BLOCK -> "原作者区块格式"
+        }
+    }
+
+    private fun renderCoreSelectors() {
+        renderCoreGrid(binding.bestCoresGrid, binding.bestCoresWarning, bestCores)
+        renderCoreGrid(binding.highCoresGrid, binding.highCoresWarning, highCores)
+        renderCoreGrid(binding.midCoresGrid, binding.midCoresWarning, midCores)
+        renderCoreGrid(binding.fallbackCoresGrid, binding.fallbackCoresWarning, fallbackCores)
+        val alpha = if (policyEditable) 1f else 0.55f
+        setCoreGridEnabled(binding.bestCoresGrid, policyEditable, alpha)
+        setCoreGridEnabled(binding.highCoresGrid, policyEditable, alpha)
+        setCoreGridEnabled(binding.midCoresGrid, policyEditable, alpha)
+        setCoreGridEnabled(binding.fallbackCoresGrid, policyEditable, alpha)
+    }
+
+    private fun renderTopologySummary(topology: Map<String, String>) {
+        val entries = listOf(
+            "最高性能" to topology["big"],
+            "高性能" to topology["middle_high"],
+            "主性能" to topology["middle"],
+            "低性能" to topology["low"],
+            "非最高" to topology["nonbig"],
+            "全部" to topology["all"]
+        ).filter { !it.second.isNullOrBlank() }
+
+        binding.topologySummaryGrid.removeAllViews()
+        if (entries.isEmpty()) {
+            binding.topologySummaryPanel.visibility = View.GONE
+            return
+        }
+
+        val clusters = topology["clusters"]?.toIntOrNull()
+        binding.topologySummaryDesc.text = if (clusters != null && clusters > 0) {
+            "按最大频率识别为 ${clusters} 个性能簇，同频核心不会被拆开"
+        } else {
+            "按最大频率识别性能档位，同频核心不会被拆开"
+        }
+        binding.topologySummaryPanel.visibility = View.VISIBLE
+        binding.topologySummaryGrid.columnCount = 2
+
+        for ((label, cores) in entries) {
+            val item = LinearLayout(requireContext()).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundResource(R.drawable.bg_topology_chip)
+                setPadding(10.dp, 8.dp, 10.dp, 8.dp)
+                addView(TextView(requireContext()).apply {
+                    text = label
+                    setTextColor(getColor(R.color.text_secondary))
+                    textSize = 11.5f
+                    includeFontPadding = false
+                })
+                addView(TextView(requireContext()).apply {
+                    text = "CPU ${cores.orEmpty()}"
+                    setTextColor(getColor(R.color.text_primary))
+                    textSize = 13.5f
+                    typeface = Typeface.DEFAULT_BOLD
+                    includeFontPadding = false
+                })
+            }
+            val params = GridLayout.LayoutParams().apply {
+                width = 0
+                height = ViewGroup.LayoutParams.WRAP_CONTENT
+                columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+                setMargins(0, 0, 8.dp, 8.dp)
+            }
+            binding.topologySummaryGrid.addView(item, params)
+        }
+    }
+
+    private fun renderCoreGrid(grid: GridLayout, warning: TextView, selected: MutableSet<Int>) {
+        grid.removeAllViews()
+        warning.visibility = View.GONE
+        grid.columnCount = minOf(4, availableCpus.size.coerceAtLeast(1))
+        for (cpu in availableCpus) {
+            val box = MaterialCheckBox(requireContext()).apply {
+                text = "CPU$cpu"
+                textSize = 15f
+                isChecked = selected.contains(cpu)
+                minHeight = 44.dp
+                setPadding(0, 0, 8.dp, 0)
+                setOnCheckedChangeListener { button, checked ->
+                    if (suppressPolicyChange) return@setOnCheckedChangeListener
+                    val next = selected.toMutableSet()
+                    if (checked) {
+                        next.add(cpu)
+                    } else if (selected.size <= 1) {
+                        suppressPolicyChange = true
+                        button.isChecked = true
+                        suppressPolicyChange = false
+                        showCoreWarning(warning, "每一档至少选择一个核心")
+                        return@setOnCheckedChangeListener
+                    } else {
+                        next.remove(cpu)
+                    }
+                    selected.clear()
+                    selected.addAll(next.sorted())
+                    warning.visibility = View.GONE
+                    schedulePolicySave()
+                }
+            }
+            val params = GridLayout.LayoutParams().apply {
+                width = 0
+                height = ViewGroup.LayoutParams.WRAP_CONTENT
+                columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+                setMargins(0, 2.dp, 0, 2.dp)
+            }
+            grid.addView(box, params)
+        }
+    }
+
+    private fun setCoreGridEnabled(grid: GridLayout, enabled: Boolean, alpha: Float) {
+        grid.alpha = alpha
+        for (i in 0 until grid.childCount) {
+            grid.getChildAt(i).isEnabled = enabled
+        }
+    }
+
+    private fun setCoreSelection(target: MutableSet<Int>, ranges: String) {
+        target.clear()
+        target.addAll(parseCpuRanges(ranges))
+        target.retainAll(availableCpus.toSet())
+        if (target.isEmpty()) {
+            target.add(availableCpus.lastOrNull() ?: 0)
+        }
+    }
+
+    private fun resolveCores(cores: String, defaultCores: String): String {
+        return CalibPolicy.normalizeCoresOrNull(cores) ?: defaultCores
+    }
+
+    private fun availableCpuList(policy: CalibPolicy, topology: Map<String, String>): List<Int> {
+        if (presentCpus.isNotEmpty()) return presentCpus.sorted()
+        val detected = topology["all"]?.let { parseCpuRanges(it) }.orEmpty()
+        if (detected.isNotEmpty()) return detected.sorted()
+
+        val fromPolicy = listOf(
+            policy.bestCores,
+            policy.highCores,
+            policy.midCores,
+            policy.fallbackCores
+        ).flatMap {
+            CalibPolicy.normalizeCoresOrNull(it)?.let { ranges -> parseCpuRanges(ranges) } ?: emptyList()
+        }
+        if (fromPolicy.isNotEmpty()) {
+            val max = fromPolicy.maxOrNull() ?: 7
+            return (0..max).toList()
+        }
+        return listOf(0)
+    }
+
+    private fun parseDetectedTopology(block: String): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        for (line in block.lineSequence()) {
+            val trimmed = line.trim()
+            val eq = trimmed.indexOf('=')
+            if (eq <= 0) continue
+            val key = trimmed.substring(0, eq).trim()
+            val value = trimmed.substring(eq + 1).trim()
+            when (key) {
+                "detected_clusters" -> map["clusters"] = value
+                "detected_low", "detected_little" -> map["low"] = value
+                "detected_top", "detected_big" -> map["big"] = value
+                "detected_high", "detected_middle_high" -> map["middle_high"] = value
+                "detected_main", "detected_middle" -> map["middle"] = value
+                "detected_non_top", "detected_nonbig" -> map["nonbig"] = value
+                "detected_all" -> map["all"] = value
+            }
+        }
+        return map
+    }
+
+    private fun parseCpuRanges(ranges: String): Set<Int> {
+        val out = linkedSetOf<Int>()
+        for (part in ranges.split(',')) {
+            val p = part.trim()
+            if (p.isEmpty()) continue
+            val dash = p.indexOf('-')
+            if (dash >= 0) {
+                val start = p.substring(0, dash).toIntOrNull()
+                val end = p.substring(dash + 1).toIntOrNull()
+                if (start != null && end != null) {
+                    val range = if (start <= end) start..end else end..start
+                    out.addAll(range)
+                }
+            } else {
+                p.toIntOrNull()?.let { out.add(it) }
+            }
+        }
+        return out
+    }
+
+    private fun formatCpuSet(cpus: Set<Int>): String {
+        return RuleConfigLogic.formatCpuRangeList(cpus)
+    }
+
+    private fun Double.formatOne(): String {
+        val rounded = kotlin.math.round(this * 10.0) / 10.0
+        return if (rounded % 1.0 == 0.0) rounded.toInt().toString() else rounded.toString()
+    }
+
+    private val Int.dp: Int
+        get() = (this * resources.displayMetrics.density).toInt()
+
+    private fun setPolicyStatus(text: String) {
+        binding.policyStatus.setTextColor(getColor(R.color.text_secondary))
+        binding.policyStatus.text = text
+    }
+
+    private fun showCoreWarning(view: TextView, message: String) {
+        coreWarningRunnable?.let { mainHandler.removeCallbacks(it) }
+        if (coreWarningView !== view) {
+            coreWarningView?.visibility = View.GONE
+        }
+        coreWarningView = view
+        view.text = message
+        view.visibility = View.VISIBLE
+        val hide = Runnable {
+            if (isFinishing || isDestroyed) return@Runnable
+            view.visibility = View.GONE
+            coreWarningRunnable = null
+            if (coreWarningView === view) coreWarningView = null
+        }
+        coreWarningRunnable = hide
+        mainHandler.postDelayed(hide, 3500L)
+    }
+
+    private fun toast(msg: String) {
+        AppToast.show(requireContext(), msg)
+    }
+
+    override fun onStop() {
+        flushAutoSave()
+        super.onStop()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt(STATE_SETTINGS_TAB, selectedSettingsTab.ordinal)
+        if (_binding != null) {
+            outState.putInt(STATE_RULE_SCROLL_Y, binding.ruleSettingsPage.scrollY)
+            outState.putInt(STATE_PERFORMANCE_SCROLL_Y, binding.performanceSettingsPage.scrollY)
+            if (policyLoaded && !formatConversionBusy) {
+                readPolicyFromInputs()?.let { policy ->
+                    outState.putString(STATE_POLICY_DRAFT, policy.toConfigText())
+                }
+            }
+        }
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onDestroyView() {
+        cancelAutoSave()
+        policyLoadGeneration++
+        policyLoadInFlight = false
+        policyLoaded = false
+        policyGuideLayoutReady = false
+        ++saveSeq
+        coreWarningRunnable?.let { mainHandler.removeCallbacks(it) }
+        coreWarningRunnable = null
+        coreWarningView = null
+        formatConversionBusy = false
+        cpusetEditable = false
+        _binding = null
+        super.onDestroyView()
+    }
+}

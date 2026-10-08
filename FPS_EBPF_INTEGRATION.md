@@ -1,233 +1,69 @@
-# AppOpt FPS 监测 eBPF 集成说明
+# 柒夏线程 FPS 采集说明
 
-## 当前架构
+FPS 采集由 Rust 守护 `QiXiaRs`、Rust/aya bridge、eBPF 探针和 SurfaceFlinger 降级路径组成。
+CPU 核心分配与校准建议在守护进程的其他模块中实现，不在 FPS bridge 内生成规则。
 
-AppOpt 的 FPS 监测由 Rust 守护进程、Rust/aya bridge 和 Rust 实现的
-SurfaceFlinger fallback 组成。`AppOptRs` 直接链接并调用 `appopt_ebpf_bridge`。
-
-```text
-native_daemon/daemon_rs/
-  Rust daemon, 负责 FPS 命令、前台 PID 确认、eBPF 生命周期和 SurfaceFlinger fallback
-
-native_daemon/fps_monitor/
-  bpf/queuebuffer_probe.bpf.c        RingBuf 内核侧 BPF 程序
-  bpf/queuebuffer_probe_perf.bpf.c   PerfEvent 备用内核侧 BPF 程序
-  appopt_ebpf_bridge/                Rust crate, 负责 BPF 加载、uprobe attach、事件通道读取
-  aya/                          精简后的本地 vendored aya
-```
-
-旧 C 守护及其 C shim 已移除。uprobe 加载和 attach 统一由 Rust/aya 完成。
-
-## eBPF 路径
-
-1. App 写入 `fps.cmd` 请求开始监测某个包名。
-2. 当前守护进程优先通过 ActivityTaskManager helper / cgroup 前台组 / 包名进程查找目标 PID。
-3. 找到具体 PID 后，Rust daemon 调用 `appopt_ebpf_start_for_package(pid, bpf_obj, pkg)`。
-4. 如果暂时找不到 PID，不再启动全局 uprobe；守护进程会等待后续拿到真实 PID 后再尝试 eBPF，
-   期间可由 SurfaceFlinger fallback 兜底输出。
-5. Rust/aya 优先加载 `queuebuffer_probe.bpf.o` 并初始化 RingBuf 事件通道。
-6. 如果 RingBuf 创建/映射失败（例如 Android 17 上的 `mmap failed`），立即释放本次 eBPF 上下文，改为加载 `queuebuffer_probe_perf.bpf.o` 并使用 PerfEvent 备用通道。
-7. Rust/aya 按优先级 attach `libgui.so` 的帧提交符号，attach 范围限制为目标 PID。
-8. BPF 程序把帧事件写入当前可用事件通道，并同步维护 `frame_stats` 计数 map。
-9. RingBuf 后端直接按事件滑动窗口计算 FPS；PerfEvent 后端优先使用 `frame_stats`
-   计数差计算 FPS，避免 per-CPU PerfEvent 乱序或丢样本导致帧率偏低。
-
-## App 通信路径
-
-FPS 数据源和 App 通信是两层逻辑:
+## 数据源与降级顺序
 
 ```text
-FPS 数据源:
-  eBPF uprobe
-    -> SurfaceFlinger --latency
-    -> SurfaceFlinger --timestats
-
-FPS 传给 App:
-  Android 本地 socket
-    -> app 私有目录 fps 文件兜底
+目标应用进程的 libgui 帧提交事件
+  RingBuf → StatsMap → PerfEvent
+    → SurfaceFlinger --latency
+    → SurfaceFlinger --timestats
 ```
 
-App 启动悬浮胶囊时会先创建一次性本地 socket, 并把 socket 名和随机 token 写入
-`fps.cmd`。当前守护进程收到 `start <pkg> <socket> <token>` 后优先反连该 socket,
-握手成功后按行推送 FPS。socket 被 SELinux/ROM 行为拦住时, 守护进程才覆盖写
-`/data/data/top.suto.appopt/files/fps`, App 侧用 FileObserver 兜底读取。
+- Rust 先确认目标包名对应的 PID，再为其线程挂载 uprobe；内核和用户态同时检查目标进程身份。
+- RingBuf 适用于支持它的内核；旧内核或加载失败时尝试只轮询计数映射的 StatsMap，随后尝试 PerfEvent。
+- RingBuf 按逐帧事件计算；StatsMap 按 `frame_stats` 的时间戳和计数差计算。PerfEvent 在计数映射可用时也优先读取映射，减少逐帧唤醒。
+- eBPF 无法工作或长期没有目标帧时，按运行时探测结果切换到 SurfaceFlinger。
+- SurfaceFlinger `--timestats` 会改变全局统计状态，与其他监测工具同时使用时需要留意该后端。
 
-守护进程存活检测也走反向验证: App 创建一次性 socket, 通过 root helper 下发
-`--ping-daemon <socket> <token>`, 当前守护进程连接回 App 并回传 token/版本/PID。
-这样 App 不再只靠进程名判断, 可以区分同名或二改版本。
+## FPS 的含义与计时
 
-## uprobe 符号策略
+eBPF 探针挂在 `libgui.so` 的 `Surface::queueBuffer` 候选函数入口，统计的是应用提交帧率。
+它不是屏幕最终呈现帧率：提交的帧可能排队、被替换，或者未实际呈现。因此提交 FPS 可能高于屏幕刷新率。
 
-当前符号列表在 `native_daemon/fps_monitor/appopt_ebpf_bridge/src/lib.rs` 中维护。
+逐帧路径按 PID 和 Surface 区分来源，缺少 Surface 指针时按 TID 区分；从稳定帧源中选择一个，
+不把多个应用进程或多个 Surface 的 FPS 简单相加。事件先按时间戳排序，再进入约一秒的滑动窗口。
 
-优先级最高的两个符号对齐 `frame-analyzer-ebpf` 的做法:
+- 帧率由有效间隔数量与累计间隔计算，不读取固定的 120／144／165 Hz 上限，也不要求用户填写最高刷新率。
+- 小于 1 毫秒的短间隔事件按重复样本丢弃，不能推进上一有效帧的时间戳或刷新其有效性，否则会缩短下一帧间隔并抬高 FPS。
+- 当前 1 毫秒最小间隔对应最高 1000 FPS 的测量边界。它是去重与有效性检查的边界，不是无限帧率支持。
+- 高刷新率回归覆盖 144、165、240、360、480 Hz 等帧序列，以及运行中的刷新率切换。
+- 启动阶段需积累有效样本；短暂事件突发不能代替预热。长卡顿保留，超过暂停边界后重新预热。
 
-```text
-_ZN7android7Surface11queueBufferEP19ANativeWindowBufferi
-_ZN7android7Surface11queueBufferEP19ANativeWindowBufferiPNS_24SurfaceQueueBufferOutputE
-```
+历史报告的最大帧间隔与 FPS 滑动窗口分别统计。StatsMap / PerfEvent 探针保留当前及上一已完成窗口，
+避免轮询跨窗口时丢失峰值或重复上报。报告没有完整逐帧分布，不据此计算帧耗时 P95/P99；
+掉帧定位表示采样区间，低帧采样占比不等于逐帧慢帧比例。
 
-如果这两个都 attach 失败, 再尝试额外候选作为 ROM/版本兼容兜底:
+## App 通信与存储
 
-```text
-_ZN7android7Surface16hook_queueBufferEP13ANativeWindowP19ANativeWindowBufferi
-_ZN7android7Surface27hook_queueBuffer_DEPRECATEDEP13ANativeWindowP19ANativeWindowBuffer
-_ZN7android7Surface19queueBufferInternalEP13ANativeWindowP19ANativeWindowBufferi
-```
+App 创建本地 socket，并在开始请求中传入 socket 名称和一次性 token。Rust 验证后推送 FPS；
+socket 不可用时，使用 App 私有目录下的 `fps` 文件兜底。
+守护存活检查通过反向 socket 返回 token、版本和 PID，不仅依赖进程名。
 
-实际运行时只需要成功 attach 一个符号。日志中的 `ebpf_fps_symbol()` 会返回当前锁定的符号。
+校准和自动分配历史在 App 私有目录中按需生成，导入数据库后清理对应暂存文件。
+校准记录、自动分配记录与首页最近使用摘要的保存条件不同，见 [README](README.md)。
 
-## fallback 路径
+## 代码位置
 
-如果 eBPF 初始化失败, AppOpt 会降级到 SurfaceFlinger fallback:
+| 路径 | 职责 |
+| --- | --- |
+| `native_daemon/daemon_rs/src/fps_core/` | 监测生命周期、命令、socket 与 SurfaceFlinger 降级 |
+| `native_daemon/fps_monitor/qixia_ebpf_bridge/src/fps_stream.rs` | 窗口计时、有效样本、独立报告峰值 |
+| `native_daemon/fps_monitor/qixia_ebpf_bridge/src/streams.rs` | 帧源分流、选择与淘汰 |
+| `native_daemon/fps_monitor/qixia_ebpf_bridge/src/stats.rs` | 计数映射轮询与报告窗口读取 |
+| `native_daemon/fps_monitor/qixia_ebpf_bridge/src/constants.rs` | 候选符号与采集参数 |
+| `native_daemon/fps_monitor/bpf/` | RingBuf、PerfEvent、StatsMap 探针 |
+| `native_daemon/fps_monitor/aya/` | Aya Git 子模块及其许可 |
 
-```text
-eBPF uprobe
-  -> SurfaceFlinger --latency
-  -> SurfaceFlinger --timestats
-```
+## 构建与验证
 
-注意: `--timestats` 会修改 SurfaceFlinger 的统计状态, 可能影响 Scene 等工具的统计结果。
-排查 Scene 数据异常时, 优先确认日志里是否出现 `切换到 timestats`。
+在项目根目录执行 `bash build_module.sh release`，构建四个 Android ABI、各后端 BPF 对象及内嵌 APK。
+本地构建时可设置 `QIXIA_SKIP_SUBMODULE_UPDATE=1`，使用当前已检出的 Aya 提交。
 
-## 与 auto 规则生成的关系
+FPS bridge 依赖 Linux / Android 的 Aya，完整测试应交叉编译后在 Android 上执行。
+`fps_stream.rs` 只依赖标准库，也可使用 `rustc --test` 在本机运行计时回归。
 
-本文件描述 FPS/eBPF 监测链路。CPU 亲和性 `auto` 规则生成在 Rust daemon 中实现，
-不在 `native_daemon/fps_monitor` 或 Rust/aya bridge 中完成。
-
-当前 `auto` 规则不依赖线程名白名单/黑名单, 也不特殊识别 `UnityMain`、`MainThread`、
-`RenderThread`、`worker`、`Audio` 等名字。算法只看采样负载:
-
-```text
-score = avg * 0.65 + max * 0.35
-```
-
-阈值由 `/data/adb/modules/AppOpt/config/calib_policy.conf` 控制, App 的「设置 > 自动校准策略」
-会可视化读写这个文件。刷入新模块但未重启时, App 会读取
-`/data/adb/modules_update/AppOpt/config/calib_policy.conf` 并锁定编辑, 避免待生效更新覆盖用户设置。
-
-线程组按 `score` 排序后默认最多输出 Top 6。每一档都可以在 App 设置里直接勾选
-CPU 核心, 保存后写入策略文件里的 `cores`:
-
-- Top1 单线程且 AVG 和 MAX 同时达到 `best_thread` 阈值: 最高性能簇, 固定输出在第一行。
-- AVG 和 MAX 同时达到 `group_high` 阈值: 高频中核档。
-- AVG 和 MAX 同时达到 `group_mid` 阈值: 中核档。
-- 包名兜底规则: 默认非最高性能簇, 对齐常见 `0-6` 兜底, 可在 App 设置里调整。
-- `cores:7`、`cores:5-6`、`cores:0-6`: 直接使用用户指定的连续核心范围。
-- `target:*` 已移除; 核心分配只看 `cores`。
-
-默认策略:
-
-```ini
-best_thread=avg:18,max:30,cores:7
-group_high=avg:13,max:22,cores:5-6
-group_mid=avg:8,max:18,cores:4-6
-wildcard_group=max_member
-max_thread_rules=6
-fallback=cores:0-6
-```
-
-`wildcard_group=max_member` 表示 `Thread-1/Thread-2`、`Job.worker 1/2` 这类相似线程
-会先合成 `Thread-*`、`Job.worker*` 一组, AVG 只取组内最忙的单个线程, MAX 取组内最高峰值。
-需要更激进时可在 App 设置中改为“平均负载相加”, 对应 `wildcard_group=sum`, 此时 AVG
-会累加组内所有线程。两种模式都只改变这组 AVG 的计算方式; 一旦入选, 规则名仍输出为
-`Job.worker*` 这类规则, 不会改成组内某个具体线程名。
-
-`fallback=cores:0-6` 对应 App 设置里的“进程兜底核心”。
-它只影响最后一行 `包名=...` 兜底规则, 不改变已经单独生成的线程规则。
-
-守护进程运行后会在 `calib_policy.conf` 写入当前设备拓扑。这里不再假设一定是
-“小/中/大”三段, 而是按 CPU 最大频率簇生成通用性能档位；同频簇不会再按 CPU 编号硬切,
-避免把 8 Gen 5 这类同频性能核误拆成两个档位。
-
-```ini
-# CPU 拓扑识别: 3 个性能簇, 全部=[0-7] 低性能=[0-3] 主性能=[4-6] 高性能=[5-6] 最高性能=[7] 非最高=[0-6]
-detected_low=0-3
-detected_main=4-6
-detected_high=5-6
-detected_non_top=0-6
-detected_top=7
-detected_all=0-7
-```
-
-示例规则:
-
-- 3 簇设备如 870: 低性能=`0-3`, 主性能/高性能=`4-6`, 最高性能=`7`。
-- 4 簇设备如 8 Gen 2: 低性能=`0-2`, 主性能=`3-6`, 高性能=`5-6`, 最高性能=`7`。
-- 2 簇设备如部分 8 Gen 5: 低性能/主性能/高性能=`0-5`, 最高性能=`6-7`。
-
-这样做的目的不是猜线程职责, 而是让不同游戏、不同引擎的线程命名差异只影响规则名字,
-不影响分级判断。
-
-## 日志示例
-
-eBPF 可用:
-
-```text
-[FPS] 开始监测 com.tencent.tmgp.sgame, eBPF: 尝试启动
-[FPS] 目标进程 PID: 12345, 尝试 eBPF uprobe...
-[FPS] eBPF 使用后端: RingBuf
-[FPS] eBPF 已激活, 锁定符号: _ZN7android7Surface11queueBufferEP19ANativeWindowBufferi
-[FPS] eBPF 当前帧事件 PID: 12345
-[FPS] eBPF 首次捕获到帧率: 60.0 fps
-```
-
-RingBuf 不可用, 自动切换 PerfEvent:
-
-```text
-[FPS] eBPF RingBuf 不可用: `mmap` failed
-[FPS] eBPF 使用后端: PerfEvent
-[FPS] eBPF 已激活, 锁定符号: _ZN7android7Surface16hook_queueBufferEP13ANativeWindowP19ANativeWindowBufferi
-```
-
-未及时找到 PID:
-
-```text
-[FPS] 等待约 3 秒仍未找到 com.xxx 的进程, 暂不启动全局 eBPF 探测, 后续拿到真实 PID 再重试
-[FPS] 启用 SurfaceFlinger FPS 源: com.xxx
-```
-
-降级到 fallback:
-
-```text
-[FPS] eBPF 初始化失败: ..., 降级到 SF fallback
-[Fallback] 启动 SF dump 监测: com.xxx
-```
-
-## 权限和限制
-
-- 需要 root 权限。
-- 需要内核支持 BPF syscall 和 uprobes；事件通道优先 RingBuf，RingBuf 不可用时尝试 PerfEvent。
-- 目标设备禁用 BPF 或限制 uprobe 时会自动 fallback。
-- AppOpt 当前构建包含 `arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86` 四个 ABI；
-  BPF 程序也针对 arm64/arm/x86_64/x86 读取 queueBuffer 第一个参数。
-  具体设备上能否 attach 仍取决于 libgui 路径、符号和内核能力。
-- Android 12-16 不靠版本号判断, 以实际 attach 成功与否为准。
-
-## 构建
-
-`build_module.sh` 会构建:
-
-```text
-queuebuffer_probe.bpf.o
-queuebuffer_probe_perf.bpf.o
-appopt_ebpf_bridge Rust crate
-AppOptRs Rust 守护进程
-Magisk 模块 zip
-```
-
-当前脚本会分别构建:
-
-```text
-arm64-v8a
-armeabi-v7a
-x86_64
-x86
-```
-
-## 相关文件
-
-- `native_daemon/fps_monitor/README.md`
-- `native_daemon/fps_monitor/appopt_ebpf_bridge/src/lib.rs`
-- `native_daemon/fps_monitor/bpf/queuebuffer_probe.bpf.c`
-- `native_daemon/fps_monitor/bpf/queuebuffer_probe_perf.bpf.c`
+测试覆盖重复事件不抬高 FPS、同 Surface 跨线程事件、高刷新率、刷新率切换、无效批次、窗口大小、
+长卡顿与暂停、报告峰值，以及 BPF 事件结构布局。模拟帧序列验证的是算法，不代表每种高刷硬件都已实测。

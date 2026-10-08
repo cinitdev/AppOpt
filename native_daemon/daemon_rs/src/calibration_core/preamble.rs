@@ -1,90 +1,73 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::Write as FmtWrite;
-use std::fs;
-use std::io::{self, Write as IoWrite};
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use super::*;
 
-// 校准线程负责读取 App 写入的 calibrate.cmd，采样目标应用的 CPU 负载并生成规则。
-//
-// 当前守护支持主进程线程和子进程线程规则，但自动校准保持保守生成策略：
-// - 主进程：记录每个线程的真实 CPU 使用率，用于生成 com.pkg{thread}=cpus。
-// - 子进程：记录整个子进程的 CPU 使用率，用于生成 com.pkg:proc=cpus。
-// - 子进程线程：只写入 history 明细给用户看，不生成 com.pkg:proc{thread}，
-//   因为这类线程通常数量多、生命周期短，自动生成容易产生大量易失规则；用户仍可手动添加。
-const CONFIG_DIR: &str = "/data/adb/modules/AppOpt/config";
-const CALIB_CMD_FILE: &str = "/data/adb/modules/AppOpt/config/calibrate.cmd";
-const CALIB_STATE_FILE: &str = "/data/adb/modules/AppOpt/config/calibrate.state";
-const CALIB_POLICY_FILE: &str = "/data/adb/modules/AppOpt/config/calib_policy.conf";
-const CALIB_POLICY_LOCK: &str = "/data/adb/modules/AppOpt/config/calib_policy.conf.lock";
-const CALIB_CONFIG_LOCK: &str = "/data/adb/modules/AppOpt/config/applist.conf.lock";
-const HISTORY_DIR: &str = "/data/adb/modules/AppOpt/history";
-const CALIB_TOPO_BEGIN: &str = "# AppOpt detected CPU topology begin";
-const CALIB_TOPO_END: &str = "# AppOpt detected CPU topology end";
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
-const CALIB_PROGRESS_LOG_ROUNDS: usize = 120;
-const CALIB_MAX_SESSION_DURATION: Duration = Duration::from_secs(6 * 60 * 60);
-const PROCESS_REFRESH_ROUNDS: usize = 10;
-const CALIB_MIN_DURATION: Duration = Duration::from_secs(30);
-const CALIB_MAIN_RESTART_GRACE: Duration = Duration::from_secs(8);
-const MAX_THREAD_RULES: usize = 6;
-const CALIB_MAX_SERIES_POINTS: usize = 1200;
-const CALIB_MAX_TRACKED_RECORDS: usize = 1024;
-const CALIB_MAX_CHILD_THREAD_SUMMARIES: usize = 512;
-const HISTORY_MAX_RECORDS: usize = 512;
-const HISTORY_MAX_CHILD_THREADS_PER_PROCESS: usize = 64;
-const HISTORY_MAX_SESSIONS: usize = 7;
+// 校准采集活跃线程并保存待确认建议；生效配置由 App 在用户保存时写入。
+pub(super) const CONFIG_DIR: &str = "/data/adb/modules/QixiaThreads/config";
+pub(super) const CALIB_CMD_FILE: &str = "/data/adb/modules/QixiaThreads/config/calibrate.cmd";
+pub(super) const CALIB_STATE_FILE: &str = "/data/adb/modules/QixiaThreads/config/calibrate.state";
+pub(crate) const CALIB_POLICY_FILE: &str = "/data/adb/modules/QixiaThreads/config/calib_policy.conf";
+pub(super) const CALIB_POLICY_LOCK: &str = "/data/adb/modules/QixiaThreads/config/calib_policy.conf.lock";
+pub(super) const CALIB_TOPO_BEGIN: &str = "# QixiaThreads detected CPU topology begin";
+pub(super) const CALIB_TOPO_END: &str = "# QixiaThreads detected CPU topology end";
+pub(super) const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+pub(super) const CALIB_PROGRESS_LOG_ROUNDS: usize = 120;
+pub(super) const CALIB_MAX_SESSION_DURATION: Duration = Duration::from_secs(6 * 60 * 60);
+pub(super) const PROCESS_REFRESH_ROUNDS: usize = 10;
+pub(super) const CALIB_MIN_DURATION: Duration = Duration::from_secs(30);
+pub(super) const CALIB_MAIN_RESTART_GRACE: Duration = Duration::from_secs(8);
+pub(super) const CALIB_MAX_SERIES_POINTS: usize = 1200;
+pub(super) const CALIB_MAX_TRACKED_RECORDS: usize = 1024;
+pub(super) const CALIB_MAX_CHILD_THREAD_SUMMARIES: usize = 512;
+pub(super) const HISTORY_MAX_SESSIONS: usize = 10;
 
 #[derive(Debug, Clone)]
-struct ProcInfo {
-    pid: i32,
-    owner: String,
+pub(super) struct ProcInfo {
+    pub(super) pid: i32,
+    pub(super) owner: String,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct TrackKey {
+pub(super) struct TrackKey {
     // owner 是主包名或子进程名；name 只有线程记录才使用。
-    owner: String,
-    name: String,
+    pub(super) owner: String,
+    pub(super) name: String,
     // true 表示“子进程整体负载”，false 表示“主进程线程负载”。
-    is_process: bool,
+    pub(super) is_process: bool,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-struct TidKey {
-    pid: i32,
-    tid: i32,
+pub(super) struct TidKey {
+    pub(super) pid: i32,
+    pub(super) tid: i32,
     // /proc/<pid>/task/<tid>/stat 的 starttime，用来区分被复用的 TID。
-    starttime: u64,
+    pub(super) starttime: u64,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct ChildThreadKey {
+pub(super) struct ChildThreadKey {
     // 子进程线程摘要使用 owner+线程名聚合，写入 history 让 App 展开查看。
-    owner: String,
-    name: String,
+    pub(super) owner: String,
+    pub(super) name: String,
 }
 
 #[derive(Debug, Clone)]
-struct LoadRecord {
-    owner: String,
-    name: String,
-    is_process: bool,
+pub(super) struct LoadRecord {
+    pub(super) owner: String,
+    pub(super) name: String,
+    pub(super) is_process: bool,
     // sum_pct/max_pct/samples 记录的是“真实 CPU 使用率”，不是线程占应用总负载比例。
-    sum_pct: f64,
-    max_pct: f64,
-    sample_count: usize,
-    samples: VecDeque<f32>,
-    series_stride: usize,
-    series_pending_sum: f64,
-    series_pending_count: usize,
-    last_seen_round: usize,
+    pub(super) sum_pct: f64,
+    pub(super) max_pct: f64,
+    pub(super) sample_count: usize,
+    pub(super) samples: VecDeque<f32>,
+    pub(super) series_stride: usize,
+    pub(super) series_pending_sum: f64,
+    pub(super) series_pending_count: usize,
+    pub(super) last_seen_round: usize,
+    pub(super) activity: Activity,
 }
 
 impl LoadRecord {
-    fn new(key: &TrackKey, first_seen_round: usize) -> Self {
+    pub(super) fn new(key: &TrackKey, first_seen_round: usize) -> Self {
         Self {
             owner: key.owner.clone(),
             name: key.name.clone(),
@@ -97,13 +80,15 @@ impl LoadRecord {
             series_pending_sum: 0.0,
             series_pending_count: 0,
             last_seen_round: first_seen_round,
+            activity: Activity::default(),
         }
     }
 
-    fn push(&mut self, pct: f64) {
+    pub(super) fn push(&mut self, pct: f64) {
         // history 只保留有限点数，避免用户长时间校准导致单个 log 无限膨胀。
         // 同名线程和子进程记录可能聚合多个 TID，允许超过单核的 100%。
         let pct = pct.clamp(0.0, 999.0);
+        self.activity.observe(pct);
         self.sum_pct += pct;
         self.sample_count += 1;
         self.max_pct = self.max_pct.max(pct);
@@ -123,7 +108,7 @@ impl LoadRecord {
         }
     }
 
-    fn backfill_zero(&mut self, rounds: usize) {
+    pub(super) fn backfill_zero(&mut self, rounds: usize) {
         if rounds == 0 || self.sample_count != 0 {
             return;
         }
@@ -138,7 +123,7 @@ impl LoadRecord {
         self.series_pending_count = rounds % self.series_stride;
     }
 
-    fn avg(&self) -> f64 {
+    pub(super) fn avg(&self) -> f64 {
         if self.sample_count == 0 {
             0.0
         } else {
@@ -146,12 +131,12 @@ impl LoadRecord {
         }
     }
 
-    fn retention_score(&self) -> f64 {
+    pub(super) fn retention_score(&self) -> f64 {
         // 平均负载比一次性峰值更能代表可生成规则的稳定线程。
         self.avg() * 4.0 + self.max_pct
     }
 
-    fn compact_series(&mut self) {
+    pub(super) fn compact_series(&mut self) {
         let old_stride = self.series_stride;
         let mut compacted = VecDeque::with_capacity(self.samples.len().div_ceil(2));
         while self.samples.len() >= 2 {
@@ -167,7 +152,7 @@ impl LoadRecord {
         self.series_stride = old_stride.saturating_mul(2).max(1);
     }
 
-    fn series_values(&self) -> VecDeque<f32> {
+    pub(super) fn series_values(&self) -> VecDeque<f32> {
         let mut values = self.samples.clone();
         if self.series_pending_count > 0 {
             values.push_back((self.series_pending_sum / self.series_pending_count as f64) as f32);
@@ -177,30 +162,33 @@ impl LoadRecord {
 }
 
 #[derive(Debug, Clone)]
-struct ChildThreadSummary {
-    owner: String,
-    name: String,
-    sum_pct: f64,
-    max_pct: f64,
+pub(super) struct ChildThreadSummary {
+    pub(super) owner: String,
+    pub(super) name: String,
+    pub(super) sum_pct: f64,
+    pub(super) max_pct: f64,
+    pub(super) activity: Activity,
 }
 
 impl ChildThreadSummary {
-    fn new(key: &ChildThreadKey) -> Self {
+    pub(super) fn new(key: &ChildThreadKey) -> Self {
         Self {
             owner: key.owner.clone(),
             name: key.name.clone(),
             sum_pct: 0.0,
             max_pct: 0.0,
+            activity: Activity::default(),
         }
     }
 
-    fn push(&mut self, pct: f64) {
+    pub(super) fn push(&mut self, pct: f64) {
         let pct = pct.clamp(0.0, 999.0);
+        self.activity.observe(pct);
         self.sum_pct += pct;
         self.max_pct = self.max_pct.max(pct);
     }
 
-    fn avg(&self, total_samples: usize) -> f64 {
+    pub(super) fn avg(&self, total_samples: usize) -> f64 {
         if total_samples == 0 {
             0.0
         } else {
@@ -209,27 +197,30 @@ impl ChildThreadSummary {
     }
 }
 
-struct CalibSession {
-    pkg: String,
+pub(super) struct CalibSession {
+    pub(super) pkg: String,
+    pub(super) storage: Option<crate::private_storage::Storage>,
+    pub(super) analyzer: crate::auto_affinity::calibration::Analyzer,
     // pid -> owner。owner 可能是主包名，也可能是 com.pkg:push 这类子进程。
-    processes: HashMap<i32, String>,
+    pub(super) processes: HashMap<i32, String>,
     // 每个 TID 上次读取到的 utime+stime，用相邻两次差值计算 CPU 使用率。
-    prev_ticks: HashMap<TidKey, u64>,
-    // records 只参与规则生成：主进程记录线程负载，子进程记录整体进程负载。
-    records: HashMap<TrackKey, LoadRecord>,
-    // 子进程线程明细只写入历史记录给用户查看，不生成子进程线程规则。
-    child_threads: HashMap<ChildThreadKey, ChildThreadSummary>,
+    pub(super) prev_ticks: HashMap<TidKey, u64>,
+    // 主进程线程与子进程整体曲线用于历史，线程负载同时提供规则建议。
+    pub(super) records: HashMap<TrackKey, LoadRecord>,
+    // 子进程活跃线程摘要同时用于历史和规则建议。
+    pub(super) child_threads: HashMap<ChildThreadKey, ChildThreadSummary>,
     // 这些容器每 500ms 清空复用容量，避免高线程应用持续触发分配器。
-    scratch_processes: HashMap<i32, String>,
-    scratch_observed_tids: HashSet<TidKey>,
-    scratch_child_round_deltas: HashMap<ChildThreadKey, u64>,
-    scratch_grouped_delta: HashMap<String, u64>,
-    rounds: usize,
-    started_at: Instant,
-    last_sample: Option<Instant>,
-    active_duration: Duration,
-    main_active_since: Option<Instant>,
-    main_missing_since: Option<Instant>,
+    pub(super) scratch_processes: HashMap<i32, String>,
+    pub(super) scratch_observed_tids: HashSet<TidKey>,
+    pub(super) scratch_child_round_deltas: HashMap<ChildThreadKey, u64>,
+    pub(super) scratch_grouped_delta: HashMap<String, u64>,
+    pub(super) rounds: usize,
+    pub(super) started_at: Instant,
+    pub(super) last_sample: Option<Instant>,
+    pub(super) last_process_scan: Option<Instant>,
+    pub(super) active_duration: Duration,
+    pub(super) main_active_since: Option<Instant>,
+    pub(super) main_missing_since: Option<Instant>,
 }
 
 #[cfg(test)]
@@ -237,7 +228,7 @@ mod load_record_series_tests {
     use super::*;
 
     #[test]
-    fn series_downsamples_the_full_timeline_without_changing_full_average() {
+    pub(super) fn series_downsamples_the_full_timeline_without_changing_full_average() {
         let key = TrackKey {
             owner: "com.example".to_string(),
             name: "RenderThread".to_string(),
@@ -263,7 +254,7 @@ mod load_record_series_tests {
     }
 
     #[test]
-    fn aggregate_records_preserve_multi_core_load() {
+    pub(super) fn aggregate_records_preserve_multi_core_load() {
         let key = TrackKey {
             owner: "com.example:worker".to_string(),
             name: String::new(),

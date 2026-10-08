@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity android:name=".design.CalibrationProbeActivity" android:exported="true"
+            android:theme="@style/Theme.QixiaThreads" />
+        <activity
+            android:name=".design.UiConceptActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.QixiaThreads" />
+    </application>
+</manifest>

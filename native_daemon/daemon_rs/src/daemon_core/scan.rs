@@ -1,12 +1,13 @@
+use super::*;
 // /proc 扫描与规则命中。
 //
 // 扫描分两层：
-// 1. 进程层：先用 /proc/<pid> 目录 owner UID 和 cmdline 判断是否属于目标包。
+// 1. 进程层：先用 /proc/<pid> 目录所有者的 UID 和 cmdline 判断是否属于目标包。
 // 2. 线程层：只有进程命中后，才进入 /proc/<pid>/task 读取 comm 并匹配线程规则。
 //
 // 这样保留基于 /proc 的通用兼容路径，同时避免无意义地读取全系统所有线程。
-// 这里不要引入 cmd/pm/dumpsys 这类外部命令，守护进程长期运行时 fork 成本太高。
-enum ProcessScanOutcome {
+// 这里不要引入 cmd/pm/dumpsys 这类外部命令，守护进程长期运行时创建子进程的成本太高。
+pub(super) enum ProcessScanOutcome {
     Hit(ProcHit),
     Gone,
     NotTarget,
@@ -14,12 +15,12 @@ enum ProcessScanOutcome {
 }
 
 #[derive(Debug, Default)]
-struct CandidateScanResult {
-    hits: Vec<ProcHit>,
-    gone_pids: BTreeSet<i32>,
+pub(super) struct CandidateScanResult {
+    pub(super) hits: Vec<ProcHit>,
+    pub(super) gone_pids: BTreeSet<i32>,
 }
 
-fn enumerate_proc_pids() -> io::Result<BTreeSet<i32>> {
+pub(super) fn enumerate_proc_pids() -> io::Result<BTreeSet<i32>> {
     let mut pids = BTreeSet::new();
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
@@ -30,7 +31,7 @@ fn enumerate_proc_pids() -> io::Result<BTreeSet<i32>> {
     Ok(pids)
 }
 
-fn scan_candidate_pids(
+pub(super) fn scan_candidate_pids(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     candidates: &BTreeSet<i32>,
@@ -55,7 +56,7 @@ fn scan_candidate_pids(
     result
 }
 
-fn scan_proc(
+pub(super) fn scan_proc(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     known_pids: &BTreeSet<i32>,
@@ -64,7 +65,7 @@ fn scan_proc(
     scan_proc_indexed(rules, index, known_pids, process_index, None)
 }
 
-fn scan_proc_packages(
+pub(super) fn scan_proc_packages(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     known_pids: &BTreeSet<i32>,
@@ -81,7 +82,7 @@ fn scan_proc_packages(
     scan_proc_indexed(rules, index, known_pids, process_index, Some(packages))
 }
 
-fn scan_proc_indexed(
+pub(super) fn scan_proc_indexed(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     known_pids: &BTreeSet<i32>,
@@ -97,7 +98,7 @@ fn scan_proc_indexed(
     }
     // 本轮数字 PID 快照已经重建/刷新了内存索引。这里直接按缓存 cmdline 预筛，
     // 不再第二次枚举整个 /proc；真正使用前仍由 scan_process_path_scoped 重新读取
-    // UID、cmdline 和 starttime，缓存身份绝不会直接生成 affinity 动作。
+    // UID、cmdline 和 starttime，缓存身份绝不会直接生成亲和性动作。
     let packages = scope_packages.unwrap_or(&index.plan.all_pkgs);
     let mut candidate_pids = process_index_cached_package_pids(process_index, packages);
     if scope_packages.is_none() {
@@ -151,7 +152,7 @@ fn scan_proc_indexed(
     })
 }
 
-fn indexed_candidate_package(
+pub(super) fn indexed_candidate_package(
     process_index: &ProcessIndex,
     pid: i32,
     packages: &BTreeSet<String>,
@@ -165,21 +166,21 @@ fn indexed_candidate_package(
     })
 }
 
-struct KnownPidScanPolicy<'a> {
-    now_elapsed: u64,
-    deep_scan_interval_ms: u64,
-    priority_pids: &'a BTreeSet<i32>,
-    background_budget: Duration,
+pub(super) struct KnownPidScanPolicy<'a> {
+    pub(super) now_elapsed: u64,
+    pub(super) deep_scan_interval_ms: u64,
+    pub(super) priority_pids: &'a BTreeSet<i32>,
+    pub(super) background_budget: Duration,
 }
 
-fn scan_known_pids(
+pub(super) fn scan_known_pids(
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     known_pids: &mut BTreeSet<i32>,
     process_scan_stamps: &mut HashMap<i32, ProcessScanStamp>,
     policy: KnownPidScanPolicy<'_>,
 ) -> ProcScanResult {
-    // 缓存扫描只访问上轮已经命中过的 PID，主要降低常驻 daemon 的 open/read 次数。
+    // 缓存扫描只访问上轮已经命中过的 PID，主要降低常驻守护进程打开和读取文件的次数。
     // 如果进程退出或规则不再匹配，会从 known_pids 里剔除。
     let mut hits = Vec::new();
     let mut alive = BTreeSet::new();
@@ -272,7 +273,7 @@ fn scan_known_pids(
     }
 }
 
-fn update_process_scan_stamp(
+pub(super) fn update_process_scan_stamp(
     process_scan_stamps: &mut HashMap<i32, ProcessScanStamp>,
     hit: &ProcHit,
     now_elapsed: u64,
@@ -302,7 +303,7 @@ fn update_process_scan_stamp(
     );
 }
 
-fn next_deep_scan_slot(
+pub(super) fn next_deep_scan_slot(
     pid: i32,
     starttime: u64,
     now_elapsed: u64,
@@ -326,7 +327,7 @@ fn next_deep_scan_slot(
     }
 }
 
-fn read_thread_set_fingerprint(proc_path: &Path) -> io::Result<ThreadSetFingerprint> {
+pub(super) fn read_thread_set_fingerprint(proc_path: &Path) -> io::Result<ThreadSetFingerprint> {
     let mut fingerprint = ThreadSetFingerprint::default();
     for task in fs::read_dir(proc_path.join("task"))? {
         let task = task?;
@@ -338,7 +339,7 @@ fn read_thread_set_fingerprint(proc_path: &Path) -> io::Result<ThreadSetFingerpr
 }
 
 impl ThreadSetFingerprint {
-    fn add_tid(&mut self, tid: i32) {
+    pub(super) fn add_tid(&mut self, tid: i32) {
         let mut value = tid as u64;
         value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
         value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -350,7 +351,7 @@ impl ThreadSetFingerprint {
     }
 }
 
-fn scan_process_path(
+pub(super) fn scan_process_path(
     pid: i32,
     proc_path: &Path,
     rules: &[Rule],
@@ -359,14 +360,14 @@ fn scan_process_path(
     scan_process_path_scoped(pid, proc_path, rules, index, None)
 }
 
-fn scan_process_path_scoped(
+pub(super) fn scan_process_path_scoped(
     pid: i32,
     proc_path: &Path,
     rules: &[Rule],
     index: &RuntimeRuleIndex,
     scope_packages: Option<&BTreeSet<String>>,
 ) -> ProcessScanOutcome {
-    // UID 的 appId 用于优先缩小候选包集合；厂商分身/isolated UID 仍可走严格包名兜底。
+    // UID 的 appId 用于优先缩小候选包集合；厂商分身或隔离 UID 仍可走严格包名兜底。
     // Linux/Android 内核没有“包名”概念，最终必须读取 cmdline 确认主进程/子进程名。
     let uid = match metadata_uid(proc_path) {
         Ok(uid) => uid,
@@ -497,7 +498,7 @@ fn scan_process_path_scoped(
     })
 }
 
-fn matched_plan_package<'a>(uid: u32, cmdline: &str, plan: &'a ScanPlan) -> Option<&'a str> {
+pub(super) fn matched_plan_package<'a>(uid: u32, cmdline: &str, plan: &'a ScanPlan) -> Option<&'a str> {
     // 完整 UID 的高位是 Android userId；分身/工作资料与原应用共享低位 appId。
     // appId 命中仍只作为预过滤，最终必须用 cmdline 精确确认包名或其 :子进程。
     if let Some(pkgs) = plan.by_app_id.get(&android_app_id(uid)) {
@@ -508,13 +509,13 @@ fn matched_plan_package<'a>(uid: u32, cmdline: &str, plan: &'a ScanPlan) -> Opti
             return Some(pkg.as_str());
         }
     }
-    // 部分厂商分身或 isolated 进程可能不保留宿主 appId。这里仍要求 cmdline 的
+    // 部分厂商分身或隔离进程可能不保留宿主 appId。这里仍要求 cmdline 的
     // 基础包名完全存在于配置集合中，只放宽 UID，不放宽包名边界。
     let cmdline_base = cmdline.split_once(':').map_or(cmdline, |(pkg, _)| pkg);
     plan.all_pkgs.get(cmdline_base).map(String::as_str)
 }
 
-fn scan_threads(
+pub(super) fn scan_threads(
     proc_path: &Path,
     process_rules: &[&Rule],
     thread_rules: &[&Rule],
@@ -579,7 +580,7 @@ fn scan_threads(
                 .as_deref()
                 .is_some_and(|pattern| glob_match(pattern, &name))
         }) {
-            matched_rule_health_keys.insert(rule_health_key(
+            matched_rule_health_keys.insert(rule_health::key(
                 'T',
                 &rule.owner,
                 rule.thread.as_deref().unwrap_or_default(),
@@ -595,7 +596,7 @@ fn scan_threads(
                 rule_health_keys: matched_thread_rules
                     .iter()
                     .map(|rule| {
-                        rule_health_key(
+                        rule_health::key(
                             'T',
                             &rule.owner,
                             rule.thread.as_deref().unwrap_or_default(),
@@ -632,12 +633,12 @@ fn scan_threads(
 }
 
 #[derive(Debug, Clone)]
-struct CombinedRule {
-    cpus: String,
-    line: String,
+pub(super) struct CombinedRule {
+    pub(super) cpus: String,
+    pub(super) line: String,
 }
 
-fn combine_rules(rules: &[&Rule]) -> Option<CombinedRule> {
+pub(super) fn combine_rules(rules: &[&Rule]) -> Option<CombinedRule> {
     let mut mask = CpuMask::empty();
     let mut lines = Vec::new();
     let mut any = false;

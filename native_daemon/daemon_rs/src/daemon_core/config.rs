@@ -1,6 +1,7 @@
+use super::*;
 // 配置解析与扫描计划构建。
 //
-// applist.conf 的规则语法保持 AppOpt 旧格式：
+// applist.conf 的规则语法保持 QixiaThreads 旧格式：
 // - com.pkg=0-3                         主进程/包名兜底规则
 // - com.pkg:push=0-3                    子进程规则
 // - com.pkg{RenderThread}=7             主进程线程规则
@@ -8,13 +9,13 @@
 // - com.pkg{Thread-*}=0-3               线程通配符规则
 // - com.pkg=auto                        等待校准，占位但不执行绑核
 //
-// package_uid.map 由 App/前台 helper 通过 PackageManager 写入，daemon 只读取，不自己解析系统包数据库，
-// 也不 fork cmd/pm/dumpsys。这样长期运行更稳，ROM 差异也少一点。
-fn parse_config(path: &Path) -> io::Result<Vec<Rule>> {
+// package_uid.map 由 App/前台助手通过 PackageManager 写入，守护进程只读取，不自己解析系统包数据库，
+// 也不创建子进程调用 cmd/pm/dumpsys。这样长期运行更稳，ROM 差异也少一点。
+pub(super) fn parse_config(path: &Path) -> io::Result<Vec<Rule>> {
     parse_config_with_key(path).map(|(rules, _)| rules)
 }
 
-fn parse_config_with_key(path: &Path) -> io::Result<(Vec<Rule>, FileKey)> {
+pub(super) fn parse_config_with_key(path: &Path) -> io::Result<(Vec<Rule>, FileKey)> {
     let bytes = fs::read(path)?;
     let key = content_file_key(&bytes);
     let text =
@@ -22,7 +23,7 @@ fn parse_config_with_key(path: &Path) -> io::Result<(Vec<Rule>, FileKey)> {
     Ok((parse_config_text(&text), key))
 }
 
-fn parse_config_text(text: &str) -> Vec<Rule> {
+pub(super) fn parse_config_text(text: &str) -> Vec<Rule> {
     let mut rules = Vec::new();
     let present_mask = read_present_cpus().and_then(|cpus| CpuMask::parse(&cpus));
 
@@ -52,7 +53,7 @@ fn parse_config_text(text: &str) -> Vec<Rule> {
     deduplicate_config_rules(rules)
 }
 
-fn normalize_rule_for_present(mut rule: Rule, present: Option<&CpuMask>) -> Option<Rule> {
+pub(super) fn normalize_rule_for_present(mut rule: Rule, present: Option<&CpuMask>) -> Option<Rule> {
     if rule.auto {
         return Some(rule);
     }
@@ -66,7 +67,7 @@ fn normalize_rule_for_present(mut rule: Rule, present: Option<&CpuMask>) -> Opti
 }
 
 /* 同一线程、子进程或主进程兜底只保留覆盖核心最多的一条。 */
-fn deduplicate_config_rules(rules: Vec<Rule>) -> Vec<Rule> {
+pub(super) fn deduplicate_config_rules(rules: Vec<Rule>) -> Vec<Rule> {
     let mut selected = Vec::<Rule>::new();
     let mut indices = HashMap::<(String, Option<String>), usize>::new();
     for rule in rules {
@@ -83,24 +84,24 @@ fn deduplicate_config_rules(rules: Vec<Rule>) -> Vec<Rule> {
     selected
 }
 
-fn rule_cpu_preference(rule: &Rule) -> (u8, u32, usize, usize) {
+pub(super) fn rule_cpu_preference(rule: &Rule) -> (u8, u32, usize, usize) {
     if rule.auto {
         return (1, 0, 0, 0);
     }
     let Some(mask) = CpuMask::parse(&rule.cpus) else {
         return (0, 0, 0, 0);
     };
-    let count = mask.words.iter().map(|word| word.count_ones()).sum();
+    let count = mask.count();
     let limit = CPU_MASK_WORDS * 64;
     let highest = (0..limit).rev().find(|cpu| mask.contains(*cpu)).unwrap_or(0);
     let lowest = (0..limit).find(|cpu| mask.contains(*cpu)).unwrap_or(limit);
     (2, count, highest, limit.saturating_sub(lowest))
 }
 
-fn parse_rule_key(left: &str, cpus: &str) -> Option<Rule> {
+pub(super) fn parse_rule_key(left: &str, cpus: &str) -> Option<Rule> {
     if let Some(open) = left.find('{') {
         // 线程规则：com.pkg{thread-pattern}=0-3。
-        // pattern 后续用 glob_match 支持 *、?、[0-9] 这类 AppOpt 规则写法。
+        // pattern 后续用 glob_match 支持 *、?、[0-9] 这类 QixiaThreads 规则写法。
         let close = left[open + 1..].find('}')? + open + 1;
         if close <= open {
             return None;
@@ -165,36 +166,34 @@ mod config_tests {
     }
 
     #[test]
-    fn missed_rule_stays_in_read_only_health_index() {
-        let rule = parse_rule_key("com.example{RenderThread}", "4-7").unwrap();
+    fn automatic_mode_suspends_only_its_own_rules_without_deleting_them() {
+        let rules = vec![parse_rule_key("com.game{RenderThread}", "4-7").unwrap(),
+            parse_rule_key("com.game:worker", "0-7").unwrap(),
+            parse_rule_key("com.other", "0-7").unwrap(),
+            parse_rule_key("com.game", "0-3").unwrap(),
+            parse_rule_key("com.game:worker{Job*}", "4-5").unwrap()];
         let mut state = DaemonState::default();
-        let mut health = rule_health_entry_from_rule(&rule).unwrap();
-        health.status = RuleHealthStatus::Missed;
-        state
-            .rule_health
-            .insert(rule_health_entry_key(&health), health);
-
-        let index = build_runtime_rule_index(&[rule], &HashMap::new(), None, &state);
-        assert!(index.active_rule_indices.is_empty());
-        assert!(index.rules_by_owner.is_empty());
-        assert_eq!(
-            index
-                .health_rules_by_owner
-                .get("com.example")
-                .map(Vec::len),
-            Some(1)
-        );
-        assert!(index.plan.all_pkgs.contains("com.example"));
+        state.auto_affinity_packages.insert("com.game".into());
+        let index = build_runtime_rule_index(&rules, &HashMap::new(), None, &state);
+        assert_eq!(index.active_rule_indices, vec![2]);
+        assert!(!index.plan.all_pkgs.contains("com.game"));
+        assert!(!index.health_rule_packages.contains("com.game"));
+        assert!(!index.health_rules_by_owner.contains_key("com.game:worker"));
+        assert!(!index.rules_by_owner.contains_key("com.game"));
+        state.auto_affinity_packages.clear();
+        let index = build_runtime_rule_index(&rules, &HashMap::new(), None, &state);
+        assert_eq!(index.active_rule_indices, vec![0,1,2,3,4]);
+        assert_eq!(rules[0].cpus, "4-7");
     }
 }
 
-fn parse_uid_map(path: &Path) -> io::Result<HashMap<String, u32>> {
+pub(super) fn parse_uid_map(path: &Path) -> io::Result<HashMap<String, u32>> {
     parse_uid_map_with_key(path).map(|(map, _)| map)
 }
 
-fn parse_uid_map_with_key(path: &Path) -> io::Result<(HashMap<String, u32>, Option<FileKey>)> {
-    // package_uid.map 由 App/前台 helper 写入，格式为 com.example.app=10123。
-    // 让 Android Framework 负责包名到 UID 的真实映射，daemon 不解析 packages.list，也不 fork cmd/pm。
+pub(super) fn parse_uid_map_with_key(path: &Path) -> io::Result<(HashMap<String, u32>, Option<FileKey>)> {
+    // package_uid.map 由 App/前台助手写入，格式为 com.example.app=10123。
+    // 让 Android 框架负责包名到 UID 的真实映射，守护进程不解析 packages.list，也不创建子进程调用 cmd/pm。
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((HashMap::new(), None)),
@@ -222,7 +221,7 @@ fn parse_uid_map_with_key(path: &Path) -> io::Result<(HashMap<String, u32>, Opti
     Ok((map, Some(key)))
 }
 
-fn build_runtime_rule_index(
+pub(super) fn build_runtime_rule_index(
     rules: &[Rule],
     uid_map: &HashMap<String, u32>,
     target_pkg: Option<&str>,
@@ -236,6 +235,9 @@ fn build_runtime_rule_index(
         let Some(base_pkg) = base_package(&rule.owner) else {
             continue;
         };
+        if state.auto_affinity_packages.contains(base_pkg) {
+            continue;
+        }
         if target_pkg.is_some_and(|target| target != base_pkg) {
             continue;
         }
@@ -259,7 +261,7 @@ fn build_runtime_rule_index(
         } else {
             index.plan.fallback_pkgs.insert(base_pkg.to_string());
         }
-        if rule_health_rule_disabled(rule, state) {
+        if state.rule_health.is_disabled(rule) {
             continue;
         }
         index.active_rule_indices.push(rule_index);
@@ -272,11 +274,11 @@ fn build_runtime_rule_index(
     index
 }
 
-fn android_app_id(uid: u32) -> u32 {
+pub(super) fn android_app_id(uid: u32) -> u32 {
     uid % ANDROID_UID_USER_RANGE
 }
 
-fn base_package(owner: &str) -> Option<&str> {
+pub(super) fn base_package(owner: &str) -> Option<&str> {
     let base = owner.split_once(':').map_or(owner, |(pkg, _)| pkg);
     if base.is_empty() {
         None
@@ -285,7 +287,7 @@ fn base_package(owner: &str) -> Option<&str> {
     }
 }
 
-fn content_file_key(bytes: &[u8]) -> FileKey {
+pub(super) fn content_file_key(bytes: &[u8]) -> FileKey {
     // 固定 FNV-1a 指纹足以检测本地配置变化，且不会受到文件系统 mtime 精度影响。
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {

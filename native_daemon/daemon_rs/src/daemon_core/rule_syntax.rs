@@ -9,6 +9,9 @@ pub struct CanonicalGroup {
     pub rules: Vec<CanonicalRule>,
 }
 
+// 源文本范围仅供解析器回归测试使用。守护进程不再重写配置，
+// 因此正式运行时的解析流程不为此分配内存。
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct BlockRange {
     pub owner: String,
@@ -18,7 +21,9 @@ pub struct BlockRange {
 
 struct ParsedDocument {
     groups: Vec<CanonicalGroup>,
+    #[cfg(test)]
     ranges: Vec<BlockRange>,
+    #[cfg(test)]
     valid: bool,
 }
 
@@ -49,7 +54,8 @@ pub fn parse_config_groups(text: &str) -> Vec<CanonicalGroup> {
     parse_document(text).groups
 }
 
-pub fn block_ranges(text: &str) -> Option<Vec<BlockRange>> {
+#[cfg(test)]
+fn block_ranges(text: &str) -> Option<Vec<BlockRange>> {
     let document = parse_document(text);
     document.valid.then_some(document.ranges)
 }
@@ -57,7 +63,9 @@ pub fn block_ranges(text: &str) -> Option<Vec<BlockRange>> {
 fn parse_document(text: &str) -> ParsedDocument {
     let lines = text.lines().collect::<Vec<_>>();
     let mut groups = Vec::new();
+    #[cfg(test)]
     let mut ranges = Vec::new();
+    #[cfg(test)]
     let mut valid = true;
     let mut index = 0;
 
@@ -72,10 +80,12 @@ fn parse_document(text: &str) -> ParsedDocument {
         if let Some(header) = parse_yaml_header(raw) {
             let end = yaml_end(&lines, index);
             let parsed = parse_yaml_body(&lines[index + 1..end], &header.owner);
-            valid &= parsed.is_some();
+            #[cfg(test)]
+            { valid &= parsed.is_some(); }
             groups.push(CanonicalGroup {
                 rules: parsed.unwrap_or_default(),
             });
+            #[cfg(test)]
             ranges.push(BlockRange {
                 owner: header.owner,
                 start_line: index,
@@ -87,7 +97,8 @@ fn parse_document(text: &str) -> ParsedDocument {
 
         if let Some(mut header) = parse_brace_header(code) {
             let Some(end) = brace_block_end(&lines, index) else {
-                valid = false;
+                #[cfg(test)]
+                { valid = false; }
                 break;
             };
             let close = code_part(lines[end - 1]);
@@ -109,7 +120,8 @@ fn parse_document(text: &str) -> ParsedDocument {
             let body = &lines[index + 1..end - 1];
             let parsed = parse_brace_body(body, &header);
             block_valid &= parsed.is_some();
-            valid &= block_valid;
+            #[cfg(test)]
+            { valid &= block_valid; }
             groups.push(CanonicalGroup {
                 rules: if block_valid {
                     parsed.unwrap_or_default()
@@ -117,6 +129,7 @@ fn parse_document(text: &str) -> ParsedDocument {
                     Vec::new()
                 },
             });
+            #[cfg(test)]
             ranges.push(BlockRange {
                 owner: header.owner,
                 start_line: index,
@@ -127,6 +140,7 @@ fn parse_document(text: &str) -> ParsedDocument {
         }
 
         let legacy = parse_legacy_rule(code);
+        #[cfg(test)]
         if legacy.is_none() && code.contains(['{', '}']) {
             valid = false;
         }
@@ -137,7 +151,9 @@ fn parse_document(text: &str) -> ParsedDocument {
 
     ParsedDocument {
         groups,
+        #[cfg(test)]
         ranges,
+        #[cfg(test)]
         valid,
     }
 }
@@ -734,7 +750,9 @@ mod tests {
         let text = "com.example=0-3 {\n  RenderThread=6-7\n  Worker=abc\n}\n";
         let document = parse_document(text);
         assert!(document.valid);
-        assert_eq!(block_ranges(text).unwrap().len(), 1);
+        let ranges = block_ranges(text).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((&*ranges[0].owner, ranges[0].start_line, ranges[0].end_line), ("com.example", 0, 4));
         let groups = parse_config_groups(text);
         let rules = &groups[0].rules;
         assert!(rules

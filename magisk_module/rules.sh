@@ -7,54 +7,41 @@
 # $(format_cpu_ranges "$p_core $hp_core") 为中核与大核
 common_rules="
 # 将 '微信' 渲染线程与主线程绑定到中大核
-com.tencent.mm=$(format_cpu_ranges "$e_core $p_core") {
-	RenderThread=$(format_cpu_ranges "$hp_core")
-	com.tencent.mm=$(format_cpu_ranges "$p_core $hp_core")
-}
+com.tencent.mm=$(format_cpu_ranges "$e_core $p_core")
+com.tencent.mm{RenderThread}=$(format_cpu_ranges "$hp_core")
+com.tencent.mm{com.tencent.mm}=$(format_cpu_ranges "$p_core $hp_core")
 
 # 将 '微信' 消息推送进程绑定到小核
 com.tencent.mm:push=$(format_cpu_ranges "$e_core")
 
 # 将 'QQ' 主线程与渲染线程绑定到中大核
-com.tencent.mobileqq {
-	encent.mobileqq=$(format_cpu_ranges "$p_core $hp_core")
-	RenderThread=$(format_cpu_ranges "$hp_core")
-}
+com.tencent.mobileqq{encent.mobileqq}=$(format_cpu_ranges "$p_core $hp_core")
+com.tencent.mobileqq{RenderThread}=$(format_cpu_ranges "$hp_core")
 
 # 将 'QQ' 消息推送进程绑定到小核
 com.tencent.mobileqq:MSF=$(format_cpu_ranges "$e_core")
 
 # 将 '淘宝' 主线程绑定到大核
-com.taobao.taobao {
-	m.taobao.taobao=$(format_cpu_ranges "$hp_core")
-	RenderThread=$(format_cpu_ranges "$p_core $hp_core")
-}
+com.taobao.taobao{m.taobao.taobao}=$(format_cpu_ranges "$hp_core")
+com.taobao.taobao{RenderThread}=$(format_cpu_ranges "$p_core $hp_core")
 
 # 将 '酷安' 渲染线程绑定到大核
-com.coolapk.market {
-	RenderThread=$(format_cpu_ranges "$hp_core")
-	.coolapk.market=$(format_cpu_ranges "$p_core $hp_core")
-}
+com.coolapk.market{RenderThread}=$(format_cpu_ranges "$hp_core")
+com.coolapk.market{.coolapk.market}=$(format_cpu_ranges "$p_core $hp_core")
 
 # 将 '抖音' 关键线程绑定到中大核
-com.ss.android.ugc.aweme {
-	main=$(format_cpu_ranges "$hp_core")
-	RenderThread=$(format_cpu_ranges "$hp_core")
-	droid.ugc.aweme=$(format_cpu_ranges "$p_core $hp_core")
-}
+com.ss.android.ugc.aweme{main}=$(format_cpu_ranges "$hp_core")
+com.ss.android.ugc.aweme{RenderThread}=$(format_cpu_ranges "$hp_core")
+com.ss.android.ugc.aweme{droid.ugc.aweme}=$(format_cpu_ranges "$p_core $hp_core")
 
 # 将 '支付宝' 渲染线程、主线程与扫一扫线程绑定到中大核
-com.eg.android.AlipayGphone {
-	RenderThread=$(format_cpu_ranges "$hp_core")
-	id.AlipayGphone=$(format_cpu_ranges "$p_core $hp_core")
-	ScanRecognize=$(format_cpu_ranges "$hp_core")
-}
+com.eg.android.AlipayGphone{RenderThread}=$(format_cpu_ranges "$hp_core")
+com.eg.android.AlipayGphone{id.AlipayGphone}=$(format_cpu_ranges "$p_core $hp_core")
+com.eg.android.AlipayGphone{ScanRecognize}=$(format_cpu_ranges "$hp_core")
 
 # 将 '高德地图' 渲染线程与主线程绑定到中大核
-com.autonavi.minimap {
-	RenderThread=$(format_cpu_ranges "$hp_core")
-	utonavi.minimap=$(format_cpu_ranges "$p_core $hp_core")
-}
+com.autonavi.minimap{RenderThread}=$(format_cpu_ranges "$hp_core")
+com.autonavi.minimap{utonavi.minimap}=$(format_cpu_ranges "$p_core $hp_core")
 
 # 将 'Android图形显示组件'渲染引擎线程绑定到大核
 surfaceflinger{RenderEngine}=$(format_cpu_ranges "$hp_core")
@@ -63,12 +50,10 @@ surfaceflinger{RenderEngine}=$(format_cpu_ranges "$hp_core")
 surfaceflinger=$all_core
 
 # 将 '系统界面' 渲染引擎线程与主线程绑定到中大核
-com.android.systemui {
-	RenderThread=$(format_cpu_ranges "$hp_core")
-	ndroid.systemui=$(format_cpu_ranges "$p_core $hp_core")
-}
+com.android.systemui{RenderThread}=$(format_cpu_ranges "$hp_core")
+com.android.systemui{ndroid.systemui}=$(format_cpu_ranges "$p_core $hp_core")
 "
 
-RULES_CONFIG_FILE="${APPOPT_RULES_FILE:-$MODPATH/applist.conf}"
+RULES_CONFIG_FILE="${QIXIA_RULES_FILE:-$MODPATH/applist.conf}"
 echo "$common_rules" >> "$RULES_CONFIG_FILE"
 unset common_rules RULES_CONFIG_FILE

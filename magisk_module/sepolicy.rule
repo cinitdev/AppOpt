@@ -1,4 +1,4 @@
-# AppOpt binder 直连权限
+# QixiaThreads binder 直连权限
 allow magisk surfaceflinger binder *
 allow ksu surfaceflinger binder *
 allow su surfaceflinger binder *

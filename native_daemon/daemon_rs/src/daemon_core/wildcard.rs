@@ -1,15 +1,17 @@
-// AppOpt 线程名通配符匹配。
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::ffi::CString;
+// QixiaThreads 线程名通配符匹配。
 //
 // 支持的语法按旧规则保持轻量：
 // - *      匹配任意长度
 // - ?      匹配单个字符
 // - [0-9]  匹配字符范围
 //
-// 这里不引入 regex，原因有两个：
+// 这里不引入正则表达式库，原因有两个：
 // 1. Android 守护进程不需要完整正则，旧规则也不是正则语法。
-// 2. 线程扫描会频繁调用匹配函数，轻量 glob 更容易控制性能和行为。
+// 2. 线程扫描会频繁调用匹配函数，轻量通配符匹配更容易控制性能和行为。
 #[cfg(any(target_os = "android", target_os = "linux"))]
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(super) fn glob_match(pattern: &str, text: &str) -> bool {
     let Ok(pattern) = CString::new(pattern) else {
         return false;
     };
@@ -20,12 +22,12 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(super) fn glob_match(pattern: &str, text: &str) -> bool {
     glob_match_portable(pattern, text)
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
-fn glob_match_portable(pattern: &str, text: &str) -> bool {
+pub(super) fn glob_match_portable(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -61,7 +63,7 @@ fn glob_match_portable(pattern: &str, text: &str) -> bool {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
-fn pattern_atom_matches(pattern: &[char], index: usize, ch: char) -> Option<usize> {
+pub(super) fn pattern_atom_matches(pattern: &[char], index: usize, ch: char) -> Option<usize> {
     match pattern[index] {
         '?' => Some(index + 1),
         '[' => match_class(pattern, index, ch),
@@ -71,7 +73,7 @@ fn pattern_atom_matches(pattern: &[char], index: usize, ch: char) -> Option<usiz
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
-fn match_class(pattern: &[char], index: usize, ch: char) -> Option<usize> {
+pub(super) fn match_class(pattern: &[char], index: usize, ch: char) -> Option<usize> {
     let mut i = index + 1;
     let negated = i < pattern.len() && matches!(pattern[i], '!' | '^');
     if negated {

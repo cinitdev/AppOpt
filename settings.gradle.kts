@@ -19,6 +19,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "AppOpt"
+rootProject.name = "QixiaThreads"
 include(":app")
  

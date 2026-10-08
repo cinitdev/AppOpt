@@ -1,15 +1,25 @@
+use super::*;
 // 一次性调试命令。
 //
-// --scan-once 只输出会命中的进程/线程和规则，不写 affinity，适合真机诊断。
+// --scan-once 只输出会命中的进程/线程和规则，不写亲和性，适合真机诊断。
 // --apply-once 会执行一次绑核后退出，适合排查某条规则是否能正常写入。
 //
 // 注意：这里会先从当前 /proc 快照完整重建临时索引，再只扫描预筛出的目标 PID。
 // 临时索引不会写盘，调试结果仍反映当前系统状态，也避免重复枚举整个 /proc。
-fn run_once(args: &Args, apply: bool) -> io::Result<()> {
+pub(super) fn run_once(args: &Args, apply: bool) -> io::Result<()> {
     let rules = parse_config(&args.config)?;
     let uid_map = parse_uid_map(&args.uid_map)?;
     let mut health_state = DaemonState::default();
-    if let Err(err) = ensure_rule_health_loaded(&mut health_state) {
+    // 单次诊断命令必须遵循与常驻守护进程相同的包管理归属规则。
+    // 尤其是 --apply-once，不能用已保存的静态规则
+    // 覆盖自动分配正在管理的线程。
+    health_state.auto_affinity_packages = match fs::read_to_string(auto_affinity::CONFIG) {
+        Ok(text) => auto_affinity::packages(&text),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(err) => return Err(err),
+    };
+    health_state.rule_health.suspend_packages(&health_state.auto_affinity_packages);
+    if let Err(err) = health_state.rule_health.ensure_loaded() {
         eprintln!("[RS] 规则健康状态读取失败，本次调试不禁用任何规则: {err}");
     }
     let index = build_runtime_rule_index(
@@ -95,7 +105,7 @@ fn run_once(args: &Args, apply: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn print_hits(hits: &[ProcHit], apply: bool) {
+pub(super) fn print_hits(hits: &[ProcHit], apply: bool) {
     if apply {
         return;
     }

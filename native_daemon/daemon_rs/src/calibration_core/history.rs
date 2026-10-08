@@ -1,3 +1,6 @@
+use super::*;
+#[path = "history_retention.rs"]
+mod retention;
 // 校准历史写入。
 //
 // history/<pkg>.log 是 App 历史记录页面的数据源，不只是调试日志。
@@ -6,26 +9,118 @@
 // - 后续行：avg max name|series[,series...]|child-thread-detail
 //
 // 子进程线程明细跟在子进程整体负载后面，方便 App 展开查看“哪个线程贡献了子进程负载”，
-// 但生成规则仍只看子进程整体负载。
-fn write_history(
+// 规则建议与历史各自筛选，子进程活跃线程同样可以生成建议。
+pub(super) fn select_history_records(records: &[LoadRecord]) -> Vec<&LoadRecord> {
+    let mut rows = records
+        .iter()
+        .filter(|record| record.sample_count > 0 && record.activity.worth_saving(record.avg()))
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        // 先过滤再分配容量，休眠子进程不能挤掉真正活跃的主进程线程。
+        b.is_process
+            .cmp(&a.is_process)
+            .then_with(|| b.avg().total_cmp(&a.avg()))
+            .then_with(|| b.max_pct.total_cmp(&a.max_pct))
+            .then_with(|| a.owner.cmp(&b.owner))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    rows
+}
+
+pub(super) fn select_history_child_threads<'a>(
+    records: &[&LoadRecord],
+    child_threads: &'a HashMap<ChildThreadKey, ChildThreadSummary>,
+    total_samples: usize,
+) -> Vec<&'a ChildThreadSummary> {
+    let owners = records
+        .iter()
+        .filter(|record| record.is_process)
+        .map(|record| record.owner.as_str())
+        .collect::<HashSet<_>>();
+    let mut rows = child_threads
+        .values()
+        .filter(|summary| owners.contains(summary.owner.as_str()))
+        .filter(|summary| summary.activity.worth_saving(summary.avg(total_samples)))
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.avg(total_samples)
+            .total_cmp(&a.avg(total_samples))
+            .then_with(|| b.max_pct.total_cmp(&a.max_pct))
+            .then_with(|| a.owner.cmp(&b.owner))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    rows
+}
+
+pub(super) fn write_history(
     pkg: &str,
     history_rounds: usize,
     sample_rounds: usize,
     records: &[&LoadRecord],
     child_threads: &HashMap<ChildThreadKey, ChildThreadSummary>,
-) -> io::Result<()> {
-    fs::create_dir_all(HISTORY_DIR)?;
-    let path = PathBuf::from(HISTORY_DIR).join(format!("{}.log", safe_file_name(pkg)));
+    storage: Option<&crate::private_storage::Storage>,
+) -> io::Result<usize> {
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let Some((current, written_rows)) =
+        format_history(epoch, history_rounds, sample_rounds, records, child_threads)?
+    else {
+        return Ok(0);
+    };
+    let resolved;
+    let storage = match storage {
+        Some(storage) => storage,
+        None => { resolved = crate::private_storage::resolve()?; &resolved }
+    };
+    let root = storage.prepare_root()?;
+    // 共享锁放在可删除的待导入目录之外，创建或删除该目录时均需持锁。
+    let _lock = retention::HistoryDirectoryLock::acquire(&root)?;
+    let directory = storage.prepare("history")?;
+    let path = directory.join(format!("{}.log", safe_file_name(pkg)));
+
+    // 单文件先限量，发布后在同一锁内收敛到所有应用合计最近 10 次。
+    let old = match fs::read_to_string(&path) {
+        Ok(old) => old,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
+    let recent = recent_history_tail(&old, HISTORY_MAX_SESSIONS.saturating_sub(1));
+    let tmp = path.with_extension("log.rust.tmp");
+    let mut output = fs::File::create(&tmp)?;
+    if !recent.is_empty() {
+        output.write_all(recent.as_bytes())?;
+        if !recent.ends_with('\n') {
+            output.write_all(b"\n")?;
+        }
+    }
+    output.write_all(current.as_bytes())?;
+    output.flush()?;
+    output.sync_data()?;
+    drop(output);
+    fs::rename(tmp, path)?;
+    if let Err(error) = retention::prune(&directory, HISTORY_MAX_SESSIONS) {
+        log_warn!("[校准历史] 清理超额记录失败: {error}");
+    }
+    Ok(written_rows)
+}
+
+pub(super) fn format_history(
+    epoch: u64,
+    history_rounds: usize,
+    sample_rounds: usize,
+    records: &[&LoadRecord],
+    child_threads: &HashMap<ChildThreadKey, ChildThreadSummary>,
+) -> io::Result<Option<(String, usize)>> {
+    let child_rows = select_history_child_threads(records, child_threads, sample_rounds);
     let mut current = String::new();
     // 第二列保持旧格式的“半秒单位”，但由真实有效时长换算，App 无需迁移数据库。
     writeln!(&mut current, "# {epoch} {history_rounds}").map_err(fmt_to_io)?;
     let mut written_rows = 0usize;
     for record in records.iter().copied() {
-        if record.max_pct < 0.05 && record.avg() < 0.05 {
+        if !record.activity.worth_saving(record.avg()) {
             continue;
         }
         let name = if record.is_process {
@@ -37,7 +132,7 @@ fn write_history(
             continue;
         }
         let details = if record.is_process {
-            process_history_details(&record.owner, child_threads, sample_rounds)
+            process_history_details(&record.owner, &child_rows, sample_rounds)
         } else {
             String::new()
         };
@@ -59,34 +154,13 @@ fn write_history(
     }
 
     if written_rows == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "history has no load rows",
-        ));
+        return Ok(None);
     }
 
-    // 每个包只保留最近几次历史，避免长期校准后 history 目录无限增长。
-    let old = match fs::read_to_string(&path) {
-        Ok(old) => old,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err),
-    };
-    let recent = recent_history_tail(&old, HISTORY_MAX_SESSIONS.saturating_sub(1));
-    let tmp = path.with_extension("log.rust.tmp");
-    let mut output = fs::File::create(&tmp)?;
-    if !recent.is_empty() {
-        output.write_all(recent.as_bytes())?;
-        if !recent.ends_with('\n') {
-            output.write_all(b"\n")?;
-        }
-    }
-    output.write_all(current.as_bytes())?;
-    output.flush()?;
-    drop(output);
-    fs::rename(tmp, path)
+    Ok(Some((current, written_rows)))
 }
 
-fn append_sample_series(out: &mut String, samples: &VecDeque<f32>) -> std::fmt::Result {
+pub(super) fn append_sample_series(out: &mut String, samples: &VecDeque<f32>) -> std::fmt::Result {
     for (index, value) in samples.iter().enumerate() {
         if index != 0 {
             out.push(',');
@@ -96,7 +170,7 @@ fn append_sample_series(out: &mut String, samples: &VecDeque<f32>) -> std::fmt::
     Ok(())
 }
 
-fn recent_history_tail(old: &str, max_sessions: usize) -> &str {
+pub(super) fn recent_history_tail(old: &str, max_sessions: usize) -> &str {
     if old.trim().is_empty() || max_sessions == 0 {
         return "";
     }
@@ -120,36 +194,24 @@ fn recent_history_tail(old: &str, max_sessions: usize) -> &str {
     &old[keep_from..]
 }
 
-fn fmt_to_io(_: std::fmt::Error) -> io::Error {
+pub(super) fn fmt_to_io(_: std::fmt::Error) -> io::Error {
     io::Error::other("format history failed")
 }
 
-fn child_thread_details(
+pub(super) fn child_thread_details(
     owner: &str,
-    child_threads: &HashMap<ChildThreadKey, ChildThreadSummary>,
+    child_threads: &[&ChildThreadSummary],
     total_samples: usize,
 ) -> String {
-    let mut rows = child_threads
-        .values()
+    let rows = child_threads
+        .iter()
         .filter(|summary| summary.owner == owner)
-        .filter(|summary| summary.max_pct >= 0.05 || summary.avg(total_samples) >= 0.05)
         .collect::<Vec<_>>();
     if rows.is_empty() {
         return String::new();
     }
-    rows.sort_by(|a, b| {
-        b.avg(total_samples)
-            .partial_cmp(&a.avg(total_samples))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.max_pct
-                    .partial_cmp(&a.max_pct)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
     let body = rows
         .into_iter()
-        .take(HISTORY_MAX_CHILD_THREADS_PER_PROCESS)
         .map(|summary| {
             format!(
                 "{},{:.2},{:.2}",
@@ -164,9 +226,9 @@ fn child_thread_details(
     format!("v3:{body}")
 }
 
-fn process_history_details(
+pub(super) fn process_history_details(
     owner: &str,
-    child_threads: &HashMap<ChildThreadKey, ChildThreadSummary>,
+    child_threads: &[&ChildThreadSummary],
     total_samples: usize,
 ) -> String {
     let details = child_thread_details(owner, child_threads, total_samples);
@@ -178,15 +240,15 @@ mod process_history_marker_tests {
     use super::*;
 
     #[test]
-    fn process_rows_are_marked_even_without_child_threads() {
+    pub(super) fn process_rows_are_marked_even_without_child_threads() {
         assert_eq!(
-            process_history_details("com.example:worker", &HashMap::new(), 60),
+            process_history_details("com.example:worker", &[], 60),
             "v3p:"
         );
     }
 
     #[test]
-    fn history_tail_keeps_only_requested_complete_sessions() {
+    pub(super) fn history_tail_keeps_only_requested_complete_sessions() {
         let old = (0..8)
             .map(|index| format!("# {index} 60\n1.0 1.0 e1:t|1.0\n"))
             .collect::<String>();
@@ -196,7 +258,7 @@ mod process_history_marker_tests {
     }
 
     #[test]
-    fn sample_series_is_serialized_in_queue_order() {
+    pub(super) fn sample_series_is_serialized_in_queue_order() {
         let samples = VecDeque::from([3.0, 1.26, 9.0]);
         let mut out = String::new();
         append_sample_series(&mut out, &samples).unwrap();

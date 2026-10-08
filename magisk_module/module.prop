@@ -1,7 +1,7 @@
-id=AppOpt
-name=AppOpt 线程优化
-version=v1.8.6
-versionCode=186
-author=suto & 一只小柒夏
-description=按规则将应用/游戏线程绑定到指定 CPU 核心的线程优化模块, 支持 包名=auto 自动校准生成大小核分配规则。配置文件: /data/adb/modules/AppOpt/config/applist.conf
-updateJson=https://raw.giteeusercontent.com/cinitdev/AppOpt/raw/modules-update/modules_update/AppOpt.json
+id=QixiaThreads
+name=柒夏线程
+version=v2.0.2
+versionCode=202
+author=一只小柒夏
+description=自适应线程调度与性能监测，支持自动核心分配、校准建议确认和运行记录。配置文件: /data/adb/modules/QixiaThreads/config/applist.conf
+updateJson=https://raw.giteeusercontent.com/cinitdev/AppOpt/raw/modules-update/modules_update/QixiaThreads.json

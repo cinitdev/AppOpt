@@ -1,0 +1,7 @@
+version=1
+pid=0
+boot_id=
+start_ticks=0
+package=
+state=stopped
+detail=自动分配守护尚未启动

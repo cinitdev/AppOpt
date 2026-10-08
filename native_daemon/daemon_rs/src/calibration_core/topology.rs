@@ -1,17 +1,8 @@
-// CPU 拓扑识别。
-//
-// 这里根据 /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq 分簇：
-// - 频率最低的一簇视为 low。
-// - 最后一簇视为 highest。
-// - 三簇以上时，中间簇作为 mid/high 的来源。
-//
-// 这个结果会写到 calib_policy.conf 的 detected_* 区块，App 设置页也会读取这些默认核心范围。
-enum RuleTier {
-    High,
-    Mid,
-}
-
-struct CpuTiers {
+use super::*;
+// 设置页的拓扑元数据与核心分配使用相同的硬件识别依据。
+// 汇总核心范围供诊断使用；group_N 描述互不重叠的性能组，
+// 只有 complete 为 true 时才表示分组已完整确认。
+pub(super) struct CpuTiers {
     clusters: usize,
     low: String,
     highest: String,
@@ -19,138 +10,90 @@ struct CpuTiers {
     mid: String,
     fallback: String,
     all: String,
-    cpu_count: usize,
+    groups: Vec<String>,
+    pub(super) complete: bool,
 }
-
 impl CpuTiers {
-    fn detect() -> Self {
-        // 按 cpuinfo_max_freq 分簇，与设置页自动核心分配保持一致。
-        let present = present_cpus();
-        let count = present.last().copied().unwrap_or(0) + 1;
-        let clusters = cpu_clusters(&present);
-        let all = format_cpu_list(&present).unwrap_or_else(|| "0".to_string());
+    pub(super) fn detect() -> Self {
+        Self::from_cores(&qixia_kernel_info::cpu::cores(Path::new("/")))
+    }
 
-        if clusters.len() <= 1 {
-            return Self {
-                clusters: clusters.len().max(1),
-                low: all.clone(),
-                highest: all.clone(),
-                high: all.clone(),
-                mid: all.clone(),
-                fallback: all.clone(),
-                all,
-                cpu_count: count.max(1),
-            };
-        }
-
-        let low = format_cpu_list(&clusters[0].cpus).unwrap_or_else(|| all.clone());
-        let highest =
-            format_cpu_list(&clusters[clusters.len() - 1].cpus).unwrap_or_else(|| all.clone());
-        let mut mid_cpus = Vec::new();
-        if clusters.len() >= 3 {
-            for cluster in &clusters[1..clusters.len() - 1] {
-                mid_cpus.extend(cluster.cpus.iter().copied());
-            }
-        }
-        if mid_cpus.is_empty() {
-            mid_cpus.extend(clusters[0].cpus.iter().copied());
-        }
-        let mid = format_cpu_list(&mid_cpus).unwrap_or_else(|| low.clone());
-
-        let high = if clusters.len() >= 3 {
-            format_cpu_list(&clusters[clusters.len() - 2].cpus).unwrap_or_else(|| mid.clone())
+    fn from_cores(cores: &[qixia_kernel_info::cpu::Core]) -> Self {
+        use qixia_kernel_info::cpu::{format_ids, performance_groups};
+        let detected = performance_groups(cores);
+        let groups: Vec<_> = detected.groups.iter().map(|ids| format_ids(ids)).collect();
+        let all = format_ids(&cores.iter().map(|c| c.id).collect::<Vec<_>>());
+        let low = groups.first().cloned().unwrap_or_default();
+        let highest = groups.last().cloned().unwrap_or_default();
+        let high = groups
+            .get(groups.len().saturating_sub(2))
+            .cloned()
+            .unwrap_or_else(|| low.clone());
+        let mid = if groups.len() >= 3 {
+            format_ids(&detected.groups[1..groups.len() - 1].iter().flatten().copied().collect::<Vec<_>>())
         } else {
             low.clone()
         };
-
-        let mut fallback_cpus = Vec::new();
-        for cluster in &clusters[..clusters.len() - 1] {
-            fallback_cpus.extend(cluster.cpus.iter().copied());
-        }
-        let fallback = format_cpu_list(&fallback_cpus).unwrap_or_else(|| all.clone());
-
+        let fallback = if groups.len() > 1 {
+            format_ids(&detected.groups[..groups.len() - 1].iter().flatten().copied().collect::<Vec<_>>())
+        } else {
+            all.clone()
+        };
         Self {
-            clusters: clusters.len(),
+            clusters: groups.len(),
             low,
             highest,
             high,
             mid,
             fallback,
             all,
-            cpu_count: count.max(1),
+            groups,
+            complete: detected.complete,
         }
     }
 }
-
-struct CpuCluster {
-    max_freq: u64,
-    cpus: Vec<usize>,
-}
-
-fn cpu_clusters(present: &[usize]) -> Vec<CpuCluster> {
-    if present.is_empty() {
-        return vec![CpuCluster {
-            max_freq: 0,
-            cpus: vec![0],
-        }];
-    }
-
-    let mut raw = Vec::new();
-    let mut index = 0usize;
-    while index < present.len() {
-        let first = present[index];
-        let freq = cpu_max_freq(first);
-        let mut cpus = vec![first];
-        index += 1;
-        while index < present.len()
-            && present[index] == cpus.last().copied().unwrap_or(first) + 1
-            && cpu_max_freq(present[index]) == freq
-        {
-            cpus.push(present[index]);
-            index += 1;
-        }
-        raw.push(CpuCluster {
-            max_freq: freq,
-            cpus,
-        });
-    }
-    raw.sort_by_key(|cluster| cluster.max_freq);
-    raw
-}
-
-fn cpu_max_freq(cpu: usize) -> u64 {
-    fs::read_to_string(format!(
-        "/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq"
-    ))
-    .ok()
-    .and_then(|text| text.trim().parse::<u64>().ok())
-    .unwrap_or(0)
-}
-
-fn sync_policy_topology(topo: &CpuTiers) {
-    // 设置页读取 detected_* 作为默认核心建议；这里用锁和整块替换避免半写入。
-    let _lock = match PolicyLock::acquire() {
+pub(super) fn sync_policy_topology(topo: &CpuTiers) -> bool {
+    // 设置页读取 detected_* 展示性能分组；用锁和整块替换避免半写入。
+    let _lock = match PolicyLock::try_acquire() {
         Some(lock) => lock,
-        None => return,
+        None => return false,
     };
-    let Ok(old) = fs::read_to_string(CALIB_POLICY_FILE) else {
-        return;
-    };
+    sync_policy_topology_at(Path::new(CALIB_POLICY_FILE), topo)
+}
 
-    let Some(cleaned) = policy_without_generated_topology(&old) else {
-        eprintln!(
-            "[CALIB] 检测到未闭合的 CPU 拓扑区块，已保留 calib_policy.conf 原内容"
-        );
-        return;
+fn sync_policy_topology_at(path: &Path, topo: &CpuTiers) -> bool {
+    let old = match fs::read_to_string(path) {
+        Ok(old) => old,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(_) => return false,
     };
+    let Some(next) = policy_with_topology(&old, topo) else {
+        log_error!("[CALIB] 检测到未闭合的 CPU 拓扑区块，已保留 calib_policy.conf 原内容");
+        return true;
+    };
+    if next == old { return true; }
+    let tmp = path.with_extension("conf.rust.tmp");
+    if let Err(err) = fs::write(&tmp, next).and_then(|_| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        log_error!("[CALIB] CPU 拓扑写入校准策略失败: {err}");
+        false
+    } else {
+        log_info!("[CALIB] CPU 拓扑已写入校准策略");
+        true
+    }
+}
 
-    let mut next = cleaned.trim_end().to_string();
+fn policy_with_topology(old: &str, topo: &CpuTiers) -> Option<String> {
+    let cleaned = policy_without_generated_topology(old)?;
+    // 较早版本的应用保存设置时会遗漏运行参数；在同一把锁内只补齐缺失项，
+    // 绝不重置用户已经设置的开关。
+    let mut next = policy_with_runtime_defaults(&cleaned).trim_end().to_string();
     if !next.is_empty() {
         next.push('\n');
     }
     let block = format!(
         "\n{CALIB_TOPO_BEGIN}\n\
-         # CPU 拓扑识别: {} 个性能簇, 全部=[{}] 低性能=[{}] 主性能=[{}] 高性能=[{}] 最高性能=[{}] 非最高=[{}]\n\
+         # CPU 拓扑识别: {} 个性能组, 全部=[{}] 低性能=[{}] 主性能=[{}] 高性能=[{}] 最高性能=[{}] 非最高=[{}]\n\
          detected_clusters={}\n\
          detected_low={}\n\
          detected_main={}\n\
@@ -174,36 +117,56 @@ fn sync_policy_topology(topo: &CpuTiers) {
         topo.highest,
         topo.all
     );
+    let mut block = block.replace(CALIB_TOPO_END, "");
+    block.push_str(&format!("detected_complete={}\n", u8::from(topo.complete)));
+    for (index, cpus) in topo.groups.iter().enumerate() {
+        block.push_str(&format!("detected_group_{index}={cpus}\n"));
+    }
+    block.push_str(CALIB_TOPO_END);
+    block.push('\n');
     next.push_str(&block);
 
-    if next == old {
-        return;
-    }
-
-    let tmp = PathBuf::from(format!("{CALIB_POLICY_FILE}.rust.tmp"));
-    if let Err(err) = fs::write(&tmp, next).and_then(|_| fs::rename(&tmp, CALIB_POLICY_FILE)) {
-        let _ = fs::remove_file(&tmp);
-        eprintln!("[CALIB] CPU 拓扑写入校准策略失败: {err}");
-    } else {
-        println!("[CALIB] CPU 拓扑已写入校准策略");
-    }
+    Some(next)
 }
 
-fn policy_without_generated_topology(old: &str) -> Option<String> {
+fn policy_with_runtime_defaults(old: &str) -> String {
+    let mut next = old.to_owned();
+    for (key, value) in [
+        ("keep_all_cores_online", "0"),
+        ("auto_history_version", "1"),
+        ("auto_history_enabled", "0"),
+    ] {
+        let present = old.lines().any(|line| {
+            line.split('#').next().unwrap_or_default().split_once('=')
+                .is_some_and(|(name, _)| name.trim() == key)
+        });
+        if !present {
+            if !next.is_empty() && !next.ends_with('\n') { next.push('\n'); }
+            next.push_str(&format!("{key}={value}\n"));
+        }
+    }
+    next
+}
+
+pub(super) fn policy_without_generated_topology(old: &str) -> Option<String> {
     let mut cleaned = Vec::new();
-    let mut in_block = false;
+    let mut block_end = None;
     for raw in old.lines() {
         let line = raw.trim();
-        if line == CALIB_TOPO_BEGIN {
-            if in_block {
+        let end = match line {
+            CALIB_TOPO_BEGIN => Some(CALIB_TOPO_END),
+            _ => None,
+        };
+        if let Some(end) = end {
+            if block_end.is_some() {
                 return None;
             }
-            in_block = true;
+            block_end = Some(end);
             continue;
         }
-        if in_block {
-            if line == CALIB_TOPO_END {
-                in_block = false;
+        if let Some(end) = block_end {
+            if line == end {
+                block_end = None;
             }
             continue;
         }
@@ -212,7 +175,7 @@ fn policy_without_generated_topology(old: &str) -> Option<String> {
         }
         cleaned.push(raw);
     }
-    (!in_block).then(|| cleaned.join("\n"))
+    block_end.is_none().then(|| cleaned.join("\n"))
 }
 
 #[cfg(test)]
@@ -220,21 +183,124 @@ mod topology_policy_tests {
     use super::*;
 
     #[test]
-    fn closed_generated_block_is_removed_without_touching_surrounding_policy() {
+    fn k70_metadata_combines_equal_performance_architectures_and_replaces_old_groups() {
+        use qixia_kernel_info::cpu::Core;
+        let cores: Vec<_> = (0..8).map(|id| {
+            let (capacity, max_khz, architecture) = match id {
+                0..=2 => (280, 2_016_000, 0x4100_d460),
+                3..=4 => (855, 2_803_200, 0x4100_d4d0),
+                5..=6 => (855, 2_803_200, 0x4100_d470),
+                _ => (1024, 3_187_200, 0x4100_d4e0),
+            };
+            Core { id, capacity: Some(capacity), max_khz: Some(max_khz), architecture: Some(architecture) }
+        }).collect();
+        let topo = CpuTiers::from_cores(&cores);
+        assert!(topo.complete);
+        assert_eq!(topo.groups, ["0-2", "3-6", "7"]);
+        assert_eq!(topo.mid, "3-6");
+        assert_eq!(topo.high, "3-6");
+        assert_eq!(topo.fallback, "0-6");
+        let old = format!("auto_history_enabled=1\n{CALIB_TOPO_BEGIN}\ndetected_clusters=4\ndetected_group_0=0-2\ndetected_group_1=5-6\ndetected_group_2=3-4\ndetected_group_3=7\n{CALIB_TOPO_END}\n");
+        let next = policy_with_topology(&old, &topo).unwrap();
+        assert!(next.contains("auto_history_enabled=1\n"));
+        assert!(next.contains("detected_clusters=3\n"));
+        assert!(next.contains("detected_group_1=3-6\n"));
+        assert!(!next.contains("detected_group_3="));
+        assert_eq!(policy_with_topology(&next, &topo).unwrap(), next);
+    }
+
+    #[test]
+    fn same_architecture_two_tiers_and_non_eight_core_variants_stay_distinct() {
+        use qixia_kernel_info::cpu::Core;
+        for count in [7, 8] {
+            let mut cores: Vec<_> = (0..count).map(|id| Core {
+                id,
+                capacity: Some(if id < count - 2 { 800 } else { 1024 }),
+                max_khz: Some(if id < count - 2 { 3_600_000 } else { 4_600_000 }),
+                architecture: Some(0x5100_0010),
+            }).collect();
+            let topo = CpuTiers::from_cores(&cores);
+            assert!(topo.complete);
+            assert_eq!(topo.groups.len(), 2);
+            assert_eq!(topo.groups[1], format!("{}-{}", count - 2, count - 1));
+            cores[0].capacity = None;
+            let partial = policy_with_topology("", &CpuTiers::from_cores(&cores)).unwrap();
+            assert!(partial.contains("detected_complete=0\n"));
+        }
+    }
+
+    fn two_cluster_topology() -> CpuTiers {
+        CpuTiers { clusters: 2, low: "0-5".into(), highest: "6-7".into(),
+            high: "0-5".into(), mid: "0-5".into(), fallback: "0-5".into(),
+            all: "0-7".into(), groups: vec!["0-5".into(), "6-7".into()], complete: true }
+    }
+
+    #[test]
+    fn repairs_missing_and_partial_metadata_without_resetting_user_settings() {
+        let user = "version=2\ncpuset_name=Custom\nrule_output_format=yaml\nauto_history_enabled=1\nkeep_all_cores_online=1\n";
+        let topo = two_cluster_topology();
+        let repaired = policy_with_topology(user, &topo).unwrap();
+        assert!(repaired.starts_with(user));
+        assert!(repaired.contains("detected_clusters=2\n"));
+        assert!(repaired.contains("detected_group_1=6-7\n"));
+        assert!(!repaired.contains("detected_group_2="));
+        assert_eq!(policy_with_topology(&repaired, &topo).unwrap(), repaired);
+        let partial = repaired.replace("detected_group_1=6-7\n", "");
+        assert_eq!(policy_with_topology(&partial, &topo).unwrap(), repaired);
+    }
+
+    #[test]
+    fn deleted_policy_is_recreated_and_valid_policy_is_not_rewritten() {
+        let dir = std::env::temp_dir().join(format!("qixia-topology-test-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("calib_policy.conf");
+        let topo = two_cluster_topology();
+        assert!(sync_policy_topology_at(&path, &topo));
+        let old = fs::read_to_string(&path).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(sync_policy_topology_at(&path, &topo));
+        assert_eq!(metadata.modified().unwrap(), fs::metadata(&path).unwrap().modified().unwrap());
+        fs::write(&path, policy_without_generated_topology(&old).unwrap()).unwrap();
+        assert!(sync_policy_topology_at(&path, &topo));
+        assert_eq!(fs::read_to_string(&path).unwrap(), old);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_runtime_keys_are_repaired_once_with_recording_off() {
+        let old = "version=2\ncpuset_name=Custom\nrule_output_format=legacy";
+        let repaired = policy_with_runtime_defaults(old);
+        assert_eq!(repaired, format!("{old}\nkeep_all_cores_online=0\nauto_history_version=1\nauto_history_enabled=0\n"));
+        assert_eq!(policy_with_runtime_defaults(&repaired), repaired);
+    }
+
+    #[test]
+    fn runtime_defaults_preserve_existing_switches_comments_and_unknown_fields() {
+        let old = "keep_all_cores_online = 1 # user\nauto_history_enabled = 1\ncustom_setting=keep\n";
+        let repaired = policy_with_runtime_defaults(old);
+        assert_eq!(repaired, format!("{old}auto_history_version=1\n"));
+        let unknown = "auto_history_version=2\nauto_history_enabled=1\nkeep_all_cores_online=1\n";
+        assert_eq!(policy_with_runtime_defaults(unknown), unknown);
+    }
+
+    #[test]
+    pub(super) fn closed_generated_block_is_removed_without_touching_surrounding_policy() {
         let input = format!(
-            "version=1\n{CALIB_TOPO_BEGIN}\ndetected_all=0-7\n{CALIB_TOPO_END}\ncpuset_name=AppOptRs\n"
+            "version=1\n{CALIB_TOPO_BEGIN}\ndetected_all=0-7\n{CALIB_TOPO_END}\ncpuset_name=QiXiaRs\n"
         );
         assert_eq!(
             policy_without_generated_topology(&input).as_deref(),
-            Some("version=1\ncpuset_name=AppOptRs")
+            Some("version=1\ncpuset_name=QiXiaRs")
         );
     }
 
     #[test]
-    fn unterminated_generated_block_is_never_rewritten() {
-        let input = format!(
-            "version=1\n{CALIB_TOPO_BEGIN}\ndetected_all=0-7\ncpuset_name=KeepMe\n"
-        );
+    pub(super) fn unterminated_generated_block_is_never_rewritten() {
+        let input =
+            format!("version=1\n{CALIB_TOPO_BEGIN}\ndetected_all=0-7\ncpuset_name=KeepMe\n");
         assert_eq!(policy_without_generated_topology(&input), None);
     }
+
 }

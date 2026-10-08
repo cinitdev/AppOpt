@@ -1,7 +1,10 @@
 use std::time::Duration;
+#[path = "fps_core/manual_gate.rs"]
+mod manual_gate;
 
-fn valid_fps_sample(fps: f64) -> Option<f64> {
-    (fps.is_finite() && (0.0..=300.0).contains(&fps)).then_some(fps)
+pub(crate) fn valid_fps_sample(fps: f64) -> Option<f64> {
+    // 与探针 1 毫秒最小帧间隔及历史记录的有效范围保持一致；这不是屏幕刷新率限制。
+    (fps.is_finite() && (0.0..=1_000.0).contains(&fps)).then_some(fps)
 }
 
 fn select_active_timestats_layer(
@@ -56,18 +59,8 @@ fn latency_probe_delay(failures: u32) -> Option<Duration> {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
-mod imp {
-    // Android/Linux FPS 实现聚合入口。
-    //
-    // 这里保持一个 imp 模块包住全部实现，是为了让非 Android 主机也能 cargo check：
-    // Windows/其他平台会走下面的空 start_fps_thread，不编译 binder/eBPF 代码。
-    include!("fps_core/preamble.rs");
-    include!("fps_core/monitor.rs");
-    include!("fps_core/command.rs");
-    include!("fps_core/fallback.rs");
-    include!("fps_core/binder.rs");
-    include!("fps_core/socket.rs");
-}
+#[path = "fps_core/mod.rs"]
+mod imp;
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
 mod imp {
@@ -76,7 +69,7 @@ mod imp {
     }
 }
 
-pub use imp::start_fps_thread;
+pub(crate) use imp::start_fps_thread;
 
 #[cfg(test)]
 mod tests {
@@ -121,9 +114,15 @@ mod tests {
 
     #[test]
     fn impossible_fps_samples_are_rejected() {
-        assert_eq!(valid_fps_sample(60.0), Some(60.0));
-        assert_eq!(valid_fps_sample(301.0), None);
+        for fps in [
+            0.0, 60.0, 120.0, 144.0, 165.0, 240.0, 360.0, 480.0, 600.0, 1_000.0,
+        ] {
+            assert_eq!(valid_fps_sample(fps), Some(fps));
+        }
+        assert_eq!(valid_fps_sample(1_000.1), None);
+        assert_eq!(valid_fps_sample(-1.0), None);
         assert_eq!(valid_fps_sample(f64::NAN), None);
         assert_eq!(valid_fps_sample(f64::INFINITY), None);
+        assert_eq!(valid_fps_sample(f64::NEG_INFINITY), None);
     }
 }
