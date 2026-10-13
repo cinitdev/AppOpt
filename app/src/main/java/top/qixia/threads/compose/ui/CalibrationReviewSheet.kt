@@ -96,8 +96,20 @@ fun CalibrationReviewSheet(state: CalibrationReviewsState, onDismiss: () -> Unit
                                 val grouped = row.generatedPattern && (row.memberCount > 1 || row.name.any { it in "*?[" })
                                 if (grouped) Text("通配组 · 本次匹配 ${row.memberCount} 个名称\n${row.members.take(4).joinToString("、")}${if (row.memberCount > 4) " 等" else ""}",
                                     color = OceanTextSecondary, fontSize = 11.sp, modifier = Modifier.padding(bottom = 6.dp))
-                                Text(String.format(Locale.CHINA, if (grouped) "平均合计 %.1f%% · 峰值上界 %.1f%%" else "平均 %.1f%%  ·  峰值 %.1f%%  ·  活跃 %.0f%%", row.average, row.peak, row.activity),
+                                val aggregate = row.aggregatedLoad || grouped
+                                val scope = when {
+                                    row.activeThreadCount == null -> "按线程名称汇总 · 此记录未保存同名线程数量"
+                                    row.activeThreadCount > 1 && !grouped -> "同名线程合计 · 采样最多 ${row.activeThreadCount} 个活跃线程"
+                                    aggregate -> "线程组负载合计 · 各名称活跃线程上限之和 ${row.activeThreadCount}"
+                                    else -> "单线程 CPU 使用率"
+                                }
+                                Text(scope, color = OceanTextSecondary, fontSize = 11.sp)
+                                val averageLabel = if (aggregate || row.activeThreadCount == null) "平均合计" else "平均"
+                                val peakLabel = if (row.peakIsUpperBound) "峰值上界" else "峰值"
+                                Text(String.format(Locale.CHINA, "$averageLabel %.1f%%  ·  $peakLabel %.1f%%  ·  活跃 %.0f%%", row.average, row.peak, row.activity),
                                     color = OceanTextSecondary, fontSize = 12.sp)
+                                if (aggregate || row.activeThreadCount == null) Text("100% 表示占满一颗 CPU；多个同名线程合计可超过 100%。",
+                                    color = OceanTextSecondary, fontSize = 11.sp)
                                 Text(if (review.selections[index] != row.suggested) "已手动调整 · 原建议：${if (row.suggested.isEmpty()) "系统调度" else "CPU ${RuleConfigLogic.formatCpuRangeList(row.suggested)}"}" else row.reason,
                                     color = OceanPrimary, fontSize = 11.sp, lineHeight = 17.sp, modifier = Modifier.padding(top = 7.dp))
                             }

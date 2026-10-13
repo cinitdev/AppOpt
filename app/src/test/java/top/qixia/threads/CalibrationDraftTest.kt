@@ -79,6 +79,22 @@ class CalibrationDraftTest {
         assertEquals(listOf("Binder:10534_7", "Binder:10534_9"), draft.threads.single().members)
         assertNotNull(CalibrationDraft.parse(groupedWire("thread-shared-*", "thread-shared-1\nthread-shared-2")))
     }
+    @Test fun sameNameThreadTotalsAreNotPresentedAsASingleThread() {
+        val current = groupedWire("SDLThread", "SDLThread")
+            .replace("DRAFT\t2", "DRAFT\t3")
+            .replace("\t2\t${hex("SDLThread")}\n", "\t1\t${hex("SDLThread")}\t3\t0\n")
+            .replace("21.1\t80.3", "172.2\t264.9")
+        val row = requireNotNull(CalibrationDraft.parse(current)).threads.single()
+        assertEquals(172.2, row.average, 0.001)
+        assertEquals(3, row.activeThreadCount)
+        assertTrue(row.aggregatedLoad)
+        assertFalse(row.peakIsUpperBound)
+        assertNull(CalibrationDraft.parse(current.replace("\t3\t0\n", "\t-1\t0\n")))
+        assertNull(CalibrationDraft.parse(current.replace("\t3\t0\n", "\t3\tunknown\n")))
+        val old = requireNotNull(CalibrationDraft.parse(groupedWire())).threads.single()
+        assertNull(old.activeThreadCount)
+        assertTrue(old.aggregatedLoad)
+    }
     @Test fun generatedPatternValidationStillRejectsInjectionAndUnboundedPatterns() {
         assertNull(CalibrationDraft.parse(groupedWire("*")))
         assertNull(CalibrationDraft.parse(groupedWire("Binder:*}=7")))

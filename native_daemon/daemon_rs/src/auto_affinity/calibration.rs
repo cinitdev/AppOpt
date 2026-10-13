@@ -87,6 +87,8 @@ pub(crate) struct Suggestion {
     pub peak: f64,
     pub activity: f64,
     pub members: Vec<String>,
+    pub active_threads: Option<usize>,
+    pub peak_bounded: bool,
 }
 
 pub(crate) struct Analyzer {
@@ -330,6 +332,9 @@ impl Analyzer {
                     total = joint.work.max(serial);
                 }
                 let window_bound = joint.as_ref().is_none_or(|joint| joint.bounded);
+                let active_threads = members.iter().map(|row| {
+                    self.windows.stats(owner, &row.name).map(|stats| stats.max_active_threads)
+                }).collect::<Option<Vec<_>>>().map(|counts| counts.into_iter().sum());
                 // 窗口 CPU 时间表示吞吐需求，不是精确的可运行并发量；
                 // 仅有两个名称不会自动增加一条执行通道。
                 let parallel = ((peak / 100.0).ceil() as usize).max(1);
@@ -355,6 +360,8 @@ impl Analyzer {
                             peak,
                             activity,
                             members: members.iter().map(|r| r.name.clone()).collect(),
+                            active_threads,
+                            peak_bounded: window_bound,
                         })
                         .collect::<Vec<_>>(),
                     demand,

@@ -3,8 +3,10 @@ package top.qixia.threads
 data class CalibrationThread(
     val owner: String, val name: String, val average: Double, val peak: Double,
     val activity: Double, val suggested: Set<Int>, val reason: String,
-    val generatedPattern: Boolean = false, val memberCount: Int = 1, val members: List<String> = listOf(name)
+    val generatedPattern: Boolean = false, val memberCount: Int = 1, val members: List<String> = listOf(name),
+    val activeThreadCount: Int? = null, val peakIsUpperBound: Boolean = false
 ) {
+    val aggregatedLoad: Boolean get() = memberCount > 1 || (activeThreadCount ?: 0) > 1
     val editable: Boolean get() {
         if (name.isBlank() || name != name.trim() || name.any { it.isISOControl() || it in "{}=/\\" }) return false
         if (!generatedPattern) return name.none { it in "[]*?" }
@@ -32,11 +34,12 @@ data class CalibrationDraft(
             val version = when (lines[0]) {
                 "QIXIA_CALIBRATION_DRAFT\t1" -> 1
                 "QIXIA_CALIBRATION_DRAFT\t2" -> 2
+                "QIXIA_CALIBRATION_DRAFT\t3" -> 3
                 else -> error("Unknown draft version")
             }
             val meta = lines[1].split('\t')
             require(meta.size == (if (version == 1) 5 else 6) && meta[0] == "meta")
-            val omitted = if (version == 2) meta[5].toInt().also { require(it in 0..2048) } else 0
+            val omitted = if (version >= 2) meta[5].toInt().also { require(it in 0..2048) } else 0
             val id = meta[1]; val pkg = meta[2]
             require(id.matches(Regex("[0-9]{1,18}-[0-9]{1,10}")))
             require(pkg.length <= 180 && pkg.matches(Regex("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+")))
@@ -53,7 +56,7 @@ data class CalibrationDraft(
                         require(cpu in 0..63 && capacity in 0..1_000_000 && cpus.put(cpu, capacity) == null)
                     }
                     "thread" -> {
-                        require(f.size == (if (version == 1) 8 else 10) && rows.size < (if (version == 1) 24 else 128))
+                        require(f.size == (when (version) { 1 -> 8; 2 -> 10; else -> 12 }) && rows.size < (if (version == 1) 24 else 128))
                         val owner = decode(f[1]); val name = decode(f[2])
                         require(owner == pkg || (owner.startsWith("$pkg:") &&
                             owner.substringAfter(':').matches(Regex("[A-Za-z0-9_.-]+"))))
@@ -64,12 +67,14 @@ data class CalibrationDraft(
                         val selected = if (f[6] == "-") emptySet() else
                             requireNotNull(RuleConfigLogic.parseCpuRangeList(f[6]))
                         require(rows.none { it.owner == owner && it.name == name })
-                        val count = if (version == 2) f[8].toInt().also { require(it in 1..2048) } else 1
-                        val members = if (version == 2) decode(f[9], 8192).split('\n').also { names ->
+                        val count = if (version >= 2) f[8].toInt().also { require(it in 1..2048) } else 1
+                        val members = if (version >= 2) decode(f[9], 8192).split('\n').also { names ->
                             require(names.size in 1..minOf(count, 16) && names.distinct().size == names.size)
                             require(names.all { it.isNotBlank() && it.length <= 128 && it.none(Char::isISOControl) })
                         } else listOf(name)
-                        rows += CalibrationThread(owner, name, avg, peak, activity, selected, decode(f[7]), version == 2, count, members)
+                        val activeThreads = if (version >= 3) f[10].toInt().also { require(it in 0..1_000_000) }.takeIf { it > 0 } else null
+                        val bounded = if (version >= 3) f[11].also { require(it == "0" || it == "1") } == "1" else count > 1
+                        rows += CalibrationThread(owner, name, avg, peak, activity, selected, decode(f[7]), version >= 2, count, members, activeThreads, bounded)
                     }
                     else -> error("Unknown draft record")
                 }

@@ -1,10 +1,9 @@
 use super::*;
 // 单次校准采样会话。
 //
-// 采样单位是 /proc 的 utime+stime delta：
-// - 主进程：按线程名聚合 delta，生成线程级 LoadRecord。
-// - 子进程：把所有线程 delta 汇总成一个进程级 LoadRecord。
-// - 子进程线程明细：保存在 child_threads，用于历史和待确认规则建议。
+// 按每个 TID 两次读取的时间，将 /proc 的 utime+stime 差值换算为 CPU 使用率：
+// - 主进程：按线程名合计，生成名称级 LoadRecord。
+// - 子进程：合计所有线程的使用率，并在 child_threads 中保留名称级明细。
 //
 // 注意：comm 线程名最多 15 字节，Android 会截断，所以这里按读取到的 comm 聚合，
 // App 侧展示和规则生成都必须接受这个截断现实。
@@ -127,7 +126,7 @@ impl CalibSession {
         observed_tids: &mut HashSet<TidKey>,
     ) {
         // 主进程线程按 comm 名称聚合。
-        // 同名线程可能有多个 TID，这里合并 delta，避免线程重建导致历史曲线断裂。
+        // 同名线程可能有多个 TID，分别校验使用率再合计，避免线程重建导致历史曲线断裂。
         let task_dir = PathBuf::from(format!("/proc/{pid}/task"));
         let tasks = match fs::read_dir(task_dir) {
             Ok(tasks) => tasks,
@@ -150,26 +149,26 @@ impl CalibSession {
                 starttime,
             };
             observed_tids.insert(tid_key);
-            let delta = self.tid_delta(tid_key, ticks).unwrap_or(0);
+            let (delta, pct) = self.tid_sample(tid_key, ticks, Instant::now()).unwrap_or((0, 0.0));
             if self.analyzer.wants_detail() {
                 self.analyzer.observe(crate::auto_affinity::calibration::Observation {
                     pid, tid, start: starttime, ticks, delta, owner: owner.to_string(), name: name.clone(),
                 });
             }
             if delta > 0 {
-                *grouped_delta.entry(name).or_default() += delta;
+                self.analyzer.observe_load(owner, &name, pct);
+                *grouped_delta.entry(name).or_default() += pct;
             }
         }
 
         if elapsed > 0.0 {
-            for (name, delta) in grouped_delta.drain() {
-                self.analyzer.observe_load(owner, &name, delta_to_pct(delta, elapsed));
+            for (name, pct) in grouped_delta.drain() {
                 let key = TrackKey {
                     owner: owner.to_string(),
                     name,
                     is_process: false,
                 };
-                self.record_pct(key, delta_to_pct(delta, elapsed));
+                self.record_pct(key, pct);
             }
         } else {
             grouped_delta.clear();
@@ -182,10 +181,10 @@ impl CalibSession {
         pid: i32,
         owner: &str,
         elapsed: f64,
-        child_round_deltas: &mut HashMap<ChildThreadKey, u64>,
+        child_round_deltas: &mut HashMap<ChildThreadKey, f64>,
         observed_tids: &mut HashSet<TidKey>,
     ) {
-        // 子进程只累计总 delta 生成进程级负载，同时保留线程 delta 给 history 展示。
+        // 子进程合计使用率生成进程级负载，同时保留线程明细给 history 展示。
         // 子进程线程单独存入 child_threads；活跃与 5% 门槛在各自使用边界判断。
         let task_dir = PathBuf::from(format!("/proc/{pid}/task"));
         let tasks = match fs::read_dir(task_dir) {
@@ -193,7 +192,7 @@ impl CalibSession {
             Err(_) => return,
         };
 
-        let mut total_delta = 0u64;
+        let mut total_pct = 0.0;
         for task in tasks.flatten() {
             let Some(tid) = task.file_name().to_str().and_then(parse_pid_text) else {
                 continue;
@@ -208,8 +207,8 @@ impl CalibSession {
                 starttime,
             };
             observed_tids.insert(tid_key);
-            let delta = self.tid_delta(tid_key, ticks).unwrap_or(0);
-            total_delta += delta;
+            let (delta, pct) = self.tid_sample(tid_key, ticks, Instant::now()).unwrap_or((0, 0.0));
+            total_pct += pct;
             if self.analyzer.wants_detail() {
                 self.analyzer.observe(crate::auto_affinity::calibration::Observation {
                     pid, tid, start: starttime, ticks, delta,
@@ -218,13 +217,13 @@ impl CalibSession {
             }
             if delta > 0 {
                 if elapsed > 0.0 {
-                    self.analyzer.observe_load(owner, &name, delta_to_pct(delta, elapsed));
+                    self.analyzer.observe_load(owner, &name, pct);
                 }
                 let key = ChildThreadKey {
                     owner: owner.to_string(),
                     name,
                 };
-                *child_round_deltas.entry(key).or_default() += delta;
+                *child_round_deltas.entry(key).or_default() += pct;
             }
         }
 
@@ -236,16 +235,16 @@ impl CalibSession {
             name: String::new(),
             is_process: true,
         };
-        self.record_pct(key, delta_to_pct(total_delta, elapsed));
+        self.record_pct(key, total_pct);
     }
 
-    pub(super) fn tid_delta(&mut self, key: TidKey, ticks: u64) -> Option<u64> {
+    pub(super) fn tid_sample(&mut self, key: TidKey, ticks: u64, now: Instant) -> Option<(u64, f64)> {
         // 首次看到某个 TID 时没有前一帧数据，必须等下一轮才有有效 delta。
-        let prev_ticks = self.prev_ticks.insert(key, ticks)?;
-        if ticks < prev_ticks {
-            return None;
-        }
-        Some(ticks - prev_ticks)
+        // 每个线程按自己两次读取的时间配对，避免扫描顺序和耗时变化放大占用率。
+        let (previous, before) = self.prev_ticks.insert(key, (ticks, now))?;
+        let delta = ticks.checked_sub(previous)?;
+        let pct = thread_cpu_pct(delta, now.checked_duration_since(before)?.as_secs_f64(), clock_ticks_per_second())?;
+        Some((delta, pct))
     }
 
     pub(super) fn record_pct(&mut self, key: TrackKey, pct: f64) {
@@ -315,8 +314,8 @@ impl CalibSession {
 
     pub(super) fn record_child_thread_summaries(
         &mut self,
-        child_round_deltas: &mut HashMap<ChildThreadKey, u64>,
-        elapsed: f64,
+        child_round_deltas: &mut HashMap<ChildThreadKey, f64>,
+        _elapsed: f64,
     ) {
         let total_samples = self.rounds + 1;
         // 先更新已经跟踪的线程，再处理新名称。这样达到容量上限时，淘汰评分与
@@ -326,11 +325,11 @@ impl CalibSession {
             let Some(summary) = known.get_mut(key) else {
                 return true;
             };
-            summary.push(delta_to_pct(*delta, elapsed));
+            summary.push(*delta);
             false
         });
         for (key, delta) in child_round_deltas.drain() {
-            let pct = delta_to_pct(delta, elapsed);
+            let pct = delta;
             if !self.reserve_child_thread_slot(pct, total_samples) {
                 continue;
             }
@@ -371,12 +370,12 @@ impl CalibSession {
     }
 }
 
-pub(super) fn delta_to_pct(delta: u64, elapsed: f64) -> f64 {
-    if elapsed <= 0.0 {
-        0.0
-    } else {
-        ((delta as f64 / clock_ticks_per_second()) / elapsed * 100.0).clamp(0.0, 999.0)
-    }
+fn thread_cpu_pct(delta: u64, elapsed: f64, hz: f64) -> Option<f64> {
+    if !elapsed.is_finite() || elapsed <= 0.0 || !hz.is_finite() || hz <= 0.0 { return None; }
+    let busy = delta as f64 / hz;
+    // 单个 TID 不能同时运行于多颗 CPU。允许两个时钟刻度的读取量化误差，
+    // 明显超界则重建基线、不采信该样本；同名线程在校验之后合计，仍可超过 100%。
+    (busy <= elapsed + 2.0 / hz).then(|| (busy / elapsed * 100.0).min(100.0))
 }
 
 pub(super) fn clock_ticks_per_second() -> f64 {
@@ -401,6 +400,43 @@ pub(super) fn clock_ticks_per_second() -> f64 {
 #[cfg(test)]
 mod session_capacity_tests {
     use super::*;
+
+    #[test]
+    fn per_thread_clock_handles_scan_delays_counter_resets_and_reused_tids() {
+        let mut session = CalibSession::new("com.test".into(), Vec::new());
+        let key = TidKey { pid: 100, tid: 101, starttime: 1 };
+        let now = Instant::now();
+        let hz = clock_ticks_per_second() as u64;
+        assert!(session.tid_sample(key, 0, now).is_none());
+        // 本线程晚了两秒才重新读到，不能使用本轮其他线程的 500ms 周期。
+        let (_, pct) = session.tid_sample(key, hz, now + Duration::from_secs(2)).unwrap();
+        assert!((pct - 50.0).abs() < 0.001);
+        assert!(session.tid_sample(key, hz * 10, now + Duration::from_secs(3)).is_none());
+        let (_, pct) = session.tid_sample(key, hz * 11, now + Duration::from_secs(4)).unwrap();
+        assert_eq!(pct, 100.0);
+        assert!(session.tid_sample(key, 1, now + Duration::from_secs(5)).is_none());
+        assert!(session.tid_sample(TidKey { starttime: 2, ..key }, hz * 90, now + Duration::from_secs(6)).is_none());
+        assert_eq!(thread_cpu_pct(51, 0.5, 100.0), Some(100.0));
+        assert_eq!(thread_cpu_pct(140, 0.5, 100.0), None);
+    }
+
+    #[test]
+    fn same_name_load_keeps_multiple_threads_and_reports_the_scope() {
+        let mut analyzer = crate::auto_affinity::calibration::Analyzer::new();
+        analyzer.begin_round(0);
+        for pct in [80.0, 70.0, 60.0] { analyzer.observe_load("com.test", "SDLThread", pct); }
+        analyzer.finish_window(0.5);
+        let rows = [crate::auto_affinity::calibration::ThreadLoad {
+            owner: "com.test".into(), name: "SDLThread".into(),
+            average: 172.2, peak: 264.9, activity: 100.0, active: true,
+        }];
+        let result = analyzer.suggest(&rows);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].active_threads, Some(3));
+        assert_eq!(result[0].average, 172.2);
+        assert_eq!(result[0].peak, 210.0);
+        assert!(!result[0].peak_bounded);
+    }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
@@ -466,7 +502,7 @@ mod session_capacity_tests {
                     owner: "com.example:worker".to_string(),
                     name: format!("child-{index}"),
                 },
-                (index + 1) as u64,
+                (index + 1) as f64,
             );
         }
         session.record_child_thread_summaries(&mut child, 1.0);

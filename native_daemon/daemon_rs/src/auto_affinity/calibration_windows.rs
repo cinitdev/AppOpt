@@ -12,6 +12,7 @@ const MAX_VALUES: usize = 8192;
 pub(super) struct NameStats {
     pub busy_seconds: f64,
     pub last_active_round: usize,
+    pub max_active_threads: usize,
 }
 
 struct Window {
@@ -24,6 +25,7 @@ pub(super) struct Windows {
     names: BTreeMap<String, BTreeMap<String, u16>>,
     stats: Vec<NameStats>,
     current: Vec<f64>,
+    current_threads: Vec<usize>,
     retained: Vec<Window>,
     values: usize,
 }
@@ -37,6 +39,7 @@ pub(super) struct JointPeak {
 impl Windows {
     pub fn begin(&mut self) {
         self.current.fill(0.0);
+        self.current_threads.fill(0);
     }
 
     pub fn observe(&mut self, owner: &str, name: &str, pct: f64) {
@@ -53,11 +56,13 @@ impl Windows {
                     .insert(name.into(), id as u16);
                 self.stats.push(NameStats::default());
                 self.current.push(0.0);
+                self.current_threads.push(0);
                 id
             }
             None => return,
         };
         self.current[id] += pct;
+        self.current_threads[id] += 1;
     }
 
     pub fn finish(&mut self, elapsed: f64, round: usize) {
@@ -74,6 +79,7 @@ impl Windows {
                 }
                 self.stats[id].busy_seconds += pct * elapsed / 100.0;
                 self.stats[id].last_active_round = round;
+                self.stats[id].max_active_threads = self.stats[id].max_active_threads.max(self.current_threads[id]);
                 // 向上取整，确保存储值不会低估实测窗口。
                 Some((id as u16, (pct * 100.0).ceil() as f32 / 100.0))
             })

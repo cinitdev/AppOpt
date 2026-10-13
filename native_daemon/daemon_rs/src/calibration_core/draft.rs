@@ -210,7 +210,7 @@ pub(super) fn write_calibration_draft(
     )?;
     let id = format!("{stamp}-{}", std::process::id());
     let mut text = format!(
-        "QIXIA_CALIBRATION_DRAFT\t2\nmeta\t{id}\t{pkg}\t{stamp}\t{}\t{omitted}\n",
+        "QIXIA_CALIBRATION_DRAFT\t3\nmeta\t{id}\t{pkg}\t{stamp}\t{}\t{omitted}\n",
         duration.as_millis()
     );
     for (id, capacity) in analyzer.cores() {
@@ -227,7 +227,7 @@ pub(super) fn write_calibration_draft(
             .join("\n");
         let _ = writeln!(
             text,
-            "thread\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{cpus}\t{}\t{}\t{}",
+            "thread\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{cpus}\t{}\t{}\t{}\t{}\t{}",
             draft_hex(&s.owner),
             draft_hex(&s.name),
             s.average,
@@ -235,7 +235,9 @@ pub(super) fn write_calibration_draft(
             s.activity,
             draft_hex(&s.reason),
             s.members.len(),
-            draft_hex(&preview)
+            draft_hex(&preview),
+            s.active_threads.unwrap_or(0),
+            u8::from(s.peak_bounded)
         );
     }
     persist_draft(

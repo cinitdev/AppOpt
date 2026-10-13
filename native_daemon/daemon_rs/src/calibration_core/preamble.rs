@@ -204,7 +204,7 @@ pub(super) struct CalibSession {
     // pid -> owner。owner 可能是主包名，也可能是 com.pkg:push 这类子进程。
     pub(super) processes: HashMap<i32, String>,
     // 每个 TID 上次读取到的 utime+stime，用相邻两次差值计算 CPU 使用率。
-    pub(super) prev_ticks: HashMap<TidKey, u64>,
+    pub(super) prev_ticks: HashMap<TidKey, (u64, Instant)>,
     // 主进程线程与子进程整体曲线用于历史，线程负载同时提供规则建议。
     pub(super) records: HashMap<TrackKey, LoadRecord>,
     // 子进程活跃线程摘要同时用于历史和规则建议。
@@ -212,8 +212,8 @@ pub(super) struct CalibSession {
     // 这些容器每 500ms 清空复用容量，避免高线程应用持续触发分配器。
     pub(super) scratch_processes: HashMap<i32, String>,
     pub(super) scratch_observed_tids: HashSet<TidKey>,
-    pub(super) scratch_child_round_deltas: HashMap<ChildThreadKey, u64>,
-    pub(super) scratch_grouped_delta: HashMap<String, u64>,
+    pub(super) scratch_child_round_deltas: HashMap<ChildThreadKey, f64>,
+    pub(super) scratch_grouped_delta: HashMap<String, f64>,
     pub(super) rounds: usize,
     pub(super) started_at: Instant,
     pub(super) last_sample: Option<Instant>,
