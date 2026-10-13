@@ -26,7 +26,7 @@ pub(super) use std::os::unix::fs::MetadataExt;
 // 3. 日常只比较数字 PID 目录快照，并复查新增 PID；命中后缓存 PID 和线程结果。
 // 4. 写亲和性前先读当前 Cpus_allowed_list，相同则跳过，避免重复抢系统调度配置。
 // 5. 写入后再读回一次，用于发现移植系统/厂商服务把线程绑核抢写回去的情况。
-pub(super) const VERSION: &str = "2.0.3";
+pub(super) const VERSION: &str = "2.0.4";
 pub(super) const DEFAULT_CONFIG: &str = "/data/adb/modules/QixiaThreads/config/applist.conf";
 pub(super) const STATE_DIR: &str = "/data/adb/modules/QixiaThreads/config/state";
 pub(super) const DEFAULT_UID_MAP: &str = "/data/adb/modules/QixiaThreads/config/state/package_uid.map";
