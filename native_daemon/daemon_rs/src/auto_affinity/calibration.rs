@@ -138,6 +138,12 @@ impl Analyzer {
     pub(crate) fn wants_detail(&self) -> bool {
         self.detail_round
     }
+    pub(crate) fn pause_sampling(&mut self) {
+        // 保留已完成的校准证据，但不跨主进程中断计算驻留时间和负载。
+        self.trackers.clear();
+        self.candidates.clear();
+        self.windows.begin();
+    }
     pub(crate) fn observe_load(&mut self, owner: &str, name: &str, pct: f64) {
         self.windows.observe(owner, name, pct);
     }

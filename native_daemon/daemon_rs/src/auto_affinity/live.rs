@@ -16,6 +16,7 @@ struct Tracked {
     time: Instant,
     interval_start: Instant,
     seen: Instant,
+    last_valid_sample: Option<Instant>,
     name: String,
     activity: Activity,
     latest_busy: f64,
@@ -27,6 +28,43 @@ struct Tracked {
     observed_cores: ObservationProbe,
     inheritance_checked: bool,
     inheritance_retry: Option<Instant>,
+}
+
+impl Tracked {
+    fn new(ticks: u64, read_at: Instant) -> Self {
+        Self {
+            ticks, time: read_at, interval_start: read_at, seen: read_at,
+            last_valid_sample: None, name: String::new(), activity: Activity::default(),
+            latest_busy: 0.0, placement: Placement::default(), demand: sampling::DemandWindow::default(),
+            last_detail: None, measured: None, running_cpu: None,
+            observed_cores: ObservationProbe::default(), inheritance_checked: false, inheritance_retry: None,
+        }
+    }
+
+    fn observe_ticks(&mut self, ticks: u64, read_at: Instant, hz: f64) -> bool {
+        let previous_ticks = std::mem::replace(&mut self.ticks, ticks);
+        self.interval_start = std::mem::replace(&mut self.time, read_at);
+        self.seen = read_at;
+        let elapsed = read_at.saturating_duration_since(self.interval_start).as_secs_f64();
+        let busy = ticks.checked_sub(previous_ticks).map(|delta| delta as f64 / hz / elapsed);
+        if let Some(busy) = busy.filter(|busy| self.activity.observe(*busy, elapsed)) {
+            self.latest_busy = busy;
+            self.last_valid_sample = Some(read_at);
+            true
+        } else {
+            // 只重建计数和需求估计基线，不让单次异常抹掉此前的接管依据。
+            // 连续异常仍按最后一次有效样本计算宽限期，不能永久维持旧分配。
+            self.demand = sampling::DemandWindow::default();
+            self.last_detail = None;
+            self.measured = None;
+            false
+        }
+    }
+
+    fn keep_owned(&self, now: Instant) -> bool {
+        self.last_valid_sample.is_some_and(|last|
+            self.activity.keep_owned_without_sample(now.saturating_duration_since(last)))
+    }
 }
 
 pub(super) struct Controller {
@@ -119,7 +157,7 @@ impl Controller {
         self.capture_core_history();
         let now = Instant::now();
         self.requests.retain(|request| self.tracked.get(&request.identity).is_some_and(|entry|
-            entry.activity.keep_owned_without_sample(now.saturating_duration_since(entry.seen))));
+            entry.keep_owned(now)));
         if self.requests.is_empty() { return; }
         let result = self.batch.maintain(&self.requests);
         self.collect_core_events(None, &BTreeSet::new());
@@ -235,6 +273,8 @@ impl Controller {
             let Ok(bytes) = fs::read(format!("/proc/{pid}/task/{tid}/stat")) else {
                 continue;
             };
+            // 每个计数器必须配对自己的读取时刻，不能复用整轮扫描的起点。
+            let read_at = Instant::now();
             let Some(stat) = qixia_kernel_info::proc::parse_stat(&bytes) else {
                 continue;
             };
@@ -256,23 +296,7 @@ impl Controller {
                     }
                 }
             }
-            let entry = self.tracked.entry(identity).or_insert_with(|| Tracked {
-                ticks,
-                time: now,
-                interval_start: now,
-                seen: now,
-                name: String::new(),
-                activity: Activity::default(),
-                latest_busy: 0.0,
-                placement: Placement::default(),
-                demand: sampling::DemandWindow::default(),
-                last_detail: None,
-                measured: None,
-                running_cpu: None,
-                observed_cores: ObservationProbe::default(),
-                inheritance_checked: false,
-                inheritance_retry: None,
-            });
+            let entry = self.tracked.entry(identity).or_insert_with(|| Tracked::new(ticks, read_at));
             // TID 和启动时间不变时 comm 仍可能变化。保留分配证据
             // 以及原始恢复基线，但在负载样本和后续核心事件中
             // 发布当前线程名。
@@ -283,26 +307,9 @@ impl Controller {
             entry.running_cpu = if observe_history {
                 core_history::running_cpu(&String::from_utf8_lossy(&bytes))
             } else { None };
-            entry.interval_start = entry.time;
-            let elapsed = now.saturating_duration_since(entry.time).as_secs_f64();
-            if elapsed > 0.0 {
-                let busy = ticks
-                    .checked_sub(entry.ticks)
-                    .map(|ticks| ticks as f64 / self.hz / elapsed);
-                if let Some(busy) = busy.filter(|busy| entry.activity.observe(*busy, elapsed)) {
-                    entry.latest_busy = busy;
-                    sampled.push(identity);
-                } else {
-                    entry.activity = Activity::default();
-                    entry.latest_busy = 0.0;
-                    entry.demand = sampling::DemandWindow::default();
-                    entry.last_detail = None;
-                    entry.measured = None;
-                }
+            if entry.observe_ticks(ticks, read_at, self.hz) {
+                sampled.push(identity);
             }
-            entry.ticks = ticks;
-            entry.time = now;
-            entry.seen = now;
         }
         sampled
     }
@@ -339,12 +346,14 @@ impl Controller {
             Ok(mask) if mask != 0 => mask,
             _ => return self.pause("QixiaThreads 核心分组暂不可用，正在重试", 2),
         };
-        let sampled = self.scan(now);
+        let scan_started = now;
+        let sampled = self.scan(scan_started);
+        let now = Instant::now();
         // 新线程在消耗 CPU 前就可能继承父线程的 QixiaThreads 组。
         // 每个身份先检查一次；不确定的 IO 失败只低频重试，
         // 并复用现有的有界 stat 扫描。
         let inherited: Vec<_> = self.tracked.iter()
-            .filter(|(_, entry)| entry.seen == now && !entry.inheritance_checked
+            .filter(|(_, entry)| entry.seen >= scan_started && !entry.inheritance_checked
                 && entry.inheritance_retry.is_none_or(|retry| now >= retry))
             .map(|(key, _)| *key).take(live_policy::MAX_SCAN).collect();
         if !inherited.is_empty() {
@@ -403,7 +412,7 @@ impl Controller {
             let eligible = if sampled.contains(key) {
                 entry.activity.eligible()
             } else {
-                managed && entry.activity.keep_owned_without_sample(now.saturating_duration_since(entry.seen))
+                managed && entry.keep_owned(now)
             };
             eligible.then_some((*key, managed, entry.activity.peak()))
         }));
@@ -696,4 +705,36 @@ fn owner_matches(pid: i32, pkg: &str) -> bool {
                     .strip_prefix(pkg.as_bytes())
                     .is_some_and(|suffix| suffix.starts_with(b":"))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_scan_latency_uses_each_threads_read_time() {
+        let start = Instant::now();
+        // 两轮扫描起点相隔 500ms，但该线程实际读取相隔 700ms。
+        let mut tracked = Tracked::new(40, start + Duration::from_millis(400));
+        assert!(tracked.observe_ticks(110, start + Duration::from_millis(1100), 100.0));
+        assert!((tracked.latest_busy - 1.0).abs() < 1e-9);
+        assert!(tracked.activity.eligible());
+        assert!(tracked.keep_owned(start + Duration::from_millis(1200)));
+    }
+
+    #[test]
+    fn invalid_ticks_rebase_without_releasing_recent_evidence_or_extending_it_forever() {
+        let start = Instant::now();
+        let mut tracked = Tracked::new(100, start);
+        assert!(tracked.observe_ticks(130, start + Duration::from_millis(500), 100.0));
+        assert!(!tracked.observe_ticks(1, start + Duration::from_secs(1), 100.0));
+        assert!(tracked.keep_owned(start + Duration::from_secs(1)));
+        assert!(!tracked.observe_ticks(1000, start + Duration::from_millis(1500), 100.0));
+        assert!((tracked.activity.average() - 0.6).abs() < 1e-9);
+        assert!(tracked.keep_owned(start + Duration::from_millis(3800)));
+        assert!(!tracked.keep_owned(start + Duration::from_millis(3801)));
+        // 异常值只作为新计数基线，下一次合理增量仍能恢复采样。
+        assert!(tracked.observe_ticks(1030, start + Duration::from_secs(2), 100.0));
+        assert!(tracked.keep_owned(start + Duration::from_secs(2)));
+    }
 }

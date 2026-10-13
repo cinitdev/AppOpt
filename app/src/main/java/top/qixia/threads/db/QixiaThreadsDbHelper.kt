@@ -604,7 +604,9 @@ data class ThreadData(
     val avg: Float,
     val max: Float,
     val series: String,
-    val details: String
+    val details: String,
+    // 自动分配详情解析时保留原始采样索引，不改变数据库格式或绘图序列。
+    val analysisSamples: top.qixia.threads.HistorySampleSeries? = null
 )
 
 /**

@@ -35,13 +35,23 @@ impl CalibSession {
     }
 
     pub(super) fn sample_once(&mut self) -> bool {
-        self.analyzer.begin_round(self.rounds);
         // 目标 App 运行过程中可能拉起新的子进程，每隔 PROCESS_REFRESH_ROUNDS 轮补扫一次。
         if self.rounds.is_multiple_of(PROCESS_REFRESH_ROUNDS) {
             self.refresh_processes();
         }
 
         let now = Instant::now();
+        // 先完成进程身份检查，再决定整轮是否采样，避免 HashMap 遍历顺序
+        // 使子进程汇总先写入、线程明细却因主进程缺失被丢弃。
+        self.processes.retain(|pid, owner| read_cmdline(*pid).ok().as_deref() == Some(owner.as_str()));
+        if !self.processes.values().any(|owner| owner == &self.pkg) {
+            let keep_waiting = self.pause_missing_main(now);
+            self.refresh_processes();
+            return keep_waiting;
+        }
+        self.main_missing_since = None;
+        self.main_active_since.get_or_insert(now);
+        self.analyzer.begin_round(self.rounds);
         let elapsed = self
             .last_sample
             .map(|last| now.duration_since(last).as_secs_f64())
@@ -51,18 +61,12 @@ impl CalibSession {
         let mut current_processes = std::mem::take(&mut self.processes);
         let mut alive = std::mem::take(&mut self.scratch_processes);
         alive.clear();
-        let mut main_alive = false;
         let mut observed_tids = std::mem::take(&mut self.scratch_observed_tids);
         observed_tids.clear();
         let mut child_round_deltas = std::mem::take(&mut self.scratch_child_round_deltas);
         child_round_deltas.clear();
         for (pid, owner) in current_processes.drain() {
-            // PID 可能在两轮之间被复用，只有 cmdline 仍与原 owner 一致才继续采样。
-            if read_cmdline(pid).ok().as_deref() != Some(owner.as_str()) {
-                continue;
-            }
             if owner == self.pkg {
-                main_alive = true;
                 self.sample_main_threads(pid, &owner, elapsed, &mut observed_tids);
             } else {
                 self.sample_child_process(
@@ -81,19 +85,6 @@ impl CalibSession {
         self.scratch_observed_tids = observed_tids;
         self.analyzer.finish_round();
 
-        // 常驻子进程只参与负载统计，不能单独维持校准会话。主进程热重启或
-        // /proc 瞬时不可读时保留一个短暂窗口，避免把一次重建误判为最终退出。
-        if !main_alive {
-            if let Some(started) = self.main_active_since.take() {
-                self.active_duration += now.saturating_duration_since(started);
-            }
-            self.refresh_processes();
-            let missing_since = self.main_missing_since.get_or_insert(now);
-            self.scratch_child_round_deltas = child_round_deltas;
-            return now.saturating_duration_since(*missing_since) < CALIB_MAIN_RESTART_GRACE;
-        }
-        self.main_missing_since = None;
-        self.main_active_since.get_or_insert(now);
         if elapsed > 0.0 {
             self.record_child_thread_summaries(&mut child_round_deltas, elapsed);
             self.fill_missing_record_samples();
@@ -102,6 +93,19 @@ impl CalibSession {
         }
         self.scratch_child_round_deltas = child_round_deltas;
         true
+    }
+
+    fn pause_missing_main(&mut self, now: Instant) -> bool {
+        // 常驻子进程不能单独维持会话；缺失轮次统一不计入汇总、明细与建议。
+        // 清除计时基线，恢复后的首轮只建基线，不把中断窗口混入下一次负载。
+        if let Some(started) = self.main_active_since.take() {
+            self.active_duration += now.saturating_duration_since(started);
+        }
+        self.last_sample = None;
+        self.prev_ticks.clear();
+        self.analyzer.pause_sampling();
+        let missing_since = self.main_missing_since.get_or_insert(now);
+        now.saturating_duration_since(*missing_since) < CALIB_MAIN_RESTART_GRACE
     }
 
     pub(super) fn sampled_duration(&self) -> Duration {
@@ -400,6 +404,53 @@ pub(super) fn clock_ticks_per_second() -> f64 {
 #[cfg(test)]
 mod session_capacity_tests {
     use super::*;
+
+    #[test]
+    fn missing_main_discards_the_whole_window_and_resets_resume_baselines() {
+        let mut session = CalibSession::new("com.test".into(), Vec::new());
+        let start = Instant::now();
+        let tid = TidKey { pid: 100, tid: 101, starttime: 1 };
+        let process = TrackKey { owner: "com.test:child".into(), name: String::new(), is_process: true };
+        let child = ChildThreadKey { owner: process.owner.clone(), name: "worker".into() };
+        session.record_pct(process.clone(), 40.0);
+        session.record_child_thread_summaries(&mut HashMap::from([(child.clone(), 40.0)]), 0.5);
+        session.rounds = 1;
+        session.last_sample = Some(start);
+        session.main_active_since = Some(start);
+        assert!(session.tid_sample(tid, 10, start).is_none());
+
+        assert!(session.pause_missing_main(start + Duration::from_millis(500)));
+        assert!(session.pause_missing_main(start + Duration::from_secs(1)));
+        assert_eq!(session.rounds, 1);
+        assert_eq!(session.records[&process].sample_count, 1);
+        assert_eq!(session.child_threads[&child].sum_pct, 40.0);
+        assert_eq!(session.active_duration, Duration::from_millis(500));
+        assert!(session.last_sample.is_none());
+        // 中断期间的累计 ticks 不能变成恢复后的第一个负载样本。
+        assert!(session.tid_sample(tid, 500, start + Duration::from_secs(2)).is_none());
+        session.record_pct(process.clone(), 20.0);
+        session.record_child_thread_summaries(&mut HashMap::from([(child.clone(), 20.0)]), 0.5);
+        session.rounds += 1;
+        assert_eq!(session.records[&process].sample_count, session.rounds);
+        assert_eq!(session.records[&process].avg(), session.child_threads[&child].avg(session.rounds));
+        assert!(!session.pause_missing_main(start + CALIB_MAIN_RESTART_GRACE + Duration::from_secs(1)));
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn live_child_is_not_sampled_when_main_is_missing() {
+        let pid = std::process::id() as i32;
+        let owner = read_cmdline(pid).unwrap();
+        let mut session = CalibSession::new("com.qixia.nonexistent.test".into(), vec![ProcInfo { pid, owner }]);
+        session.rounds = 1;
+        session.last_sample = Some(Instant::now() - Duration::from_millis(500));
+        assert!(session.sample_once());
+        assert_eq!(session.rounds, 1);
+        assert!(session.records.is_empty());
+        assert!(session.child_threads.is_empty());
+        assert!(session.prev_ticks.is_empty());
+        assert!(session.last_sample.is_none());
+    }
 
     #[test]
     fn per_thread_clock_handles_scan_delays_counter_resets_and_reused_tids() {

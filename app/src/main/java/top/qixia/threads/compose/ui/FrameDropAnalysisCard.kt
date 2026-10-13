@@ -28,8 +28,7 @@ internal fun FrameDropAnalysisCard(state: HistoryDetailUiState, session: Session
         val point = selected ?: return@produceState
         value = withContext(Dispatchers.Default) {
             val load = state.threads.filterNot(HistoryPresentation::isProcess).mapNotNull { thread ->
-                HistoryAnalysis.nearby(HistoryPresentation.curve(thread.series, 720), point.progress, session.durationMs)
-                    ?.value?.let { thread.name to it }
+                HistoryAnalysis.threadLoad(thread, point.progress, session.durationMs)?.let { thread.name to it }
             }.sortedByDescending { it.second }.take(6)
             val time = session.endedAtMs - session.durationMs + (point.progress * session.durationMs).toLong()
             val events = state.coreTimeline?.events.orEmpty().filter { abs(it.timestampMs - time) <= 2000 }

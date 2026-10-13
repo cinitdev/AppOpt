@@ -11,7 +11,8 @@ import kotlin.math.roundToInt
 object HistoryFpsStore {
     data class Point(val progress: Float, val fps: Float, val breakBefore: Boolean = false, val timestampMs: Long? = null)
     data class Report(val average: Float, val minimum: Float, val maximum: Float,
-        val samples: Int, val points: List<Point>, val low5: Float? = null, val jitter: Float? = null)
+        val samples: Int, val points: List<Point>, val low5: Float? = null, val jitter: Float? = null,
+        val analysisSamples: HistorySampleSeries? = null)
 
     /** Scene 报告使用最低 5% 的每秒 FPS 样本均值，而非百分位数。 */
     internal fun summary(values: List<Float>, points: List<Point>): Report {
@@ -233,8 +234,9 @@ object HistoryFpsStore {
             val window = samples.filter { it.first in since..until }
             if (window.isEmpty()) return@mapNotNull null
             val preview = FpsPreview(since, until, maxPoints = 240)
-            window.forEach { preview.add(it.first, it.second) }
-            epoch to summary(window.map { it.second }, preview.points())
+            val analysis = HistorySampleSeries.Builder(since, durationMs, gapMs = 2500)
+            window.forEach { preview.add(it.first, it.second); analysis.add(it.first, it.second) }
+            epoch to summary(window.map { it.second }, preview.points()).copy(analysisSamples = analysis.build())
         }.toMap()
     }.getOrDefault(emptyMap())
 }

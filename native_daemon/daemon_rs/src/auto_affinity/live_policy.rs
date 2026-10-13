@@ -41,7 +41,7 @@ impl Activity {
             || !elapsed.is_finite()
             || !(0.25..=12.0).contains(&elapsed)
         {
-            *self = Self::default();
+            // 异常读数不代表线程变为空闲；有效样本的时效由调用方单独检查。
             return false;
         }
         self.quiet = if busy < 0.01 {
@@ -291,15 +291,19 @@ mod tests {
         assert!(!burst.eligible());
     }
     #[test]
-    fn gaps_and_invalid_counters_cannot_keep_old_activity_alive() {
+    fn invalid_samples_preserve_evidence_but_do_not_extend_ownership_grace() {
         let mut active = Activity::default();
         for _ in 0..3 {
             active.observe(0.8, 1.1);
         }
         assert!(active.eligible());
         assert!(!active.observe(0.8, 15.0));
-        assert!(!active.eligible());
+        assert!(active.eligible());
         assert!(!active.observe(f64::NAN, 1.1));
+        assert!(!active.observe(1.2, 0.5));
+        assert!((active.average() - 0.8).abs() < 1e-9);
+        assert!(active.keep_owned_without_sample(Duration::from_secs(1)));
+        assert!(!active.keep_owned_without_sample(Duration::from_secs(4)));
     }
     #[test]
     fn a_missing_sample_briefly_preserves_an_active_owner_without_admitting_light_work() {
@@ -568,7 +572,8 @@ mod tests {
         assert_eq!(activity.samples.front(), Some(&(0.01, 6.0)));
         assert!(!activity.eligible());
         assert!(!activity.observe(0.3, 0.249));
-        assert!(activity.samples.is_empty());
+        assert_eq!(activity.samples.front(), Some(&(0.01, 6.0)));
+        assert!(!activity.eligible());
     }
 
     #[test]

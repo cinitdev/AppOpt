@@ -3,6 +3,7 @@ package top.qixia.threads.compose
 import top.qixia.threads.HistoryFpsStore
 import top.qixia.threads.HistoryMetrics
 import top.qixia.threads.db.SessionSummary
+import top.qixia.threads.db.ThreadData
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -11,25 +12,29 @@ data class FrameDrop(val progress: Float, val fps: Float?, val frameMaxMs: Float
 /** 只定位已保存的采样区间，不能从每秒 FPS 倒推出完整的逐帧耗时。 */
 object HistoryAnalysis {
     fun reference(fps: HistoryFpsStore.Report?): Float? {
-        val values = fps?.points.orEmpty().map { it.fps }.filter { it.isFinite() && it >= 10f }.sorted()
+        val values = (fps?.analysisSamples?.points()?.map { it.value } ?: fps?.points.orEmpty().map { it.fps })
+            .filter { it.isFinite() && it >= 10f }.sorted()
         return values.takeIf { it.size >= 8 }?.get(((values.size - 1) * .8).toInt())
     }
 
     fun drops(fps: HistoryFpsStore.Report?, metrics: HistoryMetrics.Report?, durationMs: Long): List<FrameDrop> {
         if (durationMs <= 0) return emptyList()
         val reference = reference(fps)
-        val frames = metrics?.series?.get("frame_max_ms")?.points.orEmpty()
+        val frames = metrics?.frameSamples?.points() ?: metrics?.series?.get("frame_max_ms")?.points.orEmpty()
         val frameCurve = frames.map { HistoryCurvePoint(it.progress, it.value, it.breakBefore) }
-        val fpsCurve = fps?.points.orEmpty().map { HistoryCurvePoint(it.progress, it.fps, it.breakBefore) }
+        val fpsCurve = fps?.analysisSamples?.points()?.map { HistoryCurvePoint(it.progress, it.value, it.breakBefore) }
+            ?: fps?.points.orEmpty().map { HistoryCurvePoint(it.progress, it.fps, it.breakBefore) }
         val candidates = sortedMapOf<Float, FrameDrop>()
-        fps?.points.orEmpty().filter { reference != null && it.fps.isFinite() && it.fps >= 0 &&
-            it.fps < reference * .8f && !it.breakBefore }.forEach {
-            candidates[it.progress] = FrameDrop(it.progress, it.fps,
-                nearby(frameCurve, it.progress, durationMs)?.value, reference)
+        fpsCurve.filter { reference != null && it.value.isFinite() && it.value >= 0 &&
+            it.value < reference * .8f && !it.breakBefore }.forEach {
+            val frame = if (metrics?.frameSamples != null) metrics.frameSamples.at(it.progress)
+                else nearby(frameCurve, it.progress, durationMs)?.value
+            candidates[it.progress] = FrameDrop(it.progress, it.value, frame, reference)
         }
         frames.filter { !it.breakBefore && it.value.isFinite() &&
             it.value >= max(50f, reference?.let { fps -> 2000f / fps } ?: 50f) }.forEach {
-            val value = nearby(fpsCurve, it.progress, durationMs)?.value
+            val value = if (fps?.analysisSamples != null) fps.analysisSamples.at(it.progress)
+                else nearby(fpsCurve, it.progress, durationMs)?.value
             candidates[it.progress] = FrameDrop(it.progress, value, it.value, reference)
         }
         // 连续两秒内的候选合为一个区间，只保留最明显的采样点，避免图上堆叠标记。
@@ -48,7 +53,12 @@ object HistoryAnalysis {
         return result
     }
 
-    /** 曲线之间的关联不跨断点；指标读数另查原始采样索引。 */
+    /** 自动分配查原始时间索引；校准读取文件中完整的已保存序列，不再次绘图抽稀。 */
+    internal fun threadLoad(thread: ThreadData, progress: Float, durationMs: Long): Float? =
+        if (thread.analysisSamples != null) thread.analysisSamples.at(progress)
+        else nearby(HistoryPresentation.curve(thread.series, Int.MAX_VALUE), progress, durationMs)?.value
+
+    /** 没有原始索引的报告只查询实际保存点，不跨断点借用其他时刻的数据。 */
     internal fun nearby(points: List<HistoryCurvePoint>, progress: Float, durationMs: Long): HistoryCurvePoint? =
         if (durationMs <= 0) null else HistoryPlotMath.at(points, progress, durationMs)?.takeIf {
             it.value.isFinite() && abs(it.progress - progress).toDouble() * durationMs <= 1500.0

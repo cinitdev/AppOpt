@@ -10,7 +10,8 @@ object HistoryMetrics {
     data class Report(val series: Map<String, Series>, val samples: Int, val chargingSamples: Int,
         val durationMs: Long, val coverage: Float, val device: Map<String, String> = emptyMap(),
         val distributions: Map<String, List<FrequencyBucket>> = emptyMap(),
-        val analysisSamples: HistoryMetricSamples? = null)
+        val analysisSamples: HistoryMetricSamples? = null,
+        val frameSamples: HistorySampleSeries? = null)
 
     fun unit(key: String) = when {
         key.startsWith("cpu_mhz.") || key in setOf("gpu_mhz", "ddr_mhz") -> "MHz"

@@ -124,6 +124,7 @@ internal object AutoHistoryRecord {
         val homePreview = FpsPreview(start, end)
         val metrics = arrayListOf<HistoryMetrics.Sample>()
         val frameSamples = arrayListOf<Pair<Long, Float>>()
+        val frameAnalysis = HistorySampleSeries.Builder(start, duration)
         val affinities = arrayListOf<AffinityChange>()
         val timelineParts = arrayListOf<CoreTimelineReport>()
         val eventPool = CoreEventPool()
@@ -160,7 +161,7 @@ internal object AutoHistoryRecord {
                         if (summaryOnly && firstInSegment) decodeName(fields[5])
                         if (!summaryOnly) {
                             val key = "$pid:$tid:$ticks"
-                            val samples = threadSamples[key] ?: ThreadSamples(fields[5]).also {
+                            val samples = threadSamples[key] ?: ThreadSamples(fields[5], start, duration).also {
                                 require(threadSamples.size < MAX_THREADS)
                                 threadSamples[key] = it
                             }
@@ -178,8 +179,11 @@ internal object AutoHistoryRecord {
                             homePreview.add(time, fps)
                             if (!summaryOnly) fpsSamples += time to fps
                             previousFpsTime = time
-                            fields.getOrNull(3)?.takeUnless { summaryOnly }?.toFloatOrNull()?.takeIf { HistoryMetrics.valid("frame_max_ms", it) }
-                                ?.let { frameSamples += time to it }
+                            if (!summaryOnly) {
+                                val frame = fields.getOrNull(3)?.toFloatOrNull()?.takeIf { HistoryMetrics.valid("frame_max_ms", it) }
+                                frameAnalysis.add(time, frame ?: Float.NaN)
+                                frame?.let { frameSamples += time to it }
+                            }
                         }
                     }
                     "M" -> {
@@ -223,7 +227,9 @@ internal object AutoHistoryRecord {
                             .also { previous = point.progress }
                     }
             }
-            statistics!!.copy(points = reduced)
+            val analysis = HistorySampleSeries.Builder(start, duration, gapMs = 2500)
+            samples.forEach { analysis.add(it.first, it.second) }
+            statistics!!.copy(points = reduced, analysisSamples = analysis.build())
         }
         var report = metrics.takeIf { it.isNotEmpty() }?.let {
             HistoryMetricsStore.summarize(it, start, duration).copy(device = device)
@@ -232,8 +238,8 @@ internal object AutoHistoryRecord {
             val frameReport = HistoryMetricsStore.summarize(frameSamples.map {
                 HistoryMetrics.Sample(it.first, null, mapOf("frame_max_ms" to it.second))
             }, start, duration)
-            report = report?.copy(series = report.series + frameReport.series)
-                ?: frameReport.copy(device = device)
+            report = report?.copy(series = report.series + frameReport.series, frameSamples = frameAnalysis.build())
+                ?: frameReport.copy(device = device, frameSamples = frameAnalysis.build())
         }
         val summary = SessionSummary(sessionId(sourceName), end / 1000L,
             segments.map { it.metadata["samples"]?.toIntOrNull()?.coerceAtLeast(0) }.let { counts ->
@@ -265,7 +271,8 @@ internal object AutoHistoryRecord {
         }
         fun points() = listOf(first, minimum, maximum, last).distinct().sortedBy { it.progress }
     }
-    private class ThreadSamples(private var encodedName: String) {
+    private class ThreadSamples(private var encodedName: String, start: Long, duration: Long) {
+        private val analysis = HistorySampleSeries.Builder(start, duration)
         var name = decodeName(encodedName)
             private set
         private val buckets = mutableMapOf<Int, Bucket>()
@@ -283,6 +290,7 @@ internal object AutoHistoryRecord {
         var maximum = 0f
             private set
         fun add(progress: Float, percent: Float, time: Long) {
+            analysis.add(time, percent)
             total += percent; count++; maximum = maxOf(maximum, percent)
             val index = (progress * CURVE_BUCKETS).toInt().coerceIn(0, CURVE_BUCKETS - 1)
             val point = Point(progress, percent, lastTime != Long.MIN_VALUE && time - lastTime > 3500)
@@ -296,7 +304,7 @@ internal object AutoHistoryRecord {
                     .also { previous = point.progress }
             } }
             return ThreadData(name, (total / count.coerceAtLeast(1)).toFloat(), maximum,
-                "@t:" + points.joinToString(",") { "${it.progress}=${it.value}=${if (it.breakBefore) 1 else 0}" }, "")
+                "@t:" + points.joinToString(",") { "${it.progress}=${it.value}=${if (it.breakBefore) 1 else 0}" }, "", analysis.build())
         }
     }
     private fun decodeName(hex: String): String = decodeThreadName(hex).also { require(it.isNotBlank()) }
