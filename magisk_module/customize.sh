@@ -15,8 +15,10 @@ is_qixia_in_app_update() {
 	return 1
 }
 print_manual_migration_notice() {
+  ui_print ""
 	ui_print "********************************************"
 	ui_print "旧版迁移提醒（从 AppOpt 切换到柒夏线程）"
+	ui_print "! 首次刷入2.0版本需要手动迁移，迁移后无视。"
 	ui_print "! 请先手动备份旧版 applist.conf，再处理旧版 APK 和模块。"
 	ui_print "! 旧版 APK 请自行卸载，旧模块请自行停用或卸载。"
 	ui_print "! 请勿同时启用旧版与新版模块，以免调度冲突。"
@@ -25,6 +27,7 @@ print_manual_migration_notice() {
 	ui_print "/data/adb/modules/QixiaThreads/config/applist.conf"
 	ui_print "! 复制后重新打开柒夏线程，按当前设置同步规则格式。"
 	ui_print "********************************************"
+	ui_print ""
 }
 check_magisk_version() {
 	ui_print "- Magisk version: $MAGISK_VER_CODE"
