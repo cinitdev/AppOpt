@@ -1,5 +1,5 @@
-use crate::fps_stream::{FpsStream, FrameStreamKey};
 pub(crate) use crate::fps_stream::FrameReportValue;
+use crate::fps_stream::{FpsStream, FrameStreamKey};
 use aya::maps::Array as AyaArray;
 use aya::maps::HashMap as AyaHashMap;
 use aya::maps::perf::PerfEventArrayBuffer;
@@ -59,6 +59,19 @@ pub(crate) struct PidSymbolProbe {
     pub(crate) no_frame_mask: u32,
     pub(crate) stalled_mask: u32,
     pub(crate) unavailable_mask: u32,
+}
+
+impl PidSymbolProbe {
+    pub(crate) fn accepts_timestamp(&self, timestamp_ns: u64) -> bool {
+        !self.exhausted && timestamp_ns >= self.candidate_started_ns
+    }
+
+    pub(crate) fn should_advance(&self, now_ns: u64, last_frame_ns: u64) -> bool {
+        !self.confirmed
+            && !self.exhausted
+            && now_ns.saturating_sub(self.candidate_started_ns.max(last_frame_ns))
+                >= crate::constants::SYMBOL_PROBE_NS
+    }
 }
 
 pub(crate) enum EventBackend {

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* BPF 程序: uprobe 探测 android::Surface 帧提交函数。
+/* BPF 程序: uprobe 探测 BLAST 帧合成完成回调。
  * 编译: clang -target bpf -g -O2 -c queuebuffer_probe.bpf.c -o queuebuffer_probe.bpf.o
  *
  * 本文件不 #include <linux/bpf.h> 或 <bpf/bpf_helpers.h>, 改用内建函数声明
@@ -42,106 +42,14 @@ static long (*bpf_trace_printk)(const char *fmt, unsigned long long fmt_size, ..
 /* helper 4 同时兼容旧 Android 内核；只用于 32 位 x86 compat 参数读取。 */
 static long (*bpf_probe_read_compat)(void *dst, unsigned long long size, const void *unsafe_ptr) = (void *)4;
 
-/* --- uprobe 参数读取 ---
- * queueBuffer 是 libgui 里的用户态函数，BPF 入口 ctx 实际是 struct pt_regs*。
- * 第一个参数就是 Surface/ANativeWindow 指针：
- * - arm64: x0
- * - arm: r0
- * - x86_64: rdi
- * - x86: 用户栈 esp + 4，esp 指向返回地址
- */
-#if defined(__TARGET_ARCH_arm64)
-struct qixia_pt_regs {
-    unsigned long long regs[31];
-    unsigned long long sp;
-    unsigned long long pc;
-    unsigned long long pstate;
-};
-
-static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
-    return ((struct qixia_pt_regs *)ctx)->regs[0];
-}
-#elif defined(__TARGET_ARCH_arm)
-struct qixia_pt_regs {
-    unsigned int uregs[18];
-};
-
-static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
-    return (unsigned long long)((struct qixia_pt_regs *)ctx)->uregs[0];
-}
-#elif defined(QIXIA_BPF_X86_64)
-struct qixia_pt_regs {
-    unsigned long long r15;
-    unsigned long long r14;
-    unsigned long long r13;
-    unsigned long long r12;
-    unsigned long long bp;
-    unsigned long long bx;
-    unsigned long long r11;
-    unsigned long long r10;
-    unsigned long long r9;
-    unsigned long long r8;
-    unsigned long long ax;
-    unsigned long long cx;
-    unsigned long long dx;
-    unsigned long long si;
-    unsigned long long di;
-    unsigned long long orig_ax;
-    unsigned long long ip;
-    unsigned long long cs;
-    unsigned long long flags;
-    unsigned long long sp;
-    unsigned long long ss;
-};
-
-static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
-    return ((struct qixia_pt_regs *)ctx)->di;
-}
-#elif defined(QIXIA_BPF_I386)
-struct qixia_pt_regs {
-    unsigned int bx;
-    unsigned int cx;
-    unsigned int dx;
-    unsigned int si;
-    unsigned int di;
-    unsigned int bp;
-    unsigned int ax;
-    unsigned int ds;
-    unsigned int es;
-    unsigned int fs;
-    unsigned int gs;
-    unsigned int orig_ax;
-    unsigned int ip;
-    unsigned int cs;
-    unsigned int flags;
-    unsigned int sp;
-    unsigned int ss;
-};
-
-static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
-    unsigned int value = 0;
-    unsigned int sp = ((struct qixia_pt_regs *)ctx)->sp;
-    if (sp == 0) {
-        return 0;
-    }
-    if (bpf_probe_read_compat(&value, sizeof(value), (const void *)(unsigned long long)(sp + 4)) != 0) {
-        return 0;
-    }
-    return (unsigned long long)value;
-}
-#else
-static __always_inline unsigned long long qixia_read_parm1(void *ctx) {
-    (void)ctx;
-    return 0;
-}
-#endif
+#include "frame_callback.h"
 
 /* --- 发送给用户态的帧事件 --- */
 struct frame_event {
-    unsigned long long timestamp_ns;   /* bpf_ktime_get_ns() 时间戳 */
+    unsigned long long timestamp_ns;   /* 完成回调携带的合成时间戳 */
     unsigned int pid;                  /* 进程 TGID */
     unsigned int tid;                  /* 线程 ID */
-    unsigned long long surface_ptr;    /* arm64 x0 参数(Surface/ANativeWindow 指针) */
+    unsigned long long surface_ptr;    /* BLAST 队列指针 */
 };
 
 struct frame_stats_key {
@@ -200,7 +108,7 @@ struct {
 static __always_inline int record_frame_stats(struct frame_event *event) {
     struct frame_stats_key key = {};
     key.pid = event->pid;
-    key.tid = event->tid;
+    key.tid = event->surface_ptr ? 0 : event->tid;
     key.surface_ptr = event->surface_ptr;
 
     struct frame_stats_value *value = bpf_map_lookup_elem(&frame_stats, &key);
@@ -208,12 +116,13 @@ static __always_inline int record_frame_stats(struct frame_event *event) {
         if (event->timestamp_ns <= value->last_ts) {
             return 0;
         }
-        /* 多个 queueBuffer 符号可能命中同一次提交, 1ms 内同 stream 视为重复事件。 */
+        /* 同一队列在同一合成时刻的多次通知只计一帧，跨 Binder 线程共享去重。 */
         if (event->timestamp_ns - value->last_ts < 1000000ULL) {
             return 0;
         }
-        value->last_ts = event->timestamp_ns;
-        value->total_frames += 1;
+        struct frame_stats_value next = {event->timestamp_ns, value->total_frames + 1};
+        /* 一次替换完整快照，避免用户态读到新时间戳和旧计数。 */
+        bpf_map_update_elem(&frame_stats, &key, &next, BPF_ANY);
         return 1;
     }
 
@@ -231,30 +140,30 @@ static __always_inline int record_frame_stats(struct frame_event *event) {
     return 1;
 }
 
-/* --- uprobe 程序: 挂载 libgui 帧提交函数的入口 ---
+/* --- uprobe 程序: 挂载 libgui 帧合成完成回调入口 ---
  * attach 时指定:
  *   - binary:  /system/lib64/libgui.so (或 /system/lib/libgui.so)
  *   - symbol:  候选符号(按优先级尝试)
  *   - pid:     目标游戏进程(限制仅该进程触发)
  * 被探测函数每次被调用时, 此程序在内核态执行。
- * 记录当前时间戳和调用上下文, 通过 RingBuf 发到用户态。 */
-SEC("uprobe/libgui_queuebuffer")
-int on_queue_buffer(void *ctx) {
+ * 记录回调携带的合成时间戳和队列, 通过 RingBuf 发到用户态。 */
+SEC("uprobe/libgui_frame_completed")
+int on_frame_completed(void *ctx) {
     struct frame_event local = {};
 
     unsigned long long pid_tgid = bpf_get_current_pid_tgid();
     local.pid = (unsigned int)(pid_tgid >> 32);
-    if (!bpf_map_lookup_elem(&target_tgids, &local.pid)) {
+    unsigned int *abi = bpf_map_lookup_elem(&target_tgids, &local.pid);
+    if (!abi) {
         return 0;
     }
 
-    /* 记录目标进程帧事件。 */
-    local.timestamp_ns = bpf_ktime_get_ns();
+    local.timestamp_ns = qixia_read_latch(ctx, *abi);
+    if (!qixia_valid_latch(local.timestamp_ns, bpf_ktime_get_ns())) return 0;
     local.tid = (unsigned int)pid_tgid;
 
-    /* Surface/ANativeWindow 指针用于用户态按真实 Surface 分流。
-     * 如果当前 ABI 未实现参数读取，会返回 0，用户态自动退回 TID 分流。 */
-    local.surface_ptr = qixia_read_parm1(ctx);
+    local.surface_ptr = qixia_read_surface(ctx, *abi);
+    if (!local.surface_ptr) return 0;
 
     int stats_result = record_frame_stats(&local);
     if (stats_result == 0) {

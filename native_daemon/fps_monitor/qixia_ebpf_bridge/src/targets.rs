@@ -1,5 +1,6 @@
 use crate::attach::{attach_process_candidate, detach_pid_links, sync_process_tasks};
 use crate::clock::monotonic_ns;
+use crate::constants::frame_callback_abi;
 use crate::context::{QixiaThreadsEbpfCtx, PidSymbolProbe};
 use crate::diagnostics::{compact_error_details, cstring_lossy};
 use crate::procfs::{
@@ -129,7 +130,7 @@ pub(crate) fn sync_target_pids(ctx: &mut QixiaThreadsEbpfCtx, pids: &[c_int]) ->
                     continue;
                 }
             };
-        if let Err(err) = ctx.target_tgids.insert(pid, 1, 0) {
+        if let Err(err) = ctx.target_tgids.insert(pid, frame_callback_abi(candidate_index), 0) {
             update_errors.push(format!("更新 target_tgids[{pid}] 失败: {err}"));
             update_errors.extend(detach_pid_links(&mut ctx.bpf, pid, task_links));
             continue;

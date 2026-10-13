@@ -11,8 +11,8 @@ use std::path::Path;
 
 pub(crate) fn load_uprobe_program(bpf: &mut Ebpf) -> Result<(), String> {
     let program: &mut UProbe = bpf
-        .program_mut("on_queue_buffer")
-        .ok_or_else(|| "missing BPF program: on_queue_buffer".to_string())?
+        .program_mut("on_frame_completed")
+        .ok_or_else(|| "missing BPF program: on_frame_completed".to_string())?
         .try_into()
         .map_err(|e: aya::programs::ProgramError| e.to_string())?;
 
@@ -20,8 +20,8 @@ pub(crate) fn load_uprobe_program(bpf: &mut Ebpf) -> Result<(), String> {
 }
 
 pub(crate) fn uprobe_program(bpf: &mut Ebpf) -> Result<&mut UProbe, String> {
-    bpf.program_mut("on_queue_buffer")
-        .ok_or_else(|| "missing BPF program: on_queue_buffer".to_string())?
+    bpf.program_mut("on_frame_completed")
+        .ok_or_else(|| "missing BPF program: on_frame_completed".to_string())?
         .try_into()
         .map_err(|e: aya::programs::ProgramError| e.to_string())
 }
@@ -40,8 +40,8 @@ pub(crate) fn attach_symbol_for_task(
     let program = uprobe_program(bpf)?;
     program.attach(offset, path, scope).map_err(|err| {
         format!(
-            "pid={tgid} tid={tid} symbol={symbol} {}: {err}",
-            path.display()
+            "pid={tgid} tid={tid} symbol={symbol} {}: {}",
+            path.display(), crate::diagnostics::error_chain(&err)
         )
     })
 }
@@ -118,7 +118,7 @@ pub(crate) fn attach_process_candidate(
         }
     }
     Err(if symbol_errors.is_empty() {
-        format!("pid={pid} 没有剩余可挂载的 queueBuffer 候选")
+        format!("pid={pid} 没有剩余可挂载的 帧合成完成候选")
     } else {
         compact_error_details(&symbol_errors)
     })

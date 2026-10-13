@@ -1,4 +1,4 @@
-use crate::context::{QixiaThreadsEbpfCtx, FrameEvent};
+use crate::context::{FrameEvent, QixiaThreadsEbpfCtx};
 use crate::fps_stream::{FpsStream, FrameStreamKey, MAX_STREAMS, STREAM_STALE_NS};
 
 pub(crate) fn stream_key(event: FrameEvent) -> FrameStreamKey {
@@ -14,7 +14,7 @@ pub(crate) fn stream_key_from_parts(pid: u32, tid: u32, surface_ptr: u64) -> Fra
 }
 
 pub(crate) fn refresh_current_fps(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) {
-    const STREAM_SWITCH_SCORE_MARGIN: f64 = 120.0;
+    const STREAM_SWITCH_SCORE_MARGIN: f64 = 64.0;
     const STREAM_SWITCH_HOLD_NS: u64 = 600_000_000;
     ctx.streams.retain(|key, stream| {
         ctx.target_pids.contains(&key.pid)
@@ -87,7 +87,7 @@ pub(crate) fn refresh_current_fps(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) {
     ctx.cur_fps = ctx
         .selected_stream
         .and_then(|key| ctx.streams.get(&key))
-        .map_or(0.0, |stream| stream.cur_fps);
+        .map_or(0.0, |stream| stream.fps_at(now_ns));
     ctx.pid = ctx.selected_stream.map_or_else(
         || {
             if ctx.pid > 0 && ctx.target_pids.contains(&(ctx.pid as u32)) {
@@ -113,7 +113,12 @@ pub(crate) fn refresh_current_fps(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) {
 
 pub(crate) fn on_frame(ctx: &mut QixiaThreadsEbpfCtx, event: FrameEvent) -> bool {
     // 内核映射已经过滤一次；用户态再核对集合，防止目标切换时消费排队的旧事件。
-    if !ctx.target_pids.contains(&event.pid) {
+    if !ctx.target_pids.contains(&event.pid)
+        || !ctx
+            .pid_symbol_probes
+            .get(&event.pid)
+            .is_some_and(|probe| probe.accepts_timestamp(event.timestamp_ns))
+    {
         return false;
     }
 
@@ -121,8 +126,7 @@ pub(crate) fn on_frame(ctx: &mut QixiaThreadsEbpfCtx, event: FrameEvent) -> bool
     ctx.streams
         .entry(key)
         .or_insert_with(|| FpsStream::new(event.timestamp_ns))
-        .on_frame(event.timestamp_ns);
-    true
+        .on_frame(event.timestamp_ns)
 }
 
 pub(crate) fn clear_pid_samples(ctx: &mut QixiaThreadsEbpfCtx, pid: u32) {
@@ -138,8 +142,12 @@ pub(crate) fn clear_pid_samples(ctx: &mut QixiaThreadsEbpfCtx, pid: u32) {
             .collect::<Vec<_>>();
         for key in keys {
             let _ = stats.remove(&key);
-            if let Some(report) = ctx.frame_report.as_mut() { let _ = report.remove(&key); }
-            if let Some(report) = ctx.frame_report_prev.as_mut() { let _ = report.remove(&key); }
+            if let Some(report) = ctx.frame_report.as_mut() {
+                let _ = report.remove(&key);
+            }
+            if let Some(report) = ctx.frame_report_prev.as_mut() {
+                let _ = report.remove(&key);
+            }
         }
     }
     if ctx.selected_stream.is_some_and(|key| key.pid == pid) {

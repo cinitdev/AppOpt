@@ -312,7 +312,7 @@ mod tests {
         visible(&mut tracker, "com.game", Some(Mode::Auto), 100);
         assert_eq!(tracker.target(1099), None);
         assert_eq!(tracker.target(1100), Some("com.game"));
-        for invalid in [f64::NAN, f64::INFINITY, -1.0, 301.0] { tracker.sample("com.game", invalid); }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 1_000.1] { tracker.sample("com.game", invalid); }
         tracker.sample("com.other", 120.0);
         assert_eq!(tracker.session.as_ref().unwrap().row.average, None);
         tracker.sample("com.game", 60.0);
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(decode(&format!("{HEADER}\n{valid}\n")).unwrap()[0].average, Some(60.0));
         for line in [valid.replace("auto", "manual"), valid.replace("com.game", "com..game"),
             valid.replace("100", "-100"), valid.replace("200", "99"), valid.replace("60.00", "NaN"),
-            valid.replace("90.00", "301"), valid.replace("60.00", "100"), valid.replace("60.00", "-"),
+            valid.replace("90.00", "1000.1"), valid.replace("60.00", "100"), valid.replace("60.00", "-"),
             valid.replace("\t2", "\t0"), valid.replace("\t2", "\t4294967296"), format!("{valid}\textra"),
             format!("{valid}\n{valid}")] {
             assert!(decode(&format!("{HEADER}\n{line}\n")).is_err(), "accepted {line:?}");

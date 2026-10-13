@@ -1,36 +1,23 @@
-// Android 不同版本和厂商 ROM 的 libgui queueBuffer 符号不完全一致。
-// 每次只挂一个候选，必须实际产生稳定 FPS 才确认；无帧时再切换下一个，避免同时挂载造成重复计帧。
+// 只把合成完成回调作为 eBPF FPS 来源，提交缓冲区不等于实际合成一帧。
+// LP64 的 nsecs_t 编码为 l，32 位 Android 编码为 x；按符号确认参数 ABI。
+// 没有可用完成回调时走原有 SurfaceFlinger 降级，不退回易虚高的提交计数。
 pub(crate) const LIBGUI_FRAME_SYMBOLS: &[&str] = &[
-    "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferi",
-    "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferiPNS_24SurfaceQueueBufferOutputE",
-    "_ZN7android7Surface16hook_queueBufferEP13ANativeWindowP19ANativeWindowBufferi",
-    "_ZN7android7Surface19queueBufferInternalEP13ANativeWindowP19ANativeWindowBufferi",
-    "_ZN7android7Surface27hook_queueBuffer_DEPRECATEDEP13ANativeWindowP19ANativeWindowBuffer",
-    // Android 17 的 queueBuffer 改用 GraphicBuffer/Fence 和新的输入结构体。
-    // 放在旧候选之后作为兼容兜底，避免改变 Android 12-16 的探测顺序。
-    "_ZN7android7Surface11queueBufferERKNS_2spINS_13GraphicBufferEEERKNS1_INS_5FenceEEEPNS_24SurfaceQueueBufferOutputE",
-    "_ZN7android7Surface11queueBufferERKNS_2spINS_13GraphicBufferEEERKNS_23SurfaceQueueBufferInputEPNS_24SurfaceQueueBufferOutputE",
+    "_ZN7android16BLASTBufferQueue19transactionCallbackElRKNS_2spINS_5FenceEEERKNSt3__16vectorINS_19SurfaceControlStatsENS6_9allocatorIS8_EEEE",
+    "_ZN7android16BLASTBufferQueue19transactionCallbackExRKNS_2spINS_5FenceEEERKNSt3__16vectorINS_19SurfaceControlStatsENS6_9allocatorIS8_EEEE",
 ];
 pub(crate) const LIBGUI_FRAME_SYMBOL_NAMES: &[&str] = &[
-    "Surface::queueBuffer",
-    "Surface::queueBuffer(Output)",
-    "Surface::hook_queueBuffer",
-    "Surface::queueBufferInternal",
-    "Surface::hook_queueBuffer_DEPRECATED",
-    "Surface::queueBuffer(GraphicBuffer,Fence)",
-    "Surface::queueBuffer(GraphicBuffer,QueueInput)",
+    "BLASTBufferQueue::transactionCallback(64位)",
+    "BLASTBufferQueue::transactionCallback(32位)",
 ];
 pub(crate) const LIBGUI_FRAME_SYMBOL_NAME_CSTRS: &[&[u8]] = &[
-    b"Surface::queueBuffer\0",
-    b"Surface::queueBuffer(Output)\0",
-    b"Surface::hook_queueBuffer\0",
-    b"Surface::queueBufferInternal\0",
-    b"Surface::hook_queueBuffer_DEPRECATED\0",
-    b"Surface::queueBuffer(GraphicBuffer,Fence)\0",
-    b"Surface::queueBuffer(GraphicBuffer,QueueInput)\0",
+    b"BLASTBufferQueue::transactionCallback(LP64)\0",
+    b"BLASTBufferQueue::transactionCallback(ILP32)\0",
 ];
-pub(crate) const UNKNOWN_FRAME_SYMBOL_CSTR: &[u8] =
-    b"Surface::queueBuffer(\xE6\x9C\xAA\xE7\x9F\xA5\xE7\xAC\xA6\xE5\x8F\xB7)\0";
+pub(crate) const UNKNOWN_FRAME_SYMBOL_CSTR: &[u8] = b"unknown frame callback\0";
+
+pub(crate) fn frame_callback_abi(candidate_index: usize) -> u32 {
+    if candidate_index == 1 { 2 } else { 1 }
+}
 pub(crate) const SYMBOL_PROBE_NS: u64 = 3_000_000_000;
 pub(crate) const FRAME_STATS_RETENTION_NS: u64 = 10_000_000_000;
 pub(crate) const FRAME_STATS_POLL_INTERVAL_NS: u64 = 250_000_000;

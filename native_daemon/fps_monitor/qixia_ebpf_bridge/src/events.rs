@@ -3,7 +3,7 @@ use crate::constants::{
     MAX_PERF_BUFFERS_PER_POLL, MAX_PERF_EVENTS_PER_POLL, MAX_RING_EVENTS_PER_POLL,
     PERF_LOST_LOG_INTERVAL_NS,
 };
-use crate::context::{QixiaThreadsEbpfCtx, EventBackend, FrameEvent};
+use crate::context::{EventBackend, FrameEvent, QixiaThreadsEbpfCtx};
 use crate::stats::{
     poll_frame_stats, poll_frame_stats_drop_count, poll_ringbuf_drop_count, prune_frame_stats,
 };
@@ -170,6 +170,15 @@ pub(crate) fn poll_inner(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, String> {
     // 再进入 Surface/TID 分流的滑动窗口。RingBuf 原本就是有序的，排序不会改变语义。
     events.sort_by_key(|event| event.timestamp_ns);
 
+    // 仅诊断测试可输出逐帧证据，正式守护不编译这条路径。
+    #[cfg(test)]
+    if std::env::var_os("QIXIA_TEST_TRACE").is_some() {
+        let now = monotonic_ns();
+        for event in &events {
+            println!("frame,{now},{},{},{},{:x}", event.timestamp_ns, event.pid, event.tid, event.surface_ptr);
+        }
+    }
+
     let mut accepted = 0;
     let mut latest_ts = 0u64;
     for event in events {
@@ -178,11 +187,9 @@ pub(crate) fn poll_inner(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, String> {
             latest_ts = latest_ts.max(event.timestamp_ns);
         }
     }
-    if latest_ts > 0 {
-        // 一轮积压事件全部入窗后只重算一次活动 Surface，避免“事件数 × 帧流数”
-        // 的重复评分把高帧率场景变成用户态 CPU 热点。
-        refresh_current_fps(ctx, latest_ts);
-    }
+    // 每轮只重算一次。即使没有事件也按真实当前时间老化窗口，不能用
+    // 最后一条排队事件的时间假装帧源仍在持续出帧。
+    refresh_current_fps(ctx, monotonic_ns().max(latest_ts));
 
     Ok(accepted)
 }

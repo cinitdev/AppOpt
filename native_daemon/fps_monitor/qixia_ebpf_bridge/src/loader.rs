@@ -1,6 +1,6 @@
 use crate::attach::{attach_process_candidate, load_uprobe_program};
 use crate::clock::monotonic_ns;
-use crate::constants::{LIBGUI_FRAME_SYMBOLS, RINGBUF_MIN_KERNEL};
+use crate::constants::{LIBGUI_FRAME_SYMBOLS, RINGBUF_MIN_KERNEL, frame_callback_abi};
 use crate::context::{QixiaThreadsEbpfCtx, BackendKind, EventBackend, PidSymbolProbe};
 use crate::diagnostics::{cstring_lossy, error_chain};
 use crate::procfs::{process_starttime, resolve_libgui_path, task_starttime_snapshot};
@@ -112,7 +112,7 @@ pub(crate) fn start_backend(
         Some(map) => Some(AyaHashMap::try_from(map).map_err(|e| e.to_string())?),
         None => None,
     };
-    // 已安装的旧版探针没有这份可选报告映射，也能继续采集 FPS。
+    // RingBuf 直接统计逐帧耗时，StatsMap / PerfEvent 另有可选报告映射。
     let frame_report = bpf.take_map("frame_report").and_then(|map| AyaHashMap::try_from(map).ok());
     let frame_report_prev = bpf.take_map("frame_report_prev").and_then(|map| AyaHashMap::try_from(map).ok());
     if matches!(kind, BackendKind::StatsMap) && frame_stats.is_none() {
@@ -164,7 +164,7 @@ pub(crate) fn start_backend(
     )
     .map_err(|e| e.to_string())?;
     target_tgids
-        .insert(target_pid, 1, 0)
+        .insert(target_pid, frame_callback_abi(candidate_index), 0)
         .map_err(|e| format!("target_tgids[{target_pid}]: {e}"))?;
     let target_pids = HashSet::from([target_pid]);
     let task_count = task_links.len();

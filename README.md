@@ -12,7 +12,7 @@
 - 按包名、线程名配置 CPU affinity / cpuset 规则。
 - `auto` 校准：采样线程负载，生成核心建议与待确认结果，由用户确认后保存规则。
 - 自动分配：平均负载达到 5% 的活跃线程参与分配，按核心能力与争用持续调整。
-- FPS 监测：优先使用 eBPF uprobe 捕获 `libgui.so` queueBuffer 帧事件。
+- FPS 监测：优先使用 eBPF uprobe 捕获 `libgui.so` BLAST 帧合成完成回调。
 - eBPF 不可用时自动降级到 SurfaceFlinger fallback。
 - 历史记录：区分校准记录与自动分配记录，保留活跃线程、FPS、功率、电流、电量、温度、CPU/GPU 使用率及频率等可用数据，支持游标联动、指标展开和批量删除。
 - 自动分配记录默认关闭，开启后仅保存使用超过 3 分钟的会话；规则应用及未开启记录的自动分配应用只保留最近使用摘要，不生成详细历史。
@@ -50,17 +50,19 @@ Rust 持续采样线程负载，依据核心拓扑和联合容量预算接管 cp
 默认使用单行语法，也可切换函数语法。设置修改即时保存。
 
 FPS 监测优先通过 Rust/aya 加载 eBPF 程序，并 attach 到目标 PID 的 `libgui.so`
-queueBuffer 候选符号。Android 侧不再启用全局 uprobe；启动时如果暂时找不到目标 PID，
+`BLASTBufferQueue::transactionCallback` 完成回调。Android 侧不再启用全局 uprobe；启动时如果暂时找不到目标 PID，
 会等待后续前台进程确认后再启动 eBPF，避免把其它应用的帧算进去。设备内核、ROM 策略、
 符号或目标 ABI 不满足条件时，会自动降级到
 SurfaceFlinger `--latency` 路径，再按运行时探测结果兜底到 `--timestats`。FPS 数据优先由
 Rust 守护进程推送到 App 创建的 Android 本地 socket，socket 不可用时再写入 App 私有目录
 `fps` 文件作为兜底。
 
-eBPF 采集的是应用提交帧率，不等同于屏幕实际呈现帧率。FPS 按有效帧间隔计算，
+eBPF 使用完成回调携带的合成时间计算帧率，不使用缓冲区提交次数或批量回调的到达时间；
+它反映合成节奏，不等同于面板扫描时间。FPS 按有效帧间隔计算，
 没有写死 120／144／165 Hz 屏幕上限；运行中刷新率变化也无需额外配置。
 短间隔重复事件不会推进上一有效帧的时间戳，避免缩短统计时长导致 FPS 虚高。
 当前最小有效间隔为 1 毫秒，对应最高 1000 FPS 的技术边界；不通过屏幕限幅隐藏偏差。
+32 位应用是否能使用 eBPF 取决于内核对对应 ABI 的 uprobe 支持，不支持时走降级路径。
 
 前台识别优先使用 root `app_process` 启动的 `qixia_foreground_helper.jar`，它通过
 ActivityTaskManager/TaskStackListener 写入 `foreground_task.state`。App 侧在 helper

@@ -294,7 +294,7 @@ pub extern "C" fn qixia_ebpf_metrics(
             source_tid: ctx.selected_stream.map_or(0, |key| key.tid as i32),
             source_surface: ctx.selected_stream.map_or(0, |key| key.surface_ptr),
             last_frame_ns: stream.last_seen_ns,
-            fps: stream.cur_fps,
+            fps: stream.fps_at(monotonic_ns()),
             median_interval_ns: percentile(50),
             p95_interval_ns: percentile(95),
             max_interval_ns: intervals.last().copied().unwrap_or(0),

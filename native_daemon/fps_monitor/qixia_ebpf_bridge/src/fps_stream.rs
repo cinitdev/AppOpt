@@ -6,7 +6,7 @@ const MAX_RECORDED_FRAME_NS: u64 = 1_000_000_000;
 // Android 输入 ANR 的常见边界是 5 秒；低于该值仍可能是真实严重卡顿，不能当暂停丢掉。
 const PAUSE_FRAME_NS: u64 = 5_000_000_000;
 const MIN_STREAM_INTERVALS: usize = 8;
-const MIN_STREAM_LIFETIME_NS: u64 = 150_000_000;
+const MIN_STREAM_LIFETIME_NS: u64 = FPS_WINDOW_NS - MIN_FRAME_NS;
 // 根据最小可计量帧间隔限制窗口大小，不把任何屏幕刷新率当作 FPS 上限。
 const MAX_WINDOW_INTERVALS: u64 = FPS_WINDOW_NS / MIN_FRAME_NS;
 
@@ -58,9 +58,9 @@ impl FpsStream {
         }
     }
 
-    pub(crate) fn on_frame(&mut self, timestamp_ns: u64) {
+    pub(crate) fn on_frame(&mut self, timestamp_ns: u64) -> bool {
         if self.last_ts != 0 && timestamp_ns <= self.last_ts {
-            return;
+            return false;
         }
 
         if self.last_ts != 0 {
@@ -70,7 +70,7 @@ impl FpsStream {
             } else if delta < MIN_FRAME_NS {
                 // 丢弃重复事件时必须保留上一有效帧的时间戳，
                 // 否则下一帧的间隔会被截短，造成 FPS 虚高和帧耗时偏低。
-                return;
+                return false;
             } else {
                 self.record_report_interval(timestamp_ns, delta);
                 let recorded = delta.min(MAX_RECORDED_FRAME_NS);
@@ -84,6 +84,7 @@ impl FpsStream {
         self.last_ts = timestamp_ns;
         self.last_seen_ns = timestamp_ns;
         self.update_warmup();
+        true
     }
 
     pub(crate) fn on_frame_batch(&mut self, prev_ts: u64, timestamp_ns: u64, frames: u64) {
@@ -173,17 +174,45 @@ impl FpsStream {
             .min(STREAM_STALE_NS);
         let freshness = 1.0 - age_ns as f64 / STREAM_STALE_NS as f64;
         let coverage = self.frame_time_sum_ns.min(FPS_WINDOW_NS) as f64 / FPS_WINDOW_NS as f64;
-        freshness * 1_000.0
-            + coverage * 400.0
-            + self.frame_times.len().min(300) as f64
-            + self.cur_fps / 10.0
+        // 单次界面刷新不能不断打断视频帧源的切换等待。以完整窗口内的
+        // 持续出帧为主，新鲜度只作次级权重，避免偶发 UI 帧压住正在播放的视频。
+        freshness * 200.0 + coverage * 400.0 + self.fps_at(now_ns) * 4.0
+    }
+
+    pub(crate) fn fps_at(&self, now_ns: u64) -> f64 {
+        let age = now_ns.saturating_sub(self.last_seen_ns);
+        if age >= FPS_WINDOW_NS || !self.is_stable() {
+            return 0.0;
+        }
+        // 轮询时必须把最后一帧到现在的空闲时间算进去，不能沿用突发
+        // 末尾的高帧率。保留跨越窗口起点的完整间隔，和逐帧路径一致。
+        let mut duration = self.frame_time_sum_ns.saturating_add(age);
+        let mut count = self.frame_times.len();
+        for interval in self.frame_times.iter().rev() {
+            let remaining = duration.saturating_sub(*interval);
+            if remaining < FPS_WINDOW_NS {
+                break;
+            }
+            duration = remaining;
+            count = count.saturating_sub(1);
+        }
+        if duration == 0 {
+            0.0
+        } else {
+            count as f64 * FPS_WINDOW_NS as f64 / duration as f64
+        }
     }
 
     fn trim_window(&mut self) {
-        while self.frame_time_sum_ns > FPS_WINDOW_NS && self.frame_times.len() > 1 {
-            if let Some(old) = self.frame_times.pop_back() {
-                self.frame_time_sum_ns = self.frame_time_sum_ns.saturating_sub(old);
+        while let Some(&old) = self.frame_times.back() {
+            // 保留跨越窗口起点的完整间隔。否则停帧后的一个短间隔
+            // 就会挤掉整段停顿时间，把瞬时间隔误算成整秒 FPS。
+            let remaining = self.frame_time_sum_ns.saturating_sub(old);
+            if remaining < FPS_WINDOW_NS {
+                break;
             }
+            self.frame_times.pop_back();
+            self.frame_time_sum_ns = remaining;
         }
     }
 
@@ -196,6 +225,8 @@ impl FpsStream {
 
     fn update_warmup(&mut self) {
         self.warmed_up |= self.frame_times.len() >= MIN_STREAM_INTERVALS
+            // 创建帧流后的等待时间不能代替实际采集到的有效时间。
+            && self.frame_time_sum_ns >= MIN_STREAM_LIFETIME_NS
             && self.last_seen_ns.saturating_sub(self.first_seen_ns) >= MIN_STREAM_LIFETIME_NS;
     }
 
@@ -209,7 +240,7 @@ impl FpsStream {
 
     fn is_stable(&self) -> bool {
         self.warmed_up
-            && !self.frame_times.is_empty()
+            && self.frame_time_sum_ns >= MIN_STREAM_LIFETIME_NS
             && self.cur_fps.is_finite()
             && (1.0..=MAX_WINDOW_INTERVALS as f64).contains(&self.cur_fps)
     }
@@ -344,6 +375,37 @@ mod tests {
             stream.selection_score(stream.last_seen_ns),
             f64::NEG_INFINITY
         );
+    }
+
+    #[test]
+    fn startup_burst_cannot_publish_before_a_full_window() {
+        let stream = stream_at_fps(180, 91);
+        assert_eq!(stream.fps_at(stream.last_seen_ns), 0.0);
+        assert_eq!(
+            stream.selection_score(stream.last_seen_ns),
+            f64::NEG_INFINITY
+        );
+    }
+
+    #[test]
+    fn polling_without_new_frames_ages_the_actual_measurement() {
+        let stream = stream_at_fps(120, 241);
+        let now = stream.last_seen_ns;
+        assert!((stream.fps_at(now) - 120.0).abs() < 0.2);
+        assert!((stream.fps_at(now + 500_000_000) - 60.0).abs() < 1.1);
+        assert_eq!(stream.fps_at(now + FPS_WINDOW_NS), 0.0);
+    }
+
+    #[test]
+    fn continuous_video_outranks_occasional_ui_refreshes() {
+        let video = stream_at_fps(60, 121);
+        let now = video.last_seen_ns + 10_000_000;
+        let mut ui = stream_at_fps(120, 121);
+        ui.on_frame(now - 600_000_000);
+        ui.on_frame(now);
+        for delta in [0, 80_000_000, 160_000_000] {
+            assert!(video.selection_score(now + delta) > ui.selection_score(now + delta) + 120.0);
+        }
     }
 
     #[test]
@@ -507,5 +569,99 @@ mod tests {
             Some(MAX_RECORDED_FRAME_NS)
         );
         assert!(stream.selection_score(next).is_finite());
+    }
+
+    #[test]
+    fn resumed_frames_after_a_stall_cannot_turn_one_interval_into_a_peak() {
+        for batch in [false, true] {
+            let mut stream = stream_at_fps(60, 121);
+            let mut timestamp = stream.last_seen_ns;
+            for interval in [1_200_000_000, 1_000_600, 1_000_600, 1_000_600] {
+                let previous = timestamp;
+                timestamp += interval;
+                if batch {
+                    stream.on_frame_batch(previous, timestamp, 1);
+                } else {
+                    stream.on_frame(timestamp);
+                }
+                assert!(
+                    stream.cur_fps < 10.0,
+                    "batch={batch}, fps={}",
+                    stream.cur_fps
+                );
+                assert!(stream.frame_time_sum_ns >= FPS_WINDOW_NS);
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_catch_up_burst_after_jank_keeps_the_elapsed_time() {
+        for fps in [60, 120, 144, 165, 240, 480] {
+            for batch in [false, true] {
+                let mut stream = stream_at_fps(fps, fps as usize * 2 + 1);
+                let mut timestamp = stream.last_seen_ns + FPS_WINDOW_NS;
+                if batch {
+                    stream.on_frame_batch(timestamp - FPS_WINDOW_NS, timestamp, 1);
+                    let previous = timestamp;
+                    timestamp += 10 * 1_000_600;
+                    stream.on_frame_batch(previous, timestamp, 10);
+                    assert!(stream.cur_fps < 12.0);
+                } else {
+                    stream.on_frame(timestamp);
+                    for _ in 0..10 {
+                        timestamp += 1_000_600;
+                        stream.on_frame(timestamp);
+                        assert!(stream.cur_fps < 12.0);
+                    }
+                }
+                // 正常帧持续覆盖一秒后，旧停顿应退出窗口，不能长期压低帧率。
+                let frames_per_update = if batch { 10 } else { 1 };
+                for _ in 0..=(fps / frames_per_update) {
+                    let previous = timestamp;
+                    timestamp += (FPS_WINDOW_NS / fps) * frames_per_update;
+                    if batch {
+                        stream.on_frame_batch(previous, timestamp, frames_per_update);
+                    } else {
+                        stream.on_frame(timestamp);
+                    }
+                }
+                assert!(
+                    (stream.cur_fps - fps as f64).abs() < 0.2,
+                    "batch={batch}, target={fps}, fps={}",
+                    stream.cur_fps
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_warmup_requires_measured_time_not_just_an_old_first_timestamp() {
+        let mut stream = FpsStream::new(FPS_WINDOW_NS);
+        let previous = 2 * FPS_WINDOW_NS;
+        stream.on_frame_batch(previous, previous + 10_006_000, 10);
+        assert_eq!(
+            stream.selection_score(stream.last_seen_ns),
+            f64::NEG_INFINITY
+        );
+    }
+
+    #[test]
+    fn resumed_high_refresh_stream_requires_fresh_warmup() {
+        for fps in [120, 144, 165, 240, 480, 1000] {
+            let mut stream = stream_at_fps(fps, fps as usize + 1);
+            let mut timestamp = stream.last_seen_ns + PAUSE_FRAME_NS + 1;
+            stream.on_frame(timestamp);
+            for _ in 0..8 {
+                timestamp += 1_000_600;
+                stream.on_frame(timestamp);
+            }
+            assert_eq!(stream.selection_score(timestamp), f64::NEG_INFINITY);
+            for _ in 0..=fps {
+                timestamp += FPS_WINDOW_NS / fps;
+                stream.on_frame(timestamp);
+            }
+            assert!(stream.selection_score(timestamp).is_finite());
+            assert!((stream.cur_fps - fps as f64).abs() < 0.2);
+        }
     }
 }

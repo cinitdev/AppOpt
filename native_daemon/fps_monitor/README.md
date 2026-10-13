@@ -1,6 +1,6 @@
 # FPS 监测模块
 
-柒夏线程由 Rust 守护直接调用 Rust/aya bridge，负责目标应用的帧提交事件采集与 SurfaceFlinger 降级。
+柒夏线程由 Rust 守护直接调用 Rust/aya bridge，负责目标应用的 BLAST 帧合成完成回调采集与 SurfaceFlinger 降级。
 
 ```text
 bpf/queuebuffer_probe.bpf.c        RingBuf 探针
@@ -14,7 +14,8 @@ aya/                              Aya Git 子模块
 构建缓存 `target/` 和生成的对象文件不提交到源码仓库。
 
 FPS 按有效帧间隔计算，不按 120／144／165 Hz 等屏幕上限截断。短间隔重复事件不会推进计时基线；
-当前最小有效间隔为 1 毫秒。eBPF 统计的是应用提交帧率，与实际显示帧率可能不同。
+当前最小有效间隔为 1 毫秒。eBPF 使用完成回调携带的合成时间，不使用缓冲区提交次数或回调到达时间；
+它反映合成节奏，不等同于面板扫描时间。32 位应用还需要内核支持对应 ABI 的 uprobe。
 
 完整说明见 [FPS 采集说明](../../FPS_EBPF_INTEGRATION.md)，安装、自动分配、校准与历史记录见
 [项目 README](../../README.md)。

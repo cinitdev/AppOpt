@@ -298,7 +298,7 @@ impl FpsMonitor {
 
         // 已确认的帧源停顿不解绑、不轮换符号，也不触发 SurfaceFlinger：
         // 游戏切后台、加载场景、严重卡顿或停在静态页面都可能长时间没有
-        // queueBuffer；保留当前 attach，恢复提交帧后可以直接继续计数。
+        // 完成回调；保留当前 attach，恢复合成帧后可以直接继续计数。
 
         if fps_is_stale && !self.ebpf_stale_zero_sent {
             log_info!(

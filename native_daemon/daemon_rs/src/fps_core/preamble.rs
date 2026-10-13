@@ -4,7 +4,7 @@ use super::*;
 // 这个模块只在 Android/Linux 目标启用；Windows 主机 cargo check 会走 fps.rs 里的空实现。
 // 真正的 Android 交叉编译由 build_module.sh no 验证。
 //
-// FPS 主路径是多进程 eBPF queueBuffer；RingBuf、StatsMap、PerfEvent 和
+// FPS 主路径是多进程 eBPF 帧合成完成回调；RingBuf、StatsMap、PerfEvent 和
 // SurfaceFlinger 组成按能力降级链。
 pub(super) use std::collections::BTreeSet;
 pub(super) use std::ffi::{CStr, CString};
@@ -33,7 +33,7 @@ pub(super) use crate::process_index_find_package_pids;
 // FPS 监测流程：
 // 1. App 写 fps.cmd 请求开始监测某个包名。
 // 2. Rust daemon 优先加载 RingBuf 对象；旧内核自动切 StatsMap 对象，仍然通过
-//    libgui queueBuffer uprobe 在内核 map 中统计目标进程帧数。
+//    libgui 完成回调 uprobe 按合成时间统计目标进程帧数。
 // 3. 用户态为同包进程的现有/新增线程增量挂载 uprobe，并同步 TGID map，不重载 BPF 对象。
 // 4. 只有 eBPF 无法加载或连续轮询报错才降级到 SurfaceFlinger Binder/CLI；
 //    应用空闲、首帧尚未出现或暂时停帧都保留 eBPF 主路径。

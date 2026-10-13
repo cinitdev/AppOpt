@@ -3,7 +3,7 @@ use crate::constants::{
     FRAME_STATS_DROP_LOG_INTERVAL_NS, FRAME_STATS_POLL_INTERVAL_NS, FRAME_STATS_PRUNE_INTERVAL_NS,
     FRAME_STATS_RETENTION_NS, RINGBUF_DROP_LOG_INTERVAL_NS,
 };
-use crate::context::{QixiaThreadsEbpfCtx, EventBackend, FrameStatsSnapshot};
+use crate::context::{EventBackend, FrameStatsSnapshot, QixiaThreadsEbpfCtx};
 use crate::fps_stream::FpsStream;
 use crate::streams::{refresh_current_fps, stream_key_from_parts};
 
@@ -45,15 +45,15 @@ pub(crate) fn prune_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) {
         }
     }
     for key in stale_keys {
-        if let Some(report) = ctx.frame_report.as_mut() { let _ = report.remove(&key); }
-        if let Some(report) = ctx.frame_report_prev.as_mut() { let _ = report.remove(&key); }
-        ctx.stat_snapshots.remove(&key);
-        let stream = stream_key_from_parts(key.pid, key.tid, key.surface_ptr);
-        ctx.streams.remove(&stream);
-        if ctx.selected_stream == Some(stream) {
-            ctx.selected_stream = None;
-            ctx.cur_fps = 0.0;
+        if let Some(report) = ctx.frame_report.as_mut() {
+            let _ = report.remove(&key);
         }
+        if let Some(report) = ctx.frame_report_prev.as_mut() {
+            let _ = report.remove(&key);
+        }
+        ctx.stat_snapshots.remove(&key);
+        // 映射按 TID 区分，用户态则合并同一 Surface。旧 TID 过期不能
+        // 删除另一个活跃 TID 正在使用的帧流；帧流由自身 last_seen 统一回收。
     }
 }
 
@@ -79,7 +79,12 @@ pub(crate) fn poll_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, Str
         if value.total_frames == 0 || value.last_ts == 0 {
             continue;
         }
-        if !ctx.target_pids.contains(&key.pid) {
+        if !ctx.target_pids.contains(&key.pid)
+            || !ctx
+                .pid_symbol_probes
+                .get(&key.pid)
+                .is_some_and(|probe| probe.accepts_timestamp(value.last_ts))
+        {
             continue;
         }
         updates.push((key, value));
@@ -100,7 +105,10 @@ pub(crate) fn poll_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, Str
         let stream_key = stream_key_from_parts(key.pid, key.tid, key.surface_ptr);
         // 先读取当前窗口：若两次查询之间发生滚动，上一窗口映射中
         // 就会包含刚完成的当前窗口及其后续出现的峰值。
-        let current = ctx.frame_report.as_ref().and_then(|map| map.get(&key, 0).ok());
+        let current = ctx
+            .frame_report
+            .as_ref()
+            .and_then(|map| map.get(&key, 0).ok());
         let previous = ctx
             .frame_report_prev
             .as_ref()
@@ -117,7 +125,10 @@ pub(crate) fn poll_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, Str
                 stream.record_report_interval(report.interval_ts, report.max_interval_ns);
             }
         }
-        if prev.total_frames == 0 || prev.last_ts == 0 {
+        if prev.total_frames == 0
+            || prev.last_ts == 0
+            || !ctx.pid_symbol_probes[&key.pid].accepts_timestamp(prev.last_ts)
+        {
             ctx.streams
                 .entry(stream_key)
                 .or_insert_with(|| FpsStream::new(value.last_ts));
@@ -139,11 +150,7 @@ pub(crate) fn poll_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, Str
         latest_ts = latest_ts.max(value.last_ts);
     }
 
-    if accepted > 0 {
-        if latest_ts > 0 {
-            refresh_current_fps(ctx, latest_ts);
-        }
-    }
+    refresh_current_fps(ctx, now_ns.max(latest_ts));
 
     updates.clear();
     ctx.frame_stats_updates = updates;

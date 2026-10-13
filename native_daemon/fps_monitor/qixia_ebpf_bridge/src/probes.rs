@@ -1,6 +1,6 @@
 use crate::attach::{attach_process_candidate, detach_pid_links};
 use crate::clock::monotonic_ns;
-use crate::constants::{LIBGUI_FRAME_SYMBOLS, SYMBOL_PROBE_NS};
+use crate::constants::{LIBGUI_FRAME_SYMBOLS, frame_callback_abi};
 use crate::context::QixiaThreadsEbpfCtx;
 use crate::diagnostics::{compact_error_details, cstring_lossy, pid_role_label};
 use crate::procfs::{resolve_libgui_path, task_starttime_snapshot};
@@ -24,6 +24,11 @@ pub(crate) fn switch_pid_symbol(
 
     let next_start_index = probe.candidate_index.saturating_add(1);
     let relocking_confirmed_source = probe.confirmed_once;
+    // 先关闭这个 PID 的事件入口，避免解绑数百个线程期间仍产生旧候选
+    // 事件。新候选启用时再打开；队列中的旧事件另用时间边界排除。
+    ctx.target_tgids
+        .remove(&pid)
+        .map_err(|err| err.to_string())?;
     let mut detach_errors = ctx
         .pid_links
         .remove(&pid)
@@ -49,7 +54,7 @@ pub(crate) fn switch_pid_symbol(
                 next_probe.no_frame_mask |= candidate_bit(probe.candidate_index);
             }
             next_probe.candidate_index = candidate_index;
-            next_probe.candidate_started_ns = now_ns;
+            next_probe.candidate_started_ns = monotonic_ns();
             next_probe.confirmed = false;
             next_probe.attachable_mask |= candidate_bit(candidate_index);
             next_probe.unavailable_mask |= candidate_range_mask(next_start_index, candidate_index);
@@ -58,6 +63,9 @@ pub(crate) fn switch_pid_symbol(
             ctx.pid_symbols.insert(pid, symbol.clone());
             ctx.pid_symbol_offsets.insert(pid, offset);
             ctx.pid_symbol_probes.insert(pid, next_probe);
+            ctx.target_tgids
+                .insert(pid, frame_callback_abi(candidate_index), 0)
+                .map_err(|err| err.to_string())?;
             ctx.symbol = symbol;
             if relocking_confirmed_source {
                 log_info!(
@@ -74,6 +82,11 @@ pub(crate) fn switch_pid_symbol(
             Ok(true)
         }
         Err(err) => {
+            // 探测结束后恢复目标集合的映射项；该 PID 已无挂载，因此不会
+            // 产生事件，但后续移除目标时仍能遵守集合与映射一致的约定。
+            if let Err(error) = ctx.target_tgids.insert(pid, frame_callback_abi(probe.candidate_index), 0) {
+                detach_errors.push(format!("恢复 target_tgids[{pid}] 失败: {error}"));
+            }
             let mut exhausted_probe = probe;
             if probe.confirmed_once {
                 exhausted_probe.stalled_mask |= candidate_bit(probe.candidate_index);
@@ -194,7 +207,10 @@ pub(crate) fn confirm_observed_symbols(ctx: &mut QixiaThreadsEbpfCtx) {
     }
 }
 
-pub(crate) fn advance_symbol_probes(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) -> Result<(), String> {
+pub(crate) fn advance_symbol_probes(
+    ctx: &mut QixiaThreadsEbpfCtx,
+    now_ns: u64,
+) -> Result<(), String> {
     if now_ns == 0 {
         return Ok(());
     }
@@ -202,10 +218,14 @@ pub(crate) fn advance_symbol_probes(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) 
         .pid_symbol_probes
         .iter()
         .filter_map(|(pid, probe)| {
-            (!probe.confirmed
-                && !probe.exhausted
-                && now_ns.saturating_sub(probe.candidate_started_ns) >= SYMBOL_PROBE_NS)
-                .then_some(*pid)
+            let last_frame_ns = ctx
+                .streams
+                .iter()
+                .filter(|(key, _)| key.pid == *pid)
+                .map(|(_, stream)| stream.last_seen_ns)
+                .max()
+                .unwrap_or(0);
+            probe.should_advance(now_ns, last_frame_ns).then_some(*pid)
         })
         .collect::<Vec<_>>();
     let mut errors = Vec::new();

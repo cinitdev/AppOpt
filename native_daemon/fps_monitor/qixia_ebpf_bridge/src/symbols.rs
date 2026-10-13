@@ -21,7 +21,7 @@ pub(crate) fn readable_symbol_name(index: usize) -> &'static str {
     LIBGUI_FRAME_SYMBOL_NAMES
         .get(index)
         .copied()
-        .unwrap_or("Surface::queueBuffer(未知候选)")
+        .unwrap_or("帧合成完成(未知候选)")
 }
 
 pub(crate) fn readable_symbol_from_raw(raw: &str) -> &'static str {
@@ -29,7 +29,7 @@ pub(crate) fn readable_symbol_from_raw(raw: &str) -> &'static str {
         .iter()
         .position(|candidate| *candidate == raw)
         .map(readable_symbol_name)
-        .unwrap_or("Surface::queueBuffer(未知符号)")
+        .unwrap_or("帧合成完成(未知符号)")
 }
 
 pub(crate) fn compact_symbol_name(index: usize) -> &'static str {
@@ -91,13 +91,19 @@ pub(crate) fn resolve_candidate_offsets(path: &Path) -> Result<Vec<Option<u64>>,
         let Some((section_offset, _)) = section.file_range() else {
             continue;
         };
-        let Some(relative) = symbol.address().checked_sub(section.address()) else {
+        let address = code_address(object.architecture(), symbol.address());
+        let Some(relative) = address.checked_sub(section.address()) else {
             continue;
         };
         offsets[index] = relative.checked_add(section_offset);
     }
 
     Ok(offsets)
+}
+
+pub(crate) fn code_address(architecture: object::Architecture, address: u64) -> u64 {
+    // ELF 用最低位标记 ARM Thumb 函数；uprobe 要的是文件内实际指令偏移。
+    if architecture == object::Architecture::Arm { address & !1 } else { address }
 }
 
 pub(crate) fn cached_candidate_offsets(
