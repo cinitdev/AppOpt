@@ -63,6 +63,8 @@ eBPF 使用完成回调携带的合成时间计算帧率，不使用缓冲区提
 短间隔重复事件不会推进上一有效帧的时间戳，避免缩短统计时长导致 FPS 虚高。
 当前最小有效间隔为 1 毫秒，对应最高 1000 FPS 的技术边界；不通过屏幕限幅隐藏偏差。
 32 位应用是否能使用 eBPF 取决于内核对对应 ABI 的 uprobe 支持，不支持时走降级路径。
+页面静止时保留有效探针挂载；图层切换或丢事件后重建统计窗口，避免混入旧帧。
+缺测会明确通知 App，历史记录保留断点，不使用过期 FPS 或补零。
 
 前台识别优先使用 root `app_process` 启动的 `qixia_foreground_helper.jar`，它通过
 ActivityTaskManager/TaskStackListener 写入 `foreground_task.state`。App 侧在 helper

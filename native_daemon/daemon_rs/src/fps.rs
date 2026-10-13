@@ -2,6 +2,26 @@ use std::time::Duration;
 #[path = "fps_core/manual_gate.rs"]
 mod manual_gate;
 
+#[derive(Default)]
+struct FrameProgress {
+    generation: u64,
+    timestamp_ns: u64,
+}
+
+impl FrameProgress {
+    fn observe(&mut self, generation: u64, timestamp_ns: u64) -> bool {
+        if generation == 0 || timestamp_ns == 0 {
+            return false;
+        }
+        if generation == self.generation && timestamp_ns <= self.timestamp_ns {
+            return false;
+        }
+        self.generation = generation;
+        self.timestamp_ns = timestamp_ns;
+        true
+    }
+}
+
 pub(crate) fn valid_fps_sample(fps: f64) -> Option<f64> {
     // 与探针 1 毫秒最小帧间隔及历史记录的有效范围保持一致；这不是屏幕刷新率限制。
     (fps.is_finite() && (0.0..=1_000.0).contains(&fps)).then_some(fps)
@@ -74,6 +94,21 @@ pub(crate) use imp::start_fps_thread;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_selected_source_can_advance_frame_progress() {
+        let mut progress = FrameProgress::default();
+        assert!(!progress.observe(0, 100));
+        assert!(!progress.observe(1, 0));
+        assert!(progress.observe(1, 100));
+        // 其他图层有回调，但选中图层仍是同一帧，不能刷新停帧计时。
+        assert!(!progress.observe(1, 100));
+        assert!(!progress.observe(1, 99));
+        assert!(progress.observe(1, 101));
+        // 切换到独立且已预热的图层，可以有更早的末帧时间。
+        assert!(progress.observe(2, 100));
+        assert!(!progress.observe(2, 100));
+    }
 
     #[test]
     fn ebpf_restart_failures_back_off_without_growing_forever() {

@@ -63,6 +63,9 @@ struct frame_stats_value {
     unsigned long long total_frames;
 };
 
+#define QIXIA_FRAME_STATS_MAX_ENTRIES 4096
+#include "frame_report.h"
+
 /* 仅允许用户态登记过的目标进程触发帧统计。
  * 用户态为目标进程的线程挂载 uprobe，这里再按 TGID 过滤，避免进程切换期间接收旧目标事件。 */
 struct {
@@ -120,6 +123,7 @@ static __always_inline int record_frame_stats(struct frame_event *event) {
         if (event->timestamp_ns - value->last_ts < 1000000ULL) {
             return 0;
         }
+        record_frame_report(&key, event->timestamp_ns, event->timestamp_ns - value->last_ts);
         struct frame_stats_value next = {event->timestamp_ns, value->total_frames + 1};
         /* 一次替换完整快照，避免用户态读到新时间戳和旧计数。 */
         bpf_map_update_elem(&frame_stats, &key, &next, BPF_ANY);

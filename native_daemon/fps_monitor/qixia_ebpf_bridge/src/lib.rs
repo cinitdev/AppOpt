@@ -23,6 +23,7 @@ mod tests;
 pub use context::QixiaThreadsEbpfCtx;
 pub use logging::set_log_sink;
 pub use ffi::{
+    qixia_ebpf_source,
     qixia_ebpf_take_frame_max,
     qixia_ebpf_backend, qixia_ebpf_backend_note, qixia_ebpf_get, qixia_ebpf_last_error,
     qixia_ebpf_last_start_error, qixia_ebpf_metrics, qixia_ebpf_pid, qixia_ebpf_poll,
@@ -30,4 +31,4 @@ pub use ffi::{
     qixia_ebpf_set_target_pids, qixia_ebpf_start, qixia_ebpf_start_for_package,
     qixia_ebpf_startup_note, qixia_ebpf_stop, qixia_ebpf_symbol, qixia_ebpf_symbol_display,
 };
-pub use frame_metrics::QixiaThreadsFrameMetrics;
+pub use frame_metrics::{QixiaThreadsFrameMetrics, QixiaThreadsFrameSource};

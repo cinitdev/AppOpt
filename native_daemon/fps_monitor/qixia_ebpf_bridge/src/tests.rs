@@ -187,15 +187,20 @@ fn kernel_map_retirement_preserves_live_surface_and_symbol_epoch() {
             ..event
         }
     ));
-    // 模拟无帧候选依次耗尽，验证暂停入口与目标集合的收尾一致。
+    // 静止超过探测时间仍保留已挂载符号，避免随后滑动落入重试空窗。
+    let link_count = ctx.pid_links[&pid].len();
     for _ in crate::constants::LIBGUI_FRAME_SYMBOLS {
         crate::probes::advance_symbol_probes(
             &mut ctx,
             monotonic_ns() + crate::constants::SYMBOL_PROBE_NS * 2,
         ).unwrap();
     }
-    assert!(ctx.pid_symbol_probes[&pid].exhausted);
+    assert!(!ctx.pid_symbol_probes[&pid].exhausted);
+    assert!(ctx.pid_symbol_probes[&pid].waiting);
+    assert_eq!(ctx.pid_links[&pid].len(), link_count);
+    assert_eq!(crate::ffi::qixia_ebpf_probe_state(&*ctx), 4);
     assert!(ctx.target_tgids.get(&pid, 0).is_ok());
+    assert!(on_frame(&mut ctx, FrameEvent { timestamp_ns: now + 20_000_000, ..event }));
     crate::targets::sync_target_pids(&mut ctx, &[]).unwrap();
     assert_eq!(ctx.last_error.to_bytes(), b"");
 }
@@ -254,6 +259,7 @@ fn probe_summary_groups_no_frame_and_stalled_candidates() {
         confirmed: false,
         confirmed_once: true,
         exhausted: true,
+        waiting: false,
         attachable_mask: candidate_bit(0) | candidate_bit(1),
         no_frame_mask: candidate_bit(0),
         stalled_mask: candidate_bit(1),
@@ -282,6 +288,100 @@ fn probe_summary_groups_no_frame_and_stalled_candidates() {
         ..probe
     };
     assert!(!exhausted.accepts_timestamp(100));
+    let waiting = PidSymbolProbe { waiting: true, ..probe };
+    assert!(!waiting.should_advance(u64::MAX, 9));
+    assert!(waiting.accepts_timestamp(100));
+}
+
+#[test]
+#[ignore = "需要 Root，仅操作独立测试进程的 eBPF 映射"]
+fn kernel_loss_and_source_switch_do_not_reuse_old_windows() {
+    use crate::clock::monotonic_ns;
+    use crate::fps_stream::FpsStream;
+    use crate::streams::{refresh_current_fps, stream_key_from_parts};
+    use crate::frame_metrics::QixiaThreadsFrameSource;
+    use std::ffi::CString;
+    let pid = std::process::id();
+    let path = CString::new(std::env::var("QIXIA_TEST_BPF").unwrap()).unwrap();
+    let raw = crate::ffi::qixia_ebpf_start(pid as i32, path.as_ptr());
+    assert!(!raw.is_null());
+    let mut ctx = unsafe { Box::from_raw(raw) };
+    let now = monotonic_ns();
+    let make_stream = |end: u64, hz: u64| {
+        let mut stream = FpsStream::new(end - 2_000_000_000);
+        for index in 0..=hz * 2 {
+            stream.on_frame(end - 2_000_000_000 + index * 1_000_000_000 / hz);
+        }
+        stream
+    };
+    let first = stream_key_from_parts(pid, 1, 0x1234);
+    let second = stream_key_from_parts(pid, 2, 0x5678);
+    ctx.streams.insert(first, make_stream(now, 60));
+    refresh_current_fps(&mut ctx, now);
+    let mut source = QixiaThreadsFrameSource::default();
+    assert_eq!(crate::ffi::qixia_ebpf_source(&*ctx, &mut source), 1);
+    let generation = source.generation;
+    assert_eq!(source.surface, first.surface_ptr);
+    ctx.streams.insert(second, make_stream(now, 165));
+    refresh_current_fps(&mut ctx, now);
+    assert_eq!(ctx.selected_stream, Some(first));
+    // 新来源持续胜出后才切换；不能把原来暂存的峰值直接当作切换后的卡顿。
+    refresh_current_fps(&mut ctx, now + 610_000_000);
+    assert_eq!(ctx.selected_stream, Some(second));
+    assert_eq!(crate::ffi::qixia_ebpf_source(&*ctx, &mut source), 1);
+    assert!(source.generation > generation);
+    assert_eq!(ctx.streams.get_mut(&second).unwrap().take_report_max(now + 610_000_000), 0);
+    ctx.ringbuf_drops.as_mut().unwrap().set(0, 1, 0).unwrap();
+    crate::events::poll_inner(&mut ctx).unwrap();
+    assert!(ctx.use_frame_stats);
+    assert_eq!(crate::ffi::qixia_ebpf_source(&*ctx, &mut source), -1);
+    assert!(ctx.streams.is_empty());
+    let before_reset = ctx.samples_since_ns - 1;
+    assert!(!crate::streams::on_frame(&mut ctx, crate::context::FrameEvent {
+        timestamp_ns: before_reset, pid, tid: 1, surface_ptr: 0x1234,
+    }));
+    // 用明确的单调时间和累计帧数模拟恢复后的完整窗口，验证仍是 165 FPS，
+    // 最大帧间隔继续使用内核报告，不能被平均间隔覆盖。
+    let base = monotonic_ns();
+    ctx.samples_since_ns = base;
+    ctx.pid_symbol_probes.get_mut(&pid).unwrap().candidate_started_ns = base;
+    let key = crate::context::FrameStatsKey { pid, tid: 0, surface_ptr: 0x1234 };
+    ctx.frame_stats.as_mut().unwrap().insert(key, crate::context::FrameStatsValue {
+        last_ts: base, total_frames: 1,
+    }, 0).unwrap();
+    ctx.frame_stats_last_poll_ns = 0;
+    crate::events::poll_inner(&mut ctx).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1050));
+    let end = monotonic_ns();
+    ctx.frame_stats.as_mut().unwrap().insert(key, crate::context::FrameStatsValue {
+        last_ts: end, total_frames: (end - base) * 165 / 1_000_000_000 + 1,
+    }, 0).unwrap();
+    ctx.frame_report.as_mut().unwrap().insert(key, crate::context::FrameReportValue {
+        interval_ts: end - 50_000_000, max_interval_ns: 49_000_000, window_ts: base,
+    }, 0).unwrap();
+    ctx.frame_stats_last_poll_ns = 0;
+    crate::events::poll_inner(&mut ctx).unwrap();
+    assert!((160.0..=165.1).contains(&ctx.cur_fps), "恢复后的 FPS={}", ctx.cur_fps);
+    assert_eq!(crate::ffi::qixia_ebpf_source(&*ctx, &mut source), 1);
+    // 切换边界会清空切换前的报告；下一份内核窗口保留真实峰值。
+    std::thread::sleep(std::time::Duration::from_millis(1050));
+    let next_end = monotonic_ns();
+    ctx.frame_stats.as_mut().unwrap().insert(key, crate::context::FrameStatsValue {
+        last_ts: next_end, total_frames: (next_end - base) * 165 / 1_000_000_000 + 1,
+    }, 0).unwrap();
+    ctx.frame_report.as_mut().unwrap().insert(key, crate::context::FrameReportValue {
+        interval_ts: next_end - 50_000_000, max_interval_ns: 49_000_000, window_ts: end,
+    }, 0).unwrap();
+    crate::events::poll_inner(&mut ctx).unwrap();
+    assert_eq!(crate::ffi::qixia_ebpf_take_frame_max(&mut *ctx), 49_000_000);
+    let mut metrics = crate::frame_metrics::QixiaThreadsFrameMetrics::default();
+    assert_eq!(crate::ffi::qixia_ebpf_metrics(&*ctx, &mut metrics), 1);
+    assert_eq!(metrics.flags, 1);
+    // 累计计数也出错时退回逐帧，两个计帧方式之间重新建窗。
+    ctx.frame_stats_drops.as_mut().unwrap().set(0, 1, 0).unwrap();
+    crate::stats::poll_frame_stats_drop_count(&mut ctx).unwrap();
+    assert!(!ctx.use_frame_stats);
+    assert!(ctx.recovering_samples);
 }
 
 #[test]
@@ -480,6 +580,8 @@ fn kernel_completed_callbacks_use_latch_and_deduplicate_across_threads() {
             let value = ctx.frame_stats.as_ref().unwrap().get(&FrameStatsKey { pid, tid: 0, surface_ptr: queue as u64 }, 0).unwrap();
             assert_eq!(value.total_frames, fps * 2 + 1, "{filename}");
             assert_eq!(value.last_ts, base + 2_000_000_000, "{filename}");
+            let report = ctx.frame_report.as_ref().unwrap().get(&FrameStatsKey { pid, tid: 0, surface_ptr: queue as u64 }, 0).unwrap();
+            assert!((1_000_000_000 / fps..=1_000_000_000 / fps + 1).contains(&report.max_interval_ns), "{filename}");
         }
         drop(sender);
         worker.join().unwrap();

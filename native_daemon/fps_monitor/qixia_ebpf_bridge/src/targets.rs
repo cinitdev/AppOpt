@@ -49,6 +49,8 @@ pub(crate) fn sync_target_pids(ctx: &mut QixiaThreadsEbpfCtx, pids: &[c_int]) ->
         if let Err(err) = ctx.target_tgids.remove(pid) {
             update_errors.push(format!("移除 target_tgids[{pid}] 失败: {err}"));
         }
+        // PID 复用时也必须先清除上一代的计数与图层，不能只按 PID 集合保留。
+        crate::streams::clear_pid_samples(ctx, *pid);
         if let Some(links) = ctx.pid_links.remove(pid) {
             update_errors.extend(detach_pid_links(&mut ctx.bpf, *pid, links));
         }
@@ -156,6 +158,7 @@ pub(crate) fn sync_target_pids(ctx: &mut QixiaThreadsEbpfCtx, pids: &[c_int]) ->
                 confirmed: false,
                 confirmed_once: false,
                 exhausted: false,
+                waiting: false,
                 attachable_mask: candidate_bit(candidate_index),
                 no_frame_mask: 0,
                 stalled_mask: 0,

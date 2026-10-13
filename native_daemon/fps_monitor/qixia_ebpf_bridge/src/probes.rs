@@ -24,6 +24,24 @@ pub(crate) fn switch_pid_symbol(
 
     let next_start_index = probe.candidate_index.saturating_add(1);
     let relocking_confirmed_source = probe.confirmed_once;
+    let path = ctx
+        .pid_libgui_paths
+        .get(&pid)
+        .cloned()
+        .map_or_else(|| resolve_libgui_path(pid as i32), Ok)?;
+    let offsets = cached_candidate_offsets(ctx, &path)?;
+    // 目前候选是同一回调的两种 ABI。一个 libgui 通常只有其中一个，
+    // 没有下一符号只代表要继续等帧，不能解绑已经成功挂上的探针。
+    if !offsets.iter().skip(next_start_index).any(Option::is_some) {
+        let mut waiting = probe;
+        waiting.waiting = true;
+        waiting.unavailable_mask |= candidate_range_mask(next_start_index, LIBGUI_FRAME_SYMBOLS.len());
+        ctx.pid_symbol_probes.insert(pid, waiting);
+        if ctx.detailed_logging {
+            log_info!("[FPS] 等待合成帧: PID={pid} 符号={} 已保留挂载；无事件不视为采集失败", readable_symbol_name(probe.candidate_index));
+        }
+        return Ok(false);
+    }
     // 先关闭这个 PID 的事件入口，避免解绑数百个线程期间仍产生旧候选
     // 事件。新候选启用时再打开；队列中的旧事件另用时间边界排除。
     ctx.target_tgids
@@ -37,13 +55,7 @@ pub(crate) fn switch_pid_symbol(
     ctx.pid_task_starttimes.remove(&pid);
     clear_pid_samples(ctx, pid);
 
-    let path = ctx
-        .pid_libgui_paths
-        .get(&pid)
-        .cloned()
-        .map_or_else(|| resolve_libgui_path(pid as i32), Ok)?;
     ctx.pid_libgui_paths.insert(pid, path.clone());
-    let offsets = cached_candidate_offsets(ctx, &path)?;
     match attach_process_candidate(&mut ctx.bpf, pid, &path, &offsets, next_start_index) {
         Ok((candidate_index, symbol, offset, task_links)) => {
             let task_starttimes = task_starttime_snapshot(pid, task_links.keys().copied());
@@ -56,6 +68,7 @@ pub(crate) fn switch_pid_symbol(
             next_probe.candidate_index = candidate_index;
             next_probe.candidate_started_ns = monotonic_ns();
             next_probe.confirmed = false;
+            next_probe.waiting = false;
             next_probe.attachable_mask |= candidate_bit(candidate_index);
             next_probe.unavailable_mask |= candidate_range_mask(next_start_index, candidate_index);
             ctx.pid_links.insert(pid, task_links);
@@ -175,6 +188,7 @@ pub(crate) fn confirm_observed_symbols(ctx: &mut QixiaThreadsEbpfCtx) {
         probe.confirmed = true;
         probe.confirmed_once = true;
         probe.exhausted = false;
+        probe.waiting = false;
         if let Some(symbol) = ctx.pid_symbols.get(&pid).cloned() {
             ctx.symbol = symbol.clone();
             let raw_symbol = symbol.to_string_lossy();

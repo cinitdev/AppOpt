@@ -52,8 +52,13 @@ pub(crate) fn refresh_current_fps(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) {
             .map(|stream| (key, stream.selection_score(now_ns)))
             .filter(|(_, score)| score.is_finite())
     });
+    let previous = ctx.selected_stream;
     ctx.selected_stream = match (current, best) {
-        (_, None) => None,
+        (_, None) => {
+            ctx.pending_stream = None;
+            ctx.pending_stream_since_ns = 0;
+            None
+        },
         (None, Some((key, _))) => {
             ctx.pending_stream = None;
             ctx.pending_stream_since_ns = 0;
@@ -84,10 +89,25 @@ pub(crate) fn refresh_current_fps(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) {
             }
         }
     };
+    if ctx.selected_stream != previous {
+        if let Some(key) = ctx.selected_stream {
+            if ctx.source_generation > 0 {
+                // FPS 窗口属于新帧源自身；最大帧间隔另从切换时刻开始报告，
+                // 避免把后台图层切换前积攒的卡顿归到当前画面。
+                if let Some(stream) = ctx.streams.get_mut(&key) {
+                    stream.discard_report_before(now_ns);
+                }
+            }
+            ctx.source_generation = ctx.source_generation.saturating_add(1);
+        }
+    }
     ctx.cur_fps = ctx
         .selected_stream
         .and_then(|key| ctx.streams.get(&key))
         .map_or(0.0, |stream| stream.fps_at(now_ns));
+    if ctx.cur_fps > 0.0 {
+        ctx.recovering_samples = false;
+    }
     ctx.pid = ctx.selected_stream.map_or_else(
         || {
             if ctx.pid > 0 && ctx.target_pids.contains(&(ctx.pid as u32)) {
@@ -113,7 +133,8 @@ pub(crate) fn refresh_current_fps(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) {
 
 pub(crate) fn on_frame(ctx: &mut QixiaThreadsEbpfCtx, event: FrameEvent) -> bool {
     // 内核映射已经过滤一次；用户态再核对集合，防止目标切换时消费排队的旧事件。
-    if !ctx.target_pids.contains(&event.pid)
+    if event.timestamp_ns < ctx.samples_since_ns
+        || !ctx.target_pids.contains(&event.pid)
         || !ctx
             .pid_symbol_probes
             .get(&event.pid)
@@ -154,4 +175,21 @@ pub(crate) fn clear_pid_samples(ctx: &mut QixiaThreadsEbpfCtx, pid: u32) {
         ctx.selected_stream = None;
         ctx.cur_fps = 0.0;
     }
+    if ctx.pending_stream.is_some_and(|key| key.pid == pid) {
+        ctx.pending_stream = None;
+        ctx.pending_stream_since_ns = 0;
+    }
+}
+
+pub(crate) fn reset_sample_window(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) {
+    // 保留探针及内核累计计数，只重建用户态窗口；排队的旧事件不能跨过边界。
+    ctx.streams.clear();
+    ctx.stat_snapshots.clear();
+    ctx.selected_stream = None;
+    ctx.pending_stream = None;
+    ctx.pending_stream_since_ns = 0;
+    ctx.cur_fps = 0.0;
+    ctx.frame_stats_last_poll_ns = 0;
+    ctx.samples_since_ns = now_ns;
+    ctx.recovering_samples = true;
 }

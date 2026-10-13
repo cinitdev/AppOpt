@@ -20,6 +20,7 @@ pub(super) use std::thread;
 pub(super) use std::time::{Duration, Instant};
 
 pub(super) use qixia_ebpf_bridge::{
+    qixia_ebpf_source, QixiaThreadsFrameSource,
     qixia_ebpf_take_frame_max,
     qixia_ebpf_backend, qixia_ebpf_backend_note, qixia_ebpf_get, qixia_ebpf_last_error,
     qixia_ebpf_last_start_error, qixia_ebpf_metrics, qixia_ebpf_pid, qixia_ebpf_poll,
@@ -85,6 +86,7 @@ pub(super) struct FpsMonitor {
     pub(super) ebpf_seen_frames: bool,
     pub(super) ebpf_stale_zero_sent: bool,
     pub(super) ebpf_last_frame: Instant,
+    pub(super) ebpf_progress: super::FrameProgress,
     pub(super) last_ebpf_fps: f64,
     // 低频刷新目标 TGID，避免每 80ms 扫 /proc。
     pub(super) ebpf_last_target_refresh: Instant,

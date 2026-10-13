@@ -23,6 +23,17 @@ impl FpsSocket {
     }
 
     pub(super) fn send_fps(&mut self, fps: f64, frame_max_ns: u64) -> io::Result<()> {
+        let line = if frame_max_ns > 0 {
+            format!("{fps:.1}\nframe {:.3}\n", frame_max_ns as f64 / 1_000_000.0)
+        } else { format!("{fps:.1}\n") };
+        self.send_line(&line)
+    }
+
+    pub(super) fn send_gap(&mut self) -> io::Result<()> {
+        self.send_line("gap\n")
+    }
+
+    fn send_line(&mut self, line: &str) -> io::Result<()> {
         if self.disabled || self.name.is_none() || self.token.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -32,10 +43,6 @@ impl FpsSocket {
         if self.fd.is_none() {
             self.connect()?;
         }
-        // 较早版本的应用会忽略未知行，继续接收格式不变的 FPS 数值。
-        let line = if frame_max_ns > 0 {
-            format!("{fps:.1}\nframe {:.3}\n", frame_max_ns as f64 / 1_000_000.0)
-        } else { format!("{fps:.1}\n") };
         let Some(fd) = self.fd else {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,

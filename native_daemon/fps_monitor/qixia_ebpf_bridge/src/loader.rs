@@ -133,7 +133,7 @@ pub(crate) fn start_backend(
     } else {
         None
     };
-    let mut use_frame_stats = frame_stats.is_some();
+    let mut use_frame_stats = frame_stats.is_some() && !matches!(kind, BackendKind::RingBuf);
     let mut perf_mode_note = None;
     let mut perf_stats_only = None;
     if matches!(kind, BackendKind::PerfEvent) && frame_stats.is_some() {
@@ -194,6 +194,7 @@ pub(crate) fn start_backend(
             confirmed: false,
             confirmed_once: false,
             exhausted: false,
+            waiting: false,
             attachable_mask: candidate_bit(candidate_index),
             no_frame_mask: 0,
             stalled_mask: 0,
@@ -222,6 +223,9 @@ pub(crate) fn start_backend(
         pid,
         streams: HashMap::new(),
         selected_stream: None,
+        source_generation: 0,
+        samples_since_ns: 0,
+        recovering_samples: false,
         pending_stream: None,
         pending_stream_since_ns: 0,
         stat_snapshots: HashMap::new(),

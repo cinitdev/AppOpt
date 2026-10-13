@@ -457,10 +457,14 @@ pub(super) fn read_cmdline(pid: i32) -> io::Result<String> {
 }
 
 pub(super) fn write_fps_file(fps: f64) {
+    write_fps_text(&format!("{fps:.1}"));
+}
+
+pub(super) fn write_fps_text(text: &str) {
     let _ = fs::create_dir_all(FPS_OUT_DIR);
     let path = PathBuf::from(FPS_OUT_FILE);
     let fresh = !path.exists();
-    if fs::write(&path, format!("{fps:.1}")).is_ok() && fresh {
+    if fs::write(&path, text).is_ok() && fresh {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

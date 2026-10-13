@@ -55,6 +55,8 @@ pub(crate) struct PidSymbolProbe {
     pub(crate) confirmed: bool,
     pub(crate) confirmed_once: bool,
     pub(crate) exhausted: bool,
+    // 已挂载但还没有稳定帧；静止页面应保留探针，不能当成挂载失败。
+    pub(crate) waiting: bool,
     pub(crate) attachable_mask: u32,
     pub(crate) no_frame_mask: u32,
     pub(crate) stalled_mask: u32,
@@ -69,6 +71,7 @@ impl PidSymbolProbe {
     pub(crate) fn should_advance(&self, now_ns: u64, last_frame_ns: u64) -> bool {
         !self.confirmed
             && !self.exhausted
+            && !self.waiting
             && now_ns.saturating_sub(self.candidate_started_ns.max(last_frame_ns))
                 >= crate::constants::SYMBOL_PROBE_NS
     }
@@ -123,6 +126,10 @@ pub struct QixiaThreadsEbpfCtx {
     pub(crate) pid: i32,
     pub(crate) streams: HashMap<FrameStreamKey, FpsStream>,
     pub(crate) selected_stream: Option<FrameStreamKey>,
+    pub(crate) source_generation: u64,
+    // 丢事件或计帧模式切换后，只接受这个边界之后的新样本。
+    pub(crate) samples_since_ns: u64,
+    pub(crate) recovering_samples: bool,
     pub(crate) pending_stream: Option<FrameStreamKey>,
     pub(crate) pending_stream_since_ns: u64,
     pub(crate) stat_snapshots: HashMap<FrameStatsKey, FrameStatsSnapshot>,

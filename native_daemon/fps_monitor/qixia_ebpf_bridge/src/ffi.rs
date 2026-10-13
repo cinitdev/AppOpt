@@ -1,6 +1,6 @@
 use crate::QixiaThreadsFrameMetrics;
 use crate::clock::monotonic_ns;
-use crate::context::{QixiaThreadsEbpfCtx, BackendKind, EventBackend};
+use crate::context::{QixiaThreadsEbpfCtx, BackendKind};
 use crate::diagnostics::{backend_selection_report, cstring_lossy};
 use crate::events::poll_inner;
 use crate::loader::{perf_fallback_path, ringbuf_kernel_note, start_backend, stats_fallback_path};
@@ -212,7 +212,7 @@ pub extern "C" fn qixia_ebpf_poll(ctx: *mut QixiaThreadsEbpfCtx) -> c_int {
     .unwrap_or(-1)
 }
 
-// 0=无目标，1=仍在验证候选，2=已有真实帧确认，3=所有目标候选均已试完。
+// 0=无目标，1=验证中，2=已确认，3=无可用挂载，4=已挂载、等待稳定帧。
 #[unsafe(no_mangle)]
 pub extern "C" fn qixia_ebpf_probe_state(ctx: *const QixiaThreadsEbpfCtx) -> c_int {
     if ctx.is_null() {
@@ -225,8 +225,11 @@ pub extern "C" fn qixia_ebpf_probe_state(ctx: *const QixiaThreadsEbpfCtx) -> c_i
     if ctx.pid_symbol_probes.values().any(|probe| probe.confirmed) {
         return 2;
     }
-    if ctx.pid_symbol_probes.values().any(|probe| !probe.exhausted) {
+    if ctx.pid_symbol_probes.values().any(|probe| !probe.exhausted && !probe.waiting) {
         return 1;
+    }
+    if ctx.pid_symbol_probes.values().any(|probe| probe.waiting && !probe.exhausted) {
+        return 4;
     }
     3
 }
@@ -257,6 +260,31 @@ pub extern "C" fn qixia_ebpf_get(ctx: *const QixiaThreadsEbpfCtx) -> c_double {
     }
     let ctx = unsafe { &*ctx };
     ctx.cur_fps
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn qixia_ebpf_source(
+    ctx: *const QixiaThreadsEbpfCtx,
+    out: *mut crate::frame_metrics::QixiaThreadsFrameSource,
+) -> c_int {
+    if ctx.is_null() || out.is_null() { return 0; }
+    let ctx = unsafe { &*ctx };
+    unsafe { *out = Default::default(); }
+    // -1 表示丢事件后的重建窗口，不能记作应用的零帧或真实卡顿。
+    if ctx.recovering_samples { return -1; }
+    let Some((key, stream)) = ctx.selected_stream.and_then(|key| ctx.streams.get(&key).map(|stream| (key, stream))) else {
+        return 0;
+    };
+    unsafe {
+        *out = crate::frame_metrics::QixiaThreadsFrameSource {
+            generation: ctx.source_generation,
+            last_frame_ns: stream.last_seen_ns,
+            surface: key.surface_ptr,
+            pid: key.pid as i32,
+            tid: key.tid as i32,
+        };
+    }
+    1
 }
 
 #[unsafe(no_mangle)]
@@ -299,9 +327,7 @@ pub extern "C" fn qixia_ebpf_metrics(
             p95_interval_ns: percentile(95),
             max_interval_ns: intervals.last().copied().unwrap_or(0),
             frame_count: intervals.len().min(u32::MAX as usize) as u32,
-            flags: if (matches!(&ctx.backend, EventBackend::StatsMap)
-                || (matches!(&ctx.backend, EventBackend::PerfEvent(_)) && ctx.use_frame_stats))
-                && ctx.frame_stats.is_some()
+            flags: if ctx.use_frame_stats && ctx.frame_stats.is_some()
             {
                 1
             } else {

@@ -165,6 +165,12 @@ impl FpsStream {
         }
     }
 
+    pub(crate) fn discard_report_before(&mut self, timestamp_ns: u64) {
+        self.report_max = 0;
+        self.report_seen_ns = self.report_seen_ns.max(timestamp_ns);
+        self.report_ready_ns = timestamp_ns;
+    }
+
     pub(crate) fn selection_score(&self, now_ns: u64) -> f64 {
         if !self.is_stable() {
             return f64::NEG_INFINITY;
@@ -231,6 +237,7 @@ impl FpsStream {
     }
 
     fn reset_after_pause(&mut self, timestamp_ns: u64) {
+        self.discard_report_before(timestamp_ns);
         self.frame_times.clear();
         self.frame_time_sum_ns = 0;
         self.cur_fps = 0.0;

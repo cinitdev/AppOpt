@@ -67,6 +67,7 @@ impl FpsMonitor {
             ebpf_seen_frames: false,
             ebpf_stale_zero_sent: false,
             ebpf_last_frame: now,
+            ebpf_progress: Default::default(),
             last_ebpf_fps: 0.0,
             ebpf_last_restart: now,
             ebpf_next_restart: now + super::ebpf_restart_delay(initial_retry_failures),
@@ -167,6 +168,7 @@ impl FpsMonitor {
                         self.ebpf_seen_frames = false;
                         self.ebpf_stale_zero_sent = false;
                         self.ebpf_last_frame = now;
+                        self.ebpf_progress = Default::default();
                         self.ebpf_first_fps = true;
                         self.target_pid = choice.pid;
                         if let Some(suppressed) = retry_log {
@@ -252,13 +254,40 @@ impl FpsMonitor {
         let now = Instant::now();
         let fps = qixia_ebpf_get(self.ctx);
         let probe_state = qixia_ebpf_probe_state(self.ctx);
-        let probe_pending = probe_state == FPS_EBPF_PROBE_PENDING;
+        let probe_pending = matches!(probe_state, 0 | FPS_EBPF_PROBE_PENDING | 4);
         let active_pid = qixia_ebpf_pid(self.ctx);
-        if rc > 0 && fps > 0.0 {
-            // 原始事件经过稳定帧流筛选并得到有效 FPS 后，才刷新停帧计时。
+        let mut source = QixiaThreadsFrameSource::default();
+        let source_state = qixia_ebpf_source(self.ctx, &mut source);
+        if source_state < 0 {
+            // 传输丢事件后的预热不是目标应用的零帧；历史和摘要暂不采纳。
+            if self.ebpf_seen_frames {
+                self.last_output = None;
+            }
+            self.ebpf_seen_frames = false;
+            self.ebpf_stale_zero_sent = false;
+            self.summary_sample = None;
+            if self.fallback.is_some() {
+                self.poll_fallback();
+                return;
+            }
+            self.write_gap(now);
+            thread::sleep(Duration::from_millis(if self.output_enabled { 80 } else { 250 }));
+            return;
+        }
+        let source_age = Duration::from_nanos(now_monotonic_ns().saturating_sub(source.last_frame_ns));
+        let source_changed = self.ebpf_progress.generation != source.generation;
+        if source_state > 0 && fps > 0.0 && source_age < FPS_EBPF_STALE
+            && self.ebpf_progress.observe(source.generation, source.last_frame_ns)
+        {
+            // 只采用选中帧源的合成时间；其他 Surface 的事件、排队回调和
+            // 同一批累计计数的重复读取都不能推迟主帧源的停帧时间。
+            if source_changed {
+                log_info!("[FPS] 帧流选择: PID={} Surface=0x{:x} 代次={}；各帧流独立计数", source.pid, source.surface, source.generation);
+                self.summary_sample = None;
+            }
             self.ebpf_seen_frames = true;
             self.ebpf_stale_zero_sent = false;
-            self.ebpf_last_frame = now;
+            self.ebpf_last_frame = now.checked_sub(source_age).unwrap_or(now);
             self.last_ebpf_fps = fps;
             self.last_frame_pid = active_pid;
             self.confirmed_backend = Some(self.backend_name.clone());
@@ -553,6 +582,17 @@ impl FpsMonitor {
         write_fps_file(fps);
     }
 
+    fn write_gap(&mut self, now: Instant) {
+        if !self.output_enabled || self.last_output.is_some_and(|last| now.duration_since(last) < FPS_WINDOW) {
+            return;
+        }
+        // 明确通知校准端这段时间没有可采纳的样本；不能发送数值 0。
+        if self.socket.send_gap().is_err() {
+            write_fps_text("gap");
+        }
+        self.last_output = Some(now);
+    }
+
     pub(super) fn set_output_enabled(&mut self, enabled: bool) {
         if self.output_enabled == enabled {
             return;
@@ -566,7 +606,7 @@ impl FpsMonitor {
 
     pub(super) fn affinity_feedback(&self) -> Option<crate::auto_affinity::Sample> {
         let mut metrics = QixiaThreadsFrameMetrics::default();
-        (!self.ctx.is_null() && qixia_ebpf_metrics(self.ctx, &mut metrics) > 0).then(|| {
+        (self.fallback.is_none() && !self.ctx.is_null() && qixia_ebpf_metrics(self.ctx, &mut metrics) > 0).then(|| {
             crate::auto_affinity::Sample {
                 pid: metrics.source_pid, tid: metrics.source_tid, surface: metrics.source_surface,
                 timestamp_ns: metrics.last_frame_ns, fps: metrics.fps,

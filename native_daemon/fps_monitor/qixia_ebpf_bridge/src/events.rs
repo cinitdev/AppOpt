@@ -7,7 +7,7 @@ use crate::context::{EventBackend, FrameEvent, QixiaThreadsEbpfCtx};
 use crate::stats::{
     poll_frame_stats, poll_frame_stats_drop_count, poll_ringbuf_drop_count, prune_frame_stats,
 };
-use crate::streams::{on_frame, refresh_current_fps};
+use crate::streams::{on_frame, refresh_current_fps, reset_sample_window};
 use aya::maps::perf::PerfEvent;
 use std::ops::ControlFlow;
 use std::ptr;
@@ -42,14 +42,14 @@ pub(crate) fn poll_inner(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, String> {
     // 已退出 PID、失效 Surface 和长时间停帧的键，避免线程频繁增删填满映射。
     prune_frame_stats(ctx);
     let mut events = Vec::new();
-    let prefer_stats = matches!(ctx.backend, EventBackend::StatsMap)
-        || (matches!(ctx.backend, EventBackend::PerfEvent(_)) && ctx.use_frame_stats);
-    let prefer_stats = prefer_stats && ctx.frame_stats.is_some();
+    let prefer_stats = ctx.use_frame_stats && ctx.frame_stats.is_some();
     let ringbuf_backend = matches!(&ctx.backend, EventBackend::RingBuf(_));
+    let mut event_loss = false;
 
     if !ctx.frame_mode_reported {
         if ctx.detailed_logging {
             let source = match &ctx.backend {
+                EventBackend::RingBuf(_) if prefer_stats => "eBPF frame_stats map（RingBuf丢事件恢复）",
                 EventBackend::RingBuf(_) => "eBPF RingBuf逐帧事件",
                 EventBackend::StatsMap => "eBPF frame_stats map",
                 EventBackend::PerfEvent(_) if prefer_stats => {
@@ -132,6 +132,7 @@ pub(crate) fn poll_inner(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, String> {
                 ctx.perf_buffer_cursor = (start + poll_count) % buffer_count;
             }
             if lost_samples > 0 {
+                event_loss = true;
                 ctx.perf_lost_pending = ctx.perf_lost_pending.saturating_add(lost_samples);
                 let now_ns = monotonic_ns();
                 if ctx.perf_lost_last_log_ns == 0
@@ -147,11 +148,14 @@ pub(crate) fn poll_inner(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, String> {
     }
 
     if ringbuf_backend {
-        if let Err(error) = poll_ringbuf_drop_count(ctx) {
-            if ctx.detailed_logging {
-                log_warn!("[FPS] RingBuf 丢帧计数读取失败，已停用该诊断: {error}");
+        match poll_ringbuf_drop_count(ctx) {
+            Ok(lost) => event_loss |= lost,
+            Err(error) => {
+                if ctx.detailed_logging {
+                    log_warn!("[FPS] RingBuf 丢帧计数读取失败，已停用该诊断: {error}");
+                }
+                ctx.ringbuf_drops = None;
             }
-            ctx.ringbuf_drops = None;
         }
     }
 
@@ -162,7 +166,21 @@ pub(crate) fn poll_inner(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, String> {
         ctx.frame_stats_drops = None;
     }
 
-    if prefer_stats {
+    if event_loss && !ctx.use_frame_stats {
+        // RingBuf 同步维护内核累计帧数；事件传输丢失不影响该计数。
+        // 若映射也曾溢出，则只重建逐帧窗口，不能拿不完整计数补帧。
+        if ringbuf_backend && ctx.frame_stats.is_some() && ctx.frame_stats_drops.is_some()
+            && ctx.frame_stats_drops_seen == 0
+            && ctx.frame_report.is_some() && ctx.frame_report_prev.is_some()
+        {
+            ctx.use_frame_stats = true;
+            ctx.frame_mode_reported = false;
+            log_info!("[FPS] eBPF 计帧恢复: RingBuf丢事件 → 内核累计计数，保留原探针；帧间隔分位数标记为估算");
+        }
+        reset_sample_window(ctx, monotonic_ns());
+    }
+
+    if ctx.use_frame_stats && ctx.frame_stats.is_some() {
         return poll_frame_stats(ctx);
     }
 

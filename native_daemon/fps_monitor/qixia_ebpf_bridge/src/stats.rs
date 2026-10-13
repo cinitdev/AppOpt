@@ -5,7 +5,7 @@ use crate::constants::{
 };
 use crate::context::{EventBackend, FrameStatsSnapshot, QixiaThreadsEbpfCtx};
 use crate::fps_stream::FpsStream;
-use crate::streams::{refresh_current_fps, stream_key_from_parts};
+use crate::streams::{refresh_current_fps, reset_sample_window, stream_key_from_parts};
 
 pub(crate) fn prune_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) {
     if ctx.frame_stats.is_none() {
@@ -79,7 +79,8 @@ pub(crate) fn poll_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, Str
         if value.total_frames == 0 || value.last_ts == 0 {
             continue;
         }
-        if !ctx.target_pids.contains(&key.pid)
+        if value.last_ts < ctx.samples_since_ns
+            || !ctx.target_pids.contains(&key.pid)
             || !ctx
                 .pid_symbol_probes
                 .get(&key.pid)
@@ -108,11 +109,13 @@ pub(crate) fn poll_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, Str
         let current = ctx
             .frame_report
             .as_ref()
-            .and_then(|map| map.get(&key, 0).ok());
+            .and_then(|map| map.get(&key, 0).ok())
+            .filter(|report| report.interval_ts >= ctx.samples_since_ns);
         let previous = ctx
             .frame_report_prev
             .as_ref()
-            .and_then(|map| map.get(&key, 0).ok());
+            .and_then(|map| map.get(&key, 0).ok())
+            .filter(|report| report.interval_ts >= ctx.samples_since_ns);
         if current.is_some() || previous.is_some() {
             let stream = ctx
                 .streams
@@ -127,6 +130,7 @@ pub(crate) fn poll_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, Str
         }
         if prev.total_frames == 0
             || prev.last_ts == 0
+            || prev.last_ts < ctx.samples_since_ns
             || !ctx.pid_symbol_probes[&key.pid].accepts_timestamp(prev.last_ts)
         {
             ctx.streams
@@ -157,15 +161,16 @@ pub(crate) fn poll_frame_stats(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, Str
     Ok(accepted)
 }
 
-pub(crate) fn poll_ringbuf_drop_count(ctx: &mut QixiaThreadsEbpfCtx) -> Result<(), String> {
+pub(crate) fn poll_ringbuf_drop_count(ctx: &mut QixiaThreadsEbpfCtx) -> Result<bool, String> {
     let Some(drops) = ctx.ringbuf_drops.as_ref() else {
-        return Ok(());
+        return Ok(false);
     };
     let total = drops.get(&0, 0).map_err(|error| error.to_string())?;
-    if total > ctx.ringbuf_drops_seen {
+    let delta = total.wrapping_sub(ctx.ringbuf_drops_seen);
+    if delta > 0 {
         ctx.ringbuf_drops_pending = ctx
             .ringbuf_drops_pending
-            .saturating_add(u64::from(total - ctx.ringbuf_drops_seen));
+            .saturating_add(u64::from(delta));
         ctx.ringbuf_drops_seen = total;
     }
     let now_ns = monotonic_ns();
@@ -176,13 +181,13 @@ pub(crate) fn poll_ringbuf_drop_count(ctx: &mut QixiaThreadsEbpfCtx) -> Result<(
             || now_ns.saturating_sub(ctx.ringbuf_drops_last_log_ns) >= RINGBUF_DROP_LOG_INTERVAL_NS)
     {
         log_warn!(
-            "[FPS] RingBuf 缓冲区已满，丢弃帧事件={}；当前 FPS 可能短时偏低",
+            "[FPS] RingBuf 缓冲区已满，丢弃帧事件={}；不把缺失逐帧样本作为真实帧耗时",
             ctx.ringbuf_drops_pending
         );
         ctx.ringbuf_drops_pending = 0;
         ctx.ringbuf_drops_last_log_ns = now_ns;
     }
-    Ok(())
+    Ok(delta > 0)
 }
 
 pub(crate) fn poll_frame_stats_drop_count(ctx: &mut QixiaThreadsEbpfCtx) -> Result<(), String> {
@@ -198,6 +203,8 @@ pub(crate) fn poll_frame_stats_drop_count(ctx: &mut QixiaThreadsEbpfCtx) -> Resu
     ctx.frame_stats_drops_pending = ctx
         .frame_stats_drops_pending
         .saturating_add(u64::from(delta));
+
+    let was_using_stats = ctx.use_frame_stats;
 
     // PerfEvent 对象原本会在 frame_stats 可读后关闭逐帧事件。若映射已满，
     // 立即恢复事件通道，避免继续静默丢帧；StatsMap 后端则继续依赖过期键清理。
@@ -217,6 +224,14 @@ pub(crate) fn poll_frame_stats_drop_count(ctx: &mut QixiaThreadsEbpfCtx) -> Resu
         }
     }
 
+    if matches!(ctx.backend, EventBackend::RingBuf(_)) && ctx.use_frame_stats {
+        ctx.use_frame_stats = false;
+        ctx.frame_mode_reported = false;
+    }
+    if was_using_stats {
+        reset_sample_window(ctx, monotonic_ns());
+    }
+
     let now_ns = monotonic_ns();
     if ctx.detailed_logging
         && ctx.frame_stats_drops_pending > 0
@@ -226,7 +241,7 @@ pub(crate) fn poll_frame_stats_drop_count(ctx: &mut QixiaThreadsEbpfCtx) -> Resu
                 >= FRAME_STATS_DROP_LOG_INTERVAL_NS)
     {
         log_warn!(
-            "[FPS] frame_stats map 记录失败={}；已清理过期帧源，当前 FPS 可能短时偏低",
+            "[FPS] frame_stats map 记录失败={}；已清理过期帧源，受影响的统计窗口重新采集",
             ctx.frame_stats_drops_pending
         );
         ctx.frame_stats_drops_pending = 0;

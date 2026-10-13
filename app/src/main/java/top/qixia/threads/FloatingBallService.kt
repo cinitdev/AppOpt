@@ -88,16 +88,9 @@ class FloatingBallService : Service() {
                 !foregroundClosing
             ) {
                 val nowElapsed = SystemClock.elapsedRealtime()
-                // 至少收到过一次守护进程回调后才落样本，避免 eBPF 启动失败被误记为 0 FPS。
-                // 已建立通道后若短时失去新帧，则以 0 计入整段运行平均值。
-                if (latestFpsUpdatedAtElapsed > 0L) {
-                    val fps = if (
-                        nowElapsed - latestFpsUpdatedAtElapsed in 0L..FPS_SAMPLE_FRESH_MS
-                    ) {
-                        latestFps
-                    } else {
-                        0f
-                    }
+                // 守护会为静止页面发送真实的 0；缺测通知与过期读数应留空，
+                // 不能把采集恢复或通道中断算成应用掉帧。
+                fpsSampleForHistory(latestFps, latestFpsUpdatedAtElapsed, nowElapsed)?.let { fps ->
                     fpsSessionRecorder.record(pkg, fps)
                 }
             }

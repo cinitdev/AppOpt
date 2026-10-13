@@ -57,51 +57,7 @@ struct frame_stats_value {
     unsigned long long total_frames;
 };
 
-/* Optional report map, kept separate to preserve the existing FPS map ABI.
- * One maximum per second; no extra events or userspace per-frame wakeups. */
-struct frame_report_value {
-    unsigned long long interval_ts;
-    unsigned long long max_interval_ns;
-    unsigned long long window_ts;
-};
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(key_size, sizeof(struct frame_stats_key));
-    __uint(value_size, sizeof(struct frame_report_value));
-    __uint(max_entries, QIXIA_FRAME_STATS_MAX_ENTRIES);
-} frame_report SEC(".maps");
-
-/* Retain the completed window across userspace's 250ms polling boundary.
- * Both maps preserve the existing 24-byte report ABI. */
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(key_size, sizeof(struct frame_stats_key));
-    __uint(value_size, sizeof(struct frame_report_value));
-    __uint(max_entries, QIXIA_FRAME_STATS_MAX_ENTRIES);
-} frame_report_prev SEC(".maps");
-
-static __always_inline void record_frame_report(struct frame_stats_key *key, unsigned long long timestamp, unsigned long long interval) {
-    if (interval < 1000000ULL || interval > 5000000000ULL) return;
-    struct frame_report_value *report = bpf_map_lookup_elem(&frame_report, key);
-    if (report) {
-        struct frame_report_value next = *report;
-        if (timestamp - next.window_ts >= 1000000000ULL) {
-            bpf_map_update_elem(&frame_report_prev, key, &next, BPF_ANY);
-            next.window_ts = timestamp;
-            next.max_interval_ns = 0;
-        }
-        if (interval >= next.max_interval_ns) {
-            next.max_interval_ns = interval;
-            next.interval_ts = timestamp;
-            /* Replace the complete snapshot rather than exposing separately
-             * updated interval/timestamp fields to a concurrent lookup. */
-            bpf_map_update_elem(&frame_report, key, &next, BPF_ANY);
-        }
-    } else {
-        struct frame_report_value initial = {timestamp, interval, timestamp};
-        bpf_map_update_elem(&frame_report, key, &initial, BPF_ANY);
-    }
-}
+#include "frame_report.h"
 
 /* 目标线程 uprobe 的 TGID 白名单，由 Rust bridge 随进程变化增量更新。 */
 struct {

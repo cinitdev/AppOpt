@@ -134,7 +134,7 @@ class FrameRateMonitor(
                 val line = reader.readLine() ?: break
                 if (line.length > SOCKET_MAX_LINE_LENGTH) continue
                 if (frameReport.accept(line, SystemClock.elapsedRealtime())) continue
-                val fps = line.trim().toFloatOrNull() ?: continue
+                val fps = parseFpsChannelSample(line) ?: continue
                 emitFps(fps)
             }
         } catch (_: Exception) {
@@ -175,7 +175,7 @@ class FrameRateMonitor(
         val fps = try {
             val text = fpsFile.readText().trim()
             if (text.isEmpty()) return
-            text.toFloatOrNull() ?: return
+            parseFpsChannelSample(text) ?: return
         } catch (_: Exception) {
             return
         }
@@ -184,6 +184,11 @@ class FrameRateMonitor(
 
     private fun emitFps(fps: Float) {
         if (fps < 0f || !running) return
+        if (fps.isNaN()) {
+            frameReport.take(SystemClock.elapsedRealtime())
+            onFps(Float.NaN)
+            return
+        }
         onFps(clampToRefreshRate(fps))
     }
 
