@@ -41,10 +41,10 @@ class HistoryAnalysisTest {
         assertEquals(.25f, result.metricsCoverage)
     }
     @Test fun nearbyAnalysisRejectsInteriorGapsAndDiscontinuities() {
-        val points = listOf(HistoryMetrics.Point(0f, 10f), HistoryMetrics.Point(1f, 90f))
-        assertNull(HistoryAnalysis.at(points, .5f, 60000))
-        assertEquals(10f, HistoryAnalysis.at(points, .01f, 60000))
-        assertNull(HistoryAnalysis.at(points.mapIndexed { i, p -> p.copy(breakBefore = i == 1) }, .99f, 60000))
+        val points = listOf(HistoryCurvePoint(0f, 10f), HistoryCurvePoint(1f, 90f))
+        assertNull(HistoryAnalysis.nearby(points, .5f, 60000))
+        assertEquals(10f, HistoryAnalysis.nearby(points, .01f, 60000)?.value)
+        assertNull(HistoryAnalysis.nearby(points.mapIndexed { i, p -> p.copy(breakBefore = i == 1) }, .99f, 60000))
     }
     @Test fun wholeComparisonIncludesEveryWindowAndFailsOnMissingWindow() {
         val session = SessionSummary(-5, 100, 60, 1)

@@ -52,6 +52,8 @@ class HistoryMetricsTest {
         assertEquals(3.0008f, report.series.getValue("power_w").average, .0001f)
         assertEquals(19f, report.series.getValue("power_w").maximum, .001f)
         assertTrue(report.series.values.all { it.points.size <= 240 })
+        assertEquals(19f, report.analysisSamples!!.at(19001f / 20000)?.get("power_w"))
+        assertEquals(3f, report.analysisSamples.at(1f)?.get("power_w"))
         assertTrue(report.distributions.getValue("cpu_mhz.0").size <= 32)
         assertEquals(100f, report.distributions.getValue("cpu_mhz.0").sumOf { it.percent.toDouble() }.toFloat(), .01f)
     }

@@ -28,12 +28,10 @@ class AnalysisFeaturesInteractionTest {
         end - 30000, 30000, end)
     private val fps = HistoryFpsStore.Report(117.5f, 45f, 120f, 31,
         (0..30).map { HistoryFpsStore.Point(it / 30f, if (it == 15) 45f else 120f) })
-    private fun metric(key: String, value: Float) = HistoryMetrics.Series(key, value, value, value, 31,
-        (0..30).map { HistoryMetrics.Point(it / 30f, value) })
-    private val metrics = HistoryMetrics.Report(mapOf("cpu_usage" to metric("cpu_usage", 43f),
-        "gpu_usage" to metric("gpu_usage", 81f), "gpu_mhz" to metric("gpu_mhz", 680f),
-        "cpu_mhz.4_5_6" to metric("cpu_mhz.4_5_6", 2200f), "power_w" to metric("power_w", 4.8f)),
-        31, 0, 30000, 1f)
+    private val metrics = HistoryMetricsStore.summarize((0..30).map { index ->
+        HistoryMetrics.Sample(end - 30000 + index * 1000, false, mapOf("cpu_usage" to 43f,
+            "gpu_usage" to 81f, "gpu_mhz" to 680f, "cpu_mhz.4_5_6" to 2200f, "power_w" to 4.8f))
+    }, end - 30000, 30000)
     private val detail = HistoryDetailUiState("com.example.analysis", "示例游戏 · 测试数据", false,
         sessions = listOf(session), expandedSessionId = session.id,
         threads = listOf(ThreadData("RenderThread", 27f, 27f, List(31) { "27" }.joinToString(","), "")),
@@ -61,10 +59,35 @@ class AnalysisFeaturesInteractionTest {
         compose.onNodeWithText("0:15").performClick()
         compose.waitUntil(5000) { compose.onAllNodesWithText("RenderThread").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("27.0%").assertExists()
+        compose.onNodeWithText("2200.0 MHz").assertExists()
         compose.onNodeWithText("CPU 4–6 频率").assertIsDisplayed()
         capture("analysis-drop-preview.png")
         compose.onNodeWithText("收起").performClick()
         compose.onNodeWithText("RenderThread").assertDoesNotExist()
+    }
+
+    @Test fun longReportDropSelectionUsesOriginalMetricsRatherThanPlotPoints() {
+        val duration = 2_040_000L
+        val longSession = session.copy(startedAtMs = end - duration, recordedDurationMs = duration)
+        val longMetrics = HistoryMetricsStore.summarize((1..1020).map { index ->
+            HistoryMetrics.Sample(end - duration + index * 2000, false, mapOf("cpu_usage" to index / 20f,
+                "gpu_usage" to 0f, "gpu_mhz" to 300f + index, "cpu_mhz.7" to 2000f + index, "power_w" to 3f))
+        }, end - duration, duration)
+        val longDetail = detail.copy(sessions = listOf(longSession), threads = emptyList(),
+            sessionMetrics = mapOf(session.id to longMetrics))
+        val drop = FrameDrop(1_606_000f / duration, 1f, 1755.6f, 120f)
+        compose.setContent { QixiaThreadsTheme {
+            var selected by remember { mutableStateOf<FrameDrop?>(null) }
+            Column(Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(16.dp)) {
+                FrameDropAnalysisCard(longDetail, longSession, listOf(drop), selected, { selected = it })
+            }
+        } }
+        compose.onNodeWithText("26:46").performClick()
+        compose.onNodeWithText("2803.0 MHz").assertExists()
+        compose.onNodeWithText("1103.0 MHz").assertExists()
+        compose.onNodeWithText("3.0 W").assertExists()
+        compose.onNodeWithText("该时刻无有效样本").assertDoesNotExist()
+        capture("analysis-long-record-preview.png")
     }
 
     @Test fun plotMarkerSelectsDropAndDragDoesNotSnapBack() {

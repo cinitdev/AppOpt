@@ -48,12 +48,7 @@ object HistoryAnalysis {
         return result
     }
 
-    /** 不跨断点、长空洞或报告边界借用其他时间的数据。 */
-    fun at(points: List<HistoryMetrics.Point>, progress: Float, durationMs: Long): Float? {
-        val curves = points.map { HistoryCurvePoint(it.progress, it.value, it.breakBefore) }
-        return nearby(curves, progress, durationMs)?.value
-    }
-
+    /** 曲线之间的关联不跨断点；指标读数另查原始采样索引。 */
     internal fun nearby(points: List<HistoryCurvePoint>, progress: Float, durationMs: Long): HistoryCurvePoint? =
         if (durationMs <= 0) null else HistoryPlotMath.at(points, progress, durationMs)?.takeIf {
             it.value.isFinite() && abs(it.progress - progress).toDouble() * durationMs <= 1500.0

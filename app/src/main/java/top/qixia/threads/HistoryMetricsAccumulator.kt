@@ -3,6 +3,7 @@ package top.qixia.threads
 /** 流式归并校准数据，不需要缓存所有分片的全部样本。 */
 internal class HistoryMetricsAccumulator(private val since: Long, private val duration: Long) {
     private val series = sortedMapOf<String, Values>()
+    private val analysisSamples = HistoryMetricSamples.Builder(since, duration)
     var samples = 0
         private set
     private var charging = 0
@@ -64,6 +65,7 @@ internal class HistoryMetricsAccumulator(private val since: Long, private val du
 
     fun add(sample: HistoryMetrics.Sample) {
         if (sample.timestampMs !in since..(since + duration)) return
+        analysisSamples.add(sample)
         samples++
         if (sample.charging == true) charging++
         val progress = ((sample.timestampMs - since).toFloat() / duration).coerceIn(0f, 1f)
@@ -77,6 +79,7 @@ internal class HistoryMetricsAccumulator(private val since: Long, private val du
             }
         } }.toMap()
         return HistoryMetrics.Report(series.mapValues { it.value.report() }, samples, charging, duration,
-            (samples * 2000f / duration).coerceIn(0f, 1f), distributions = distributions, device = device)
+            (samples * 2000f / duration).coerceIn(0f, 1f), distributions = distributions, device = device,
+            analysisSamples = analysisSamples.build())
     }
 }

@@ -12,6 +12,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import top.qixia.threads.HistoryMetrics
+import top.qixia.threads.HistoryMetricSamples
 import top.qixia.threads.CoreEventKind
 import top.qixia.threads.compose.*
 import top.qixia.threads.compose.theme.*
@@ -62,10 +63,13 @@ internal fun FrameDropAnalysisCard(state: HistoryDetailUiState, session: Session
                 }
                 Text("FPS ${point.fps?.let(::historyNumber) ?: "—"} · 最大帧间隔 ${point.frameMaxMs?.let(::historyNumber) ?: "—"} ms",
                     color = OceanText, fontSize = 12.sp)
-                val values = remember(metrics, point, session.durationMs) { metrics?.series.orEmpty().filterKeys {
-                    it in setOf("cpu_usage", "gpu_usage", "gpu_mhz", "power_w") || it.startsWith("cpu_mhz.")
-                }.map { (key, series) -> (if (key.startsWith("cpu_mhz.")) HistoryPlotMath.cpuLabel(key) + " 频率" else HistoryMetrics.title(key)) to
-                    (HistoryAnalysis.at(series.points, point.progress, session.durationMs)?.let { historyNumber(it) + " " + HistoryMetrics.unit(key) } ?: "未采集") } }
+                val values = remember(metrics, point) {
+                    val readings = metrics?.analysisSamples?.at(point.progress).orEmpty()
+                    metrics?.series.orEmpty().keys.filter(HistoryMetricSamples::includes).map { key ->
+                        (if (key.startsWith("cpu_mhz.")) HistoryPlotMath.cpuLabel(key) + " 频率" else HistoryMetrics.title(key)) to
+                            (readings[key]?.let { historyNumber(it) + " " + HistoryMetrics.unit(key) } ?: "该时刻无有效样本")
+                    }
+                }
                 values.forEach { (label, value) -> Row(Modifier.fillMaxWidth().padding(top = 8.dp)) {
                     Text(label, Modifier.weight(1f), color = OceanTextSecondary, fontSize = 12.sp)
                     Text(value, color = PorcelainOnTonal, fontSize = 12.sp)

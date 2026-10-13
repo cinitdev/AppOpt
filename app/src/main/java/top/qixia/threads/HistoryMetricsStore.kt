@@ -179,6 +179,8 @@ object HistoryMetricsStore {
     }
 
     internal fun summarize(samples: List<HistoryMetrics.Sample>, since: Long, duration: Long): HistoryMetrics.Report {
+        val analysisSamples = HistoryMetricSamples.Builder(since, duration)
+        samples.forEach(analysisSamples::add)
         val series = linkedMapOf<String, HistoryMetrics.Series>()
         samples.flatMap { it.values.keys }.distinct().sorted().forEach { key ->
             var last = Long.MIN_VALUE
@@ -200,7 +202,8 @@ object HistoryMetricsStore {
             }
         }
         return HistoryMetrics.Report(series, samples.size, samples.count { it.charging == true }, duration,
-            (samples.size * 2000f / duration).coerceIn(0f, 1f), distributions = distributions)
+            (samples.size * 2000f / duration).coerceIn(0f, 1f), distributions = distributions,
+            analysisSamples = analysisSamples.build())
     }
 
     private val DEVICE_KEYS = setOf("platform", "model", "os", "resolution", "refresh")
