@@ -289,7 +289,7 @@ pub(super) fn recover_observed(token: Option<&str>, history: &mut EventLog) -> i
     }
     // 即使其他线程恢复被拒绝，也要移除已经完成的恢复项。
     // 先比较日志，避免旧守卫替换新控制器的日志。
-    if fs::read_to_string(JOURNAL).ok().as_deref() == Some(&committed) { persist(&remaining)?; }
+    commit_recovery(JOURNAL, &committed, &remaining)?;
     if let Some(error) = failure {
         return Err(error);
     }
@@ -297,8 +297,25 @@ pub(super) fn recover_observed(token: Option<&str>, history: &mut EventLog) -> i
 }
 
 fn persist(entries: &BTreeMap<Identity, Entry>) -> io::Result<()> {
+    persist_at(JOURNAL, entries)
+}
+
+fn commit_recovery(journal: &str, committed: &str, remaining: &BTreeMap<Identity, Entry>) -> io::Result<()> {
+    // 恢复被系统拒绝时保留原日志即可。重复同步写入相同内容会触发
+    // 状态目录的 inotify，再次唤醒配置交接，形成无进展的自唤醒循环。
+    // 空日志仍需清除；部分恢复成功时也必须及时提交剩余项。
+    if !remaining.is_empty() && remaining.values().map(Entry::encode).collect::<String>() == committed {
+        return Ok(());
+    }
+    if fs::read_to_string(journal).ok().as_deref() == Some(committed) {
+        persist_at(journal, remaining)?;
+    }
+    Ok(())
+}
+
+fn persist_at(journal: &str, entries: &BTreeMap<Identity, Entry>) -> io::Result<()> {
     if entries.is_empty() {
-        match fs::remove_file(JOURNAL) {
+        match fs::remove_file(journal) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
@@ -309,7 +326,7 @@ fn persist(entries: &BTreeMap<Identity, Entry>) -> io::Result<()> {
             return Err(io::Error::other("自动恢复日志达到安全容量上限"));
         }
         atomic_write(
-            JOURNAL,
+            journal,
             &encoded,
             true,
         )
@@ -562,6 +579,71 @@ impl Drop for Batch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecoveryJournal {
+        directory: std::path::PathBuf,
+        path: String,
+    }
+
+    impl RecoveryJournal {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!("qixia-recovery-{}-{id}", std::process::id()));
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("recovery.state").to_str().unwrap().to_owned();
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for RecoveryJournal {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_dir(&self.directory);
+        }
+    }
+
+    #[test]
+    fn failed_recovery_does_not_rewrite_journal_or_wake_itself() {
+        use std::os::unix::fs::MetadataExt;
+        let journal = RecoveryJournal::new();
+        let text = "v4 abc 1-2 3 4 5 ff 80 - 2f6261636b67726f756e64 - 2f516958696152732f6175746f\n";
+        let remaining = decode(text).unwrap();
+        persist_at(&journal.path, &remaining).unwrap();
+        let inode = fs::metadata(&journal.path).unwrap().ino();
+        let mut monitor = crate::CommandFileMonitor::new(&[&journal.path]).unwrap();
+        // 模拟同一线程持续恢复失败。只使用测试临时文件，不操作手机的线程或恢复日志。
+        for _ in 0..32 {
+            commit_recovery(&journal.path, text, &remaining).unwrap();
+        }
+        assert!(!monitor.drain().unwrap(), "相同恢复项反复写入会再次唤醒配置主循环");
+        assert_eq!(fs::metadata(&journal.path).unwrap().ino(), inode);
+        assert_eq!(fs::read_to_string(&journal.path).unwrap(), text);
+    }
+
+    #[test]
+    fn recovery_progress_is_saved_and_newer_journal_is_preserved() {
+        let journal = RecoveryJournal::new();
+        let first = "v1 abc 1-2 3 4 5 ff 80\n";
+        let second = "v1 abc 1-2 3 6 7 ff 40\n";
+        let initial = format!("{first}{second}");
+        persist_at(&journal.path, &decode(&initial).unwrap()).unwrap();
+        let remaining = decode(second).unwrap();
+        commit_recovery(&journal.path, &initial, &remaining).unwrap();
+        assert_eq!(fs::read_to_string(&journal.path).unwrap(), second);
+        // 旧守卫不能清空或覆盖新控制器刚刚提交的恢复基线。
+        let newer = "v1 abc 8-9 3 6 7 ff 20\n";
+        persist_at(&journal.path, &decode(newer).unwrap()).unwrap();
+        commit_recovery(&journal.path, second, &BTreeMap::new()).unwrap();
+        commit_recovery(&journal.path, &initial, &remaining).unwrap();
+        assert_eq!(fs::read_to_string(&journal.path).unwrap(), newer);
+        commit_recovery(&journal.path, newer, &BTreeMap::new()).unwrap();
+        assert!(!std::path::Path::new(&journal.path).exists());
+        fs::write(&journal.path, "").unwrap();
+        commit_recovery(&journal.path, "", &BTreeMap::new()).unwrap();
+        assert!(!std::path::Path::new(&journal.path).exists());
+    }
+
     #[test]
     fn release_keeps_written_and_previous_masks_including_kernel_filters() {
         assert!(written_mask_matches(0x20, 0x20, None, 0xff, 0x90));
