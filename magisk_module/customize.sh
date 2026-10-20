@@ -8,6 +8,11 @@ if [ "$(sed -n 's/^id=//p' /data/adb/modules/QixiaThreads/module.prop 2>/dev/nul
 	[ "$(readlink -f "$MODPATH")" != "$(readlink -f /data/adb/modules/QixiaThreads)" ]; then
 	QIXIA_UPGRADE_SOURCE="/data/adb/modules/QixiaThreads"
 fi
+# 在生成默认规则前记录状态，避免把安装包内的配置当成用户已有规则。
+QIXIA_SHOW_MANUAL_MIGRATION_NOTICE=1
+if [ -n "$QIXIA_UPGRADE_SOURCE" ] || [ -f /data/adb/modules/QixiaThreads/config/applist.conf ]; then
+	QIXIA_SHOW_MANUAL_MIGRATION_NOTICE=0
+fi
 is_qixia_in_app_update() {
 	[ "$QIXIA_IN_APP_UPDATE" = "1" ] && return 0
 	[ -n "$MODPATH" ] && [ -f "$MODPATH/$QIXIA_IN_APP_UPDATE_MARKER" ] && return 0
@@ -15,10 +20,11 @@ is_qixia_in_app_update() {
 	return 1
 }
 print_manual_migration_notice() {
-  ui_print ""
+	[ "$QIXIA_SHOW_MANUAL_MIGRATION_NOTICE" = "1" ] || return 0
+	ui_print ""
 	ui_print "********************************************"
 	ui_print "旧版迁移提醒（从 AppOpt 切换到柒夏线程）"
-	ui_print "! 首次刷入2.0版本需要手动迁移，迁移后无视。"
+	ui_print "! 首次安装未发现已有线程规则；如需沿用旧版规则，请手动迁移。"
 	ui_print "! 请先手动备份旧版 applist.conf，再处理旧版 APK 和模块。"
 	ui_print "! 旧版 APK 请自行卸载，旧模块请自行停用或卸载。"
 	ui_print "! 请勿同时启用旧版与新版模块，以免调度冲突。"
@@ -29,16 +35,45 @@ print_manual_migration_notice() {
 	ui_print "********************************************"
 	ui_print ""
 }
-check_magisk_version() {
-	ui_print "- Magisk version: $MAGISK_VER_CODE"
-	ui_print "- Module version: $(grep_prop version "${TMPDIR}/module.prop")"
-	ui_print "- Module versionCode: $(grep_prop versionCode "${TMPDIR}/module.prop")"
+check_root_version() {
+	local ROOT_NAME ROOT_VERSION ROOT_VERSION_CODE
+	# KernelSU 与 APatch 可能提供兼容用的 Magisk 变量，优先使用实际管理器标识。
+	if [ "$APATCH" = "true" ] || [ "$APATCH" = "1" ]; then
+		ROOT_NAME="APatch"
+		ROOT_VERSION="$APATCH_VER"
+		ROOT_VERSION_CODE="$APATCH_VER_CODE"
+	elif [ "$KSU" = "true" ] || [ "$KSU" = "1" ]; then
+		ROOT_NAME="KernelSU"
+		ROOT_VERSION="$KSU_VER"
+		ROOT_VERSION_CODE="$KSU_VER_CODE"
+	elif [ -n "$MAGISK_VER" ] || [ -n "$MAGISK_VER_CODE" ]; then
+		ROOT_NAME="Magisk"
+		ROOT_VERSION="$MAGISK_VER"
+		ROOT_VERSION_CODE="$MAGISK_VER_CODE"
+	else
+		ROOT_NAME="未知"
+		ROOT_VERSION=""
+		ROOT_VERSION_CODE=""
+	fi
+	ui_print "- Root 环境：$ROOT_NAME"
+	ui_print "- Root 版本：${ROOT_VERSION:-未提供}（版本编号：${ROOT_VERSION_CODE:-未提供}）"
+	ui_print "- 模块版本：$(grep_prop version "${TMPDIR}/module.prop")"
+	ui_print "- 模块版本编号：$(grep_prop versionCode "${TMPDIR}/module.prop")"
 	ui_print "********************************************"
 	ui_print "- $(grep_prop description "${TMPDIR}/module.prop")"
-	if [ "$MAGISK_VER_CODE" -lt 20400 ]; then
-		ui_print "********************************************"
-		ui_print "! 请安装 Magisk v20.4+ (20400+)"
-		abort "********************************************"
+	if [ "$ROOT_NAME" = "Magisk" ]; then
+		case "$ROOT_VERSION_CODE" in
+			''|*[!0-9]*)
+				ui_print "! 未提供有效的 Magisk 版本编号，无法检查最低版本要求。"
+				;;
+			*)
+				if [ "$ROOT_VERSION_CODE" -lt 20400 ]; then
+					ui_print "********************************************"
+					ui_print "! 请安装 Magisk v20.4+ (20400+)"
+					abort "********************************************"
+				fi
+				;;
+		esac
 	fi
 }
 
@@ -129,7 +164,7 @@ install_or_update_app() {
 
 	if is_qixia_in_app_update; then
 		ui_print "- App 内刷入模块：跳过当前会话内安装 App"
-		ui_print "- 已保留随附 App，重启后将自动更新 App"
+		ui_print "- 已保留随附 App，模块生效后由安装完成页继续更新"
 		return
 	fi
 
@@ -218,17 +253,21 @@ install_or_update_app() {
 cleanup_embedded_app() {
 	local APP_DIR="$MODPATH/config/app"
 	if is_qixia_in_app_update && [ -f "$APP_DIR/app.prop" ]; then
-		ui_print "- 已保留临时 App 安装文件，重启后自动更新"
+		ui_print "- 已保留临时 App 安装文件；可在热更新完成后安装，重启时也会重试"
 		return
 	fi
 	if [ "$EMBEDDED_APP_CLEANUP_ALLOWED" != "1" ]; then
 		ui_print "- 已保留临时 App 安装文件，可稍后重试或手动安装"
 		return
 	fi
-	if rm -rf "$APP_DIR" && rm -f \
-		"$MODPATH/config/tools/qixia_pkg_helper.jar" \
-		"$MODPATH/config/tools/qixia_pkg_helper.sh"; then
-		ui_print "- 已清理临时 App 安装文件及安装助手"
+	if rm -rf "$APP_DIR"; then
+		if [ -n "$QIXIA_UPGRADE_SOURCE" ]; then
+			ui_print "- 已清理临时 APK；安装助手保留至热更新提示完成"
+		elif rm -f "$MODPATH/config/tools/qixia_pkg_helper.jar" "$MODPATH/config/tools/qixia_pkg_helper.sh"; then
+			ui_print "- 已清理临时 App 安装文件及安装助手"
+		else
+			ui_print "! 安装助手清理失败，开机后重试"
+		fi
 	else
 		ui_print "! 临时 App 安装文件或安装助手清理失败，开机后重试"
 	fi
@@ -402,6 +441,13 @@ module_instructions() {
 	done | paste -sd+)
 	ui_print "当前$(getprop ro.soc.model)设备为$(nproc)核CPU，规格是：$cores"
 	ui_print "可用CPU范围：$all_core"
+	ui_print "独立调频范围（按内核策略，不代表性能档位）："
+	for cpus in /sys/devices/system/cpu/cpufreq/policy*/related_cpus; do
+		[ -r "$cpus" ] || continue
+		domain_cpus=$(format_cpu_ranges "$(cat "$cpus")")
+		[ -z "$domain_cpus" ] || ui_print "  CPU $domain_cpus"
+	done
+	ui_print "完整性能组与调频域识别结果请查看 App 设置。"
 	ui_print "------------------------------------------"
 	[ -n "$(format_cpu_ranges "$e_core")" ] && ui_print "$(format_cpu_ranges "$e_core") 为低频性能簇，频率最低"
 	[ $total_groups -ge 3 ] && [ -n "$(format_cpu_ranges "$p_core")" ] && ui_print "$(format_cpu_ranges "$p_core") 为主性能簇"
@@ -439,15 +485,19 @@ module_instructions() {
 	ui_print "********************************************"
 }
 
+# 同一模块升级时共用配置保留逻辑；缺失时由各调用方生成默认值。
+preserve_config() {
+	local FILE="$1" LABEL="$2"
+	[ -n "$QIXIA_UPGRADE_SOURCE" ] && [ -f "$QIXIA_UPGRADE_SOURCE/config/$FILE" ] || return 1
+	cp -f "$QIXIA_UPGRADE_SOURCE/config/$FILE" "$MODPATH/config/$FILE" \
+		|| abort "! $LABEL 保留失败，原文件仍保留"
+	ui_print "- ${LABEL}：已保留"
+}
+
 add_default_rules() {
-	mkdir -p $MODPATH/config
+	mkdir -p "$MODPATH/config"
 	local CONFIG_FILE="$MODPATH/config/applist.conf"
-	local ACTIVE_CONFIG="$QIXIA_UPGRADE_SOURCE/config/applist.conf"
-	if [ -n "$QIXIA_UPGRADE_SOURCE" ] && [ -f "$ACTIVE_CONFIG" ]; then
-		cp -f "$ACTIVE_CONFIG" "$CONFIG_FILE" || abort "! 线程规则迁移失败，旧文件仍保留"
-		ui_print "- 线程规则配置：已保留"
-		return
-	fi
+	preserve_config applist.conf "线程规则配置" && return
 	[ -f "$MODPATH/rules.sh" ] || abort "! 找不到默认规则文件 rules.sh"
 	QIXIA_RULES_FILE="$CONFIG_FILE"
 	. "$MODPATH/rules.sh"
@@ -464,13 +514,9 @@ normalize_cpuset_name() {
 }
 
 prepare_calib_policy() {
-	mkdir -p $MODPATH/config
-	local ACTIVE_POLICY="$QIXIA_UPGRADE_SOURCE/config/calib_policy.conf"
+	mkdir -p "$MODPATH/config"
 	local PENDING_POLICY="$MODPATH/config/calib_policy.conf"
-	if [ -n "$QIXIA_UPGRADE_SOURCE" ] && [ -f "$ACTIVE_POLICY" ]; then
-		cp -f "$ACTIVE_POLICY" "$PENDING_POLICY" || abort "! 校准设置迁移失败，旧文件仍保留"
-		ui_print "- 自动校准策略：已保留"
-	else
+	if ! preserve_config calib_policy.conf "自动校准策略"; then
 		cat > "$PENDING_POLICY" <<EOF
 # QixiaThreads 规则格式与运行设置
 # App 内可视化编辑；手动改动时请保持 key=value 格式。
@@ -512,12 +558,7 @@ EOF
 
 # 模块升级时保留自动核心分配的应用选择。
 prepare_auto_affinity_config() {
-	mkdir -p "$MODPATH/config"
-	[ -n "$QIXIA_UPGRADE_SOURCE" ] || return 0
-	if [ -f "$QIXIA_UPGRADE_SOURCE/config/auto_affinity.conf" ]; then
-		cp -f "$QIXIA_UPGRADE_SOURCE/config/auto_affinity.conf" "$MODPATH/config/auto_affinity.conf" \
-			|| abort "! 自动分配应用列表迁移失败，旧文件仍保留"
-	fi
+	preserve_config auto_affinity.conf "自动分配应用列表" || true
 }
 
 # 记录设置共用策略文件，升级时保留当前模块的记录开关。
@@ -649,7 +690,31 @@ normalize_calib_rule_output_format() {
 			;;
 	esac
 }
-check_magisk_version
+print_install_result() {
+	local HOT_UPDATE="$MODPATH/config/tools/qixia_hot_update.sh"
+	ui_print ""
+	ui_print "============================================"
+	if [ -z "$QIXIA_UPGRADE_SOURCE" ] || [ ! -s "$QIXIA_UPGRADE_SOURCE/service.sh" ] ||
+		[ ! -x "$QIXIA_UPGRADE_SOURCE/config/bin/QiXiaRs" ]; then
+		ui_print "【首次安装完成】请重启手机生效"
+		ui_print "首次安装需要重启，完成模块初始化后再使用。"
+	elif is_qixia_in_app_update; then
+		ui_print "【模块刷入完成】即将进行热更新"
+		ui_print "当前页面会继续验证，并显示是否无需重启。"
+	elif [ -f "$HOT_UPDATE" ] && sh "$HOT_UPDATE" --queue-installer "$$" >/dev/null; then
+		ui_print "【模块刷入完成】热更新已排队"
+		ui_print "安装器退出后开始切换，请等待屏幕上的结果提示。"
+		ui_print "成功后会弹出带应用图标的 Toast：热更新成功，无需重启手机。"
+		ui_print "也可打开柒夏线程查看生效状态。"
+	else
+		ui_print "【模块刷入完成】请重启手机生效"
+		ui_print "热更新任务未能启动，重启后应用本次更新。"
+	fi
+	ui_print "============================================"
+	ui_print ""
+}
+
+check_root_version
 check_required_files
 extract_bin
 configure_joyose_smartop
@@ -672,3 +737,4 @@ done
 install_or_update_app
 cleanup_embedded_app
 print_manual_migration_notice
+print_install_result

@@ -1,11 +1,16 @@
 package qixia.pkghelper;
 
 import android.content.ComponentName;
+import android.content.AttributionSource;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.Looper;
+import android.system.Os;
+import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -56,6 +61,9 @@ public final class PackageHelper {
             } else if ("install".equals(cmd)) {
                 requireArgs(args, 2);
                 helper.install(args[1]);
+            } else if ("toast".equals(cmd)) {
+                requireArgs(args, 2);
+                helper.showToast(args[1]);
             } else {
                 usage();
                 System.exit(2);
@@ -70,6 +78,7 @@ public final class PackageHelper {
             if (trace != null && trace.length > 0) {
                 print("where", trace[0].toString());
             }
+            if (args.length > 0 && "toast".equals(args[0])) t.printStackTrace(System.err);
             System.exit(1);
         }
     }
@@ -94,6 +103,7 @@ public final class PackageHelper {
         System.err.println("  app-info <package>");
         System.err.println("  component-state <package/component> [userId]");
         System.err.println("  install <apk>");
+        System.err.println("  toast <message>");
     }
 
     private void appInfo(String packageName) throws Exception {
@@ -293,7 +303,7 @@ public final class PackageHelper {
     }
 
     @SuppressWarnings("deprecation")
-    private PackageInfo getArchivePackageInfo(String apkPath) throws Exception {
+    private static Context systemContext() throws Exception {
         // app_process 进入 main() 时尚未初始化 Android Looper；即使助手不打开
         // Activity，ActivityThread 仍会创建 Handler，因此需要先准备消息循环。
         if (Looper.getMainLooper() == null) {
@@ -307,11 +317,77 @@ public final class PackageHelper {
         if (!(value instanceof Context)) {
             throw new IllegalStateException("system context is unavailable");
         }
-        Context context = (Context) value;
-        return context.getPackageManager().getPackageArchiveInfo(
+        return (Context) value;
+    }
+
+    @SuppressWarnings("deprecation")
+    private PackageInfo getArchivePackageInfo(String apkPath) throws Exception {
+        return systemContext().getPackageManager().getPackageArchiveInfo(
             apkPath,
             PackageManager.GET_SIGNING_CERTIFICATES
         );
+    }
+
+    // setuid/setgid 的弃用说明针对普通应用权限不足；这里由独立 Root 助手主动降权。
+    @SuppressWarnings("deprecation")
+    private void showToast(String message) throws Exception {
+        if (message.trim().isEmpty() || message.length() > 160) {
+            throw new IllegalArgumentException("提示文字为空或过长");
+        }
+        Context system = systemContext();
+        Context application = system.createPackageContext("top.qixia.threads", 0);
+        int appUid = application.getApplicationInfo().uid;
+        boolean useSystemText = !areAppNotificationsEnabled(appUid);
+        int uid = useSystemText ? android.os.Process.SYSTEM_UID : appUid;
+        String packageName = useSystemText ? "android" : "top.qixia.threads";
+        // 只改变当前短命助手的身份，不调整应用通知权限。文字与窗口均交由 SystemUI
+        // 绘制，避免新系统拒绝未登记的 app_process 进程直接创建 Toast 窗口。
+        Os.setgid(uid);
+        Os.setuid(uid);
+        Context context = new ContextWrapper(useSystemText ? system : application) {
+            @Override public String getPackageName() { return packageName; }
+            public String getOpPackageName() { return packageName; }
+            @Override public AttributionSource getAttributionSource() {
+                return new AttributionSource.Builder(uid).setPackageName(packageName).build();
+            }
+        };
+        print("toast_mode", useSystemText ? "system_text" : "app_icon");
+        Handler handler = new Handler(Looper.getMainLooper());
+        AtomicBoolean shown = new AtomicBoolean(false);
+        Toast toast = Toast.makeText(context,
+            useSystemText ? "柒夏线程：" + message : message, Toast.LENGTH_LONG);
+        toast.addCallback(new Toast.Callback() {
+            @Override public void onToastShown() {
+                shown.set(true);
+                print("shown", "1");
+            }
+
+            @Override public void onToastHidden() {
+                print("ok", shown.get() ? "1" : "0");
+                System.exit(shown.get() ? 0 : 1);
+            }
+        });
+        // 等系统回调后才退出，安装脚本随后才能删除助手；厂商漏回调时也不能一直阻塞更新。
+        handler.postDelayed(() -> {
+            toast.cancel();
+            print("ok", shown.get() ? "1" : "0");
+            if (!shown.get()) print("error", "系统未确认显示 Toast");
+            System.exit(shown.get() ? 0 : 1);
+        }, 9000L);
+        toast.show();
+        Looper.loop();
+    }
+
+    private static boolean areAppNotificationsEnabled(int uid) throws Exception {
+        // 在降权前读取通知状态，只查询，不授权或修改用户设置。
+        Object binder = Class.forName("android.os.ServiceManager")
+            .getMethod("getService", String.class).invoke(null, Context.NOTIFICATION_SERVICE);
+        if (binder == null) throw new IllegalStateException("系统通知服务尚未就绪");
+        Class<?> service = Class.forName("android.app.INotificationManager");
+        Object manager = Class.forName("android.app.INotificationManager$Stub")
+            .getMethod("asInterface", android.os.IBinder.class).invoke(null, binder);
+        return (Boolean) service.getMethod("areNotificationsEnabledForPackage", String.class, int.class)
+            .invoke(manager, "top.qixia.threads", uid);
     }
 
     private static Set<String> signerDigests(PackageInfo info) throws Exception {

@@ -569,14 +569,9 @@ pub(super) fn process_index_print_pids(name: &str) -> io::Result<()> {
     for pid in &pids {
         println!("{pid}");
     }
-    if pids.is_empty() {
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "进程索引未命中",
-        ))
-    } else {
-        Ok(())
-    }
+    // 完整扫描后没有匹配进程也是成功结果。只有扫描失败才返回错误，
+    // 否则启动助手时会把正常的空集合误当成故障，再执行高开销的 shell 扫描。
+    Ok(())
 }
 
 pub(super) fn process_index_print_names(names: &[String]) -> io::Result<()> {

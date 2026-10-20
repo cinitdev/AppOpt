@@ -53,7 +53,7 @@ class UpdateInstallActivity : ComponentActivity() {
                     rebootStatus = rebootStatus,
                     onBack = ::requestClose,
                     onPrimaryAction = {
-                        if (installState.rebootRequired) rebootSystem() else finish()
+                        if (installState.rebootRequired) rebootSystem() else requestClose()
                     }
                 )
             }
@@ -64,8 +64,28 @@ class UpdateInstallActivity : ComponentActivity() {
     private fun requestClose() {
         if (installState.running) {
             AppToast.show(this, "正在刷入模块，请等待完成")
+        } else if (installState.appUpdatePending) {
+            completeAppUpdate()
         } else {
             finish()
+        }
+    }
+
+    private fun completeAppUpdate() {
+        if (rebooting) return
+        rebooting = true
+        rebootStatus = "正在交接 App 更新" to "模块已生效，请稍后从桌面重新打开 App"
+        thread(name = "QixiaThreadsAppUpdate") {
+            val queued = ModuleHotUpdate.queueAppInstall()
+            runOnUiThread {
+                if (queued) {
+                    AppToast.show(this@UpdateInstallActivity, "正在更新 App，请稍后从桌面重新打开")
+                    finishAffinity()
+                } else {
+                    rebooting = false
+                    rebootStatus = "App 更新未能启动" to "模块已生效，可再次点击完成重试"
+                }
+            }
         }
     }
 

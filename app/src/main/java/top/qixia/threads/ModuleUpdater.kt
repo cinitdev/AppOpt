@@ -485,14 +485,24 @@ object ModuleUpdater {
                 // Android 重建此 Activity 时也遵循这一顺序。
                 if (completed != null && targetVersionCode != null && pendingModuleIsComplete(targetVersionCode)) {
                     completed?.log?.takeIf(String::isNotBlank)?.let(::log)
-                    log("\n- 已恢复刷入结果：模块已就绪，等待重启；不会重复刷入\n")
+                    log("\n- 已恢复刷入结果：模块已就绪；不会重复刷入\n")
+                    val hotUpdate = ModuleHotUpdate.apply(targetVersionCode) { message ->
+                        progress(message, null)
+                        log("- $message\n")
+                    }
                     if (appContext != null) {
                         rememberCompletedInstall(appContext, zip, targetVersionCode,
                             completed?.bootId?.takeIf(String::isNotBlank) ?: currentBootId(),
                             synchronized(pendingLogLock) { completeLog.toString() })
                     }
                     if (zip.exists()) cleanupUpdateZips(zip, inAppUpdate, ::log)
-                    postSuccess("模块已刷入，重启后生效；App 将在重启后自动更新")
+                    postSuccess(hotUpdate.message, rebootRequired = !hotUpdate.applied)
+                    return@thread
+                }
+                if (completed != null && targetVersionCode != null && ModuleHotUpdate.isApplied(targetVersionCode)) {
+                    completed.log.takeIf(String::isNotBlank)?.let(::log)
+                    log("\n- 已验证本次开机的新版守护，热更新已生效；不会重复刷入\n")
+                    postSuccess("模块已热更新生效，无需重启手机", rebootRequired = false)
                     return@thread
                 }
                 if (completed != null && completed.bootId.isNotBlank()) {
@@ -584,17 +594,29 @@ object ModuleUpdater {
                 val pendingReady = targetVersionCode?.let(::waitForPendingModuleUpdate)
                     ?: (result.success && DaemonBridge.hasPendingModuleUpdate())
                 if (result.success && pendingReady) {
+                    // 管理器已经完成安装，先落盘，避免 App 在热切换期间被回收后重复刷入。
+                    if (appContext != null && targetVersionCode != null) {
+                        rememberCompletedInstall(appContext, zip, targetVersionCode, currentBootId(),
+                            synchronized(pendingLogLock) { completeLog.toString() })
+                    }
+                    val hotUpdate = targetVersionCode?.let { version ->
+                        progress("正在检查是否可以热更新", null)
+                        ModuleHotUpdate.apply(version) { message ->
+                            progress(message, null)
+                            log("- $message\n")
+                        }
+                    }
                     if (appContext != null && targetVersionCode != null) {
                         rememberCompletedInstall(appContext, zip, targetVersionCode, currentBootId(),
                             synchronized(pendingLogLock) { completeLog.toString() })
                     }
                     cleanupUpdateZips(zip, inAppUpdate, ::log)
-                    val message = if (inAppUpdate) {
+                    val message = hotUpdate?.message ?: if (inAppUpdate) {
                         "模块已刷入，重启后生效；App 将在重启后自动更新"
                     } else {
                         "模块已刷入，重启后生效"
                     }
-                    postSuccess(message)
+                    postSuccess(message, rebootRequired = hotUpdate?.applied != true)
                 } else {
                     markInstallFailed()
                     val manualZip = retainOriginalZipForManualInstall(context, zip, inAppUpdate, ::log)

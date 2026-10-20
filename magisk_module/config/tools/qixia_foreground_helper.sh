@@ -50,14 +50,13 @@ is_helper_pid() {
 
 helper_pids() {
     if [ -x "$BIN_RS" ]; then
-        found=0
-        for pid in $("$BIN_RS" --find-pid "$NICE_NAME" 2>/dev/null); do
-            if is_helper_pid "$pid"; then
-                echo "$pid"
-                found=1
-            fi
-        done
-        [ "$found" -eq 1 ] && return 0
+        if indexed_pids=$("$BIN_RS" --find-pid "$NICE_NAME" 2>/dev/null); then
+            for pid in $indexed_pids; do
+                is_helper_pid "$pid" && echo "$pid"
+            done
+            # 空集合也是完整的查询结果，不能为此再启动几千个 Shell 子进程。
+            return 0
+        fi
     fi
 
     # 首次开机时进程索引可能尚未生成，直接遍历 /proc。不要在看门狗关键路径

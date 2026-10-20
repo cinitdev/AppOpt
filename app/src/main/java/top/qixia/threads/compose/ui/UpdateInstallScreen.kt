@@ -150,7 +150,7 @@ fun UpdateInstallScreen(
                 modifier = Modifier.fillMaxWidth().height(50.dp),
                 shape = RoundedCornerShape(14.dp)
             ) {
-                Text(if (state.rebootRequired) "重启系统" else "返回")
+                Text(if (state.rebootRequired) "重启系统" else if (state.appUpdatePending) "完成并更新 App" else "返回")
             }
         }
         Spacer(Modifier.height(16.dp))

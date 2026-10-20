@@ -9,6 +9,12 @@ use super::*;
 // 入口只做参数分流，业务逻辑分别放在守护主循环、CLI、前台状态和控制套接字模块里。
 pub(super) fn run() {
     #[cfg(any(target_os = "android", target_os = "linux"))]
+    if env::args().nth(1).as_deref() == Some("--check-daemon") {
+        let result = daemon_socket_health_client();
+        if let Err(error) = &result { eprintln!("守护健康检查失败: {error}"); }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     if env::args().nth(1).as_deref() == Some("--affinity-diagnostics") {
         let result = env::args().nth(2).filter(|pkg| auto_affinity::packages(pkg).contains(pkg))
             .ok_or_else(|| io::Error::other("缺少有效包名"))

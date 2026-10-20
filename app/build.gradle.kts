@@ -13,8 +13,8 @@ android {
         minSdk = 31
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 204
-        versionName = "v2.0.4"
+        versionCode = 205
+        versionName = "v2.0.5"
     }
 
     signingConfigs {
@@ -116,4 +116,6 @@ val buildHistoryProbe by tasks.registering {
     }
 }
 android.sourceSets.getByName("main").assets.srcDir(historyProbeOutput)
+// 设备回归直接读取安装脚本源码，避免测试维护另一份实现。
+android.sourceSets.getByName("androidTest").assets.srcDir(rootProject.file("magisk_module"))
 tasks.named("preBuild").configure { dependsOn(buildHistoryProbe) }

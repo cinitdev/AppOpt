@@ -108,6 +108,10 @@ pub(super) fn daemon_socket_handle_client(client_fd: i32) {
             return;
         }
     };
+    if req == "qixia.health v1" {
+        let _ = socket_send_all(client_fd, format!("qixia.health v1 version={VERSION} pid={}\n", std::process::id()).as_bytes());
+        return;
+    }
     if let Some(pkg) = req.strip_prefix("qixia.diagnostics v1 ") {
         let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
         let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -146,6 +150,36 @@ pub(super) fn daemon_socket_handle_client(client_fd: i32) {
     if let Err(err) = daemon_socket_send_callback(&callback_name, &callback_token) {
         log_error!("[CTRL] 守护反向验证回调失败: {err}");
     }
+}
+
+// 热更新必须验证响应者确实运行当前文件，版本相同的重新构建也不能误认旧进程。
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(super) fn daemon_socket_health_client() -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let fd = unix_connect_abstract(DAEMON_SOCKET_NAME)?;
+    let result = (|| {
+        socket_set_recv_timeout(fd, Duration::from_secs(2))?;
+        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED,
+            (&mut peer as *mut libc::ucred).cast(), &mut size) } != 0 || peer.uid != 0 || peer.pid <= 0 {
+            return Err(io::Error::other("无法核实守护身份"));
+        }
+        let current = fs::metadata(env::current_exe()?)?;
+        let running = fs::metadata(format!("/proc/{}/exe", peer.pid))?;
+        if current.dev() != running.dev() || current.ino() != running.ino() {
+            return Err(io::Error::other("运行中的守护不是当前二进制"));
+        }
+        socket_send_all(fd, b"qixia.health v1\n")?;
+        let reply = socket_recv_line(fd, 512)?;
+        if reply != format!("qixia.health v1 version={VERSION} pid={}", peer.pid) {
+            return Err(io::Error::other("守护版本或协议不匹配"));
+        }
+        println!("{reply}");
+        Ok(())
+    })();
+    close_fd(fd);
+    result
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]

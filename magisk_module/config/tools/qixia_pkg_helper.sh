@@ -5,6 +5,7 @@
 #   qixia_pkg_helper.sh app-info top.qixia.threads
 #   qixia_pkg_helper.sh component-state com.xiaomi.joyose/.smartop.SmartOpService 0
 #   qixia_pkg_helper.sh install /data/adb/modules/QixiaThreads/config/app/QixiaThreads.apk
+#   qixia_pkg_helper.sh toast '热更新成功，无需重启手机'
 
 DIR="${QIXIA_HELPER_DIR:-${0%/*}}"
 if command -v realpath >/dev/null 2>&1; then
@@ -34,6 +35,9 @@ if [ -z "$APP_PROCESS" ]; then
     echo "error=找不到 app_process"
     exit 1
 fi
+
+# 安装器退出后会删除临时工作目录；ART 初始化仍会读取当前目录，必须先切到有效目录。
+cd / || exit 1
 
 exec "$APP_PROCESS" \
     -Djava.class.path="$JAR" \

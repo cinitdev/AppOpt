@@ -1,11 +1,12 @@
 #!/system/bin/sh
-# service.sh —— 后期启动服务阶段执行（系统基本启动完成后）
-# 在原版基础上改进:
-#   1) 用看门狗拉起 QixiaThreads 守护进程, 异常退出自动重启 (单实例)
-#   2) 把守护进程标准输出和标准错误写入 QixiaThreads.log，便于在 App 内查看
-# 其余启动兼容和厂商性能调度开关保留；core_ctl 锁核改为显式可选。
+# 后期启动服务：单实例看门狗管理 Rust 守护与前台助手，并处理延后安装。
 
 MODDIR=${0%/*}
+# 更新中断后先恢复完整运行文件；正常热启动由事务工作进程负责检查。
+if [ "$1" != --hot-update ] && [ "$1" != --install-app ] &&
+	[ -f /data/adb/qixia_hot_update/worker.sh ]; then
+	sh /data/adb/qixia_hot_update/worker.sh --recover || exit 1
+fi
 WATCHDOG_STATE_DIR="$MODDIR/config/state"
 WATCHDOG_LOCK="$WATCHDOG_STATE_DIR/service_watchdog.lock"
 WATCHDOG_OWNER=""
@@ -40,6 +41,20 @@ service_watchdog_owner_alive() {
 	[ -z "$current_boot" ] || [ -z "$owner_boot" ] || [ "$owner_boot" = "$current_boot" ]
 }
 
+# 统一读取当前链接锁和升级前的目录锁，存活判断共用 PID、启动时间与开机标识。
+service_watchdog_read_owner() {
+	if [ -L "$1" ]; then
+		readlink "$1" 2>/dev/null
+	elif [ -d "$1" ]; then
+		awk -F= '
+		$1 == "pid" && !p++ { pid=$2 }
+		$1 == "boot_id" && !b++ { boot=$2 }
+		$1 == "starttime" && !s++ { start=$2 }
+		END { printf "%s:%s:%s", pid, boot, start }
+		' "$1/owner" 2>/dev/null
+	fi
+}
+
 release_watchdog_recovery_lock() {
 	[ "$WATCHDOG_RECOVERY_HELD" = 1 ] || return
 	WATCHDOG_RECOVERY_HELD=0
@@ -57,7 +72,7 @@ publish_watchdog_lock_from_recovery() {
 }
 
 acquire_watchdog_lock() {
-	local owner owner_pid owner_boot owner_start owner_rest current_boot current_start recovery_owner
+	local owner current_boot current_start recovery_owner
 	mkdir -p "$WATCHDOG_STATE_DIR"
 	current_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 	[ -n "$current_boot" ] || exit 1
@@ -74,12 +89,8 @@ acquire_watchdog_lock() {
 		# 只有取得恢复互斥锁的进程才能检查和删除失效主锁。其他并发启动者只等待，
 		# 避免多个恢复者在“读取旧 owner”和“删除锁”之间误删刚发布的新锁。
 		if [ -d "$WATCHDOG_RECOVERY_LOCK" ] && [ ! -L "$WATCHDOG_RECOVERY_LOCK" ]; then
-			owner_pid="$(sed -n 's/^pid=//p' "$WATCHDOG_RECOVERY_LOCK/owner" 2>/dev/null | head -n 1)"
-			owner_boot="$(sed -n 's/^boot_id=//p' "$WATCHDOG_RECOVERY_LOCK/owner" 2>/dev/null | head -n 1)"
-			owner_start="$(sed -n 's/^starttime=//p' "$WATCHDOG_RECOVERY_LOCK/owner" 2>/dev/null | head -n 1)"
-			current_start="$(service_watchdog_starttime "$owner_pid")"
-			if [ -n "$owner_start" ] && [ "$owner_start" = "$current_start" ] &&
-				{ [ -z "$current_boot" ] || [ -z "$owner_boot" ] || [ "$owner_boot" = "$current_boot" ]; }; then
+			owner="$(service_watchdog_read_owner "$WATCHDOG_RECOVERY_LOCK")"
+			if service_watchdog_owner_alive "$owner" "$current_boot"; then
 				sleep 0.05
 				continue
 			fi
@@ -102,58 +113,17 @@ acquire_watchdog_lock() {
 			continue
 		fi
 		WATCHDOG_RECOVERY_HELD=1
-		if [ ! -e "$WATCHDOG_LOCK" ] && [ ! -L "$WATCHDOG_LOCK" ]; then
-			if publish_watchdog_lock_from_recovery; then
-				return 0
-			fi
-			continue
-		fi
-
-		# 兼容升级前遗留的目录锁。有效 owner 仍在运行时直接退出。
-		if [ -d "$WATCHDOG_LOCK" ]; then
-			owner_pid="$(sed -n 's/^pid=//p' "$WATCHDOG_LOCK/owner" 2>/dev/null | head -n 1)"
-			owner_boot="$(sed -n 's/^boot_id=//p' "$WATCHDOG_LOCK/owner" 2>/dev/null | head -n 1)"
-			owner_start="$(sed -n 's/^starttime=//p' "$WATCHDOG_LOCK/owner" 2>/dev/null | head -n 1)"
-			current_start="$(service_watchdog_starttime "$owner_pid")"
-			if [ -n "$owner_start" ] && [ "$owner_start" = "$current_start" ] &&
-				{ [ -z "$current_boot" ] || [ -z "$owner_boot" ] || [ "$owner_boot" = "$current_boot" ]; }; then
-				release_watchdog_recovery_lock
-				exit 0
-			fi
-			rm -f "$WATCHDOG_LOCK/owner" 2>/dev/null || true
-			rmdir "$WATCHDOG_LOCK" 2>/dev/null || true
-			if publish_watchdog_lock_from_recovery; then
-				return 0
-			fi
-			continue
-		fi
-		if [ ! -L "$WATCHDOG_LOCK" ]; then
-			rm -f "$WATCHDOG_LOCK" 2>/dev/null || true
-			if publish_watchdog_lock_from_recovery; then
-				return 0
-			fi
-			continue
-		fi
-
-		owner="$(readlink "$WATCHDOG_LOCK" 2>/dev/null)"
-		if [ -z "$owner" ]; then
-			rm -f "$WATCHDOG_LOCK" 2>/dev/null || true
-			if publish_watchdog_lock_from_recovery; then
-				return 0
-			fi
-			continue
-		fi
-		owner_pid=${owner%%:*}
-		owner_rest=${owner#*:}
-		owner_boot=${owner_rest%:*}
-		owner_start=${owner_rest##*:}
-		current_start="$(service_watchdog_starttime "$owner_pid")"
-		if [ -n "$owner_start" ] && [ "$owner_start" = "$current_start" ] &&
-			{ [ -z "$current_boot" ] || [ -z "$owner_boot" ] || [ "$owner_boot" = "$current_boot" ]; }; then
+		owner="$(service_watchdog_read_owner "$WATCHDOG_LOCK")"
+		if service_watchdog_owner_alive "$owner" "$current_boot"; then
 			release_watchdog_recovery_lock
 			exit 0
 		fi
-		rm -f "$WATCHDOG_LOCK" 2>/dev/null || true
+		if [ -d "$WATCHDOG_LOCK" ] && [ ! -L "$WATCHDOG_LOCK" ]; then
+			rm -f "$WATCHDOG_LOCK/owner" 2>/dev/null || true
+			rmdir "$WATCHDOG_LOCK" 2>/dev/null || true
+		else
+			rm -f "$WATCHDOG_LOCK" 2>/dev/null || true
+		fi
 		if publish_watchdog_lock_from_recovery; then
 			return 0
 		fi
@@ -232,9 +202,11 @@ cleanup_watchdog() {
 	release_watchdog_lock
 }
 
-acquire_watchdog_lock
-trap 'cleanup_watchdog' EXIT
-trap 'exit 0' HUP INT TERM
+if [ "$1" != --install-app ]; then
+	acquire_watchdog_lock
+	trap 'cleanup_watchdog' EXIT
+	trap 'exit 0' HUP INT TERM
+fi
 
 wait_sys_boot_completed() {
 	local i=9
@@ -243,7 +215,7 @@ wait_sys_boot_completed() {
 		sleep 9
 	done
 }
-wait_sys_boot_completed
+[ "$1" = --install-app ] || wait_sys_boot_completed
 
 cd "$MODDIR"
 BIN="$MODDIR/config/bin/QiXiaRs"
@@ -251,14 +223,12 @@ DAEMON_PROC_NAME="QiXiaRs"
 RS_RESTART_FLAG="$MODDIR/config/.qixia_restart_rs_daemon"
 CONF="$MODDIR/config/applist.conf"
 CALIB_POLICY="$MODDIR/config/calib_policy.conf"
-LOG="$MODDIR/logs/QixiaThreads.log"
-FOREGROUND_HELPER="$MODDIR/config/tools/qixia_foreground_helper.sh"
 FOREGROUND_HELPER_LOG="$MODDIR/logs/ForegroundHelper.log"
 QIXIA_IN_APP_UPDATE_FLAG="/data/adb/qixia_in_app_update"
 
 mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" \
 	"$MODDIR/config/state" "$MODDIR/logs"
-rm -f "$RS_RESTART_FLAG" 2>/dev/null || true
+[ "$1" = --install-app ] || rm -f "$RS_RESTART_FLAG" 2>/dev/null || true
 
 # 二进制不存在直接退出
 [ -f "$BIN" ] || exit 0
@@ -268,7 +238,9 @@ chmod 0755 "$BIN"
 LOG_BOOT_MARKER="$WATCHDOG_STATE_DIR/service_log.boot_id"
 CURRENT_BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 LOG_BOOT_ID="$(cat "$LOG_BOOT_MARKER" 2>/dev/null)"
-if [ -n "$CURRENT_BOOT_ID" ] && [ "$LOG_BOOT_ID" != "$CURRENT_BOOT_ID" ]; then
+if [ "$1" = --install-app ]; then
+	:
+elif [ -n "$CURRENT_BOOT_ID" ] && [ "$LOG_BOOT_ID" != "$CURRENT_BOOT_ID" ]; then
 	: > "$LOG"
 	[ -f "$FOREGROUND_HELPER_LOG" ] && : > "$FOREGROUND_HELPER_LOG"
 	printf '%s\n' "$CURRENT_BOOT_ID" > "$LOG_BOOT_MARKER"
@@ -326,16 +298,18 @@ run_app_helper() {
 }
 
 cleanup_deferred_app_files() {
-	if rm -rf "$MODDIR/config/app" && rm -f \
-		"$MODDIR/config/tools/qixia_pkg_helper.jar" \
-		"$MODDIR/config/tools/qixia_pkg_helper.sh"; then
-		return 0
+	if rm -rf "$MODDIR/config/app"; then
+		# 热更新事务还需用助手显示结果，由事务持有者在提示结束后统一清理。
+		if [ -d /data/adb/qixia_hot_update ] && [ -f "$MODDIR/config/tools/qixia_hot_update.sh" ]; then
+			return 0
+		fi
+		rm -f "$MODDIR/config/tools/qixia_pkg_helper.jar" "$MODDIR/config/tools/qixia_pkg_helper.sh" && return 0
 	fi
 	echo "- 临时 App 安装文件或安装助手清理失败，下次启动重试" >> "$LOG"
 	return 1
 }
 
-# App 内刷入模块时，随包 APK 留到重启后安装，避免终止当前刷入界面。
+# 热更新的 APK 在用户离开刷入页面后安装；普通开机仍可完成失败重试。
 install_deferred_embedded_app() {
 	local APP_DIR="$MODDIR/config/app"
 	local APP_META="$APP_DIR/app.prop"
@@ -400,7 +374,19 @@ install_deferred_embedded_app() {
 	fi
 }
 
-install_deferred_embedded_app
+if [ "$1" = --install-app ]; then
+	install_deferred_embedded_app
+	[ ! -d "$MODDIR/config/app" ]
+	exit $?
+fi
+if [ "$1" != --hot-update ] &&
+	[ "$(cat "$MODDIR/config/app/.defer_boot" 2>/dev/null)" != "$CURRENT_BOOT_ID" ]; then
+	install_deferred_embedded_app
+	# 开机补装 APK 成功后收尾；热更新工作进程会自行完成清理。
+	if [ -f "$MODDIR/config/tools/qixia_hot_update.sh" ]; then
+		sh "$MODDIR/config/tools/qixia_hot_update.sh" --cleanup >> "$LOG" 2>&1 || true
+	fi
+fi
 rm -f "$MODDIR/logs/QixiaThreads_app_info.prop" "$MODDIR/logs/QixiaThreads_app_install.prop" 2>/dev/null || true
 rm -f "$QIXIA_IN_APP_UPDATE_FLAG" 2>/dev/null || true
 
@@ -412,11 +398,14 @@ start_foreground_helper() {
 # 只检查由本模块路径启动的守护进程，避免误判其他同名进程。
 is_our_daemon_running() {
     INDEX_PIDS=""
+    INDEX_READ_OK=0
     if [ -x "$BIN" ]; then
-        INDEX_PIDS="$("$BIN" --find-pid "$DAEMON_PROC_NAME" 2>/dev/null)" || INDEX_PIDS=""
+        if INDEX_PIDS="$("$BIN" --find-pid "$DAEMON_PROC_NAME" 2>/dev/null)"; then
+            INDEX_READ_OK=1
+        fi
     fi
-    if [ -z "$INDEX_PIDS" ]; then
-        # 进程索引尚未建立时使用有界 /proc 快照，避免 pidof/pgrep 在异常 ROM 上卡死。
+    if [ "$INDEX_READ_OK" = 0 ]; then
+        # Rust 已执行完整刷新，成功返回空集合就是没有守护；只有查询失败才降级。
         for PROC_DIR in /proc/[0-9]*; do
             PID=${PROC_DIR##*/}
             [ -r "$PROC_DIR/exe" ] || continue

@@ -16,6 +16,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -23,12 +24,13 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import top.qixia.threads.ModuleUpdateDownloadViewModel
 import top.qixia.threads.ModuleUpdateDownloadViewModel.Stage
 import top.qixia.threads.ModuleUpdater
 import top.qixia.threads.compose.theme.*
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ModuleUpdateSheet(
     update: ModuleUpdater.UpdateInfo?,
@@ -43,70 +45,75 @@ fun ModuleUpdateSheet(
     val busy = state.stage == Stage.DOWNLOADING || state.stage == Stage.DETECTING_MANAGER ||
         state.stage == Stage.RETAINING_MANUAL
     val maxHeight = LocalConfiguration.current.screenHeightDp.dp * .9f
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-        containerColor = OceanSurface,
-        dragHandle = null
+    // 固定弹窗不参与正文的嵌套拖动，滚动到边界时不会重新计算底部面板锚点。
+    Dialog(
+        onDismissRequest = {},
+        properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false,
+            usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
     ) {
-        Column(Modifier.fillMaxWidth().heightIn(max = maxHeight)) {
-            Box(Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 16.dp), contentAlignment = Alignment.Center) {
-                Box(Modifier.size(32.dp, 4.dp).background(OceanOutline, RoundedCornerShape(2.dp)))
-            }
-            Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp), verticalAlignment = Alignment.CenterVertically) {
-                Surface(color = PorcelainHeader, shape = RoundedCornerShape(14.dp)) {
-                    Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
-                        Icon(Icons.Outlined.SystemUpdateAlt, null, tint = PorcelainAction, modifier = Modifier.size(24.dp))
+        Box(Modifier.fillMaxSize().safeDrawingPadding().testTag("module-update-window"),
+            contentAlignment = Alignment.BottomCenter) {
+            Surface(Modifier.widthIn(max = 640.dp).fillMaxWidth().heightIn(max = maxHeight)
+                .testTag("module-update-dialog"), color = OceanSurface,
+                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)) {
+                Column(Modifier.fillMaxWidth().height(maxHeight)) {
+                    Spacer(Modifier.height(22.dp))
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Surface(color = PorcelainHeader, shape = RoundedCornerShape(14.dp)) {
+                            Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
+                                Icon(Icons.Outlined.SystemUpdateAlt, null, tint = PorcelainAction, modifier = Modifier.size(24.dp))
+                            }
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("ROOT 模块更新", color = PorcelainOnTonal, fontSize = 10.sp,
+                                fontWeight = FontWeight.Medium, letterSpacing = 1.sp)
+                            Text("更新 QixiaThreads", color = OceanText, fontSize = 23.sp,
+                                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 3.dp))
+                        }
+                        IconButton(onDismiss) {
+                            Icon(Icons.Outlined.Close, "关闭更新详情", tint = OceanTextSecondary, modifier = Modifier.size(22.dp))
+                        }
                     }
-                }
-                Spacer(Modifier.width(12.dp))
-                Column(Modifier.weight(1f)) {
-                    Text("ROOT 模块更新", color = PorcelainOnTonal, fontSize = 10.sp,
-                        fontWeight = FontWeight.Medium, letterSpacing = 1.sp)
-                    Text("更新 QixiaThreads", color = OceanText, fontSize = 23.sp,
-                        fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 3.dp))
-                }
-                IconButton(onDismiss) {
-                    Icon(Icons.Outlined.Close, "关闭更新详情", tint = OceanTextSecondary, modifier = Modifier.size(22.dp))
-                }
-            }
-            Spacer(Modifier.height(18.dp))
-            // 主体只保留一个滚动区域，较长更新说明也不会遮住操作按钮。
-            key(update.remoteVersionCode, update.zipUrl) {
-                Column(Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState())
-                    .padding(horizontal = 22.dp).padding(bottom = 20.dp),
-                    verticalArrangement = Arrangement.spacedBy(20.dp)) {
-                    UpdateVersionSummary(update)
-                    if (state.stage != Stage.IDLE) UpdateDownloadStatus(state, busy)
-                    Column {
+                    Spacer(Modifier.height(18.dp))
+                    // 主体只保留一个滚动区域，较长更新说明也不会遮住操作按钮。
+                    key(update.remoteVersionCode, update.zipUrl) {
+                        Column(Modifier.weight(1f).fillMaxWidth().testTag("module-update-content")
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 22.dp).padding(bottom = 20.dp),
+                            verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                            UpdateVersionSummary(update)
+                            if (state.stage != Stage.IDLE) UpdateDownloadStatus(state, busy)
+                            Column {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(Modifier.size(3.dp, 16.dp).background(PorcelainAction, RoundedCornerShape(2.dp)))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("更新内容", color = OceanText, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                Spacer(Modifier.height(16.dp))
+                                if (update.changelogLoadFailed) {
+                                    Text("更新说明暂时未能加载。可稍后重新检查更新，也可继续下载模块。",
+                                        color = OceanWarning, fontSize = 14.sp, lineHeight = 23.sp)
+                                } else if (update.changelogText.isBlank()) {
+                                    Text("此版本暂未提供更新说明。", color = OceanTextSecondary, fontSize = 14.sp)
+                                } else {
+                                    UpdateChangelog(update.changelogText, Modifier.fillMaxWidth())
+                                }
+                            }
+                        }
+                    }
+                    HorizontalDivider(color = OceanDivider)
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp).padding(top = 12.dp, bottom = 16.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(Modifier.size(3.dp, 16.dp).background(PorcelainAction, RoundedCornerShape(2.dp)))
-                            Spacer(Modifier.width(8.dp))
-                            Text("更新内容", color = OceanText, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            Icon(Icons.Outlined.Info, null, tint = OceanTextSecondary, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(if (busy) "关闭弹窗后可在设置中查看进度" else "支持刷入后热更新；涉及启动策略时需要重启",
+                                color = OceanTextSecondary, fontSize = 11.sp, lineHeight = 17.sp)
                         }
-                        Spacer(Modifier.height(16.dp))
-                        if (update.changelogLoadFailed) {
-                            Text("更新说明暂时未能加载。可稍后重新检查更新，也可继续下载模块。",
-                                color = OceanWarning, fontSize = 14.sp, lineHeight = 23.sp)
-                        } else if (update.changelogText.isBlank()) {
-                            Text("此版本暂未提供更新说明。", color = OceanTextSecondary, fontSize = 14.sp)
-                        } else {
-                            UpdateChangelog(update.changelogText, Modifier.fillMaxWidth())
-                        }
+                        Spacer(Modifier.height(12.dp))
+                        UpdateSheetActions(state.stage, update, onBegin, onRetry, onCancel, onInstall)
                     }
                 }
-            }
-            HorizontalDivider(color = OceanDivider)
-            Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp).padding(top = 12.dp, bottom = 16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.Info, null, tint = OceanTextSecondary, modifier = Modifier.size(14.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(if (busy) "关闭弹窗后可在设置中查看进度" else "模块刷入后需重启设备生效",
-                        color = OceanTextSecondary, fontSize = 11.sp, lineHeight = 17.sp)
-                }
-                Spacer(Modifier.height(12.dp))
-                UpdateSheetActions(state.stage, update, onDismiss, onBegin, onRetry, onCancel, onInstall)
             }
         }
     }
@@ -173,7 +180,7 @@ private fun UpdateDownloadStatus(state: ModuleUpdateDownloadViewModel.State, bus
 
 @Composable
 private fun UpdateSheetActions(
-    stage: Stage, update: ModuleUpdater.UpdateInfo, onDismiss: () -> Unit,
+    stage: Stage, update: ModuleUpdater.UpdateInfo,
     onBegin: (ModuleUpdater.UpdateInfo) -> Unit, onRetry: () -> Unit, onCancel: () -> Unit, onInstall: () -> Unit
 ) {
     val processing = stage == Stage.DOWNLOADING || stage == Stage.DETECTING_MANAGER || stage == Stage.RETAINING_MANUAL
@@ -183,14 +190,14 @@ private fun UpdateSheetActions(
         Stage.READY_TO_INSTALL -> "开始刷入"
         Stage.FAILED -> "重试下载"
         Stage.MANUAL_READY, Stage.HANDED_OFF -> "完成"
-        else -> "查看后台进度"
+        else -> "正在处理"
     }
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (stage != Stage.MANUAL_READY && stage != Stage.HANDED_OFF) {
-            TextButton(onClick = if (processing) onCancel else onDismiss,
+        if (processing) {
+            TextButton(onClick = onCancel,
                 modifier = Modifier.heightIn(min = 50.dp), shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.textButtonColors(contentColor = OceanTextSecondary)) {
-                Text(if (processing) "取消更新" else "稍后再说", fontSize = 13.sp)
+                Text("取消更新", fontSize = 13.sp)
             }
         }
         Button(onClick = {
@@ -198,9 +205,10 @@ private fun UpdateSheetActions(
                 Stage.IDLE, Stage.RESUME_READY -> onBegin(update)
                 Stage.READY_TO_INSTALL -> onInstall()
                 Stage.FAILED -> onRetry()
-                else -> onDismiss()
+                else -> Unit
             }
-        }, modifier = Modifier.weight(1f).heightIn(min = 50.dp), shape = RoundedCornerShape(15.dp),
+        }, enabled = stage in setOf(Stage.IDLE, Stage.RESUME_READY, Stage.READY_TO_INSTALL, Stage.FAILED),
+            modifier = Modifier.weight(1f).heightIn(min = 50.dp), shape = RoundedCornerShape(15.dp),
             colors = ButtonDefaults.buttonColors(containerColor = PorcelainAction, contentColor = Color.White)) {
             Icon(when (stage) {
                 Stage.READY_TO_INSTALL -> Icons.Outlined.SystemUpdateAlt

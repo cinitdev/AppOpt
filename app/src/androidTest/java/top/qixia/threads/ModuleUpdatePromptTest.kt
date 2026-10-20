@@ -11,6 +11,14 @@ import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeUp
+import androidx.compose.ui.test.swipeDown
+import androidx.compose.ui.test.click
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.test.espresso.Espresso
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -82,6 +90,51 @@ class ModuleUpdatePromptTest {
         assertNoAutomaticAction()
         compose.onNodeWithText("下载模块").performClick()
         compose.runOnIdle { assertEquals(1, downloads); assertEquals(0, installs) }
+    }
+
+    @Test fun onlyCloseButtonDismissesAndScrollingKeepsDialogBoundsStable() {
+        val longUpdate = update.copy(changelogText = (1..35).joinToString("\n\n") {
+            "## 更新 $it\n\n**修复** 长文档滚动边界，保留 `配置` 和 [说明](https://example.com)。"
+        })
+        updates.value = updates.value.copy(moduleResult = ModuleUpdater.CheckResult.UpdateAvailable(longUpdate))
+        show()
+        val dialog = compose.onNodeWithTag("module-update-dialog")
+        val content = compose.onNodeWithTag("module-update-content")
+        val bounds = dialog.fetchSemanticsNode().boundsInRoot
+        repeat(30) { content.performTouchInput { swipeUp() } }
+        val range = content.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange]
+        compose.runOnIdle {
+            assertEquals(range.maxValue(), range.value(), 1f)
+        }
+        repeat(3) {
+            content.performTouchInput { swipeUp() }
+            assertEquals(bounds, dialog.fetchSemanticsNode().boundsInRoot)
+            compose.onNodeWithText("下载模块").assertIsDisplayed()
+        }
+        compose.onNodeWithText("更新 QixiaThreads").performTouchInput { swipeDown() }
+        Espresso.pressBackUnconditionally()
+        compose.onNodeWithTag("module-update-window").performTouchInput {
+            click(Offset(centerX, 1f))
+        }
+        compose.onNodeWithContentDescription("关闭更新详情").assertIsDisplayed()
+        assertEquals(bounds, dialog.fetchSemanticsNode().boundsInRoot)
+        compose.onNodeWithText("稍后再说").assertDoesNotExist()
+        assertNoAutomaticAction()
+        compose.onNodeWithContentDescription("关闭更新详情").performClick()
+        dialog.assertDoesNotExist()
+    }
+
+    @Test fun progressUpdatesAndCancelDoNotCloseTheDialog() {
+        download.value = ModuleUpdateDownloadViewModel.State(update, Stage.DOWNLOADING, percent = 10)
+        show()
+        compose.onNodeWithText("设置查看更新").performClick()
+        val dialog = compose.onNodeWithTag("module-update-dialog")
+        val bounds = dialog.fetchSemanticsNode().boundsInRoot
+        compose.runOnIdle { download.value = download.value.copy(percent = 70) }
+        assertEquals(bounds, dialog.fetchSemanticsNode().boundsInRoot)
+        compose.onNodeWithText("取消更新").performClick()
+        compose.runOnIdle { assertEquals(1, cancellations) }
+        compose.onNodeWithContentDescription("关闭更新详情").assertIsDisplayed()
     }
 
     @Test fun startupWaitsForGlobalBlockersAndResumedLifecycle() {

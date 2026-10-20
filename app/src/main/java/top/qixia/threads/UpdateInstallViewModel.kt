@@ -6,6 +6,7 @@ import android.os.Looper
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
+import kotlin.concurrent.thread
 
 internal object BoundedInstallLog {
     const val DEFAULT_MAX_CHARS = 64 * 1024
@@ -42,7 +43,8 @@ class UpdateInstallViewModel : ViewModel() {
         val log: String = "",
         val running: Boolean = true,
         val success: Boolean? = null,
-        val rebootRequired: Boolean = false
+        val rebootRequired: Boolean = false,
+        val appUpdatePending: Boolean = false
     )
 
     private val mutableState = MutableLiveData(State())
@@ -84,19 +86,25 @@ class UpdateInstallViewModel : ViewModel() {
                     ModuleUpdater.clearPersistedDownload(context, update)
                     appendResult(
                         true,
-                        if (rebootRequired) listOf("模块已刷入，重启后生效", "App 将在重启后自动更新")
-                        else listOf(message)
+                        listOf(message)
                     )
                     flushLogPublish()
                     updateState {
                         copy(
                             statusTitle = if (rebootRequired) "等待重启" else "更新已完成",
-                            statusDetail = if (rebootRequired) "模块已刷入，重启后生效" else message,
+                            statusDetail = message,
                             log = logSnapshot(),
-                            running = false,
+                            running = !rebootRequired,
                             success = true,
                             rebootRequired = rebootRequired
                         )
+                    }
+                    if (!rebootRequired) thread(name = "QixiaThreadsPendingApk") {
+                        val pending = ModuleHotUpdate.hasPendingApp()
+                        mainHandler.post {
+                            updateState { copy(appUpdatePending = pending, running = false,
+                                statusDetail = if (pending) "$message；点击完成后更新 App，稍后从桌面重新打开" else message) }
+                        }
                     }
                 }
 
