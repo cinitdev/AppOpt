@@ -72,6 +72,8 @@ pub struct Policy {
     pub paths: Vec<String>,
     pub members: Vec<usize>,
     pub max_khz: Option<u64>,
+    /// related_cpus 包含离线成员；只有 affected_cpus 时不能确认完整调频域。
+    pub related_cpus_known: bool,
 }
 
 pub fn policies(root: &Path) -> Vec<Policy> {
@@ -94,12 +96,11 @@ pub fn policies(root: &Path) -> Vec<Policy> {
     );
     let mut result: BTreeMap<Vec<usize>, Policy> = BTreeMap::new();
     for p in paths {
-        let members = ["related_cpus", "affected_cpus"]
-            .iter()
-            .filter_map(|key| read(root, &format!("{p}/{key}")))
-            .map(|s| ids(&s))
-            .find(|v| !v.is_empty())
-            .unwrap_or_default();
+        let related = read(root, &format!("{p}/related_cpus"))
+            .map(|s| ids(&s)).filter(|v| !v.is_empty());
+        let related_cpus_known = related.is_some();
+        let members = related.or_else(|| read(root, &format!("{p}/affected_cpus"))
+            .map(|s| ids(&s))).unwrap_or_default();
         if members.is_empty() {
             continue;
         }
@@ -108,9 +109,11 @@ pub fn policies(root: &Path) -> Vec<Policy> {
             paths: Vec::new(),
             members,
             max_khz: None,
+            related_cpus_known: false,
         });
         policy.paths.push(p);
         policy.max_khz = policy.max_khz.or(max_khz);
+        policy.related_cpus_known |= related_cpus_known;
     }
     result.into_values().collect()
 }
@@ -203,6 +206,37 @@ pub struct PerformanceGroups {
     pub complete: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrequencyDomains {
+    pub domains: Vec<Vec<usize>>,
+    pub complete: bool,
+}
+
+/// 调频域由内核策略成员决定；同频同能力的独立域也不能合并。
+/// 只供拓扑展示使用，缺失、重叠或包含设备之外的成员时不宣称识别完整。
+pub fn frequency_domains(cores: &[Core], policies: &[Policy]) -> FrequencyDomains {
+    use std::collections::BTreeSet;
+    let present: BTreeSet<_> = cores.iter().map(|core| core.id).collect();
+    let mut complete = !present.is_empty() && present.len() == cores.len();
+    let mut domains = BTreeSet::new();
+    for policy in policies {
+        let members: BTreeSet<_> = policy.members.iter().copied().collect();
+        complete &= policy.related_cpus_known && !members.is_empty()
+            && members.len() == policy.members.len() && members.is_subset(&present);
+        if !members.is_empty() {
+            domains.insert(members.into_iter().collect::<Vec<_>>());
+        }
+    }
+    let mut covered = BTreeSet::new();
+    for domain in &domains {
+        for cpu in domain {
+            if !covered.insert(*cpu) { complete = false; }
+        }
+    }
+    complete &= covered == present;
+    FrequencyDomains { domains: domains.into_iter().collect(), complete }
+}
+
 /// 按测得的硬件能力分组，不依据型号名称、MIDR 编号顺序或频率策略归属。
 /// 此视图不会改变调度器使用的各 CPU 硬件信息。
 pub fn performance_groups(cores: &[Core]) -> PerformanceGroups {
@@ -240,6 +274,10 @@ pub fn performance_groups(cores: &[Core]) -> PerformanceGroups {
 #[cfg(test)]
 #[path = "cpu_performance_tests.rs"]
 mod performance_tests;
+
+#[cfg(test)]
+#[path = "cpu_domain_tests.rs"]
+mod domain_tests;
 
 #[cfg(test)]
 mod tests {

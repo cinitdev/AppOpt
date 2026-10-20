@@ -4,6 +4,71 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SettingsTopologyPresentationTest {
+    @Test fun dimensity8100KeepsThreeDomainsWithoutCreatingAFakePrimeTier() {
+        val result = SettingsTopologyPresentation.parse(
+            block(listOf("0-3", "4-7")) + domains(listOf("0-3", "4-6", "7")), (0..7).toSet())
+        assertTrue(result.confirmed)
+        assertTrue(result.domainsConfirmed)
+        assertEquals(2, result.groups.size)
+        assertEquals(listOf((0..3).toSet(), (4..6).toSet(), setOf(7)), result.domains.map { it.cpus })
+    }
+
+    @Test fun unknownDomainsNeverBorrowThePerformanceGroupCount() {
+        val performance = block(listOf("0-3", "4-7"))
+        for (frequency in listOf("", domains(listOf("0-3", "4-7")).replace("freq_complete=1", "freq_complete=0"))) {
+            val result = SettingsTopologyPresentation.parse(performance + frequency, (0..7).toSet())
+            assertTrue(result.confirmed)
+            assertFalse(result.domainsConfirmed)
+            assertTrue(result.domains.isEmpty())
+        }
+    }
+
+    @Test fun invalidDomainsDoNotDiscardValidPerformanceGroups() {
+        val performance = block(listOf("0-3", "4-7"))
+        val valid = domains(listOf("0-3", "4-6", "7"))
+        for (frequency in listOf(
+            domains(listOf("0-3", "3-7")), domains(listOf("0-3", "4-6")),
+            domains(listOf("0-3", "4-8")), domains(listOf("0-3", "4-7,7")),
+            domains(listOf("0-3", "4-2147483647")),
+            valid.replace("freq_domains=3", "freq_domains=2"),
+            valid.replace("detected_freq_domain_1=4-6", "detected_freq_domain_5=4-6"),
+            valid.replace("detected_freq_domains=3\n", "")
+        )) {
+            val result = SettingsTopologyPresentation.parse(performance + frequency, (0..7).toSet())
+            assertTrue(result.confirmed)
+            assertFalse(frequency, result.domainsConfirmed)
+            assertTrue(result.domains.isEmpty())
+        }
+    }
+
+    @Test fun frequencyDomainsCanBeKnownBeforePerformanceAndCanCrossGroups() {
+        val result = SettingsTopologyPresentation.parse(
+            "detected_complete=0\n" + domains(listOf("0-3", "4-6", "7")), (0..7).toSet())
+        assertFalse(result.confirmed)
+        assertTrue(result.domainsConfirmed)
+        val crossed = SettingsTopologyPresentation.parse(
+            block(listOf("0-1", "2-3")) + domains(listOf("0,2", "1,3")), (0..3).toSet())
+        assertTrue(crossed.confirmed)
+        assertTrue(crossed.domainsConfirmed)
+        assertEquals(listOf(setOf(0, 2), setOf(1, 3)), crossed.domains.map { it.cpus })
+    }
+
+    @Test fun tenCoreAndSparseDomainsUseReportedMembers() {
+        for (groups in listOf(listOf("0-3", "4-7", "8-9"), listOf("2", "6,10"))) {
+            val present = if (groups.size == 3) (0..9).toSet() else setOf(2, 6, 10)
+            val result = SettingsTopologyPresentation.parse(block(groups) + domains(groups), present)
+            assertTrue(result.domainsConfirmed)
+            assertEquals(present, result.domains.flatMap { it.cpus }.toSet())
+        }
+    }
+
+    private fun domains(groups: List<String>): String = buildString {
+        appendLine()
+        appendLine("detected_freq_complete=1")
+        appendLine("detected_freq_domains=${groups.size}")
+        groups.forEachIndexed { index, cpus -> appendLine("detected_freq_domain_$index=$cpus") }
+    }
+
     @Test fun twoThreeAndFourPerformanceGroupsStayDynamic() {
         for (groups in listOf(
             listOf("0-5", "6-7"),

@@ -136,6 +136,7 @@ internal fun SettingsCalibrationNote() {
 @Composable
 internal fun SettingsTopologyContent(block: String, presentCpus: Set<Int>) {
     var expanded by rememberSaveable { mutableStateOf(false) }
+    var rawExpanded by rememberSaveable { mutableStateOf(false) }
     val topology = remember(block, presentCpus) {
         SettingsTopologyPresentation.parse(block, presentCpus)
     }
@@ -154,6 +155,10 @@ internal fun SettingsTopologyContent(block: String, presentCpus: Set<Int>) {
                     !topology.confirmed -> "${presentCpus.size} 个核心 · 分组待确认"
                     else -> "${presentCpus.size} 个核心 · ${topology.groups.size} 个性能组"
                 }, color = OceanTextSecondary, fontSize = 12.sp, lineHeight = 18.sp, modifier = Modifier.padding(top = 3.dp))
+                if (presentCpus.isNotEmpty()) {
+                    Text(if (topology.domainsConfirmed) "${topology.domains.size} 个独立调频域" else "调频域待确认",
+                        color = PorcelainOnTonal, fontSize = 12.sp, lineHeight = 18.sp)
+                }
             }
             TextButton({ expanded = !expanded }, enabled = topology.fields.isNotEmpty(),
                 modifier = Modifier.heightIn(min = 48.dp), contentPadding = PaddingValues(horizontal = 6.dp)) {
@@ -166,14 +171,23 @@ internal fun SettingsTopologyContent(block: String, presentCpus: Set<Int>) {
             Text(if (presentCpus.isEmpty()) "暂无设备拓扑数据" else "CPU ${RuleConfigLogic.formatCpuRangeList(presentCpus)}",
                 color = PorcelainOnTonal, fontSize = 12.sp, lineHeight = 18.sp)
         } else {
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 topology.groups.forEachIndexed { index, group ->
-                    Surface(color = OceanSurfaceHigh, shape = RoundedCornerShape(10.dp)) {
-                        Column(Modifier.padding(horizontal = 11.dp, vertical = 8.dp)) {
-                            Text("性能组 ${index + 1}",
-                                color = OceanTextSecondary, fontSize = 11.sp, lineHeight = 16.sp)
+                    Surface(Modifier.fillMaxWidth(), color = OceanSurfaceHigh, shape = RoundedCornerShape(10.dp)) {
+                        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                            Text("性能组 ${index + 1}", color = OceanTextSecondary, fontSize = 11.sp, lineHeight = 16.sp)
                             Text("CPU ${RuleConfigLogic.formatCpuRangeList(group.cpus)}", color = PorcelainOnTonal, fontSize = 12.sp, lineHeight = 18.sp,
                                 fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 2.dp))
+                            if (topology.domainsConfirmed) {
+                                topology.domains.forEachIndexed { domainIndex, domain ->
+                                    if (domain.cpus.any { it in group.cpus }) {
+                                        val crossGroup = if (domain.cpus.any { it !in group.cpus }) "（跨性能组共享）" else ""
+                                        Text("调频域 ${domainIndex + 1} · CPU ${RuleConfigLogic.formatCpuRangeList(domain.cpus)}$crossGroup",
+                                            color = OceanTextSecondary, fontSize = 12.sp, lineHeight = 18.sp,
+                                            modifier = Modifier.padding(top = 4.dp))
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -181,16 +195,39 @@ internal fun SettingsTopologyContent(block: String, presentCpus: Set<Int>) {
         }
         if (expanded) {
             HorizontalDivider(Modifier.padding(vertical = 12.dp), color = OceanDivider)
-            topology.fields.forEach { (name, value) ->
-                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(name.removePrefix("detected_"), Modifier.weight(.4f), color = OceanTextSecondary,
-                        fontSize = 12.sp, lineHeight = 18.sp, fontFamily = FontFamily.Monospace)
-                    Text(value.ifBlank { "—" }, Modifier.weight(.6f), color = OceanText,
-                        fontSize = 12.sp, lineHeight = 18.sp, fontFamily = FontFamily.Monospace)
+            Text("独立调频范围", color = OceanText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            if (topology.domainsConfirmed) {
+                topology.domains.forEachIndexed { index, domain ->
+                    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("调频域 ${index + 1}", Modifier.weight(1f), color = OceanTextSecondary, fontSize = 12.sp)
+                        Text("CPU ${RuleConfigLogic.formatCpuRangeList(domain.cpus)}", Modifier.weight(1f),
+                            color = PorcelainOnTonal, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    }
+                }
+            } else {
+                Text(topology.domainPendingReason.orEmpty(), color = OceanTextSecondary, fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 6.dp))
+            }
+            Text("性能组表示能力相近的核心；调频域表示内核可以独立调节频率的核心范围。同一性能组可以包含多个调频域。",
+                color = OceanTextSecondary, fontSize = 12.sp, lineHeight = 18.sp, modifier = Modifier.padding(top = 8.dp))
+            TextButton(onClick = { rawExpanded = !rawExpanded }, contentPadding = PaddingValues(0.dp)) {
+                Text(if (rawExpanded) "收起诊断字段" else "查看诊断字段", fontSize = 12.sp)
+            }
+            if (rawExpanded) {
+                Text("low / main / high 等是内部范围别名，可能重复，不代表额外硬件分组。",
+                    color = OceanTextSecondary, fontSize = 12.sp, lineHeight = 18.sp)
+                topology.fields.forEach { (name, value) ->
+                    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(name.removePrefix("detected_"), Modifier.weight(.55f), color = OceanTextSecondary,
+                            fontSize = 12.sp, lineHeight = 18.sp, fontFamily = FontFamily.Monospace)
+                        Text(value.ifBlank { "—" }, Modifier.weight(.45f), color = OceanText,
+                            fontSize = 12.sp, lineHeight = 18.sp, fontFamily = FontFamily.Monospace)
+                    }
                 }
             }
         }
-        Text(topology.pendingReason ?: "按核心能力与硬件最高频率分组，同组可包含不同核心架构。", color = OceanTextSecondary, fontSize = 12.sp,
+        Text(topology.pendingReason ?: if (!topology.domainsConfirmed) topology.domainPendingReason.orEmpty()
+            else "性能相近不代表共用调频域，核心分配仍可单独指定 CPU。", color = OceanTextSecondary, fontSize = 12.sp,
             lineHeight = 18.sp, modifier = Modifier.padding(top = 10.dp))
     }
 }

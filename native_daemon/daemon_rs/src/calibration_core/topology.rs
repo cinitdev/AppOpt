@@ -11,16 +11,20 @@ pub(super) struct CpuTiers {
     fallback: String,
     all: String,
     groups: Vec<String>,
+    domains: Vec<String>,
+    pub(super) domains_complete: bool,
     pub(super) complete: bool,
 }
 impl CpuTiers {
     pub(super) fn detect() -> Self {
-        Self::from_cores(&qixia_kernel_info::cpu::cores(Path::new("/")))
+        let root = Path::new("/");
+        Self::from_cores(&qixia_kernel_info::cpu::cores(root), &qixia_kernel_info::cpu::policies(root))
     }
 
-    fn from_cores(cores: &[qixia_kernel_info::cpu::Core]) -> Self {
-        use qixia_kernel_info::cpu::{format_ids, performance_groups};
+    fn from_cores(cores: &[qixia_kernel_info::cpu::Core], policies: &[qixia_kernel_info::cpu::Policy]) -> Self {
+        use qixia_kernel_info::cpu::{format_ids, performance_groups, frequency_domains};
         let detected = performance_groups(cores);
+        let frequency = frequency_domains(cores, policies);
         let groups: Vec<_> = detected.groups.iter().map(|ids| format_ids(ids)).collect();
         let all = format_ids(&cores.iter().map(|c| c.id).collect::<Vec<_>>());
         let low = groups.first().cloned().unwrap_or_default();
@@ -48,6 +52,8 @@ impl CpuTiers {
             fallback,
             all,
             groups,
+            domains: frequency.domains.iter().map(|ids| format_ids(ids)).collect(),
+            domains_complete: frequency.complete,
             complete: detected.complete,
         }
     }
@@ -122,6 +128,11 @@ fn policy_with_topology(old: &str, topo: &CpuTiers) -> Option<String> {
     for (index, cpus) in topo.groups.iter().enumerate() {
         block.push_str(&format!("detected_group_{index}={cpus}\n"));
     }
+    block.push_str(&format!("detected_freq_complete={}\ndetected_freq_domains={}\n",
+        u8::from(topo.domains_complete), topo.domains.len()));
+    for (index, cpus) in topo.domains.iter().enumerate() {
+        block.push_str(&format!("detected_freq_domain_{index}={cpus}\n"));
+    }
     block.push_str(CALIB_TOPO_END);
     block.push('\n');
     next.push_str(&block);
@@ -183,6 +194,37 @@ mod topology_policy_tests {
     use super::*;
 
     #[test]
+    fn equal_big_cores_keep_independent_frequency_domains_in_policy() {
+        use qixia_kernel_info::cpu::{Core, Policy};
+        let cores: Vec<_> = (0..8).map(|id| Core {
+            id, capacity: Some(if id < 4 { 274 } else { 1024 }),
+            max_khz: Some(if id < 4 { 2_000_000 } else { 2_850_000 }), architecture: None,
+        }).collect();
+        let policies: Vec<_> = [vec![0, 1, 2, 3], vec![4, 5, 6], vec![7]].into_iter()
+            .map(|members| Policy { paths: vec![], members, max_khz: None, related_cpus_known: true }).collect();
+        let topo = CpuTiers::from_cores(&cores, &policies);
+        let next = policy_with_topology("auto_history_enabled=1\n", &topo).unwrap();
+        assert!(next.contains("detected_clusters=2\n"));
+        assert!(next.contains("detected_freq_complete=1\ndetected_freq_domains=3\n"));
+        assert!(next.contains("detected_freq_domain_1=4-6\ndetected_freq_domain_2=7\n"));
+        assert_eq!(policy_with_topology(&next, &topo).unwrap(), next);
+        let missing = CpuTiers::from_cores(&cores, &[]);
+        let replaced = policy_with_topology(&next, &missing).unwrap();
+        assert!(replaced.contains("detected_complete=1\n"));
+        assert!(replaced.contains("detected_freq_complete=0\n"));
+        assert!(!replaced.contains("detected_freq_domain_2="));
+    }
+
+    #[test]
+    #[ignore = "只读实机拓扑诊断，需在 Android 设备手动执行"]
+    fn inspect_device_topology() {
+        let topo = CpuTiers::detect();
+        println!("{}", policy_with_topology("", &topo).unwrap());
+        assert!(topo.complete, "设备未提供完整的核心能力与最高频率");
+        assert!(topo.domains_complete, "设备未提供完整的调频域成员");
+    }
+
+    #[test]
     fn k70_metadata_combines_equal_performance_architectures_and_replaces_old_groups() {
         use qixia_kernel_info::cpu::Core;
         let cores: Vec<_> = (0..8).map(|id| {
@@ -194,7 +236,7 @@ mod topology_policy_tests {
             };
             Core { id, capacity: Some(capacity), max_khz: Some(max_khz), architecture: Some(architecture) }
         }).collect();
-        let topo = CpuTiers::from_cores(&cores);
+        let topo = CpuTiers::from_cores(&cores, &[]);
         assert!(topo.complete);
         assert_eq!(topo.groups, ["0-2", "3-6", "7"]);
         assert_eq!(topo.mid, "3-6");
@@ -219,12 +261,12 @@ mod topology_policy_tests {
                 max_khz: Some(if id < count - 2 { 3_600_000 } else { 4_600_000 }),
                 architecture: Some(0x5100_0010),
             }).collect();
-            let topo = CpuTiers::from_cores(&cores);
+            let topo = CpuTiers::from_cores(&cores, &[]);
             assert!(topo.complete);
             assert_eq!(topo.groups.len(), 2);
             assert_eq!(topo.groups[1], format!("{}-{}", count - 2, count - 1));
             cores[0].capacity = None;
-            let partial = policy_with_topology("", &CpuTiers::from_cores(&cores)).unwrap();
+            let partial = policy_with_topology("", &CpuTiers::from_cores(&cores, &[])).unwrap();
             assert!(partial.contains("detected_complete=0\n"));
         }
     }
@@ -232,7 +274,8 @@ mod topology_policy_tests {
     fn two_cluster_topology() -> CpuTiers {
         CpuTiers { clusters: 2, low: "0-5".into(), highest: "6-7".into(),
             high: "0-5".into(), mid: "0-5".into(), fallback: "0-5".into(),
-            all: "0-7".into(), groups: vec!["0-5".into(), "6-7".into()], complete: true }
+            all: "0-7".into(), groups: vec!["0-5".into(), "6-7".into()], complete: true,
+            domains: vec!["0-5".into(), "6-7".into()], domains_complete: true }
     }
 
     #[test]

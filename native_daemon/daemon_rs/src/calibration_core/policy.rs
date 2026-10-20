@@ -27,7 +27,7 @@ impl PolicyTopologySync {
         if !changed && now < self.next_check { return; }
         // 同次开机期间硬件拓扑保持稳定，只有启动时证据不完整才需重新探测
         // sysfs；正常检查只读取一个小文件。
-        if !self.topology.complete && now >= self.next_detection {
+        if (!self.topology.complete || !self.topology.domains_complete) && now >= self.next_detection {
             self.topology = CpuTiers::detect();
             self.next_detection = now + Duration::from_secs(60);
         }
