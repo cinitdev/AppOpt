@@ -49,22 +49,8 @@ fn diagnose_live_streams() {
         let links = state.pid_links.remove(&pid).unwrap();
         assert!(crate::attach::detach_pid_links(&mut state.bpf, pid, links).is_empty());
         crate::streams::clear_pid_samples(state, pid);
-        let mut links = std::collections::HashMap::new();
-        for tid in crate::procfs::collect_task_ids(pid).unwrap() {
-            if let Ok(link) = crate::attach::attach_symbol_for_task(
-                &mut state.bpf,
-                pid,
-                tid,
-                &path,
-                &symbol,
-                offset,
-            ) {
-                links.insert(tid, vec![link]);
-            }
-        }
-        assert!(!links.is_empty());
-        state.pid_links.insert(pid, links);
-        state.pid_symbol_offsets.insert(pid, offset);
+        let link = crate::attach::attach_symbol_for_process(&mut state.bpf, pid, &path, &symbol, offset).unwrap();
+        state.pid_links.insert(pid, vec![link]);
         state.pid_symbol_probes.get_mut(&pid).unwrap().confirmed = true;
         state.pid_symbols.insert(pid, CString::new(symbol).unwrap());
     }
@@ -189,6 +175,7 @@ fn kernel_map_retirement_preserves_live_surface_and_symbol_epoch() {
     ));
     // 静止超过探测时间仍保留已挂载符号，避免随后滑动落入重试空窗。
     let link_count = ctx.pid_links[&pid].len();
+    assert_eq!(link_count, 1, "同一进程的帧入口不能按线程重复挂载");
     for _ in crate::constants::LIBGUI_FRAME_SYMBOLS {
         crate::probes::advance_symbol_probes(
             &mut ctx,
@@ -201,8 +188,80 @@ fn kernel_map_retirement_preserves_live_surface_and_symbol_epoch() {
     assert_eq!(crate::ffi::qixia_ebpf_probe_state(&*ctx), 4);
     assert!(ctx.target_tgids.get(&pid, 0).is_ok());
     assert!(on_frame(&mut ctx, FrameEvent { timestamp_ns: now + 20_000_000, ..event }));
+    // 静止时不换入口；确实收到无效回调参数后，才切到时间戳更新入口。
+    let previous = ctx.pid_symbol_probes[&pid].candidate_index;
+    let offsets = crate::symbols::resolve_candidate_offsets(&ctx.pid_libgui_paths[&pid]).unwrap();
+    let next = offsets.iter().enumerate().skip(previous + 1).find_map(|(index, offset)| offset.map(|_| index));
+    ctx.invalid_latch.insert(pid, 1, 0).unwrap();
+    crate::probes::advance_symbol_probes(&mut ctx, monotonic_ns() + crate::constants::SYMBOL_PROBE_NS * 2).unwrap();
+    // 不同系统导出的兼容符号不同，按设备实际可用的下一入口断言。
+    assert_eq!(ctx.pid_symbol_probes[&pid].candidate_index, next.unwrap_or(previous));
+    if next.is_some() { assert!(ctx.invalid_latch.get(&pid, 0).is_err()); }
+    else { assert!(ctx.pid_symbol_probes[&pid].waiting); }
     crate::targets::sync_target_pids(&mut ctx, &[]).unwrap();
     assert_eq!(ctx.last_error.to_bytes(), b"");
+}
+
+#[test]
+#[ignore = "需要 Root，仅使用独立测试进程的映射验证多帧源选择"]
+fn kernel_sparse_secondary_stream_does_not_suppress_live_frames() {
+    use crate::clock::monotonic_ns;
+    use crate::context::BackendKind;
+    use crate::fps_stream::FpsStream;
+    use crate::streams::{refresh_current_fps, stream_key_from_parts};
+    let dir = PathBuf::from(std::env::var("QIXIA_TEST_BPF").unwrap());
+    let pid = std::process::id();
+    let make_stream = |end: u64, hz: u64| {
+        let mut stream = FpsStream::new(end - 3_000_000_000);
+        for index in 0..=hz * 3 {
+            stream.on_frame(end - 3_000_000_000 + index * 1_000_000_000 / hz);
+        }
+        stream
+    };
+    for (filename, kind) in [
+        ("queuebuffer_probe.bpf.o", BackendKind::RingBuf),
+        ("queuebuffer_probe_stats.bpf.o", BackendKind::StatsMap),
+        ("queuebuffer_probe_perf.bpf.o", BackendKind::PerfEvent),
+    ] {
+        let mut ctx = crate::loader::start_backend(
+            &dir.with_file_name(filename), kind, pid as i32, None,
+        ).unwrap();
+        let live = stream_key_from_parts(pid, 1, 0x1234);
+        let secondary = stream_key_from_parts(pid, 2, 0x5678);
+        let warming = stream_key_from_parts(pid, 3, 0x9abc);
+        for hz in [24, 30, 60, 120, 144, 165, 240, 480] {
+            let now = monotonic_ns();
+            ctx.streams.clear();
+            ctx.pending_stream = None;
+            ctx.selected_stream = Some(secondary);
+            ctx.streams.insert(secondary, make_stream(now, 5));
+            ctx.streams.insert(live, make_stream(now, hz));
+            refresh_current_fps(&mut ctx, now);
+            // 连续帧源胜出仍需经过原有等待，避免来回跳动；等待结束后必须离开低频队列。
+            assert_eq!(ctx.selected_stream, Some(secondary), "{filename}, {hz}");
+            let next = now + 610_000_000;
+            ctx.streams.insert(secondary, make_stream(next, 5));
+            ctx.streams.insert(live, make_stream(next, hz));
+            refresh_current_fps(&mut ctx, next);
+            assert_eq!(ctx.selected_stream, Some(live), "{filename}, {hz}");
+            assert!((ctx.cur_fps - hz as f64).abs() < 0.2);
+            let mut partial = FpsStream::new(next - 50_000_000);
+            for timestamp in [next - 50_000_000, next - 25_000_000, next] {
+                partial.on_frame(timestamp);
+            }
+            ctx.streams.insert(warming, partial);
+            refresh_current_fps(&mut ctx, next);
+            assert_eq!(ctx.selected_stream, Some(live));
+            assert!((ctx.cur_fps - hz as f64).abs() < 0.2);
+            // 持续画面结束后，真正仅有 5 FPS 的场景仍按实测值输出。
+            ctx.streams.remove(&live);
+            ctx.streams.remove(&warming);
+            refresh_current_fps(&mut ctx, next);
+            assert_eq!(ctx.selected_stream, Some(secondary));
+            assert!((ctx.cur_fps - 5.0).abs() < 0.1);
+        }
+        println!("{filename}: 多帧源选择、预热隔离、切换等待和真实低帧保留通过");
+    }
 }
 
 #[test]
@@ -484,10 +543,14 @@ fn completion_sources_only_use_known_timestamp_abis() {
     assert_eq!(crate::symbols::code_address(object::Architecture::Arm, 0x8793c), 0x8793c);
     assert_eq!(crate::symbols::code_address(object::Architecture::Aarch64, 0xc945c), 0xc945c);
     for (index, symbol) in LIBGUI_FRAME_SYMBOLS.iter().enumerate() {
-        assert!(symbol.contains("BLASTBufferQueue19transactionCallback"));
+        assert!(symbol.contains(match index {
+            0 | 1 => "BLASTBufferQueue19transactionCallback",
+            2 | 3 => "BLASTBufferItemConsumer21updateFrameTimestamps",
+            _ => "ConsumerFrameEventHistory8addLatch",
+        }));
         assert!(!symbol.contains("Committed"));
         let abi = crate::constants::frame_callback_abi(index);
-        assert_eq!(symbol.contains("CallbackEx"), abi == 2);
+        assert_eq!(symbol.contains("CallbackEx") || symbol.ends_with("Eyx") || symbol.ends_with("Exx"), abi % 2 == 0);
     }
 }
 
@@ -513,8 +576,56 @@ fn batched_completed_callbacks_preserve_high_refresh_timing() {
 
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub extern "C" fn qixia_test_frame_callback(queue: usize, latch: i64) -> u64 {
-    std::hint::black_box(queue as u64).wrapping_add(std::hint::black_box(latch as u64))
+pub extern "C" fn qixia_test_frame_callback(queue: usize, frame_number: u64, latch: i64) -> u64 {
+    std::hint::black_box(queue as u64)
+        .wrapping_add(std::hint::black_box(frame_number))
+        .wrapping_add(std::hint::black_box(latch as u64))
+}
+
+#[test]
+#[ignore = "需要 Root，仅验证测试进程的单个 uprobe 是否覆盖已有和新建线程"]
+fn kernel_process_probe_covers_existing_and_new_threads() {
+    use crate::context::{BackendKind, FrameStatsKey};
+    use object::{Object, ObjectSection, ObjectSymbol};
+    let path = PathBuf::from(std::env::var("QIXIA_TEST_BPF").unwrap());
+    let executable = std::fs::read_link("/proc/self/exe").unwrap();
+    let bytes = std::fs::read(&executable).unwrap();
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    let symbol = object.symbols().find(|symbol| symbol.name() == Ok("qixia_test_frame_callback")).unwrap();
+    let section = object.section_by_index(symbol.section_index().unwrap()).unwrap();
+    let offset = crate::symbols::code_address(object.architecture(), symbol.address()) - section.address() + section.file_range().unwrap().0;
+    let pid = std::process::id();
+    let (send, recv) = std::sync::mpsc::channel::<()>();
+    let (done, received) = std::sync::mpsc::channel();
+    let existing = std::thread::spawn(move || {
+        recv.recv().unwrap();
+        qixia_test_frame_callback(0x1111, 1, crate::clock::monotonic_ns() as i64);
+        done.send(()).unwrap();
+    });
+    let mut ctx = crate::loader::start_backend(&path, BackendKind::StatsMap, pid as i32, None).unwrap();
+    assert_eq!(ctx.pid_links[&pid].len(), 1);
+    let links = ctx.pid_links.remove(&pid).unwrap();
+    assert!(crate::attach::detach_pid_links(&mut ctx.bpf, pid, links).is_empty());
+    let link = crate::attach::attach_symbol_for_process(&mut ctx.bpf, pid, &executable, "qixia_test_frame_callback", offset).unwrap();
+    ctx.pid_links.insert(pid, vec![link]);
+    ctx.target_tgids.insert(pid, if cfg!(target_pointer_width = "32") { 4 } else { 3 }, 0).unwrap();
+    send.send(()).unwrap();
+    received.recv().unwrap();
+    existing.join().unwrap();
+    std::thread::spawn(|| { qixia_test_frame_callback(0x2222, 2, crate::clock::monotonic_ns() as i64); }).join().unwrap();
+    qixia_test_frame_callback(0x3333, 3, crate::clock::monotonic_ns() as i64);
+    for queue in [0x1111, 0x2222, 0x3333] {
+        let value = ctx.frame_stats.as_ref().unwrap().get(&FrameStatsKey { pid, tid: 0, surface_ptr: queue }, 0);
+        assert!(value.is_ok(), "进程级探针未覆盖线程 queue={queue:x}: {:?}", value.as_ref().err());
+        assert_eq!(value.unwrap().total_frames, 1);
+    }
+    assert_eq!(ctx.pid_links[&pid].len(), 1);
+    crate::targets::sync_target_pids(&mut ctx, &[pid as i32]).unwrap();
+    assert_eq!(ctx.pid_links[&pid].len(), 1, "目标刷新不能重新按线程挂载");
+    ctx.target_tgids.remove(&pid).unwrap();
+    qixia_test_frame_callback(0x4444, 4, crate::clock::monotonic_ns() as i64);
+    assert!(ctx.frame_stats.as_ref().unwrap().get(&FrameStatsKey { pid, tid: 0, surface_ptr: 0x4444 }, 0).is_err());
+    println!("单个进程探针覆盖已有线程、新建线程和测试线程");
 }
 
 #[test]
@@ -536,6 +647,10 @@ fn kernel_completed_callbacks_use_latch_and_deduplicate_across_threads() {
         ("queuebuffer_probe_stats.bpf.o", BackendKind::StatsMap),
         ("queuebuffer_probe_perf.bpf.o", BackendKind::PerfEvent),
     ] {
+        if matches!(kind, BackendKind::RingBuf) && crate::loader::ringbuf_kernel_note().is_some() {
+            println!("{filename}: 当前内核不支持 RingBuf，验证 StatsMap 和 PerfEvent");
+            continue;
+        }
         let mut ctx = crate::loader::start_backend(&dir.with_file_name(filename), kind, pid as i32, None).unwrap();
         let links = ctx.pid_links.remove(&pid).unwrap();
         assert!(crate::attach::detach_pid_links(&mut ctx.bpf, pid, links).is_empty());
@@ -543,14 +658,13 @@ fn kernel_completed_callbacks_use_latch_and_deduplicate_across_threads() {
         let (reply, replies) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             for (queue, latch) in receiver {
-                qixia_test_frame_callback(queue, latch);
+                qixia_test_frame_callback(queue, 0x1234_5678_9abc_def0, latch);
                 reply.send(()).unwrap();
             }
         });
-        // 把测试线程和新工作线程都挂上；不读取或改动任何应用的映射。
-        let mut links = std::collections::HashMap::new();
-        for tid in crate::procfs::collect_task_ids(pid).unwrap() {
-            let result = crate::attach::attach_symbol_for_task(&mut ctx.bpf, pid, tid, &executable, "qixia_test_frame_callback", offset);
+        // 单个进程探针必须覆盖不同线程，不读取或改动任何应用的映射。
+        {
+            let result = crate::attach::attach_symbol_for_process(&mut ctx.bpf, pid, &executable, "qixia_test_frame_callback", offset);
             // ARM64 Linux 5.15 原生不支持 AArch32 指令探测。明确验证拒绝，
             // 不将内核不支持伪装成已验证 32 位帧采集；正式链会按现有路径降级。
             if cfg!(target_arch = "arm") && result.as_ref().err().is_some_and(|error| error.contains("os error 95")) {
@@ -560,22 +674,22 @@ fn kernel_completed_callbacks_use_latch_and_deduplicate_across_threads() {
                 return;
             }
             let link = result.unwrap();
-            links.insert(tid, vec![link]);
+            ctx.pid_links.insert(pid, vec![link]);
         }
-        ctx.pid_links.insert(pid, links);
+        ctx.target_tgids.insert(pid, if cfg!(target_pointer_width = "32") { 4 } else { 3 }, 0).unwrap();
         let base = monotonic_ns() - 3_000_000_000;
         ctx.pid_symbol_probes.get_mut(&pid).unwrap().candidate_started_ns = base;
         for (queue, fps) in [(0x1234, 165), (0x5678, 240)] {
             for index in 0..=fps * 2 {
                 let timestamp = (base + index * 1_000_000_000 / fps) as i64;
-                qixia_test_frame_callback(queue, timestamp);
+                qixia_test_frame_callback(queue, 0x1234_5678_9abc_def0, timestamp);
                 sender.send((queue, timestamp)).unwrap();
                 replies.recv().unwrap();
                 // 及时清空事件通道，防止此测试因故意的批量输入塞满 RingBuf。
                 crate::events::poll_inner(&mut ctx).unwrap();
             }
             for invalid in [0, -1, (monotonic_ns() + 60_000_000_000) as i64, base as i64] {
-                qixia_test_frame_callback(queue, invalid);
+                qixia_test_frame_callback(queue, 0x1234_5678_9abc_def0, invalid);
             }
             let value = ctx.frame_stats.as_ref().unwrap().get(&FrameStatsKey { pid, tid: 0, surface_ptr: queue as u64 }, 0).unwrap();
             assert_eq!(value.total_frames, fps * 2 + 1, "{filename}");

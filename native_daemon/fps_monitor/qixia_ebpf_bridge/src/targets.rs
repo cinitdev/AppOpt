@@ -1,10 +1,10 @@
-use crate::attach::{attach_process_candidate, detach_pid_links, sync_process_tasks};
+use crate::attach::{attach_process_candidate, detach_pid_links};
 use crate::clock::monotonic_ns;
 use crate::constants::frame_callback_abi;
 use crate::context::{QixiaThreadsEbpfCtx, PidSymbolProbe};
 use crate::diagnostics::{compact_error_details, cstring_lossy};
 use crate::procfs::{
-    pid_matches_pkg, process_starttime, resolve_libgui_path, task_starttime_snapshot,
+    pid_matches_pkg, process_starttime, resolve_libgui_path,
 };
 use crate::symbols::{cached_candidate_offsets, candidate_bit, candidate_range_mask};
 use std::collections::HashSet;
@@ -56,10 +56,9 @@ pub(crate) fn sync_target_pids(ctx: &mut QixiaThreadsEbpfCtx, pids: &[c_int]) ->
         }
         ctx.pid_libgui_paths.remove(pid);
         ctx.pid_starttimes.remove(pid);
-        ctx.pid_task_starttimes.remove(pid);
         ctx.pid_symbols.remove(pid);
-        ctx.pid_symbol_offsets.remove(pid);
         ctx.pid_symbol_probes.remove(pid);
+        let _ = ctx.invalid_latch.remove(pid);
     }
 
     let mut effective = previous
@@ -67,47 +66,7 @@ pub(crate) fn sync_target_pids(ctx: &mut QixiaThreadsEbpfCtx, pids: &[c_int]) ->
         .copied()
         .filter(|pid| !reused.contains(pid))
         .collect::<HashSet<_>>();
-    for pid in effective.iter().copied().collect::<Vec<_>>() {
-        if !ctx.pid_libgui_paths.contains_key(&pid) {
-            match resolve_libgui_path(pid as i32) {
-                Ok(path) => {
-                    ctx.pid_libgui_paths.insert(pid, path);
-                }
-                Err(err) => {
-                    update_errors.push(err);
-                    continue;
-                }
-            }
-        }
-        let Some(path) = ctx.pid_libgui_paths.get(&pid) else {
-            continue;
-        };
-        if let Some(task_links) = ctx.pid_links.get_mut(&pid) {
-            let selected_symbol = ctx
-                .pid_symbols
-                .get(&pid)
-                .unwrap_or(&ctx.symbol)
-                .to_string_lossy()
-                .into_owned();
-            let Some(offset) = ctx.pid_symbol_offsets.get(&pid).copied() else {
-                update_errors.push(format!("pid={pid} 缺少已解析的 uprobe 符号偏移"));
-                continue;
-            };
-            let task_starttimes = ctx.pid_task_starttimes.entry(pid).or_default();
-            let sync = sync_process_tasks(
-                &mut ctx.bpf,
-                pid,
-                path,
-                &selected_symbol,
-                offset,
-                task_links,
-                task_starttimes,
-            );
-            // 新线程沿用当前候选符号即可；不能因为线程频繁增删而反复重置候选
-            // 计时，否则错误符号在持续创建线程的游戏里会永不轮换。
-            update_errors.extend(sync.errors);
-        }
-    }
+    // 同进程的新线程由已有探针自动覆盖；这里只处理 PID 增删与复用。
     let added_pids = desired.difference(&effective).copied().collect::<Vec<_>>();
     for pid in added_pids {
         let path = match resolve_libgui_path(pid as i32) {
@@ -124,7 +83,7 @@ pub(crate) fn sync_target_pids(ctx: &mut QixiaThreadsEbpfCtx, pids: &[c_int]) ->
                 continue;
             }
         };
-        let (candidate_index, pid_symbol, symbol_offset, task_links) =
+        let (candidate_index, pid_symbol, process_links) =
             match attach_process_candidate(&mut ctx.bpf, pid, &path, &offsets, 0) {
                 Ok(attached) => attached,
                 Err(err) => {
@@ -134,20 +93,15 @@ pub(crate) fn sync_target_pids(ctx: &mut QixiaThreadsEbpfCtx, pids: &[c_int]) ->
             };
         if let Err(err) = ctx.target_tgids.insert(pid, frame_callback_abi(candidate_index), 0) {
             update_errors.push(format!("更新 target_tgids[{pid}] 失败: {err}"));
-            update_errors.extend(detach_pid_links(&mut ctx.bpf, pid, task_links));
+            update_errors.extend(detach_pid_links(&mut ctx.bpf, pid, process_links));
             continue;
         }
         ctx.pid_libgui_paths.insert(pid, path);
-        ctx.pid_links.insert(pid, task_links);
+        ctx.pid_links.insert(pid, process_links);
         if let Some(starttime) = process_starttime(pid) {
             ctx.pid_starttimes.insert(pid, starttime);
         }
-        ctx.pid_task_starttimes.insert(
-            pid,
-            task_starttime_snapshot(pid, ctx.pid_links[&pid].keys().copied()),
-        );
         ctx.pid_symbols.insert(pid, pid_symbol);
-        ctx.pid_symbol_offsets.insert(pid, symbol_offset);
         let probe_started_ns = monotonic_ns();
         ctx.pid_symbol_probes.insert(
             pid,

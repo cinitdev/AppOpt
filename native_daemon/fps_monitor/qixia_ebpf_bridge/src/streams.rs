@@ -33,6 +33,8 @@ pub(crate) fn refresh_current_fps(ctx: &mut QixiaThreadsEbpfCtx, now_ns: u64) {
         }
     }
 
+    // 不按线程名推断画面类型，也不能把未识别的队列直接当作视频。
+    // 所有完成预热的帧源参与比较，零散更新的队列不能强制排除持续合成的画面。
     let best = ctx
         .streams
         .iter()

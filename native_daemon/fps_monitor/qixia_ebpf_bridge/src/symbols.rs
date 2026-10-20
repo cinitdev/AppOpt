@@ -67,16 +67,20 @@ pub(crate) fn probe_candidate_results(probe: PidSymbolProbe) -> String {
 }
 
 pub(crate) fn resolve_candidate_offsets(path: &Path) -> Result<Vec<Option<u64>>, String> {
+    resolve_symbol_offsets(path, LIBGUI_FRAME_SYMBOLS)
+}
+
+pub(crate) fn resolve_symbol_offsets(path: &Path, symbols: &[&str]) -> Result<Vec<Option<u64>>, String> {
     let data = fs::read(path).map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
     let object = object::read::File::parse(data.as_slice())
         .map_err(|err| format!("解析 {} 失败: {err}", path.display()))?;
-    let mut offsets = vec![None; LIBGUI_FRAME_SYMBOLS.len()];
+    let mut offsets = vec![None; symbols.len()];
 
     for symbol in object.dynamic_symbols().chain(object.symbols()) {
         let Ok(name) = symbol.name() else {
             continue;
         };
-        let Some(index) = LIBGUI_FRAME_SYMBOLS
+        let Some(index) = symbols
             .iter()
             .position(|candidate| *candidate == name)
         else {

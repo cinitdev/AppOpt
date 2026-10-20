@@ -37,6 +37,7 @@ pub(crate) struct FpsStream {
     pub(crate) last_seen_ns: u64,
     pub(crate) cur_fps: f64,
     warmed_up: bool,
+    warmup_intervals: usize,
     report_max: u64,
     report_seen_ns: u64,
     report_ready_ns: u64,
@@ -52,6 +53,7 @@ impl FpsStream {
             last_seen_ns: timestamp_ns,
             cur_fps: 0.0,
             warmed_up: false,
+            warmup_intervals: 0,
             report_max: 0,
             report_seen_ns: 0,
             report_ready_ns: 0,
@@ -72,6 +74,7 @@ impl FpsStream {
                 // 否则下一帧的间隔会被截短，造成 FPS 虚高和帧耗时偏低。
                 return false;
             } else {
+                self.warmup_intervals = (self.warmup_intervals + 1).min(MIN_STREAM_INTERVALS);
                 self.record_report_interval(timestamp_ns, delta);
                 let recorded = delta.min(MAX_RECORDED_FRAME_NS);
                 self.frame_times.push_front(recorded);
@@ -104,6 +107,8 @@ impl FpsStream {
         }
         let delta = delta.min(MAX_RECORDED_FRAME_NS);
 
+        self.warmup_intervals = (self.warmup_intervals
+            + frames.min(MIN_STREAM_INTERVALS as u64) as usize).min(MIN_STREAM_INTERVALS);
         for _ in 0..frames.min(MAX_WINDOW_INTERVALS) {
             self.frame_times.push_front(delta);
             self.frame_time_sum_ns = self.frame_time_sum_ns.saturating_add(delta);
@@ -230,7 +235,8 @@ impl FpsStream {
     }
 
     fn update_warmup(&mut self) {
-        self.warmed_up |= self.frame_times.len() >= MIN_STREAM_INTERVALS
+        // 预热统计累计收到的有效间隔；真实低帧场景的一秒窗口可能永远装不下 8 帧。
+        self.warmed_up |= self.warmup_intervals >= MIN_STREAM_INTERVALS
             // 创建帧流后的等待时间不能代替实际采集到的有效时间。
             && self.frame_time_sum_ns >= MIN_STREAM_LIFETIME_NS
             && self.last_seen_ns.saturating_sub(self.first_seen_ns) >= MIN_STREAM_LIFETIME_NS;
@@ -243,6 +249,7 @@ impl FpsStream {
         self.cur_fps = 0.0;
         self.first_seen_ns = timestamp_ns;
         self.warmed_up = false;
+        self.warmup_intervals = 0;
     }
 
     fn is_stable(&self) -> bool {
@@ -534,6 +541,53 @@ mod tests {
             fresh.selection_score(now)
                 > stale.selection_score(now.saturating_add(STREAM_STALE_NS / 2))
         );
+    }
+
+    #[test]
+    fn sparse_secondary_stream_cannot_exclude_continuous_frames() {
+        for fps in [24, 30, 60, 120, 144, 165, 240, 480] {
+            let continuous = stream_at_fps(fps, fps as usize * 2 + 1);
+            for sparse_fps in [5, 9] {
+                let sparse = stream_at_fps(sparse_fps, sparse_fps as usize * 2 + 1);
+                let now = continuous.last_seen_ns.max(sparse.last_seen_ns);
+                assert!(continuous.selection_score(now) > sparse.selection_score(now));
+                assert!((continuous.fps_at(now) - fps as f64).abs() < 0.2);
+            }
+        }
+    }
+
+    #[test]
+    fn low_frame_rate_remains_valid_without_a_competing_stream() {
+        for fps in [5, 9, 24, 30] {
+            let stream = stream_at_fps(fps, fps as usize * 3 + 1);
+            assert!(stream.selection_score(stream.last_seen_ns).is_finite());
+            assert!((stream.fps_at(stream.last_seen_ns) - fps as f64).abs() < 0.2);
+        }
+    }
+
+    #[test]
+    fn low_frame_rate_batches_warm_up_and_pause_resets_the_count() {
+        let mut stream = FpsStream::new(FPS_WINDOW_NS);
+        let mut timestamp = FPS_WINDOW_NS;
+        for _ in 0..2 {
+            stream.on_frame_batch(timestamp, timestamp + FPS_WINDOW_NS, 5);
+            timestamp += FPS_WINDOW_NS;
+        }
+        assert!(stream.selection_score(timestamp).is_finite());
+        assert!((stream.fps_at(timestamp) - 5.0).abs() < 0.1);
+        timestamp += PAUSE_FRAME_NS + 1;
+        stream.on_frame(timestamp);
+        for _ in 0..7 {
+            timestamp += FPS_WINDOW_NS / 5;
+            stream.on_frame(timestamp);
+        }
+        assert!(!stream.selection_score(timestamp).is_finite());
+        // 丢弃的重复事件不能补足第 8 个有效间隔。
+        stream.on_frame(timestamp + 800_000);
+        assert!(!stream.selection_score(timestamp).is_finite());
+        timestamp += FPS_WINDOW_NS / 5;
+        stream.on_frame(timestamp);
+        assert!(stream.selection_score(timestamp).is_finite());
     }
 
     #[test]

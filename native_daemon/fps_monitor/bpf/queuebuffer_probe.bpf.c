@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* BPF 程序: uprobe 探测 BLAST 帧合成完成回调。
+/* BPF 程序: uprobe 读取 ConsumerFrameEventHistory 记录的合成时间。
  * 编译: clang -target bpf -g -O2 -c queuebuffer_probe.bpf.c -o queuebuffer_probe.bpf.o
  *
  * 本文件不 #include <linux/bpf.h> 或 <bpf/bpf_helpers.h>, 改用内建函数声明
@@ -39,17 +39,18 @@ static void (*bpf_ringbuf_discard)(void *data, long long flags) = (void *)133;
 
 /* 输出到 trace_pipe(调试用) */
 static long (*bpf_trace_printk)(const char *fmt, unsigned long long fmt_size, ...) = (void *)6;
-/* helper 4 同时兼容旧 Android 内核；只用于 32 位 x86 compat 参数读取。 */
+/* helper 4 兼容 Android 旧内核，用于 32 位应用的用户栈参数。 */
 static long (*bpf_probe_read_compat)(void *dst, unsigned long long size, const void *unsafe_ptr) = (void *)4;
 
 #include "frame_callback.h"
+#include "probe_health.h"
 
 /* --- 发送给用户态的帧事件 --- */
 struct frame_event {
     unsigned long long timestamp_ns;   /* 完成回调携带的合成时间戳 */
     unsigned int pid;                  /* 进程 TGID */
     unsigned int tid;                  /* 线程 ID */
-    unsigned long long surface_ptr;    /* BLAST 队列指针 */
+    unsigned long long surface_ptr;    /* 每个队列独立的 ConsumerFrameEventHistory 指针 */
 };
 
 struct frame_stats_key {
@@ -152,7 +153,7 @@ static __always_inline int record_frame_stats(struct frame_event *event) {
  * 被探测函数每次被调用时, 此程序在内核态执行。
  * 记录回调携带的合成时间戳和队列, 通过 RingBuf 发到用户态。 */
 SEC("uprobe/libgui_frame_completed")
-int on_frame_completed(void *ctx) {
+int on_frame_latched(void *ctx) {
     struct frame_event local = {};
 
     unsigned long long pid_tgid = bpf_get_current_pid_tgid();
@@ -163,7 +164,7 @@ int on_frame_completed(void *ctx) {
     }
 
     local.timestamp_ns = qixia_read_latch(ctx, *abi);
-    if (!qixia_valid_latch(local.timestamp_ns, bpf_ktime_get_ns())) return 0;
+    if (!qixia_check_latch(local.pid, local.timestamp_ns)) return 0;
     local.tid = (unsigned int)pid_tgid;
 
     local.surface_ptr = qixia_read_surface(ctx, *abi);

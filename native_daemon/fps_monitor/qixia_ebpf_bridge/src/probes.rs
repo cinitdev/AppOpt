@@ -3,7 +3,7 @@ use crate::clock::monotonic_ns;
 use crate::constants::{LIBGUI_FRAME_SYMBOLS, frame_callback_abi};
 use crate::context::QixiaThreadsEbpfCtx;
 use crate::diagnostics::{compact_error_details, cstring_lossy, pid_role_label};
-use crate::procfs::{resolve_libgui_path, task_starttime_snapshot};
+use crate::procfs::resolve_libgui_path;
 use crate::streams::clear_pid_samples;
 use crate::symbols::{
     cached_candidate_offsets, candidate_bit, candidate_range_mask, probe_candidate_results,
@@ -30,8 +30,14 @@ pub(crate) fn switch_pid_symbol(
         .cloned()
         .map_or_else(|| resolve_libgui_path(pid as i32), Ok)?;
     let offsets = cached_candidate_offsets(ctx, &path)?;
-    // 目前候选是同一回调的两种 ABI。一个 libgui 通常只有其中一个，
-    // 没有下一符号只代表要继续等帧，不能解绑已经成功挂上的探针。
+    // 没有参数无效的证据时，可能只是页面静止，不能解绑有效入口。
+    if ctx.invalid_latch.get(&pid, 0).is_err() {
+        let mut waiting = probe;
+        waiting.waiting = true;
+        ctx.pid_symbol_probes.insert(pid, waiting);
+        return Ok(false);
+    }
+    // 没有下一符号时保留最后的挂载，允许后续有效帧恢复计数。
     if !offsets.iter().skip(next_start_index).any(Option::is_some) {
         let mut waiting = probe;
         waiting.waiting = true;
@@ -42,8 +48,8 @@ pub(crate) fn switch_pid_symbol(
         }
         return Ok(false);
     }
-    // 先关闭这个 PID 的事件入口，避免解绑数百个线程期间仍产生旧候选
-    // 事件。新候选启用时再打开；队列中的旧事件另用时间边界排除。
+    // 先关闭这个 PID 的事件入口，避免切换期间仍产生旧候选事件。
+    // 新候选启用时再打开；队列中的旧事件另用时间边界排除。
     ctx.target_tgids
         .remove(&pid)
         .map_err(|err| err.to_string())?;
@@ -52,13 +58,12 @@ pub(crate) fn switch_pid_symbol(
         .remove(&pid)
         .map(|links| detach_pid_links(&mut ctx.bpf, pid, links))
         .unwrap_or_default();
-    ctx.pid_task_starttimes.remove(&pid);
     clear_pid_samples(ctx, pid);
+    let _ = ctx.invalid_latch.remove(&pid);
 
     ctx.pid_libgui_paths.insert(pid, path.clone());
     match attach_process_candidate(&mut ctx.bpf, pid, &path, &offsets, next_start_index) {
-        Ok((candidate_index, symbol, offset, task_links)) => {
-            let task_starttimes = task_starttime_snapshot(pid, task_links.keys().copied());
+        Ok((candidate_index, symbol, process_links)) => {
             let mut next_probe = probe;
             if probe.confirmed_once {
                 next_probe.stalled_mask |= candidate_bit(probe.candidate_index);
@@ -71,15 +76,14 @@ pub(crate) fn switch_pid_symbol(
             next_probe.waiting = false;
             next_probe.attachable_mask |= candidate_bit(candidate_index);
             next_probe.unavailable_mask |= candidate_range_mask(next_start_index, candidate_index);
-            ctx.pid_links.insert(pid, task_links);
-            ctx.pid_task_starttimes.insert(pid, task_starttimes);
+            ctx.pid_links.insert(pid, process_links);
             ctx.pid_symbols.insert(pid, symbol.clone());
-            ctx.pid_symbol_offsets.insert(pid, offset);
             ctx.pid_symbol_probes.insert(pid, next_probe);
             ctx.target_tgids
                 .insert(pid, frame_callback_abi(candidate_index), 0)
                 .map_err(|err| err.to_string())?;
             ctx.symbol = symbol;
+            log_info!("[FPS] 合成时间参数无效，切换兼容入口: PID={pid} {} → {}", readable_symbol_name(probe.candidate_index), readable_symbol_name(candidate_index));
             if relocking_confirmed_source {
                 log_info!(
                     "[FPS] 符号重锁: PID={pid} 剩余候选={} 当前尝试={}",
@@ -111,7 +115,6 @@ pub(crate) fn switch_pid_symbol(
             exhausted_probe.exhausted = true;
             ctx.pid_symbol_probes.insert(pid, exhausted_probe);
             ctx.pid_symbols.remove(&pid);
-            ctx.pid_symbol_offsets.remove(&pid);
             detach_errors.push(err);
             let error = compact_error_details(&detach_errors);
             ctx.last_error = cstring_lossy(&error);
@@ -227,6 +230,15 @@ pub(crate) fn advance_symbol_probes(
 ) -> Result<(), String> {
     if now_ns == 0 {
         return Ok(());
+    }
+    // 页面先静止、后开始绘制时仍需处理新出现的无效参数，不能永远停在 waiting。
+    for (pid, probe) in &mut ctx.pid_symbol_probes {
+        let has_next = ctx.pid_libgui_paths.get(pid)
+            .and_then(|path| ctx.libgui_symbol_offsets.get(path))
+            .is_some_and(|offsets| offsets.iter().skip(probe.candidate_index + 1).any(Option::is_some));
+        if probe.waiting && !probe.confirmed && has_next && ctx.invalid_latch.get(pid, 0).is_ok() {
+            probe.waiting = false;
+        }
     }
     let expired = ctx
         .pid_symbol_probes

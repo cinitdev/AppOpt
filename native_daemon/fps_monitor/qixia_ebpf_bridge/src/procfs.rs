@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -90,26 +89,6 @@ pub(crate) fn process_is_64_bit(pid: i32) -> Option<bool> {
     }
 }
 
-pub(crate) fn collect_task_ids(pid: u32) -> Result<HashSet<u32>, String> {
-    let entries = fs::read_dir(format!("/proc/{pid}/task"))
-        .map_err(|err| format!("读取 pid={pid} 线程列表失败: {err}"))?;
-    let mut tids = HashSet::new();
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if let Ok(tid) = name.parse::<u32>() {
-            if tid > 0 {
-                tids.insert(tid);
-            }
-        }
-    }
-    if tids.is_empty() {
-        return Err(format!("pid={pid} 没有可挂载线程"));
-    }
-    Ok(tids)
-}
-
 pub(crate) fn read_proc_starttime(path: &Path) -> Option<u64> {
     let content = fs::read_to_string(path).ok()?;
     let close = content.rfind(") ")?;
@@ -124,16 +103,4 @@ pub(crate) fn read_proc_starttime(path: &Path) -> Option<u64> {
 
 pub(crate) fn process_starttime(pid: u32) -> Option<u64> {
     read_proc_starttime(Path::new(&format!("/proc/{pid}/stat")))
-}
-
-pub(crate) fn task_starttime(pid: u32, tid: u32) -> Option<u64> {
-    read_proc_starttime(Path::new(&format!("/proc/{pid}/task/{tid}/stat")))
-}
-
-pub(crate) fn task_starttime_snapshot(
-    pid: u32,
-    tids: impl Iterator<Item = u32>,
-) -> HashMap<u32, u64> {
-    tids.filter_map(|tid| task_starttime(pid, tid).map(|start| (tid, start)))
-        .collect()
 }
