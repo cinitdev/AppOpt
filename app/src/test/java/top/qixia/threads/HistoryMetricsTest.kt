@@ -174,10 +174,28 @@ class HistoryMetricsTest {
         assertTrue(HistoryMetricsStore.read(file, "different.package").isEmpty())
     }
 
-    @Test fun retainsAtMostThirtyRunsPerPackage() {
+    @Test fun retainsAllRecentRunsWithoutACountLimit() {
         repeat(35) { i -> HistoryMetricsStore.Writer(temp.root, "app.one", i.toLong()).use { writer ->
             writer.append(HistoryMetrics.Sample(i + 1L, false, mapOf("power_w" to 2f)))
         } }
-        assertEquals(30, File(temp.root, "history_metrics").listFiles()!!.size)
+        assertEquals(35, File(temp.root, "history_metrics").listFiles()!!.size)
+    }
+
+    @Test fun expiresClosedMetricsAfterSevenDaysAndKeepsActiveWriter() {
+        HistoryMetricsStore.Writer(temp.root, "app.one", 1000).use {
+            it.append(HistoryMetrics.Sample(2000, false, mapOf("power_w" to 2f)))
+        }
+        val closed = File(temp.root, "history_metrics").listFiles()!!.single()
+        assertTrue(closed.setLastModified(2000))
+        val active = HistoryMetricsStore.Writer(temp.root, "app.two", 3000)
+        active.append(HistoryMetrics.Sample(4000, false, mapOf("power_w" to 3f)))
+        val activeFile = File(temp.root, "history_metrics").listFiles()!!.single { it != closed }
+        assertTrue(activeFile.setLastModified(1000))
+        HistoryMetricsStore.pruneHistory(temp.root, HistoryRetention.MAX_AGE_MS + 2000)
+        assertTrue(closed.exists() && activeFile.exists())
+        HistoryMetricsStore.pruneHistory(temp.root, HistoryRetention.MAX_AGE_MS + 2001)
+        assertFalse(closed.exists())
+        assertTrue(activeFile.exists())
+        active.close()
     }
 }

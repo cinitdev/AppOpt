@@ -19,12 +19,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import top.qixia.threads.R
+import top.qixia.threads.AutoStartAccess
+import top.qixia.threads.AutoStartStatus
 import top.qixia.threads.compose.EnvironmentUiState
 import top.qixia.threads.compose.theme.*
 
@@ -47,11 +50,16 @@ internal fun HomeEnvironmentSheet(
 ) = MintHomeTheme {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
-    val ready = !env.loading && env.featuresAvailable && env.overlayGranted && env.usageAccessGranted &&
+    val context = LocalContext.current
+    val baseReady = !env.loading && env.featuresAvailable && env.overlayGranted && env.usageAccessGranted &&
         env.foregroundState?.available == true && env.statusMessage == null
+    val ready = baseReady && env.autoStartStatus == AutoStartStatus.ALLOWED && !env.autoStartChecking
     val summary = when {
         env.loading -> "正在读取权限与服务状态"
         ready -> "所有必需权限与服务均已准备好"
+        baseReady && env.autoStartChecking -> "基础权限与服务已就绪，正在检查应用自启动"
+        baseReady && env.autoStartStatus == AutoStartStatus.BLOCKED -> "应用自启动未允许，可能影响后台胶囊拉起"
+        baseReady -> "基础权限与服务已就绪，自启动状态请在系统设置中确认"
         env.statusMessage != null -> "状态读取失败，请返回首页下拉重试"
         !env.hasRoot -> stringResource(R.string.root_permission_hint, stringResource(R.string.app_name))
         !env.overlayGranted || !env.usageAccessGranted -> "部分权限尚未授权，点击“去授权”完成设置"
@@ -60,7 +68,8 @@ internal fun HomeEnvironmentSheet(
         !env.daemonRuntime.running -> "Rust 守护进程尚未运行"
         else -> "前台监听尚未连接，请返回首页下拉重试"
     }
-    val accent = if (ready || env.loading) MintAction else OceanWarning
+    val neutral = env.loading || (baseReady && env.autoStartStatus != AutoStartStatus.BLOCKED)
+    val accent = if (neutral) MintAction else OceanWarning
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
@@ -81,7 +90,8 @@ internal fun HomeEnvironmentSheet(
                     Text("${stringResource(R.string.qixia_page_eyebrow)} · RUNTIME STATUS", color = OceanTextSecondary, fontSize = 9.sp,
                         lineHeight = 12.sp, letterSpacing = 2.sp)
                     Spacer(Modifier.height(7.dp))
-                    Text(if (env.loading) "正在检查运行环境。" else if (ready) "一切就绪，安心运行。" else "还有几项，需要准备。",
+                    Text(if (env.loading) "正在检查运行环境。" else if (ready) "一切就绪，安心运行。"
+                        else if (neutral) "基础环境已就绪。" else "还有几项，需要准备。",
                         fontSize = 24.sp, lineHeight = 34.sp, fontWeight = FontWeight.Bold,
                         letterSpacing = (-.5).sp)
                 }
@@ -98,7 +108,7 @@ internal fun HomeEnvironmentSheet(
                 }
             }
             Spacer(Modifier.height(14.dp))
-            Surface(color = if (ready || env.loading) OceanSurfaceHigh else Color(0xFFF7F1E7),
+            Surface(color = if (neutral) OceanSurfaceHigh else Color(0xFFF7F1E7),
                 shape = RoundedCornerShape(14.dp)) {
                 Row(Modifier.fillMaxWidth().heightIn(min = 42.dp).padding(horizontal = 13.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically) {
@@ -112,6 +122,13 @@ internal fun HomeEnvironmentSheet(
                 env.overlayGranted, env.loading, "已授权", "去授权", onOpenOverlayPermission)
             EnvironmentStatusRow(R.drawable.ic_mint_activity, "使用情况访问", "辅助判断目标应用前台状态",
                 env.usageAccessGranted, env.loading, "已授权", "去授权", onOpenUsagePermission)
+            EnvironmentStatusRow(R.drawable.ic_mint_activity, "应用自启动", when (env.autoStartStatus) {
+                AutoStartStatus.ALLOWED -> "系统已允许，支持后台拉起性能胶囊"
+                AutoStartStatus.BLOCKED -> "允许柒夏线程在后台启动悬浮服务"
+                AutoStartStatus.UNKNOWN -> "系统状态无法可靠读取，点此手动确认"
+            }, env.autoStartStatus == AutoStartStatus.ALLOWED, env.loading || env.autoStartChecking,
+                "已允许", if (env.autoStartStatus == AutoStartStatus.BLOCKED) "去设置" else "待确认",
+                { AutoStartAccess.openSettings(context) })
             EnvironmentStatusRow(R.drawable.ic_mint_key, "Root", "执行线程规则与读取模块状态",
                 env.hasRoot, env.loading, "可用", "未授权")
             val version = (env.daemonRuntime.versionName ?: env.moduleVersion?.versionName)?.removePrefix("v")
@@ -123,7 +140,7 @@ internal fun HomeEnvironmentSheet(
                 })
             EnvironmentStatusRow(R.drawable.ic_mint_focus, "前台监听", "ActivityTaskManager 助手",
                 env.foregroundState?.available == true, env.loading, "已连接", "未连接")
-            Text(if (ready) "权限与服务状态来自当前设备。" else "授权返回后自动更新状态。",
+            Text("返回 App 后自动更新状态；自启动“待确认”不代表未授权。",
                 Modifier.fillMaxWidth().padding(top = 18.dp, bottom = 22.dp),
                 color = MintMuted, fontSize = 11.sp, lineHeight = 16.sp)
         }

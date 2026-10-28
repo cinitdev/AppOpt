@@ -40,7 +40,7 @@ class HistoryChartPaletteTest {
 
     @Test fun coreLabelsStayReadableOnWhite() {
         for (cpu in 0..15) {
-            val color = HistoryChartPalette.core(cpu)
+            val color = HistoryChartPalette.label(HistoryChartPalette.core(cpu))
             fun linear(shift: Int): Double {
                 val value = (color ushr shift and 255) / 255.0
                 return if (value <= .04045) value / 12.92 else ((value + .055) / 1.055).pow(2.4)

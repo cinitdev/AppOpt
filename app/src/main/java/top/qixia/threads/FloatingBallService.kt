@@ -421,7 +421,7 @@ class FloatingBallService : Service() {
 
         val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
 
-        // 固定尺寸胶囊，只显示当前阶段，不展示会持续跳动的实时 FPS。
+        // 固定胶囊尺寸，显示实时 FPS；外围保留足够的点击区域。
         layoutParams = WindowManager.LayoutParams(
             dp(48f),
             dp(48f),
@@ -1216,6 +1216,8 @@ class FloatingBallService : Service() {
         mainHandler.removeCallbacksAndMessages(null)
         finishFpsSession(expectedStopReason ?: "service_destroyed")
         // fpsMonitor 在 onStartCommand 才初始化; 服务若在那之前被回收, 直接访问会崩
+        val fpsSocket = if (::fpsMonitor.isInitialized) fpsMonitor.socketName else null
+        val fpsToken = if (::fpsMonitor.isInitialized) fpsMonitor.socketToken else null
         if (::fpsMonitor.isInitialized) fpsMonitor.stop()
         // 通知守护进程停止 FPS 监测(省电)。su 是独立进程,
         // 即使本进程随后退出, 已 fork 的命令仍会执行完。
@@ -1233,7 +1235,8 @@ class FloatingBallService : Service() {
             }
         }
         FPS_COMMAND_EXECUTOR.execute {
-            DaemonBridge.stopFpsMonitor()
+            if (fpsSocket != null && fpsToken != null) DaemonBridge.stopFpsMonitor(fpsSocket, fpsToken)
+            else DaemonBridge.stopFpsMonitor()
         }
         removeCapsule()
         bannerView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }

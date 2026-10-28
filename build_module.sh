@@ -311,6 +311,23 @@ build_foreground_helper() {
     }
 }
 
+build_refresh_helper() {
+    local android_jar d8_jar helper_build tools_dir
+    android_jar="$(latest_dir "$SDK_DIR/platforms")/android.jar"
+    d8_jar="$(latest_dir "$SDK_DIR/build-tools")/lib/d8.jar"
+    helper_build="$ROOT/build/refresh-helper"
+    tools_dir="$WORK/config/tools"
+    rm -rf "$helper_build"
+    mkdir -p "$helper_build/classes" "$helper_build/dex" "$tools_dir"
+    echo "- 编译独立刷新率服务 JAR"
+    javac -encoding UTF-8 --release 11 -classpath "$android_jar" -d "$helper_build/classes" \
+        $(find "$ROOT/tools/qixia_refresh_helper/src" "$ROOT/shared/refresh" -name '*.java' | sort)
+    java -cp "$d8_jar" com.android.tools.r8.D8 --release --min-api 31 --lib "$android_jar" \
+        --output "$helper_build/dex" $(find "$helper_build/classes" -name '*.class' | sort)
+    (cd "$helper_build/dex" && jar cf "$tools_dir/qixia_refresh_helper.jar" classes.dex)
+    [ -s "$tools_dir/qixia_refresh_helper.jar" ] || { echo '! 独立刷新率 JAR 编译失败'; exit 1; }
+}
+
 read_app_version_code() {
     grep -E 'versionCode[[:space:]]*=' "$APP_GRADLE" | head -n1 | sed -E 's/.*=[[:space:]]*([0-9]+).*/\1/'
 }
@@ -804,6 +821,7 @@ if [ "$PUBLISH_RELEASE" = "1" ]; then
 fi
 build_pkg_helper
 build_foreground_helper
+build_refresh_helper
 build_and_embed_app
 
 BPF_SRC="$FPS_MON/bpf/queuebuffer_probe.bpf.c"

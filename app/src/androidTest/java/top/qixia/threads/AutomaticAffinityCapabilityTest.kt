@@ -6,6 +6,31 @@ import org.junit.Test
 import java.io.File
 
 class AutomaticAffinityCapabilityTest {
+    @Test fun fallbackSwitchPreservesOtherAppsAndRequiresNewCapability() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val config = File.createTempFile("fallback-mode-", ".conf", context.cacheDir)
+        val state = File.createTempFile("fallback-mode-", ".state", context.cacheDir)
+        try {
+            config.writeText("# 保留\ncom.other,fallback\ncom.game\ncom.game # 重复\n")
+            state.writeText("version=1\n")
+            fun write(enabled: Boolean = true, fallback: Boolean? = null) = runFixtureScript(
+                DaemonBridge.automaticAffinityMutationScript("com.game", enabled, "fallback-test", config.path, state.path, fallback))
+            val original = config.readText()
+            org.junit.Assert.assertFalse(write(fallback = true))
+            assertEquals(original, config.readText())
+            state.writeText("version=1\nfallback_version=1\n")
+            org.junit.Assert.assertTrue(write(fallback = true))
+            assertEquals("# 保留\ncom.other,fallback\ncom.game,fallback\n", config.readText())
+            org.junit.Assert.assertTrue(write())
+            assertEquals("# 保留\ncom.other,fallback\ncom.game,fallback\n", config.readText())
+            org.junit.Assert.assertTrue(write(fallback = false))
+            assertEquals("# 保留\ncom.other,fallback\ncom.game\n", config.readText())
+            org.junit.Assert.assertTrue(write(enabled = false))
+            org.junit.Assert.assertFalse(write(fallback = true))
+            assertEquals("# 保留\ncom.other,fallback\n", config.readText())
+        } finally { config.delete(); state.delete() }
+    }
+
     // 夹具位于本应用缓存目录，直接运行同一份写入脚本即可验证，不依赖 Root 授权。
     private fun runFixtureScript(script: String): Boolean {
         val process = ProcessBuilder("sh", "-c", script).redirectErrorStream(true).start()

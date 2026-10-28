@@ -46,7 +46,7 @@ internal fun HistoryMetricsCard(group: MetricsGroup, report: HistoryMetrics.Repo
         else if (it.key == "cpu_usage") -1 else it.key.substringAfter('.').substringBefore('_').toIntOrNull() ?: 999
     }.thenBy { it.key }).orEmpty() }
     val cpuGroups = remember(report) { HistoryCpuGroups.fromKeys(report?.series?.keys.orEmpty()) }
-    val series = remember(items, group, cpuGroups) { items.mapIndexed { index, item ->
+    val series = remember(items, group, cpuGroups, report) { items.mapIndexed { index, item ->
         val label = when (item.key) {
             "cpu_usage" -> "总使用率"
             "gpu_usage" -> "GPU 使用率"
@@ -69,7 +69,11 @@ internal fun HistoryMetricsCard(group: MetricsGroup, report: HistoryMetrics.Repo
             legendLabel = if (group == MetricsGroup.POWER) when (item.key) {
                 "power_w" -> "功率 W"; "battery_ma" -> "电流 A"; else -> "电量 %"
             } else cpuGroup?.label ?: label,
-            valueScale = if (group == MetricsGroup.POWER && item.key == "battery_ma") .001f else 1f)
+            valueScale = if (group == MetricsGroup.POWER && item.key == "battery_ma") .001f else 1f,
+            sampleAt = if (item.key == "frame_max_ms" && report?.frameSamples != null) report.frameSamples::pointAt
+                else report?.analysisSamples?.let { samples -> { position -> samples.pointAt(item.key, position) } },
+            plotSamples = if (item.key == "frame_max_ms") report?.frameSamples?.plotPoints()
+                else report?.analysisSamples?.plotPoints(item.key))
     } }
     val note = when (group) {
         MetricsGroup.CPU_USAGE -> "绘制总使用率和每一颗核心的独立曲线。按本次记录保存的核心簇分组，同组核心共用颜色和图例，游标与指标表仍逐核心显示。点击组图例可统一开关，在图表选项中可单独选择核心。没有核心簇信息的旧记录保留逐核心配色。不会用簇平均值代替每颗核心的使用率，离线、缺失或计数重置不补零。"
@@ -114,6 +118,7 @@ internal fun HistoryMetricsCard(group: MetricsGroup, report: HistoryMetrics.Repo
 
 @Composable
 private fun HistoryFrequencyDistribution(report: HistoryMetrics.Report?) {
+        val groups = remember(report) { HistoryCpuGroups.fromKeys(report?.series?.keys.orEmpty()) }
         Column(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
             if (report?.distributions.isNullOrEmpty()) Text("此记录没有频率分布样本", color = OceanTextSecondary)
             report?.distributions?.forEach { (key, values) ->
@@ -123,7 +128,7 @@ private fun HistoryFrequencyDistribution(report: HistoryMetrics.Report?) {
                         Text((if (minimum == maximum) historyNumber(minimum) else "${historyNumber(minimum)}–${historyNumber(maximum)}") + " MHz", color = OceanTextSecondary, fontSize = 11.sp, modifier = Modifier.weight(1f))
                         Text("${historyNumber(percent)}%", color = PorcelainOnTonal, fontSize = 11.sp)
                     }
-                    LinearProgressIndicator(progress = { percent / 100 }, color = Color(HistoryChartPalette.metric(key)), trackColor = OceanSurfaceHigh,
+                    LinearProgressIndicator(progress = { percent / 100 }, color = Color(groups.forMetric(key)?.color ?: HistoryChartPalette.metric(key)), trackColor = OceanSurfaceHigh,
                         modifier = Modifier.fillMaxWidth().height(3.dp), drawStopIndicator = {})
                 }
             }

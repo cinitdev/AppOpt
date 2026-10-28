@@ -74,8 +74,8 @@ internal fun HistoryLineChart(points: List<HistoryCurvePoint>, unit: String, min
                     lineTo(xy(points.first()).x, size.height - inset)
                     close()
                 }
-                if (points.none { it.breakBefore }) drawPath(fill, Brush.verticalGradient(listOf(OceanPrimary.copy(alpha = .12f), Color.Transparent)))
-                drawPath(line, OceanPrimary, style = Stroke(1.6.dp.toPx(), cap = StrokeCap.Round))
+                if (points.none { it.breakBefore }) drawPath(fill, Brush.verticalGradient(listOf(ReportBlue.copy(alpha = .04f), Color.Transparent)))
+                drawPath(line, ReportBlue.copy(alpha = .9f), style = Stroke(.8.dp.toPx(), cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
                 if (points.size == 1) drawCircle(OceanPrimary, 2.5.dp.toPx(), xy(points.first()))
                 selected?.let { point ->
                     val position = xy(point)

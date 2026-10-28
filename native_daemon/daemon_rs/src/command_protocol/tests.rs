@@ -114,6 +114,23 @@ fn fps_commands_keep_socket_token_and_base_package() {
 }
 
 #[test]
+fn closing_an_old_capsule_preserves_the_new_fps_channel() {
+    let current = FpsRequest {
+        pkg: "com.example".into(),
+        socket: Some("qixia_new".into()),
+        token: Some("new_token".into()),
+    };
+    for stale in ["stop_owned qixia_old new_token", "stop_owned qixia_new old_token"] {
+        assert!(!FpsCommand::parse(stale).unwrap().stops(&current));
+    }
+    assert!(FpsCommand::parse("stop_owned qixia_new new_token").unwrap().stops(&current));
+    assert!(FpsCommand::parse("stop").unwrap().stops(&current));
+    for invalid in ["stop_owned", "stop_owned qixia_new", "stop_owned qixia_new new_token extra"] {
+        assert_eq!(FpsCommand::parse(invalid), None);
+    }
+}
+
+#[test]
 fn missing_mailbox_keeps_the_long_idle_wait() {
     let mut mailbox = Mailbox::new();
     assert_eq!(mailbox.reader.read(FpsCommand::parse).unwrap(), None);

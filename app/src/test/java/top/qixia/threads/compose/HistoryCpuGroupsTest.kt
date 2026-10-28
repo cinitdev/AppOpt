@@ -12,7 +12,7 @@ class HistoryCpuGroupsTest {
         for (cpu in 0..7) {
             val group = requireNotNull(groups.forMetric("cpu_core.$cpu"))
             assertSame(group, groups.forMetric("cpu_cycles_core.$cpu"))
-            assertEquals(HistoryChartPalette.metric("cpu_mhz.${group.cpus.joinToString("_")}"), group.color)
+            assertSame(group, groups.forMetric("cpu_mhz.${group.cpus.joinToString("_")}"))
         }
         val colors = (0..7).map { groups.forMetric("cpu_core.$it")!!.color }.toSet()
         assertEquals(3, colors.size)
@@ -20,6 +20,14 @@ class HistoryCpuGroupsTest {
         assertFalse(HistoryChartPalette.temperature in colors)
         assertNull(groups.forMetric("cpu_usage"))
         assertNull(groups.forMetric("cpu_c"))
+    }
+
+    @Test fun groupPaletteFollowsOrderInsteadOfCoreNumberAcrossTopologies() {
+        val fourThreeOne = HistoryCpuGroups.fromKeys(listOf("cpu_mhz.0_1_2_3", "cpu_mhz.4_5_6", "cpu_mhz.7"))
+        val threeFourOne = HistoryCpuGroups.fromKeys(listOf("cpu_mhz.0_1_2", "cpu_mhz.3_4_5_6", "cpu_mhz.7"))
+        assertEquals(fourThreeOne.forMetric("cpu_core.4")?.color, threeFourOne.forMetric("cpu_core.3")?.color)
+        assertEquals(fourThreeOne.forMetric("cpu_core.7")?.color, threeFourOne.forMetric("cpu_core.7")?.color)
+        assertSame(threeFourOne.forMetric("cpu_core.4"), threeFourOne.forMetric("cpu_mhz.6_5_4_3"))
     }
 
     @Test fun tenCoreFrequencyPoliciesTakePrecedenceOverLegacyClusters() {

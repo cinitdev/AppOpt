@@ -15,9 +15,8 @@ import top.qixia.threads.db.SessionSummary
 /** 应用私有归档，独立于校准数据库及其导入认领状态。 */
 internal object AutoHistoryStore {
     private val ROOT_DIRECTORY: String get() = PrivateCaptureStorage.automatic.absolutePath
-    private const val MAX_TOTAL_BYTES = 64L * 1024 * 1024
     private const val MAX_IMPORTS = 24
-    private const val META_VERSION = 6
+    private const val META_VERSION = 7
     private const val MAX_MEMBERS = 400
     private const val MAX_REPORT_BYTES = 24L * 1024 * 1024
     private const val WINDOW_BYTES = 16L * 1024 * 1024
@@ -34,8 +33,8 @@ internal object AutoHistoryStore {
         val folder = directory(context.filesDir)
         // 先压缩旧明文记录，避免按无损归档不再需要的空间占用将其清理。
         // 转换失败时保留源文件。
-        val compacted = compactHistory(context.filesDir)
-        pruneHistory(context.filesDir, enforceByteLimit = compacted)
+        compactHistory(context.filesDir)
+        pruneHistory(context.filesDir)
         val listing = DaemonBridge.runRootCommand(
             "for f in $ROOT_DIRECTORY/auto_*.log $ROOT_DIRECTORY/auto_*.log.gz; do " +
                 "[ -f \"\$f\" ] && [ ! -L \"\$f\" ] && basename \"\$f\"; done; true")
@@ -103,8 +102,8 @@ internal object AutoHistoryStore {
             }
         }
         if (acknowledge(acknowledged)) acknowledged.forEach { clearMarkerIfRemoved(folder, it) }
-        val importedCompacted = compactHistory(context.filesDir)
-        pruneHistory(context.filesDir, enforceByteLimit = importedCompacted)
+        compactHistory(context.filesDir)
+        pruneHistory(context.filesDir)
         cleanupInbox()
     }
 
@@ -338,8 +337,9 @@ internal object AutoHistoryStore {
 
     private fun readEntry(input: DataInputStream, name: String): AutoHistoryRecord.Entry {
         val pkg = input.readUTF()
+        val source = HistorySource.valueOf(input.readUTF()).also { require(it != HistorySource.CALIBRATION) }
         val session = SessionSummary(AutoHistoryRecord.sessionId(name), input.readLong(), input.readInt(),
-            input.readInt(), HistorySource.AUTO_ALLOCATION, input.readLong(), input.readLong(), input.readLong())
+            input.readInt(), source, input.readLong(), input.readLong(), input.readLong())
         val fps = if (!input.readBoolean()) null else {
             val average = input.readFloat(); val minimum = input.readFloat(); val maximum = input.readFloat()
             val samples = input.readInt()
@@ -367,6 +367,7 @@ internal object AutoHistoryStore {
 
     private fun writeEntry(output: DataOutputStream, entry: AutoHistoryRecord.Entry) {
         output.writeUTF(entry.pkg)
+        output.writeUTF(entry.session.source.name)
         output.writeLong(entry.session.epoch); output.writeInt(entry.session.rounds)
         output.writeInt(entry.session.threadCount); output.writeLong(entry.session.startedAtMs)
         output.writeLong(entry.session.recordedDurationMs); output.writeLong(entry.session.recordedEndedAtMs)
@@ -460,18 +461,15 @@ internal object AutoHistoryStore {
     }
 
     @Synchronized
-    fun pruneHistory(filesDir: File, enforceByteLimit: Boolean = true,
+    fun pruneHistory(filesDir: File, nowMs: Long = System.currentTimeMillis(),
         acknowledgeDeleted: (List<String>) -> Boolean = ::acknowledge) {
         val folder = directory(filesDir)
         val all = entries(filesDir)
-        var bytes = 0L
-        var count = 0
         val deleted = mutableListOf<String>()
         for (entry in all) {
-            val size = entry.memberFileNames.sumOf { File(folder, it).length() }
-            if (count >= HistoryRetention.AUTOMATIC_LIMIT || enforceByteLimit && bytes + size > MAX_TOTAL_BYTES) {
+            if (HistoryRetention.expired(entry.session.endedAtMs, nowMs)) {
                 if (markEntryDeleted(folder, entry)) { removeEntryLocal(folder, entry); deleted += entry.memberFileNames }
-            } else { count++; bytes += size }
+            }
         }
         if (acknowledgeDeleted(deleted)) deleted.forEach { clearMarkerIfRemoved(folder, it) }
     }

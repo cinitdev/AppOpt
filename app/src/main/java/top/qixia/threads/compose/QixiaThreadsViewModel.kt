@@ -38,6 +38,7 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
 
     private var dashboardGeneration = 0L
     private var dashboardJob: Job? = null
+    private var autoStartJob: Job? = null
     private var dashboardRefreshPending = false
     private var catalogJob: Job? = null
     private var historyLoaded = false
@@ -59,6 +60,7 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
     private var uiVisible = false
     private var visibleDestination = MainDestination.HOME
     val calibrationReviews = CalibrationReviewController(application, viewModelScope) { refreshDashboard() }
+    val refreshRates = RefreshRateSettingsController(application, viewModelScope)
 
     init {
         viewModelScope.launch {
@@ -159,7 +161,9 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
                             current.copy(
                                 refreshing = false,
                                 environment = snapshot.environment.copy(configuredAppCount = apps.configured.size,
-                                    ruleCount = apps.configured.sumOf(AppItemModel::ruleCount)),
+                                    ruleCount = apps.configured.sumOf(AppItemModel::ruleCount),
+                                    autoStartStatus = current.environment.autoStartStatus,
+                                    autoStartChecking = current.environment.autoStartChecking),
                                 applications = apps
                             )
                         }
@@ -183,8 +187,27 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
             loadHome()
             // 首页已可用后启动独立后台任务，网络请求不占用首页加载流程。
             moduleUpdateChecks.checkOnStartup(_state.value.environment)
+            refreshAutoStart()
             importHistoryInBackground()
             synchronizeRuleFormatInBackground()
+        }
+    }
+
+    /** 自启动查询独立于首屏加载，进入环境页及从系统设置返回时更新。 */
+    fun refreshAutoStart() {
+        if (autoStartJob?.isActive == true) return
+        if (!_state.value.environment.hasRoot) {
+            _state.update { it.copy(environment = it.environment.copy(
+                autoStartStatus = top.qixia.threads.AutoStartStatus.UNKNOWN, autoStartChecking = false)) }
+            return
+        }
+        _state.update { it.copy(environment = it.environment.copy(autoStartChecking = true)) }
+        autoStartJob = viewModelScope.launch {
+            val status = withContext(Dispatchers.IO) {
+                runCatching { top.qixia.threads.AutoStartAccess.read() }
+                    .getOrDefault(top.qixia.threads.AutoStartStatus.UNKNOWN)
+            }
+            _state.update { it.copy(environment = it.environment.copy(autoStartStatus = status, autoStartChecking = false)) }
         }
     }
 
@@ -220,7 +243,7 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
         }
     }
 
-    private fun loadApplicationCatalog() {
+    fun loadApplicationCatalog() {
         if (catalogJob?.isActive == true) return
         _state.update { it.copy(applications = it.applications.copy(catalogLoading = true)) }
         catalogJob = viewModelScope.launch {
@@ -357,12 +380,38 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
         "已删除 ${app.label} 的配置"
     }
 
+    fun setPerformanceRecording(app: AppItemModel, enabled: Boolean) =
+        runPackageAction(app.packageName, "正在保存性能记录开关",
+            onSuccess = { apps -> apps.copy(
+                configured = apps.configured.map { if (it.packageName == app.packageName) it.copy(performanceRecordingEnabled = enabled) else it },
+                addable = apps.addable.map { if (it.packageName == app.packageName) it.copy(performanceRecordingEnabled = enabled) else it }
+            ) }) {
+            check(DaemonBridge.setPerformanceRecording(app.packageName, enabled)) { "保存失败，请检查 Root 和模块状态" }
+            if (enabled) "已开启，进入应用后点击胶囊开始记录，长按可关闭" else "已关闭此应用的性能记录"
+        }
+
     fun setAutomaticAffinity(app: AppItemModel, enabled: Boolean) =
         runPackageAction(app.packageName, "正在更新自动核心分配",
             onSuccess = { it.automaticModeChanged(app.packageName, enabled) }) {
             check(repository.setAutomaticAffinity(app.packageName, enabled)) { "保存失败，请确认已安装支持自动分配的新模块" }
             if (enabled) "已开启 ${app.label} 的自动分配，直接进入游戏即可" else "已关闭自动分配，恢复原有规则模式"
         }
+
+    fun setAutomaticFallback(app: AppItemModel, enabled: Boolean, cpus: String?) {
+        var saved: DaemonBridge.AutomaticFallbackResult? = null
+        runPackageAction(app.packageName, "正在更新主进程兜底",
+            onSuccess = { apps -> apps.copy(configured = apps.configured.map {
+                if (it.packageName == app.packageName) it.copy(automaticFallbackEnabled = enabled,
+                    mainFallbackCpus = saved?.cpus, ruleCount = saved?.ruleCount ?: it.ruleCount,
+                    manualRuleState = if ((saved?.ruleCount ?: 0) > 0) AppRuleState.CONFIGURED else it.manualRuleState,
+                    manualCpuSummary = saved?.cpus?.let { cores -> "CPU $cores" } ?: it.manualCpuSummary,
+                    automaticAffinityDetail = "设置已保存，前台运行时生效") else it
+            }) }) {
+            saved = DaemonBridge.setAutomaticFallback(app.packageName, enabled, cpus)
+            if (enabled) "主进程低负载线程使用 CPU ${saved?.cpus}，达到 5% 后动态分配"
+            else "已关闭主进程兜底，低于 5% 的线程恢复系统调度"
+        }
+    }
 
     private fun runPackageAction(
         pkg: String,
@@ -525,8 +574,6 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
         openHistory(item, session.id)
 
     private fun openHistory(item: HistoryPackageModel, sessionId: Long?) {
-        val source = item.sessions.firstOrNull { it.id == sessionId }?.source
-            ?: item.sessions.firstOrNull()?.source
         val generation = ++historyDetailGeneration
         _state.update {
             it.copy(history = it.history.copy(
@@ -535,7 +582,7 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
         }
         viewModelScope.launch(Dispatchers.IO) {
             val result = runCatching {
-                repository.loadSessions(item.packageName).filter { source == null || it.source == source }
+                repository.loadSessions(item.packageName)
             }
             withContext(Dispatchers.Main) {
                 if (generation != historyDetailGeneration) return@withContext
@@ -665,10 +712,9 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
 
     fun deleteHistoryPackage(item: HistoryPackageModel) {
         if (item.packageName in _state.value.history.busyPackages) return
-        val source = item.sessions.firstOrNull()?.source ?: return
         _state.update { it.copy(history = it.history.copy(busyPackages = it.history.busyPackages + item.packageName)) }
         viewModelScope.launch(Dispatchers.IO) {
-            val result = runCatching { repository.deleteHistoryPackage(item.packageName, source) }
+            val result = runCatching { repository.deleteHistoryPackage(item.packageName) }
             withContext(Dispatchers.Main) {
                 _state.update {
                     it.copy(history = it.history.copy(busyPackages = it.history.busyPackages - item.packageName),
@@ -836,7 +882,7 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
     }
 
     fun exportHistoryPackage(item: HistoryPackageModel) = runExport {
-        repository.exportHistory(item.packageName, item.label, source = item.sessions.firstOrNull()?.source)
+        repository.exportHistory(item.packageName, item.label)
     }
 
     fun exportHistorySession(id: Long) {

@@ -9,8 +9,6 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.selection.selectable
-import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -49,7 +47,8 @@ fun HistoryScreen(
     autoHistoryEnabled: Boolean = false,
     onSelectWindow: (Int) -> Unit = {},
     onCompare: (String, SessionSummary, SessionSummary) -> Unit = { _, _, _ -> },
-    onCloseComparison: () -> Unit = {}
+    onCloseComparison: () -> Unit = {},
+    onNewRecording: () -> Unit = onNewCalibration
 ) {
     state.comparison?.let { comparison ->
         HistoryComparisonScreen(comparison, contentPadding, onCloseComparison) {
@@ -59,27 +58,17 @@ fun HistoryScreen(
     }
     var query by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf<String?>(null) }
-    var sourceName by rememberSaveable { mutableStateOf(HistorySource.CALIBRATION.name) }
-    val source = HistorySource.entries.firstOrNull { it.name == sourceName } ?: HistorySource.CALIBRATION
     var deleteApp by remember { mutableStateOf<HistoryPackageModel?>(null) }
     var deleteRecord by remember { mutableStateOf<Pair<HistoryPackageModel, SessionSummary>?>(null) }
     var selecting by rememberSaveable { mutableStateOf(false) }
     // 切换筛选时重置选择范围，隐藏记录不会继续保持选中。
-    var selectedIds by rememberSaveable(sourceName, filter, query) { mutableStateOf(emptyList<Long>()) }
-    var deleteSelection by remember(sourceName, filter, query) { mutableStateOf<List<Long>?>(null) }
+    var selectedIds by rememberSaveable(filter, query) { mutableStateOf(emptyList<Long>()) }
+    var deleteSelection by remember(filter, query) { mutableStateOf<List<Long>?>(null) }
     val listState = rememberLazyListState()
-    val sourcePackages = remember(state.packages, source) {
-        state.packages.mapNotNull { app ->
-            val sessions = app.sessions.filter { it.source == source }
-            if (sessions.isEmpty()) null else app.copy(sessions = sessions, sessionCount = sessions.size)
-        }
-    }
-    val selectedApp = sourcePackages.firstOrNull { it.packageName == filter }
-    val sourceCount = remember(sourcePackages, source) {
-        sourcePackages.sumOf { it.sessions.size }
-    }
-    val visible = remember(sourcePackages, query, filter, source) {
-        sourcePackages.filter { (filter == null || it.packageName == filter) &&
+    val selectedApp = state.packages.firstOrNull { it.packageName == filter }
+    val recordCount = remember(state.packages) { state.packages.sumOf { it.sessions.size } }
+    val visible = remember(state.packages, query, filter) {
+        state.packages.filter { (filter == null || it.packageName == filter) &&
             (it.label.contains(query, true) || it.packageName.contains(query, true)) }
             .flatMap { app -> app.sessions.map { app to it } }
             .sortedByDescending { it.second.endedAtMs }
@@ -90,16 +79,8 @@ fun HistoryScreen(
             .map { it.second.id }.toSet()
     }
     val selected = remember(selectedIds, selectableIds) { selectedIds.filter { it in selectableIds }.toSet() }
-    val sourceCounts = remember(state.packages) {
-        HistorySource.entries.associateWith { entry -> state.packages.sumOf { app -> app.sessions.count { it.source == entry } } }
-    }
-    LaunchedEffect(query, filter, source) { listState.scrollToItem(0) }
+    LaunchedEffect(query, filter) { listState.scrollToItem(0) }
     LaunchedEffect(selectableIds) { selectedIds = selectedIds.filter { it in selectableIds } }
-    LaunchedEffect(state.detail?.expandedSessionId) {
-        state.detail?.let { detail ->
-            detail.sessions.firstOrNull { it.id == detail.expandedSessionId }?.let { sourceName = it.source.name }
-        }
-    }
     LaunchedEffect(state.packages, state.loading) {
         if (!state.loading && filter != null && state.packages.none { it.packageName == filter }) filter = null
     }
@@ -124,8 +105,8 @@ fun HistoryScreen(
                     fontWeight = FontWeight.Medium)
                 Text(if (selecting) "选择记录" else "运行档案", color = OceanText, fontSize = 29.sp, lineHeight = 38.sp,
                     fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 5.dp))
-                Text(if (selecting) "${HistoryPresentation.sourceLabel(source)} · 已选择 ${selected.size} 条"
-                    else "回看性能表现，了解每一次运行", color = OceanTextSecondary,
+                Text(if (selecting) "已选择 ${selected.size} 条"
+                    else "校准 / 自动分配 / 性能记录", color = OceanTextSecondary,
                     fontSize = 12.sp, lineHeight = 18.sp, modifier = Modifier.padding(top = 4.dp))
             }
             if (selecting) {
@@ -156,36 +137,19 @@ fun HistoryScreen(
         LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("history-records"), state = listState,
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            item(key = "source") {
-                HistorySourceSelector(source, sourceCounts) { sourceName = it.name }
-            }
             item(key = "summary") {
-                if (source == HistorySource.CALIBRATION) {
-                    Row(Modifier.fillMaxWidth().padding(start = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("校准结果，随时回看", color = OceanText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                            Text("最多保留 ${HistoryRetention.CALIBRATION_LIMIT} 条 · 已收录 ${sourcePackages.size} 个应用", color = OceanTextSecondary, fontSize = 11.sp,
-                                modifier = Modifier.padding(top = 4.dp))
-                        }
-                        if (!selecting) TextButton(onNewCalibration, shape = RoundedCornerShape(12.dp),
-                            contentPadding = PaddingValues(horizontal = 10.dp)) {
-                            Icon(Icons.Outlined.Add, null, Modifier.size(17.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("开始校准", fontSize = 12.sp)
-                        }
+                Row(Modifier.fillMaxWidth().padding(start = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("保留最近 ${HistoryRetention.DAYS} 天 · 不限条数", color = OceanText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        Text(if (autoHistoryEnabled) "自动记录已开启 · 使用超过 3 分钟才留档"
+                            else "自动记录已关闭 · 已有记录按 7 天保留", color = OceanTextSecondary,
+                            fontSize = 11.sp, lineHeight = 17.sp, modifier = Modifier.padding(top = 4.dp))
                     }
-                } else {
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 3.dp, vertical = 3.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Top) {
-                        Icon(if (autoHistoryEnabled) Icons.Outlined.CheckCircle else Icons.Outlined.Info,
-                            null, Modifier.padding(top = 2.dp).size(16.dp), tint = PorcelainOnTonal)
-                        Column {
-                            Text(if (autoHistoryEnabled) "前台使用超过 3 分钟才留档" else "自动记录已关闭",
-                                color = OceanText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                            Text(if (autoHistoryEnabled) "最多保留 ${HistoryRetention.AUTOMATIC_LIMIT} 条 · 已收录 ${sourcePackages.size} 个应用"
-                                else "可在设置中开启，已有记录仍保留，最多 ${HistoryRetention.AUTOMATIC_LIMIT} 条。", color = OceanTextSecondary,
-                                fontSize = 11.sp, lineHeight = 18.sp, modifier = Modifier.padding(top = 3.dp))
-                        }
+                    if (!selecting) TextButton(onNewRecording, shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp)) {
+                        Icon(Icons.Outlined.Add, null, Modifier.size(17.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("开始记录", fontSize = 12.sp)
                     }
                 }
             }
@@ -193,7 +157,7 @@ fun HistoryScreen(
             item(key = "apps") {
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     item { FilterChip(filter == null, { filter = null }, label = { Text("全部应用", fontSize = 12.sp) }, shape = RoundedCornerShape(12.dp)) }
-                    items(state.packages.filter { app -> sourcePackages.any { it.packageName == app.packageName } || app.packageName == filter }, key = { it.packageName }) { app ->
+                    items(state.packages, key = { it.packageName }) { app ->
                         FilterChip(filter == app.packageName, { filter = app.packageName },
                             label = { Text(app.label, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 120.dp)) },
                             leadingIcon = { AppDrawableIcon(app.icon, "", Modifier.size(20.dp)) }, shape = RoundedCornerShape(12.dp))
@@ -203,10 +167,10 @@ fun HistoryScreen(
             if (selectedApp != null && !selecting) item(key = "app-actions") {
                 Surface(color = OceanSurface, shape = RoundedCornerShape(16.dp), border = BorderStroke(1.dp, OceanOutline)) {
                     Row(Modifier.fillMaxWidth().padding(start = 13.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("当前分类 · ${selectedApp.sessions.size} 次", Modifier.weight(1f), color = OceanTextSecondary, fontSize = 11.sp)
+                        Text("全部记录 · ${selectedApp.sessions.size} 次", Modifier.weight(1f), color = OceanTextSecondary, fontSize = 11.sp)
                         TextButton({ onExportPackage(selectedApp) }, enabled = visible.isNotEmpty()) { Text("导出全部", fontSize = 12.sp) }
                         IconButton({ deleteApp = selectedApp }, enabled = selectedApp.packageName !in state.busyPackages) {
-                            Icon(Icons.Outlined.DeleteOutline, "删除此应用当前分类的历史", tint = OceanTextSecondary, modifier = Modifier.size(20.dp))
+                            Icon(Icons.Outlined.DeleteOutline, "删除此应用的全部历史", tint = OceanTextSecondary, modifier = Modifier.size(20.dp))
                         }
                     }
                 }
@@ -214,13 +178,9 @@ fun HistoryScreen(
             if (state.loading && state.packages.isEmpty()) item { LoadingState("正在读取历史记录") }
             else if (visible.isEmpty()) item {
                 val searching = query.isNotBlank() || filter != null
-                HistorySurface { EmptyState(if (searching) "没有匹配的记录" else "还没有${HistoryPresentation.sourceLabel(source)}",
-                    when {
-                        searching -> "试试其他名称，或切换到全部应用。"
-                        source == HistorySource.CALIBRATION -> "从应用页启动一次校准，完成后在这里查看报告与线程曲线。"
-                        !autoHistoryEnabled -> "在设置中开启“记录自动分配历史”，再使用已开启自动分配的应用。记录默认关闭。"
-                        else -> "使用已开启自动分配的应用，前台使用超过 3 分钟，结束后便会在这里生成完整报告。"
-                    }) }
+                HistorySurface { EmptyState(if (searching) "没有匹配的记录" else "还没有运行记录",
+                    if (searching) "试试其他名称，或切换到全部应用。"
+                    else "完成一次校准，或在设置中开启自动分配历史后使用目标应用超过 3 分钟，即可在这里查看报告。") }
             }
             days.forEach { (date, records) ->
                 item(key = "date-$date") {
@@ -247,7 +207,7 @@ fun HistoryScreen(
                 }
             }
             if (visible.isNotEmpty()) item {
-                Text("${visible.size} / $sourceCount 次记录 · 数据仅保存在本机", color = OceanTextSecondary, fontSize = 10.sp,
+                Text("${visible.size} / $recordCount 次记录 · 数据仅保存在本机", color = OceanTextSecondary, fontSize = 10.sp,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp))
             }
         }
@@ -262,8 +222,7 @@ fun HistoryScreen(
         )
     }
     deleteApp?.let { app ->
-        val category = app.sessions.firstOrNull()?.source?.let(HistoryPresentation::sourceLabel).orEmpty()
-        HistoryDeleteDialog("删除这些$category？", "将删除 ${app.label} 的 ${app.sessions.size} 次${category}及相关曲线。其他分类和已保存的核心规则不受影响。",
+        HistoryDeleteDialog("删除此应用的全部记录？", "将删除 {app.label} 的 {app.sessions.size} 次校准与自动分配记录及相关曲线，已保存的核心规则不受影响。",
             { deleteApp = null }, { deleteApp = null; onDeletePackage(app) })
     }
     deleteRecord?.let { (app, session) ->
@@ -281,7 +240,7 @@ fun HistoryScreen(
                 Text(if (targets.isEmpty()) "所选记录已不存在或正在处理，无需重复删除。"
                     else buildString {
                         if (changed) append("部分记录已不存在或正在处理，将仅删除剩余 ${targets.size} 条。\n\n")
-                        append("将删除所选${HistoryPresentation.sourceLabel(source)}及相关曲线，无法撤销。已保存的核心规则不受影响。")
+                        append("将删除所选记录及相关曲线，无法撤销。已保存的核心规则不受影响。")
                     })
             },
             confirmButton = {
@@ -319,31 +278,6 @@ private fun HistorySelectionBar(selectedCount: Int, allSelected: Boolean, enable
                 Icon(Icons.Outlined.DeleteOutline, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(5.dp))
                 Text("删除所选 · $selectedCount", fontSize = 12.sp)
-            }
-        }
-    }
-}
-
-@Composable
-private fun HistorySourceSelector(selected: HistorySource, counts: Map<HistorySource, Int>, onSelected: (HistorySource) -> Unit) {
-    Row(Modifier.fillMaxWidth().selectableGroup(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        HistorySource.entries.forEach { source ->
-            val active = source == selected
-            Surface(modifier = Modifier.weight(1f), shape = RoundedCornerShape(20.dp),
-                color = if (active) PorcelainHeader.copy(alpha = .62f) else OceanSurface,
-                border = BorderStroke(1.dp, if (active) PorcelainOnTonal.copy(alpha = .38f) else OceanOutline)) {
-                Column(Modifier.fillMaxWidth().testTag("history-source-${source.name}")
-                    .selectable(active, role = Role.Tab, onClick = { onSelected(source) })
-                    .heightIn(min = 76.dp).padding(horizontal = 15.dp, vertical = 13.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(HistoryPresentation.sourceLabel(source), Modifier.weight(1f),
-                            color = if (active) PorcelainOnTonal else OceanText,
-                            fontSize = 13.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold)
-                        if (active) Icon(Icons.Outlined.Check, null, Modifier.padding(start = 3.dp).size(16.dp), tint = PorcelainOnTonal)
-                    }
-                    Text("${counts[source] ?: 0} 次记录", color = OceanTextSecondary, fontSize = 11.sp,
-                        modifier = Modifier.padding(top = 5.dp))
-                }
             }
         }
     }
@@ -395,9 +329,9 @@ private fun HistoryRecordCard(app: HistoryPackageModel, session: SessionSummary,
                     }
                     VerticalDivider(Modifier.height(36.dp), color = OceanOutline)
                     Column(Modifier.weight(.8f).padding(start = 17.dp)) {
-                        Text("线程记录", color = OceanTextSecondary, fontSize = 10.sp)
+                        Text(if (session.source == HistorySource.PERFORMANCE) "帧率样本" else "线程记录", color = OceanTextSecondary, fontSize = 10.sp)
                         Row(Modifier.padding(top = 5.dp), verticalAlignment = Alignment.Bottom) {
-                            Text("${session.threadCount}", color = OceanText, fontSize = 23.sp, lineHeight = 34.sp,
+                            Text("${if (session.source == HistorySource.PERFORMANCE) fps?.samples ?: 0 else session.threadCount}", color = OceanText, fontSize = 23.sp, lineHeight = 34.sp,
                                 fontWeight = FontWeight.SemiBold)
                             Text("条", color = OceanTextSecondary, fontSize = 10.sp,
                                 modifier = Modifier.padding(start = 5.dp, bottom = 5.dp))
@@ -406,8 +340,16 @@ private fun HistoryRecordCard(app: HistoryPackageModel, session: SessionSummary,
                 }
             }
             Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(HistoryPresentation.sourceLabel(session.source), color = OceanTextSecondary, fontSize = 10.sp,
-                    modifier = Modifier.weight(1f))
+                Surface(color = if (session.source == HistorySource.CALIBRATION) OceanSurfaceHigh else PorcelainHeader,
+                    shape = RoundedCornerShape(8.dp)) {
+                    Row(Modifier.padding(horizontal = 8.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Icon(when (session.source) { HistorySource.CALIBRATION -> Icons.Outlined.Tune; HistorySource.PERFORMANCE -> Icons.Outlined.RadioButtonChecked; else -> Icons.Outlined.AutoMode },
+                            null, Modifier.size(13.dp), tint = PorcelainOnTonal)
+                        Text(HistoryPresentation.sourceLabel(session.source), color = PorcelainOnTonal, fontSize = 11.sp)
+                    }
+                }
+                Spacer(Modifier.weight(1f))
                 if (selecting) {
                     Text(if (busy) "正在处理" else if (selected) "已选择" else "选择此记录",
                         color = if (selected) PorcelainOnTonal else OceanTextSecondary, fontSize = 11.sp)

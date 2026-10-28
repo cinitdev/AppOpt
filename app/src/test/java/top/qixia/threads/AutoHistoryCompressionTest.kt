@@ -139,17 +139,22 @@ class AutoHistoryCompressionTest {
         assertTrue(AutoHistoryStore.entries(temp.root).isEmpty())
     }
 
-    @Test fun compressedRetentionKeepsSevenVisitsAndTheirStableIds() {
+    @Test fun compressedRetentionKeepsEveryRecentVisitAndStableIds() {
+        val now = 10 * HistoryRetention.MAX_AGE_MS
         repeat(8) { index ->
-            val start = 1000L + index * 300000L
+            val start = now - 3000000L + index * 300000L
             plain("auto_${start}_12_0.log", payload(start, start + 200000))
         }
+        val expiredStart = now - HistoryRetention.MAX_AGE_MS - 400000L
+        plain("auto_${expiredStart}_12_0.log", payload(expiredStart, expiredStart + 200000))
         val before = AutoHistoryStore.entries(temp.root).map { it.session.id }
+        assertEquals(9, before.size)
         assertTrue(AutoHistoryStore.compactHistory(temp.root) {})
         assertEquals(before, AutoHistoryStore.entries(temp.root).map { it.session.id })
-        AutoHistoryStore.pruneHistory(temp.root) { false }
+        AutoHistoryStore.pruneHistory(temp.root, now) { false }
         val retained = AutoHistoryStore.entries(temp.root)
-        assertEquals(before.take(7), retained.map { it.session.id })
+        // 八条有效记录均保留，只删除七天前结束的记录；压缩不改变记录身份。
+        assertEquals(before.take(8), retained.map { it.session.id })
         assertTrue(retained.all { it.memberFileNames.single().endsWith(".log.gz") })
     }
 

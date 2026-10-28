@@ -4,12 +4,14 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
+import android.os.Process
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.lifecycle.Lifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -22,6 +24,7 @@ class UpdateInstallActivity : ComponentActivity() {
     private var installState by mutableStateOf(UpdateInstallViewModel.State())
     private var rebooting by mutableStateOf(false)
     private var rebootStatus by mutableStateOf<Pair<String, String>?>(null)
+    private var exitForAppUpdate = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,35 +40,49 @@ class UpdateInstallActivity : ComponentActivity() {
 
         val update = readUpdateInfo()
         val zipPath = intent.getStringExtra(EXTRA_ZIP_PATH)
-        if (update == null || zipPath.isNullOrBlank()) {
+        val appOnly = intent.getBooleanExtra(EXTRA_APP_ONLY, false)
+        if (!appOnly && (update == null || zipPath.isNullOrBlank())) {
             AppToast.show(this, "更新信息无效")
             finish()
             return
         }
 
-        viewModel.state.observe(this) { installState = it }
+        if (appOnly) {
+            installState = UpdateInstallViewModel.State(statusTitle = "检查 App 更新",
+                statusDetail = "正在读取模块随附的安装包")
+            thread(name = "QixiaThreadsPendingApk") {
+                val pending = ModuleHotUpdate.hasPendingApp()
+                runOnUiThread {
+                    installState = UpdateInstallViewModel.State(statusTitle = "模块已生效",
+                        statusDetail = if (pending) "可单独安装模块随附的 App" else "没有待安装的 App 更新",
+                        log = "模块与 App 分开更新，点击完成可直接返回。", running = false,
+                        success = true, appUpdatePending = pending)
+                }
+            }
+        } else viewModel.state.observe(this) { installState = it }
         setContent {
             QixiaThreadsTheme {
                 UpdateInstallScreen(
                     state = installState,
-                    subtitle = "当前 ${update.localVersion} (${update.localVersionCode}) → ${update.remoteVersion} (${update.remoteVersionCode})",
+                    subtitle = if (update == null) "安装模块随附的 App" else
+                        "当前 ${update.localVersion} (${update.localVersionCode}) → ${update.remoteVersion} (${update.remoteVersionCode})",
                     rebooting = rebooting,
                     rebootStatus = rebootStatus,
                     onBack = ::requestClose,
                     onPrimaryAction = {
                         if (installState.rebootRequired) rebootSystem() else requestClose()
-                    }
+                    },
+                    onUpdateApp = ::completeAppUpdate
                 )
             }
         }
-        viewModel.start(applicationContext, zipPath, update)
+        if (!appOnly) viewModel.start(applicationContext, requireNotNull(zipPath), requireNotNull(update))
     }
 
     private fun requestClose() {
+        if (rebooting) return
         if (installState.running) {
             AppToast.show(this, "正在刷入模块，请等待完成")
-        } else if (installState.appUpdatePending) {
-            completeAppUpdate()
         } else {
             finish()
         }
@@ -74,19 +91,38 @@ class UpdateInstallActivity : ComponentActivity() {
     private fun completeAppUpdate() {
         if (rebooting) return
         rebooting = true
-        rebootStatus = "正在交接 App 更新" to "模块已生效，请稍后从桌面重新打开 App"
+        rebootStatus = "正在准备 App 更新" to "即将返回桌面，安装完成后会显示提示"
         thread(name = "QixiaThreadsAppUpdate") {
-            val queued = ModuleHotUpdate.queueAppInstall()
+            val queued = ModuleHotUpdate.queueAppInstall(Process.myPid())
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 if (queued) {
-                    AppToast.show(this@UpdateInstallActivity, "正在更新 App，请稍后从桌面重新打开")
-                    finishAffinity()
+                    // 先显示桌面并走完 Activity 退出，再让独立安装器替换本进程。
+                    // 安装器会核对 PID 与启动时间，交接失败时保留安装包而不强制覆盖。
+                    runCatching {
+                        startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        exitForAppUpdate = true
+                        finishAffinity()
+                        finishAndRemoveTask()
+                        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                            Process.killProcess(Process.myPid())
+                        }
+                    }.onFailure {
+                        rebooting = false
+                        rebootStatus = "无法返回桌面" to "App 尚未更新，请稍后重试"
+                    }
                 } else {
                     rebooting = false
-                    rebootStatus = "App 更新未能启动" to "模块已生效，可再次点击完成重试"
+                    rebootStatus = "App 更新未能启动" to "模块已生效，可再次点击更新 App 重试"
                 }
             }
         }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (exitForAppUpdate) Process.killProcess(Process.myPid())
     }
 
     private fun rebootSystem() {
@@ -143,6 +179,10 @@ class UpdateInstallActivity : ComponentActivity() {
         private const val EXTRA_REMOTE_CODE = "remote_code"
         private const val EXTRA_ZIP_URL = "zip_url"
         private const val EXTRA_ZIP_PATH = "zip_path"
+        private const val EXTRA_APP_ONLY = "app_update_only"
+
+        fun pendingAppIntent(context: Context) = Intent(context, UpdateInstallActivity::class.java)
+            .putExtra(EXTRA_APP_ONLY, true)
 
         fun intent(context: Context, update: ModuleUpdater.UpdateInfo, zipPath: String): Intent {
             return Intent(context, UpdateInstallActivity::class.java)

@@ -7,7 +7,6 @@ import java.util.UUID
 /** 仅追加的记录文件可应对应用意外中断，不迁移数据库或改动线程历史。 */
 object HistoryMetricsStore {
     private const val MAX_FILE_BYTES = 8L * 1024 * 1024
-    private const val MAX_TOTAL_BYTES = 64L * 1024 * 1024
     private const val MAX_ROWS = 21_600 // 每两秒一条，可记录 12 小时
     private fun prefix(pkg: String) = MessageDigest.getInstance("SHA-256").digest(pkg.toByteArray())
         .joinToString("") { "%02x".format(it) }
@@ -23,7 +22,7 @@ object HistoryMetricsStore {
         init {
             synchronized(HistoryMetricsStore) {
                 val dir = directory(filesDir).also { check(it.isDirectory || it.mkdirs()) }
-                pruneHistory(filesDir)
+                pruneHistory(filesDir, startedAt)
                 file = File(dir, "${prefix(pkg)}_${startedAt}_${UUID.randomUUID()}.tsv")
                 file.writeText("# QixiaThreads metrics v1\n# package=$pkg\n# started=$startedAt\n")
                 captureId?.takeIf { CAPTURE_ID.matches(it) }?.let { file.appendText("# capture_id=$it\n") }
@@ -52,26 +51,18 @@ object HistoryMetricsStore {
             closed = true
             synchronized(HistoryMetricsStore) {
                 activeFiles -= file.absolutePath
-                pruneHistory(filesDir)
+                pruneHistory(filesDir, lastTimestamp)
             }
         }
     }
 
     @Synchronized
-    internal fun pruneHistory(filesDir: File) {
-        val files = directory(filesDir).listFiles { f -> f.name.endsWith(".tsv") && f.absolutePath !in activeFiles }
-            ?.sortedByDescending { it.name.substringAfter('_').substringBefore('_').toLongOrNull() ?: 0L }.orEmpty()
-        var bytes = 0L
-        val perApp = mutableMapOf<String, Int>()
-        files.forEachIndexed { index, file ->
-            bytes += file.length()
-            val app = file.name.substringBefore('_')
-            val count = perApp.getOrDefault(app, 0) + 1
-            perApp[app] = count
-            // 一次校准可能包含多段前台片段，因此独立限制此缓冲区，
-            // 并按校准区间删除已完成会话。
-            if (index >= 300 || count > 30 || bytes > MAX_TOTAL_BYTES) file.delete()
-        }
+    internal fun pruneHistory(filesDir: File, nowMs: Long = System.currentTimeMillis()) {
+        directory(filesDir).listFiles { f -> f.extension == "tsv" && f.absolutePath !in activeFiles }
+            .orEmpty().forEach { file ->
+                // 文件关闭时间不会早于最后一个采样，避免刚完成的记录提前过期。
+                if (HistoryRetention.expired(file.lastModified(), nowMs)) file.delete()
+            }
     }
 
     @Synchronized
@@ -92,7 +83,7 @@ object HistoryMetricsStore {
         val windows = sessions.filter { it.first > 0 && it.second > 0 }
         val result = mutableMapOf<Long, HistoryMetrics.Report>()
         val groups = directory(filesDir).listFiles { f -> f.name.startsWith(prefix(pkg)) && f.name.endsWith(".tsv") }
-            .orEmpty().sortedByDescending { it.lastModified() }.take(30).groupBy { file ->
+            .orEmpty().sortedByDescending { it.lastModified() }.groupBy { file ->
                 val id = runCatching { file.useLines { lines -> lines.take(12)
                     .firstOrNull { it.startsWith("# capture_id=") }?.substringAfter('=') } }.getOrNull()
                 // 旧文件没有足够信息证明两次启动属于同一次记录，

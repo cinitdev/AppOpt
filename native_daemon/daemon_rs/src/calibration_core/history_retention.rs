@@ -90,84 +90,23 @@ fn recover_abandoned_lock(path: &Path) {
 }
 
 /// 仅重写已完成且未被认领的校准 .log 文件，未知格式保持原样。
-pub(super) fn prune(directory: &Path, limit: usize) -> io::Result<()> {
-    let mut files = Vec::new();
-    let mut sessions = Vec::new();
-    let mut entries = fs::read_dir(directory)?;
-    for entry in entries.by_ref().take(1000) {
+pub(super) fn retained_text(text: &str, now_secs: u64) -> String {
+    let Some(parts) = session_ranges(text) else { return text.to_owned() };
+    parts.iter().filter(|(epoch, _, _)| !crate::history_retention::expired(epoch.saturating_mul(1000), now_secs.saturating_mul(1000)))
+        .map(|(_, start, end)| &text[*start..*end]).collect()
+}
+
+pub(super) fn prune(directory: &Path, now_secs: u64) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("log")
-            || !entry.file_type()?.is_file()
-        {
-            continue;
-        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("log") || !entry.file_type()?.is_file() { continue; }
         let mut text = String::new();
-        if let Err(error) = fs::File::open(&path)
-            .and_then(|file| file.take(64 * 1024 * 1024 + 1).read_to_string(&mut text))
-        {
-            log_warn!(
-                "[校准历史] 跳过不可读的历史文件 {}: {error}",
-                path.display()
-            );
-            continue;
-        }
-        if text.len() > 64 * 1024 * 1024 {
-            continue;
-        }
-        let Some(parts) = session_ranges(&text) else {
-            continue;
-        };
-        let file_index = files.len();
-        for (index, (epoch, _, _)) in parts.iter().enumerate() {
-            sessions.push((*epoch, path.clone(), file_index, index));
-        }
-        files.push((path, parts));
-    }
-    if entries.next().is_some() {
-        return Err(io::Error::other(
-            "calibration history directory exceeds entry limit",
-        ));
-    }
-    sessions.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| b.3.cmp(&a.3))
-    });
-    let keep = sessions
-        .into_iter()
-        .take(limit)
-        .map(|(_, _, file, row)| (file, row))
-        .collect::<HashSet<_>>();
-    for (file_index, (path, parts)) in files.into_iter().enumerate() {
-        let retained_count = (0..parts.len())
-            .filter(|index| keep.contains(&(file_index, *index)))
-            .count();
-        if retained_count == parts.len() {
-            continue;
-        }
-        if retained_count == 0 {
-            fs::remove_file(path)?;
-            continue;
-        }
-        // 内存中最多保留一个完整文件，大部分文件无需重写。
-        let mut text = String::new();
-        fs::File::open(&path)?
-            .take(64 * 1024 * 1024 + 1)
-            .read_to_string(&mut text)?;
-        if text.len() > 64 * 1024 * 1024 || session_ranges(&text).as_ref() != Some(&parts) {
-            log_warn!(
-                "[校准历史] 文件已变化，保留等待下次清理: {}",
-                path.display()
-            );
-            continue;
-        }
-        let retained = parts
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| keep.contains(&(file_index, *index)))
-            .map(|(_, (_, start, end))| &text[*start..*end])
-            .collect::<String>();
+        if fs::File::open(&path).and_then(|file| file.take(64 * 1024 * 1024 + 1).read_to_string(&mut text)).is_err()
+            || text.len() > 64 * 1024 * 1024 { continue; }
+        let retained = retained_text(&text, now_secs);
+        if retained == text { continue; }
+        if retained.is_empty() { fs::remove_file(&path)?; continue; }
         let pending = path.with_extension("log.retention.tmp");
         let mut output = fs::File::create(&pending)?;
         output.write_all(retained.as_bytes())?;
@@ -206,7 +145,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retention_is_global_and_preserves_claims_drafts_and_in_progress_files() {
+    fn retention_expires_by_age_and_preserves_claims_drafts_and_in_progress_files() {
         let directory = std::env::temp_dir().join(format!(
             "qixia-calibration-retention-{}-{}",
             std::process::id(),
@@ -233,7 +172,10 @@ mod tests {
         }
         fs::write(directory.join("broken.log"), [0xff, 0xfe]).unwrap();
         let lock = HistoryDirectoryLock::acquire(&directory).unwrap();
-        prune(&directory, 10).unwrap();
+        prune(&directory, 20).unwrap();
+        assert_eq!(session_ranges(&fs::read_to_string(directory.join("one.log")).unwrap()).unwrap().len(), 8);
+        assert_eq!(session_ranges(&fs::read_to_string(directory.join("two.log")).unwrap()).unwrap().len(), 8);
+        prune(&directory, crate::history_retention::MAX_AGE_MS / 1000 + 7).unwrap();
         assert_eq!(
             fs::read_to_string(directory.join("one.log")).unwrap(),
             [record(7), record(8)].concat()

@@ -44,6 +44,7 @@ class ModuleHotUpdateTest {
         listOf("service.sh", "config/bin/QiXiaRs", "config/ebpf/queuebuffer_probe.bpf.o",
             "config/ebpf/queuebuffer_probe_perf.bpf.o", "config/ebpf/queuebuffer_probe_stats.bpf.o",
             "config/tools/qixia_foreground_helper.sh", "config/tools/qixia_foreground_helper.jar",
+            "config/tools/qixia_java_service.sh", "config/tools/qixia_refresh_helper.sh", "config/tools/qixia_refresh_helper.jar",
             "config/tools/qixia_pkg_helper.sh", "config/tools/qixia_pkg_helper.jar",
             "config/tools/qixia_hot_update.sh")
             .forEach { file("$path/$it", "$build:$it\n").setExecutable(true) }
@@ -131,6 +132,26 @@ class ModuleHotUpdateTest {
         run("! runtime_cgroup_targets '${root.path}/init.cgroup' '${root.path}/caller.cgroup' '${root.path}/mountinfo'")
     }
 
+    @Test fun kernelWriteErrorAfterSuccessfulMigrationUsesActualMembership() {
+        file("init.cgroup", "2:memory:/\n")
+        file("caller.cgroup", "2:memory:/apps\n")
+        file("mountinfo", "21 1 0:21 / /dev/memcg rw - cgroup none rw,memory\n")
+        run("""
+            write_runtime_cgroup() { cp '${root.path}/init.cgroup' '${root.path}/caller.cgroup'; return 1; }
+            align_runtime_cgroups 123 '${root.path}/init.cgroup' '${root.path}/caller.cgroup' '${root.path}/mountinfo'
+        """.trimIndent())
+    }
+
+    @Test fun unsuccessfulMigrationIsRejectedEvenIfWriteReportsSuccess() {
+        file("init.cgroup", "2:memory:/\n")
+        file("caller.cgroup", "2:memory:/apps\n")
+        file("mountinfo", "21 1 0:21 / /dev/memcg rw - cgroup none rw,memory\n")
+        for (status in listOf(0, 1)) run("""
+            write_runtime_cgroup() { return $status; }
+            ! align_runtime_cgroups 123 '${root.path}/init.cgroup' '${root.path}/caller.cgroup' '${root.path}/mountinfo'
+        """.trimIndent())
+    }
+
     @Test fun isolationFailureLeavesCurrentServiceAndStagingUntouched() {
         run("detach_runtime() { return 1; }; ! apply_update ''")
         assertFalse(File(root, "starts").exists())
@@ -148,6 +169,84 @@ class ModuleHotUpdateTest {
         assertFalse(File(root, "staged").exists())
         assertFalse(File(root, "active/config/tools/qixia_pkg_helper.jar").exists())
         assertFalse(File(root, "active/config/tools/qixia_pkg_helper.sh").exists())
+    }
+
+    @Test fun synchronousInstallReportsLiveServiceBeforeManagerExitThenCleansMarkers() {
+        file("staged/customize.sh", "installer script\n")
+        val output = run(captureToasts() + "\n" + """
+
+            wait_installers() {
+                [ "${'$'}(phase)" = activated ] || return 1
+                test -f "${'$'}STAGED/module.prop" || return 1
+                grep -Fq 'activated|toast ' '${root.path}/toasts' || return 1
+                # 模拟管理器在 customize.sh 返回后执行的收尾动作。
+                touch "${'$'}ACTIVE/update"
+                cp "${'$'}STAGED/module.prop" "${'$'}ACTIVE/module.prop"
+                rm "${'$'}STAGED/customize.sh"
+                echo completed > '${root.path}/installer-finished'
+            }
+            apply_update 'installer' sync
+            if [ "${'$'}(phase)" != applied ]; then
+                cat '${root.path}/toasts' '${root.path}/installer-finished' "${'$'}TX/expected.manifest" "${'$'}TX/final.manifest" 2>/dev/null
+            fi
+            true
+        """.trimIndent())
+        assertEquals(output, "phase=applied", phase())
+        assertEquals("completed\n", File(root, "installer-finished").readText())
+        assertEquals(1, File(root, "toasts").readLines().size)
+        assertTrue(File(root, "toasts").readText().contains("无需重启"))
+        assertFalse(File(root, "staged").exists())
+        assertFalse(File(root, "active/update").exists())
+        assertFalse(File(root, "transaction").exists())
+    }
+
+    @Test fun synchronousHealthFailureNeverReportsSuccess() {
+        run(captureToasts() + "\napply_update '' sync", healthy = false)
+        assertEquals("phase=deferred", phase())
+        assertEquals("old:config/bin/QiXiaRs\n", File(root, "active/config/bin/QiXiaRs").readText())
+        val notice = File(root, "toasts").readText()
+        assertTrue(notice.contains("需要重启"))
+        assertFalse(notice.contains("无需重启"))
+        assertTrue(File(root, "staged").exists())
+    }
+
+    @Test fun synchronousCleanupDoesNotDeleteAReplacedStagingDirectory() {
+        run("""
+            wait_installers() {
+                mv "${'$'}STAGED" '${root.path}/original-staged'
+                mkdir "${'$'}STAGED"
+                echo next-update > "${'$'}STAGED/keep"
+            }
+            apply_update 'installer' sync
+        """.trimIndent())
+        assertEquals("phase=deferred", phase())
+        assertEquals("next-update\n", File(root, "staged/keep").readText())
+        assertEquals("old:config/bin/QiXiaRs\n", File(root, "active/config/bin/QiXiaRs").readText())
+    }
+
+    @Test fun installerPrintsExplicitSuccessFailureAndFirstInstallResults() {
+        val customize = instrumentation.context.assets.open("customize.sh").bufferedReader().use { it.readText() }
+        val function = "print_install_result() {" + customize.substringAfter("print_install_result() {")
+            .substringBefore("\ncheck_root_version\n")
+        val setup = """
+            ui_print() { printf '%s\n' "${'$'}*"; }
+            MODPATH='${root.path}/staged'
+            QIXIA_UPGRADE_SOURCE='${root.path}/active'
+            EMBEDDED_APP_CLEANUP_ALLOWED=1
+            $function
+        """.trimIndent()
+        file("staged/config/tools/qixia_hot_update.sh", "#!/system/bin/sh\nexit 0\n")
+        val success = run(setup + "\nprint_install_result")
+        assertTrue(success.contains("【热更新成功】无需重启手机"))
+        assertFalse(success.contains("已排队"))
+        file("staged/config/tools/qixia_hot_update.sh", "#!/system/bin/sh\necho '服务检查失败'\nexit 1\n")
+        val failure = run(setup + "\nprint_install_result")
+        assertTrue(failure.contains("【需要重启】"))
+        assertTrue(failure.contains("服务检查失败"))
+        assertFalse(failure.contains("【热更新成功】"))
+        val first = run(setup + "\nQIXIA_UPGRADE_SOURCE=\nprint_install_result")
+        assertTrue(first.contains("【首次安装完成】请重启手机生效"))
+        assertFalse(first.contains("正在热更新"))
     }
 
     @Test fun failedHealthOnlyShowsRebootToastAfterRollback() {
@@ -195,8 +294,9 @@ class ModuleHotUpdateTest {
         file("staged/config/app/app.prop", "versionCode=205\n")
         file("staged/config/app/test.apk", "pending apk")
         file("transaction/worker.sh", "recovery worker")
-        run("apply_update ''")
+        run(captureToasts() + "\napply_update ''")
         assertEquals("phase=applied", phase())
+        assertTrue(File(root, "toasts").readText().contains("App 尚未更新"))
         assertTrue(File(root, "transaction/worker.sh").exists())
         assertTrue(File(root, "active/config/tools/qixia_hot_update.sh").exists())
         assertTrue(File(root, "active/config/tools/qixia_pkg_helper.jar").exists())
@@ -289,6 +389,88 @@ class ModuleHotUpdateTest {
         run("mkdir -p '${root.path}/active/system' '${root.path}/staged/system'; " +
             "ln -s one '${root.path}/active/system/link'; ln -s two '${root.path}/staged/system/link'; apply_update ''")
         assertEquals("phase=deferred", phase())
+        assertFalse(File(root, "starts").exists())
+    }
+
+    @Test fun kernelSuVendorRelocationIsEquivalentBeforeAndAfterInstaller() {
+        file("active/vendor/bin/msm_irqbalance", "")
+        file("staged/system/vendor/bin/msm_irqbalance", "")
+        run("""
+            mkdir -p "${'$'}ACTIVE/system"
+            ln -s ../vendor "${'$'}ACTIVE/system/vendor"
+            wait_installers() {
+                mv "${'$'}STAGED/system/vendor" "${'$'}STAGED/vendor"
+                ln -s ../vendor "${'$'}STAGED/system/vendor"
+                touch "${'$'}ACTIVE/update"
+            }
+            apply_update 'installer' sync
+        """.trimIndent())
+        assertEquals("phase=applied", phase())
+        assertFalse(File(root, "staged").exists())
+        assertTrue(File(root, "active/vendor/bin/msm_irqbalance").exists())
+    }
+
+    @Test fun apatchPartitionAliasesDoNotRequireReboot() {
+        for (partition in listOf("vendor", "product", "system_ext", "odm", "oem")) {
+            file("active/system/$partition/bin/empty", "")
+            file("staged/system/$partition/bin/empty", "")
+        }
+        run("""
+            for partition in vendor product system_ext odm oem; do
+                ln -s "./system/${'$'}partition" "${'$'}ACTIVE/${'$'}partition"
+            done
+            wait_installers() {
+                for partition in vendor product system_ext odm oem; do
+                    ln -s "./system/${'$'}partition" "${'$'}STAGED/${'$'}partition"
+                done
+            }
+            apply_update 'installer' sync
+        """.trimIndent())
+        assertEquals("phase=applied", phase())
+    }
+
+    @Test fun changedVendorContentsStillRequireRebootAfterNormalization() {
+        file("active/vendor/bin/msm_irqbalance", "")
+        file("staged/system/vendor/bin/msm_irqbalance", "changed")
+        run("mkdir -p \"${'$'}ACTIVE/system\"; ln -s ../vendor \"${'$'}ACTIVE/system/vendor\"; apply_update ''")
+        assertEquals("phase=deferred", phase())
+        assertFalse(File(root, "starts").exists())
+    }
+
+    @Test fun removedEmptyOverlayStillRequiresReboot() {
+        file("active/system/vendor/bin/msm_irqbalance", "")
+        File(root, "staged/system/vendor/bin").mkdirs()
+        run("apply_update ''")
+        assertEquals("phase=deferred", phase())
+        assertFalse(File(root, "starts").exists())
+    }
+
+    @Test fun externalOrConflictingPartitionAliasesAreRejected() {
+        file("active/system/vendor/bin/empty", "")
+        file("staged/system/vendor/bin/empty", "")
+        file("outside/empty", "")
+        run("ln -s '${root.path}/outside' \"${'$'}ACTIVE/vendor\"; apply_update ''")
+        assertEquals("phase=deferred", phase())
+        assertFalse(File(root, "starts").exists())
+        run("rm \"${'$'}ACTIVE/vendor\"; mkdir -p \"${'$'}ACTIVE/vendor\"; apply_update ''")
+        assertEquals("phase=deferred", phase())
+        assertFalse(File(root, "starts").exists())
+    }
+
+    @Test fun appInstallWaitsForExactCallerExitAndKeepsPendingOnTimeout() {
+        file("active/config/app/app.prop", "package=top.qixia.threads\n")
+        run("""
+            alive() { test "${'$'}exited" != 1; }
+            sleep() { exited=1; }
+            wait_app_exit '123:456'
+            test "${'$'}exited" = 1 || exit 1
+            alive() { return 0; }
+            sleep() { :; }
+            ! install_app_after_exit '123:456' || exit 1
+            ! wait_app_exit ''
+        """.trimIndent())
+        assertTrue(File(root, "active/config/app/app.prop").exists())
+        assertFalse(File(root, "transaction/status").exists())
         assertFalse(File(root, "starts").exists())
     }
 

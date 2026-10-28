@@ -11,6 +11,7 @@ object HistoryPresentation {
     fun sourceLabel(source: HistorySource): String = when (source) {
         HistorySource.CALIBRATION -> "校准记录"
         HistorySource.AUTO_ALLOCATION -> "自动分配记录"
+        HistorySource.PERFORMANCE -> "性能记录"
     }
     fun durationMs(rounds: Int): Long = rounds.coerceAtLeast(0).toLong() * 500L
 

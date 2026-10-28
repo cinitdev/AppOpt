@@ -33,14 +33,12 @@ import top.qixia.threads.db.SessionSummary
 import top.qixia.threads.db.HistorySource
 
 private enum class ReportArea(val title: String, val detail: String, val icon: ImageVector, val groups: List<MetricsGroup>) {
-    OVERVIEW("概览", "流畅度与关键线程", Icons.Outlined.Insights, listOf(MetricsGroup.FRAME_TIME)),
+    OVERVIEW("数据图表", "滑动图表查看同一时刻的原始样本", Icons.Outlined.Insights,
+        listOf(MetricsGroup.FRAME_TIME, MetricsGroup.CPU_USAGE, MetricsGroup.CPU_FREQUENCY,
+            MetricsGroup.CPU_CYCLES, MetricsGroup.GPU_FREQUENCY, MetricsGroup.DDR,
+            MetricsGroup.POWER, MetricsGroup.TEMPERATURE)),
     CORE("调度", "自动分配与采样观察", Icons.Outlined.Route, emptyList()),
-    CPU("处理器", "使用率、频率与硬件周期", Icons.Outlined.Memory,
-        listOf(MetricsGroup.CPU_USAGE, MetricsGroup.CPU_FREQUENCY, MetricsGroup.CPU_CYCLES)),
-    GRAPHICS("图形", "GPU 与内存运行状态", Icons.Outlined.Layers,
-        listOf(MetricsGroup.GPU_FREQUENCY, MetricsGroup.DDR)),
-    ENERGY("能耗", "功率、电量与温度变化", Icons.Outlined.Bolt,
-        listOf(MetricsGroup.POWER, MetricsGroup.TEMPERATURE))
+    ANALYSIS("掉帧与线程", "关联帧率、负载与核心事件", Icons.Outlined.Memory, emptyList())
 }
 
 @Composable
@@ -51,7 +49,7 @@ internal fun HistoryReportScreen(state: HistoryDetailUiState, padding: PaddingVa
     val wholeSession = state.sessions.firstOrNull { it.id == state.expandedSessionId }
     val session = state.reportSession ?: wholeSession
     val hasWindows = state.reportWindows.size > 1
-    val automatic = session?.source == HistorySource.AUTO_ALLOCATION
+    val automatic = session?.source == HistorySource.AUTO_ALLOCATION || state.coreTimeline?.events?.isNotEmpty() == true
     var threadsPage by rememberSaveable(state.packageName, state.expandedSessionId) { mutableStateOf(false) }
     var selectSession by remember(state.packageName, state.expandedSessionId) { mutableStateOf(false) }
     var delete by remember(state.packageName, state.expandedSessionId) { mutableStateOf(false) }
@@ -68,9 +66,12 @@ internal fun HistoryReportScreen(state: HistoryDetailUiState, padding: PaddingVa
             HistoryAnalysis.drops(fps, metrics, session?.durationMs ?: 0)
         }
     }
+    val plotCache = remember(fps, metrics) { HistoryPlotRasterCache() }
+    val dropMarkers = remember(drops) { drops.map { it.progress } }
     val threads = remember(state.threads) { state.threads.sortedByDescending { it.avg } }
     BackHandler { if (threadsPage) threadsPage = false else onBack() }
 
+    CompositionLocalProvider(LocalHistoryPlotCache provides plotCache) {
     Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(OceanBackground, ClearTechBackgroundEnd))).padding(padding)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton({ if (threadsPage) threadsPage = false else onBack() }) {
@@ -113,8 +114,8 @@ internal fun HistoryReportScreen(state: HistoryDetailUiState, padding: PaddingVa
                 LazyColumn(
                     Modifier.weight(1f).fillMaxWidth(),
                     state = sectionScroll,
-                    contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 24.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 24.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     if (state.loading) item { LoadingState("正在读取报告") }
                     else if (state.threadsError != null && state.reportSession == null) item {
@@ -173,18 +174,18 @@ internal fun HistoryReportScreen(state: HistoryDetailUiState, padding: PaddingVa
                             }
                         }
                         if (area == ReportArea.OVERVIEW) {
-                            if (automatic) item(key = "core-entry") {
-                                CoreTimelineEntry(state.coreTimeline) { cursor.value = null; areaName = ReportArea.CORE.name }
-                            }
                             item(key = "summary") {
                                 HistorySessionSummary(fps, metrics, session.durationMs, session.threadCount)
                             }
                             item(key = "fps-${session.id}") {
-                                HistoryFpsPlotCard(fps, metrics, session.durationMs, cursor, drops.map { it.progress }) { position ->
+                                HistoryFpsPlotCard(fps, metrics, session.durationMs, cursor, dropMarkers) { position ->
                                     selectedDrop = drops.minByOrNull { kotlin.math.abs(it.progress - position) }
                                     cursor.value = selectedDrop?.progress
+                                    areaName = ReportArea.ANALYSIS.name
                                 }
                             }
+                        }
+                        if (area == ReportArea.ANALYSIS) {
                             item(key = "drop-analysis") {
                                 FrameDropAnalysisCard(state, session, drops, selectedDrop,
                                     { selectedDrop = it; cursor.value = it?.progress })
@@ -195,7 +196,7 @@ internal fun HistoryReportScreen(state: HistoryDetailUiState, padding: PaddingVa
                                 HistoryMetricsCard(group, metrics, session.durationMs, cursor)
                             }
                         }
-                        if (area == ReportArea.OVERVIEW || area == ReportArea.CPU) {
+                        if (area == ReportArea.ANALYSIS) {
                             item(key = "threads-entry") {
                                 Surface(onClick = { cursor.value = null; threadsPage = true }, shape = RoundedCornerShape(20.dp),
                                     color = PorcelainHeader.copy(alpha = .7f)) {
@@ -264,6 +265,7 @@ internal fun HistoryReportScreen(state: HistoryDetailUiState, padding: PaddingVa
                 }
             }
         }
+    }
     }
     if (delete && session != null) HistoryDeleteDialog(if (hasWindows) "删除整次记录？" else "删除这次记录？",
         if (hasWindows) "这次记录的全部 ${state.reportWindows.size} 个区间都会被删除，包括所有负载数据与曲线。已保存的核心规则不受影响。"

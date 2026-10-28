@@ -13,9 +13,7 @@ pub(super) use std::io::{self, Read};
 pub(super) use std::mem;
 pub(super) use std::path::PathBuf;
 pub(super) use std::ptr;
-pub(super) use std::process::{Command, Stdio};
 pub(super) use std::slice;
-pub(super) use std::sync::mpsc;
 pub(super) use std::thread;
 pub(super) use std::time::{Duration, Instant};
 

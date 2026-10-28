@@ -20,6 +20,7 @@ import top.qixia.threads.db.ThreadImport
 class HistoryRetentionDatabaseTest {
     private lateinit var folder: File
     private lateinit var database: QixiaThreadsDbHelper
+    private var nowMs = 100_000L
 
     @Before fun setup() {
         val target = InstrumentationRegistry.getInstrumentation().targetContext
@@ -33,7 +34,7 @@ class HistoryRetentionDatabaseTest {
                 errorHandler: DatabaseErrorHandler?): SQLiteDatabase =
                 SQLiteDatabase.openOrCreateDatabase(getDatabasePath(name).absolutePath, factory, errorHandler)
         }
-        database = QixiaThreadsDbHelper(isolated)
+        database = QixiaThreadsDbHelper(isolated) { nowMs }
     }
 
     @After fun cleanup() { database.close(); folder.deleteRecursively() }
@@ -41,10 +42,13 @@ class HistoryRetentionDatabaseTest {
     private fun add(pkg: String, epoch: Long): Boolean = database.insertSessionWithThreadsIfAbsent(
         pkg, epoch, 2, listOf(ThreadImport("worker", 10f, 20f, "10,20")))
 
-    @Test fun globalLimitKeepsNewestTenAndExpiredClaimCannotReimport() {
+    @Test fun retentionHasNoCountLimitExpiresAfterSevenDaysAndRejectsOldImports() {
         assertTrue(add("app.1", 1))
         val oldId = database.getSessionSummariesByPackage("app.1").single().id
         (2L..16L).forEach { assertTrue(add("app.${it % 3}", it)) }
+        assertEquals(16, database.getPackagesWithHistory().sumOf { it.sessionCount })
+        nowMs = HistoryRetention.MAX_AGE_MS + 7000L
+        assertEquals(6, database.pruneHistory())
         val sessions = database.getPackagesWithHistory().flatMap { database.getSessionSummariesByPackage(it.pkg) }
         assertEquals((7L..16L).toList(), sessions.map { it.epoch }.sorted())
         assertTrue(database.getThreadsBySessionId(oldId).isEmpty())

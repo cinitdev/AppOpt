@@ -76,14 +76,14 @@ internal fun FrameDropAnalysisCard(state: HistoryDetailUiState, session: Session
                 HorizontalDivider(Modifier.padding(vertical = 12.dp), color = OceanOutline)
                 Text("当时的线程负载", fontWeight = FontWeight.SemiBold, color = OceanText, fontSize = 13.sp)
                 if (context == null) Text("正在关联样本…", color = OceanTextSecondary, fontSize = 12.sp)
-                else if (context!!.first.isEmpty()) Text("附近没有有效线程样本", color = OceanTextSecondary, fontSize = 12.sp)
+                else if (context!!.first.isEmpty()) Text("此时段没有保存线程负载样本，无法还原当时负载", color = OceanTextSecondary, fontSize = 12.sp)
                 context?.first?.forEach { (name, load) -> Row(Modifier.fillMaxWidth().padding(top = 8.dp)) {
                     Text(name, Modifier.weight(1f), color = OceanTextSecondary, fontSize = 12.sp)
                     Text("${historyNumber(load)}%", color = PorcelainOnTonal, fontSize = 12.sp)
                 } }
                 Text("前后 2 秒的核心事件", fontWeight = FontWeight.SemiBold, color = OceanText, fontSize = 13.sp,
                     modifier = Modifier.padding(top = 16.dp))
-                if (context?.second.isNullOrEmpty()) Text(if (state.coreTimeline == null) "本次没有核心事件记录" else "此时段未记录到核心事件",
+                if (context?.second.isNullOrEmpty()) Text(if (state.coreTimeline == null) "本次没有记录核心事件" else "前后 2 秒没有记录到核心变化；不代表线程没有运行",
                     color = OceanTextSecondary, fontSize = 12.sp)
                 context?.second?.forEach { Text(it, color = OceanTextSecondary, fontSize = 11.sp, lineHeight = 18.sp,
                     modifier = Modifier.padding(top = 10.dp)) }

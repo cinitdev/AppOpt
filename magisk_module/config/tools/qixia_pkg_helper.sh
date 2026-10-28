@@ -2,7 +2,7 @@
 # QixiaThreads APK/包管理助手启动脚本。
 #
 # 用法：
-#   qixia_pkg_helper.sh app-info top.qixia.threads
+#   qixia_pkg_helper.sh app-info top.qixia.threads [待比较APK]
 #   qixia_pkg_helper.sh component-state com.xiaomi.joyose/.smartop.SmartOpService 0
 #   qixia_pkg_helper.sh install /data/adb/modules/QixiaThreads/config/app/QixiaThreads.apk
 #   qixia_pkg_helper.sh toast '热更新成功，无需重启手机'

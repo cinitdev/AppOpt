@@ -20,6 +20,7 @@ import top.qixia.threads.FpsSessionRecorder
 import top.qixia.threads.ModuleUpdater
 import top.qixia.threads.RuleConfigLogic
 import top.qixia.threads.RuleSyntax
+import top.qixia.threads.AutomaticAffinityConfig
 import top.qixia.threads.AutoHistoryStore
 import top.qixia.threads.db.QixiaThreadsDbHelper
 import top.qixia.threads.db.HistorySource
@@ -80,14 +81,21 @@ class QixiaThreadsRepository(private val application: Application) {
         val safeConfig = config ?: ConfigReader.ConfigPackages(emptyList(), emptyList())
         stage("config_parse")
         val automatic = if (usable) DaemonBridge.readAutomaticAffinity() else DaemonBridge.AutomaticAffinityState()
+        val performance = if (usable) DaemonBridge.performanceRecordingApps() else emptySet()
         stage("automatic")
         val health = if (usable) DaemonBridge.readRuleHealthOrNull().orEmpty() else emptyMap()
         stage("health")
         val cpuRanges = rawConfig?.let(::cpuRangesByPackage).orEmpty()
+        val parsedRules = rawConfig?.let { RuleSyntax.parse(it).rules }.orEmpty()
+        val presentCpus = RuleConfigLogic.readPresentCpuSet()
         stage("cpu_ranges")
         val configured = buildConfiguredApps(safeConfig, health, cpuRanges).map { app ->
             app.withAutomaticAffinity(app.packageName in automatic.packages,
                 if (automatic.activePackage == app.packageName) automatic.detail else "等待所选游戏进入前台")
+                .copy(performanceRecordingEnabled = app.packageName in performance,
+                    automaticFallbackSupported = automatic.fallbackSupported,
+                    automaticFallbackEnabled = app.packageName in automatic.fallbackPackages,
+                    mainFallbackCpus = AutomaticAffinityConfig.fallbackCpus(parsedRules, app.packageName, presentCpus))
         }
         stage("configured")
         val foreground = if (usable) {
@@ -126,14 +134,9 @@ class QixiaThreadsRepository(private val application: Application) {
 
     @Suppress("DEPRECATION")
     internal fun loadInstalledApps(onStage: (String, Long) -> Unit): List<AppItemModel> {
-        val apps = installedLaunchableApps(onStage)
-        val started = android.os.SystemClock.elapsedRealtime()
-        // 一次 Binder 调用也可避免厂商 PackageManager 实现逐包进行冷查询。
-        val packages = packageManager.getInstalledPackages(0).associateBy { it.packageName }
-        val sorted = sortAppsByInstallTime(apps) { packages[it]?.firstInstallTime ?: 0L }
-            .map { it.copy(iconVersion = packages[it.packageName]?.lastUpdateTime ?: 0L) }
-        onStage("catalog_sort", android.os.SystemClock.elapsedRealtime() - started)
-        return sorted
+        val apps = launchableAppCatalog(application, onStage)
+        val performance = DaemonBridge.performanceRecordingApps()
+        return apps.map { it.copy(performanceRecordingEnabled = it.packageName in performance) }
     }
 
     private fun buildConfiguredApps(
@@ -213,33 +216,6 @@ class QixiaThreadsRepository(private val application: Application) {
     private fun configuredComponents(names: Collection<String>): Map<String, AppComponentKind> =
         resolveConfiguredComponents(names, { isInstalled(lookupPackage(it)) },
             DaemonBridge::findRunningProcessNames, ::ownerPackage)
-
-    @Suppress("DEPRECATION")
-    private fun installedLaunchableApps(onStage: (String, Long) -> Unit): List<AppItemModel> {
-        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val seen = HashSet<String>()
-        val started = android.os.SystemClock.elapsedRealtime()
-        val activities = packageManager.queryIntentActivities(intent, 0)
-        onStage("catalog_query", android.os.SystemClock.elapsedRealtime() - started)
-        var labelsMs = 0L
-        val apps = activities.mapNotNull { info ->
-            val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
-            if (!seen.add(pkg) || pkg == application.packageName) return@mapNotNull null
-            val time = android.os.SystemClock.elapsedRealtime()
-            val label = info.loadLabel(packageManager)?.toString().orEmpty().ifBlank { pkg }
-            labelsMs += android.os.SystemClock.elapsedRealtime() - time
-            AppItemModel(
-                packageName = pkg,
-                label = label,
-                installed = true,
-                // 可见行异步解析图标，屏幕外的图标不能阻塞列表。
-                icon = null,
-                state = AppRuleState.CONFIGURED
-            )
-        }
-        onStage("catalog_labels", labelsMs)
-        return apps
-    }
 
     fun addAutoPackage(pkg: String): Boolean = DaemonBridge.addAutoPackage(pkg)
 
@@ -387,7 +363,10 @@ class QixiaThreadsRepository(private val application: Application) {
         }
     }
 
-    fun loadHistory(): List<HistoryPackageModel> = readHistory(includeReports = true)
+    fun loadHistory(): List<HistoryPackageModel> {
+        top.qixia.threads.HistoryRetention.pruneLocal(application)
+        return readHistory(includeReports = true)
+    }
 
     /** 导入安排在首页数据加载之后，不作为最近记录卡片的加载前提。 */
     fun importHistory() {
@@ -430,8 +409,11 @@ class QixiaThreadsRepository(private val application: Application) {
             val autoEntries = automatic[pkg].orEmpty()
             val sessions = (calibration + autoEntries.map { it.session }).sortedByDescending { it.endedAtMs }
             val lastFps = FpsSessionRecorder.readLastAverage(application.filesDir, pkg)
-            val calibrationFps = if (includeReports) top.qixia.threads.HistoryFpsStore.reports(application.filesDir,
-                pkg, calibration.map { it.epoch to it.durationMs }) else emptyMap()
+            // 列表不限条数后只读轻量摘要，完整曲线仍在打开报告时加载。
+            val calibrationFps = if (includeReports) calibration.mapNotNull { session ->
+                top.qixia.threads.HistoryFpsStore.cachedSummary(application.filesDir, pkg, session.epoch,
+                    session.durationMs)?.let { session.epoch to it }
+            }.toMap() else emptyMap()
             val fpsReports = if (!includeReports) emptyMap() else
                 calibration.mapNotNull { session -> calibrationFps[session.epoch]?.let { session.id to it } }.toMap() +
                     autoEntries.mapNotNull { entry -> entry.fps?.let { entry.session.id to it } }.toMap()
@@ -450,8 +432,11 @@ class QixiaThreadsRepository(private val application: Application) {
     }
 
     fun loadHome(configured: List<AppItemModel>): HomeUiState {
-        val calibration = database.getPackagesWithHistory().associate { it.pkg to database.getSessionSummariesByPackage(it.pkg) }
-        val automatic = AutoHistoryStore.cachedEntriesForHome(application.filesDir).groupBy { it.pkg }
+        val now = System.currentTimeMillis()
+        val calibration = database.getPackagesWithHistory().associate { it.pkg to database.getSessionSummariesByPackage(it.pkg)
+            .filterNot { session -> top.qixia.threads.HistoryRetention.expired(session.endedAtMs, now) } }
+        val automatic = AutoHistoryStore.cachedEntriesForHome(application.filesDir)
+            .filterNot { top.qixia.threads.HistoryRetention.expired(it.session.endedAtMs, now) }.groupBy { it.pkg }
         val configuredByPackage = configured.associateBy { it.packageName }
         val applications = mutableMapOf<String, HistoryPackageModel>()
         fun app(pkg: String): HistoryPackageModel = applications.getOrPut(pkg) {
@@ -482,7 +467,7 @@ class QixiaThreadsRepository(private val application: Application) {
         for ((pkg, entries) in automatic) for (entry in entries) {
             val session = entry.session
             if (!HomeRecordSelector.hasRecordableDuration(session.startedAtMs, session.endedAtMs)) continue
-            reports += HomeRecord(app(pkg), HomeRecordMode.AUTOMATIC, session.startedAtMs, session.endedAtMs,
+            reports += HomeRecord(app(pkg), if (session.source == HistorySource.PERFORMANCE) HomeRecordMode.PERFORMANCE else HomeRecordMode.AUTOMATIC, session.startedAtMs, session.endedAtMs,
                 entry.fps?.let { homeFpsPreview(it, session.startedAtMs, session.endedAtMs) }, session)
         }
         return HomeUiState(loading = false, records = HomeRecordSelector.select(reports,
@@ -517,7 +502,7 @@ class QixiaThreadsRepository(private val application: Application) {
 
     /** 对选中的不可变记录只解析一次，为全部详情面板提供数据。 */
     fun loadHistorySessionDetail(pkg: String, session: SessionSummary, windowIndex: Int = 0): HistorySessionDetail {
-        if (session.source == HistorySource.AUTO_ALLOCATION) {
+        if (session.source != HistorySource.CALIBRATION) {
             return synchronized(AutoHistoryStore) {
                 // 两次独立读取之间可能导入刚完成的分片，
                 // 需确保区间列表与解析数据来自同一归档快照。
@@ -539,14 +524,14 @@ class QixiaThreadsRepository(private val application: Application) {
             loadHistorySessionDetail(pkg, session, index)
         }
         // 与导入、删除共用归档锁，保证整次对比的数据来自同一快照。
-        return if (session.source == HistorySource.AUTO_ALLOCATION) synchronized(AutoHistoryStore) { read() } else read()
+        return if (session.source != HistorySource.CALIBRATION) synchronized(AutoHistoryStore) { read() } else read()
     }
 
     fun loadHistoryFps(pkg: String, sessions: List<SessionSummary>): Map<Long, top.qixia.threads.HistoryFpsStore.Report> {
         val reports = top.qixia.threads.HistoryFpsStore.reports(application.filesDir, pkg,
             sessions.filter { it.source == HistorySource.CALIBRATION }.map { it.epoch to it.durationMs })
         return sessions.mapNotNull { session ->
-            val report = if (session.source == HistorySource.AUTO_ALLOCATION)
+            val report = if (session.source != HistorySource.CALIBRATION)
                 AutoHistoryStore.record(application.filesDir, session.id)?.fps else reports[session.epoch]
             report?.let { session.id to it }
         }.toMap()
@@ -556,13 +541,17 @@ class QixiaThreadsRepository(private val application: Application) {
         val reports = top.qixia.threads.HistoryMetricsStore.reports(application.filesDir, pkg,
             sessions.filter { it.source == HistorySource.CALIBRATION }.map { it.epoch to it.durationMs })
         return sessions.mapNotNull { session ->
-            val report = if (session.source == HistorySource.AUTO_ALLOCATION)
+            val report = if (session.source != HistorySource.CALIBRATION)
                 AutoHistoryStore.record(application.filesDir, session.id)?.metrics else reports[session.epoch]
             report?.let { session.id to it }
         }.toMap()
     }
 
     fun deleteHistoryPackage(pkg: String, source: HistorySource? = null): Boolean {
+        if (source != null && source != HistorySource.CALIBRATION) {
+            val ids = AutoHistoryStore.entries(application.filesDir).filter { it.pkg == pkg && it.session.source == source }.map { it.session.id }
+            return AutoHistoryStore.deleteSessions(application.filesDir, ids).containsAll(ids)
+        }
         return DatabaseMigrator.withPackageLock(pkg) {
             val calibration = if (source == HistorySource.AUTO_ALLOCATION) emptyList()
                 else database.getSessionSummariesByPackage(pkg)

@@ -2,21 +2,22 @@ package top.qixia.threads.compose
 
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.pow
 
 /** 稳定 ID 确保筛选后曲线、图例、游标和统计颜色保持一致。 */
 internal object HistoryChartPalette {
-    val fps = 0xFF356FE5.toInt()
-    val cpuUsage = 0xFF8A59CA.toInt()
-    val gpuUsage = 0xFF078D8D.toInt()
-    val temperature = 0xFFC17D19.toInt()
-    val battery = 0xFFC43D70.toInt()
+    val fps = 0xFF1474E4.toInt()
+    val cpuUsage = 0xFF87D3FF.toInt()
+    val gpuUsage = 0xFF599CE8.toInt()
+    val temperature = 0xFFFFBA7A.toInt()
+    val battery = 0xFFEB91C1.toInt()
 
-    // 颜色互不相同，在报告白色背景上的对比度至少为 4.5:1。
+    // 曲线采用浅紫、青、橙等清亮色；小字号文字另用同色相的加深色。
     private val cores = intArrayOf(
-        0x2563EB, 0xDC2626, 0x15803D, 0xC026D3,
-        0xB45309, 0x0E7490, 0xBE185D, 0x4D7C0F,
-        0x4338CA, 0x9A3412, 0x047857, 0x7E22CE,
-        0xA16207, 0x0369A1, 0x9F1239, 0x365314,
+        0xB177E3, 0x00D5D9, 0xFC8A1B, 0xEC8DB9,
+        0x688DE0, 0x54B8A0, 0xCB9D5A, 0xE47672,
+        0x8D89CF, 0x4BA6C4, 0xB29369, 0xCA80AB,
+        0x84AA60, 0x729AC5, 0xBA77A0, 0x5DAAA9,
     )
 
     fun core(cpu: Int): Int {
@@ -41,6 +42,21 @@ internal object HistoryChartPalette {
         return (0xFF shl 24) or (channel(r) shl 16) or (channel(g) shl 8) or channel(b)
     }
 
+    /** 浅色适合曲线，文字仍需在白底上清晰可读；不把未选中图例改成灰色。 */
+    fun label(color: Int): Int {
+        var r = color ushr 16 and 255
+        var g = color ushr 8 and 255
+        var b = color and 255
+        fun linear(value: Int): Double {
+            val v = value / 255.0
+            return if (v <= .04045) v / 12.92 else ((v + .055) / 1.055).pow(2.4)
+        }
+        while (1.05 / (.2126 * linear(r) + .7152 * linear(g) + .0722 * linear(b) + .05) < 4.5) {
+            r = (r * .95).toInt(); g = (g * .95).toInt(); b = (b * .95).toInt()
+        }
+        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+    }
+
     fun metric(key: String, fallbackIndex: Int = 0): Int = when {
         key.startsWith("cpu_core.") || key.startsWith("cpu_cycles_core.") ->
             core(key.substringAfter('.').toIntOrNull() ?: fallbackIndex)
@@ -49,9 +65,11 @@ internal object HistoryChartPalette {
         else -> when (key) {
             "fps", "frame_max_ms", "gpu_mhz", "power_w" -> fps
             "cpu_usage", "ddr_mhz" -> cpuUsage
-            "gpu_usage", "gpu_c", "ddr_mbps", "battery_ma" -> gpuUsage
-            "cpu_c" -> temperature
-            "battery_pct", "battery_used_pct", "battery_c" -> battery
+            "gpu_usage", "ddr_mbps", "battery_ma" -> gpuUsage
+            "cpu_c" -> 0xFFEF6C73.toInt()
+            "gpu_c" -> cores[0] or (0xFF shl 24)
+            "battery_c" -> temperature
+            "battery_pct", "battery_used_pct" -> battery
             else -> core(fallbackIndex)
         }
     }

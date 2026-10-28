@@ -24,6 +24,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.geometry.Rect
 import top.qixia.threads.UsageGuide
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import top.qixia.threads.ModuleUpdater
 import top.qixia.threads.ModuleUpdateDownloadViewModel
 import top.qixia.threads.compose.*
@@ -50,6 +51,18 @@ fun QixiaThreadsApp(
     val applicationPageState = rememberSaveableStateHolder()
     var showHomeEnvironment by rememberSaveable { mutableStateOf(false) }
     var showModuleUpdate by rememberSaveable { mutableStateOf(false) }
+    var showRefreshRate by rememberSaveable { mutableStateOf(false) }
+    var showPerformancePicker by rememberSaveable { mutableStateOf(false) }
+    val refreshRates by viewModel.refreshRates.state.collectAsStateWithLifecycle()
+    val refreshLifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(showRefreshRate, refreshLifecycle) {
+        if (showRefreshRate) {
+            viewModel.refreshRates.load()
+            refreshLifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
+                while (true) { kotlinx.coroutines.delay(3000); viewModel.refreshRates.refreshRuntime() }
+            }
+        }
+    }
     val snackbar = remember { SnackbarHostState() }
     val context = LocalContext.current
     val guideAnchors = remember { mutableStateMapOf<String, Rect>() }
@@ -59,6 +72,7 @@ fun QixiaThreadsApp(
     val navigate: (MainDestination) -> Unit = remember(viewModel) {
         { next ->
             viewModel.closeAffinityDiagnostics()
+            showRefreshRate = false
             destinationName = next.name
         }
     }
@@ -66,7 +80,7 @@ fun QixiaThreadsApp(
     LaunchedEffect(state.message) {
         state.message?.let { snackbar.showSnackbar(it); viewModel.clearMessage() }
     }
-    BackHandler(enabled = state.ruleEditor == null && destination != MainDestination.HOME) {
+    BackHandler(enabled = !showRefreshRate && state.ruleEditor == null && destination != MainDestination.HOME) {
         if (destination == MainDestination.HISTORY && state.history.detail != null) viewModel.closeHistoryDetail()
         else navigate(MainDestination.HOME)
     }
@@ -80,7 +94,9 @@ fun QixiaThreadsApp(
         bottomBar = { QixiaThreadsBottomNavigation(destination, navigate) }
     ) { padding ->
         val diagnostic = state.affinityDiagnostics
-        if (diagnostic != null) AffinityDiagnosticsScreen(diagnostic, padding,
+        if (showRefreshRate) RefreshRateScreen(refreshRates, padding, null,
+            { showRefreshRate = false }, viewModel.refreshRates::change)
+        else if (diagnostic != null) AffinityDiagnosticsScreen(diagnostic, padding,
             viewModel::closeAffinityDiagnostics, viewModel::refreshAffinityDiagnostics)
         else when (destination) {
             MainDestination.HOME -> HomeScreen(
@@ -97,7 +113,11 @@ fun QixiaThreadsApp(
                     viewModel::selectApplicationTab, viewModel::setApplicationQuery, viewModel::setHideMissing,
                     viewModel::addApplication, viewModel::deleteApplication, { onLaunchApp(it.packageName) },
                     viewModel::openRuleEditor, viewModel::setAutoStartCalibration, viewModel::setAutomaticAffinity,
-                    viewModel::openAffinityDiagnostics)
+                    viewModel::openAffinityDiagnostics, viewModel::setAutomaticFallback,
+                    onPerformanceRecording = { app, enabled ->
+                        if (enabled && !android.provider.Settings.canDrawOverlays(context)) onOpenOverlayPermission()
+                        else viewModel.setPerformanceRecording(app, enabled)
+                    })
             }
             MainDestination.HISTORY -> HistoryScreen(
                 state.history, padding, { viewModel.loadHistory(force = true) },
@@ -109,7 +129,8 @@ fun QixiaThreadsApp(
                 autoHistoryEnabled = state.settings.autoHistoryEnabled,
                 onSelectWindow = viewModel::selectHistoryWindow,
                 onCompare = viewModel::compareHistory,
-                onCloseComparison = viewModel::closeHistoryComparison
+                onCloseComparison = viewModel::closeHistoryComparison,
+                onNewRecording = { viewModel.loadApplicationCatalog(); showPerformancePicker = true }
             )
             MainDestination.LOGS -> LogsScreen(
                 state.logs, padding, { viewModel.loadLogs(force = true) },
@@ -123,7 +144,8 @@ fun QixiaThreadsApp(
                 onCheckModuleUpdate = viewModel::checkModuleUpdate,
                 moduleDownloadState = moduleDownloadState,
                 onOpenModuleUpdate = { showModuleUpdate = true },
-                onAutoHistoryChange = viewModel::setAutomaticHistory
+                onAutoHistoryChange = viewModel::setAutomaticHistory,
+                onRefreshRate = { showRefreshRate = true }
             )
         }
     }
@@ -133,6 +155,14 @@ fun QixiaThreadsApp(
     }
     }
     }
+    if (showPerformancePicker) PerformanceRecordingPicker(
+        (state.applications.configured + state.applications.addable).distinctBy { it.packageName }
+            .filter { it.installed && !it.isSystemComponent }, state.applications.catalogLoading,
+        state.applications.busyPackages, onDismiss = { showPerformancePicker = false },
+        onToggle = { app, enabled ->
+            if (enabled && !android.provider.Settings.canDrawOverlays(context)) onOpenOverlayPermission()
+            else viewModel.setPerformanceRecording(app, enabled)
+        }, onLaunch = { app -> showPerformancePicker = false; onLaunchApp(app.packageName) })
     state.ruleEditor?.let { editor ->
         RuleEditorScreen(editor, viewModel::updateRuleDraft, viewModel::closeRuleEditor,
             viewModel::saveRuleEditor, viewModel::recheckRules)
@@ -144,6 +174,7 @@ fun QixiaThreadsApp(
             viewModel.calibrationReviews::selectProcess)
     }
     if (showHomeEnvironment && reviews.active == null) {
+        LaunchedEffect(Unit) { viewModel.refreshAutoStart() }
         HomeEnvironmentSheet(state.environment, { showHomeEnvironment = false },
             onOpenOverlayPermission, onOpenUsagePermission)
     }

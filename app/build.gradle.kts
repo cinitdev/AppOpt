@@ -13,8 +13,8 @@ android {
         minSdk = 31
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 205
-        versionName = "v2.0.5"
+        versionCode = 206
+        versionName = "v2.0.6"
     }
 
     signingConfigs {
@@ -116,6 +116,9 @@ val buildHistoryProbe by tasks.registering {
     }
 }
 android.sourceSets.getByName("main").assets.srcDir(historyProbeOutput)
+android.sourceSets.getByName("main").java.srcDir(rootProject.file("shared/refresh"))
 // 设备回归直接读取安装脚本源码，避免测试维护另一份实现。
 android.sourceSets.getByName("androidTest").assets.srcDir(rootProject.file("magisk_module"))
+// 设备测试直接验证独立安装助手的错误分类，不维护第二份判断逻辑。
+android.sourceSets.getByName("androidTest").java.srcDir(rootProject.file("tools/qixia_pkg_helper/src"))
 tasks.named("preBuild").configure { dependsOn(buildHistoryProbe) }

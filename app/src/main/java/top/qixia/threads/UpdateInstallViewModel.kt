@@ -91,7 +91,7 @@ class UpdateInstallViewModel : ViewModel() {
                     flushLogPublish()
                     updateState {
                         copy(
-                            statusTitle = if (rebootRequired) "等待重启" else "更新已完成",
+                            statusTitle = if (rebootRequired) "等待重启" else "热更新成功",
                             statusDetail = message,
                             log = logSnapshot(),
                             running = !rebootRequired,
@@ -102,8 +102,7 @@ class UpdateInstallViewModel : ViewModel() {
                     if (!rebootRequired) thread(name = "QixiaThreadsPendingApk") {
                         val pending = ModuleHotUpdate.hasPendingApp()
                         mainHandler.post {
-                            updateState { copy(appUpdatePending = pending, running = false,
-                                statusDetail = if (pending) "$message；点击完成后更新 App，稍后从桌面重新打开" else message) }
+                            updateState { copy(appUpdatePending = pending, running = false) }
                         }
                     }
                 }

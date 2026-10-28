@@ -26,6 +26,8 @@ internal class HistoryCursorRenderer(
     width: Float,
     density: Density,
 ) {
+    // 拖动时复用格式器，避免每个核心、每帧调用 String.format 创建格式化器。
+    private val numberFormat = java.text.DecimalFormat("0.0", java.text.DecimalFormatSymbols.getInstance())
     private val gap = with(density) { 10.dp.toPx() }
     private val padding = with(density) { 8.dp.toPx() }
     private val top = with(density) { 4.dp.toPx() }
@@ -43,7 +45,7 @@ internal class HistoryCursorRenderer(
     // 手势期间宽度固定，切换左右侧不会重新排版标签。
     private val tooltipWidth = minOf(width, with(density) { (width / 2 - gap).coerceIn(96.dp.toPx(), 158.dp.toPx()) })
     private val rows = series.map { item ->
-        val valueWidth = maxOf(paint.measureText("未采集"),
+        val valueWidth = maxOf(paint.measureText("无样本"),
             paint.measureText("${historyNumber(item.data.minimum)} ${item.unit}"),
             paint.measureText("${historyNumber(item.data.maximum)} ${item.unit}"))
         val labelWidth = (tooltipWidth - padding * 2 - gap * 1.5f - valueWidth).coerceAtLeast(0f)
@@ -55,7 +57,7 @@ internal class HistoryCursorRenderer(
 
     private class Row(val item: HistoryPlotSeries, val label: String) {
         var point: HistoryCurvePoint? = null
-        var value = "未采集"
+        var value = "无样本"
         var valueWidth = 0f
         var initialized = false
     }
@@ -64,11 +66,11 @@ internal class HistoryCursorRenderer(
         val anchor = progress * size.width
         drawLine(OceanPrimary.copy(alpha = .65f), Offset(anchor, 0f), Offset(anchor, size.height), stroke)
         rows.forEach { row ->
-            val point = HistoryPlotMath.at(row.item.points, progress, durationMs)
+            val point = row.item.at(progress, durationMs)
             // 多数指针事件仍指向同一个已保存样本，可复用文字及宽度。
-            if (!row.initialized || row.point !== point) {
+            if (!row.initialized || row.point != point) {
                 row.point = point
-                row.value = point?.let { "${historyNumber(it.value)} ${row.item.unit}" } ?: "未采集"
+                row.value = point?.let { "${numberFormat.format(it.value.toDouble())} ${row.item.unit}" } ?: "无样本"
                 row.valueWidth = paint.measureText(row.value)
                 row.initialized = true
             }
@@ -80,7 +82,7 @@ internal class HistoryCursorRenderer(
             }
         }
         val x = HistoryPlotMath.tooltipOffset(anchor, size.width, tooltipWidth, gap)
-        drawRoundRect(Color(0xF223365B), Offset(x, top), Size(tooltipWidth, tooltipHeight), corner)
+        drawRoundRect(Color(0xEC253044), Offset(x, top), Size(tooltipWidth, tooltipHeight), corner)
         val second = (durationMs * progress).toLong() / 1000
         if (second != headerSecond) {
             headerSecond = second

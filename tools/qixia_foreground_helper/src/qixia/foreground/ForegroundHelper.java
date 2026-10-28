@@ -106,7 +106,20 @@ public final class ForegroundHelper {
     private ForegroundHelper() {
     }
 
+    @SuppressWarnings("deprecation") // 独立 app_process 必须显式注册主消息循环，厂商 framework 会读取它。
     public static void main(String[] args) {
+        if (args.length == 2 && "--autostart-status".equals(args[0])) {
+            String status = "unknown";
+            try {
+                int user = Integer.parseInt(args[1]);
+                if (user < 0) throw new IllegalArgumentException("无效用户");
+                Looper.prepareMainLooper();
+                PerformanceOverlayController.initialize();
+                status = PerformanceOverlayController.autoStartStatus(user);
+            } catch (Exception error) { System.err.println("自启动检查不可用: " + error); }
+            System.out.println("qixia_autostart=" + status);
+            System.exit(0);
+        }
         if (args.length != 1 || args[0] == null || args[0].isEmpty()) {
             System.err.println("用法: ForegroundHelper <state-file>");
             System.exit(2);
@@ -126,7 +139,8 @@ public final class ForegroundHelper {
         bootId = readBootId();
         restorePreviousState();
 
-        Looper.prepare();
+        // 普通 prepare() 不会设置全局主循环，MIUI 的 Application 初始化因此会空指针。
+        Looper.prepareMainLooper();
         handler = new Handler(Looper.myLooper());
         connectActivityTaskManager();
         Runtime.getRuntime().addShutdownHook(new Thread(
@@ -482,6 +496,9 @@ public final class ForegroundHelper {
             line(out, "task_count", String.valueOf(taskCount));
             line(out, "error", startupError);
         });
+        PerformanceOverlayController.update(configDir, handler,
+            result != null && isHealthSelection(selection) ? result.component.getPackageName() : "",
+            "1".equals(interactiveState()));
     }
 
     private static void writeErrorState(String reason, Throwable error) {

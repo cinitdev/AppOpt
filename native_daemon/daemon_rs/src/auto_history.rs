@@ -1,6 +1,10 @@
 //! 可选的前台历史记录；本模块不修改亲和性，也不启动校准。
 //! 关闭记录后只保留配置事件监听器。
 mod core_events;
+#[cfg(any(target_os = "android", target_os = "linux", test))]
+mod performance;
+#[cfg(any(target_os = "android", test))]
+mod display;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 mod runtime;
 mod storage;

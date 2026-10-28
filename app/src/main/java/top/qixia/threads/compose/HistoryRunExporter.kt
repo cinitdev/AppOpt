@@ -26,7 +26,7 @@ internal object HistoryRunExporter {
     internal fun appendTo(output: Appendable, pkg: String, label: String,
         sessions: List<SessionSummary>, previousFps: FpsSessionRecorder.AverageRecord? = null,
         detail: (SessionSummary, Int) -> QixiaThreadsRepository.HistorySessionDetail) {
-        if (sessions.any { it.source == HistorySource.AUTO_ALLOCATION }) {
+        if (sessions.any { it.source != HistorySource.CALIBRATION }) {
             // 导入可能补入更早完成的分片，导致所有查看区间重新划分。
             // 需锁定归档直到最后一个区间写入完成，不能只在每次读取时加锁。
             synchronized(AutoHistoryStore) { appendSnapshot(output, pkg, label, sessions, previousFps, detail) }
@@ -50,11 +50,11 @@ internal object HistoryRunExporter {
             // 不累积整次记录的全部列表。
             var current: QixiaThreadsRepository.HistorySessionDetail? = detail(visit, 0)
             val windows = current!!.windows.toList()
-            val automatic = visit.source == HistorySource.AUTO_ALLOCATION
+            val automatic = visit.source != HistorySource.CALIBRATION
             if (automatic) {
                 val start = visit.startedAtMs.takeIf { it > 0L }
                     ?: (visit.endedAtMs - visit.durationMs).coerceAtLeast(0L)
-                appendLine("QixiaThreads 自动分配完整运行记录")
+                appendLine("QixiaThreads ${HistoryPresentation.sourceLabel(visit.source)}完整运行记录")
                 appendLine("应用: $label")
                 appendLine("包名: $pkg")
                 appendLine("完整运行会话 ID: ${visit.id}")
@@ -134,7 +134,7 @@ internal object HistoryRunExporter {
                 appendLine()
             }
         }
-        if (session.source == HistorySource.AUTO_ALLOCATION) {
+        if (session.source != HistorySource.CALIBRATION) {
             detail.coreTimeline?.appendTo(output)
         }
     }

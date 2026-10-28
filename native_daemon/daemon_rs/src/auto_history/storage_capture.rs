@@ -27,6 +27,8 @@ pub(in crate::auto_history) struct Capture {
     usage: UsageClock,
     segment_started_ms: u64,
     admitted: bool,
+    minimum_ms: u64,
+    source: &'static str,
     // 采集存活期间，守卫会将已封存的临时文件排除在恢复和清理之外。
     // 记录器失败或退出后，这些文件即可恢复。
     pending: Vec<(PathBuf, OpenFile)>,
@@ -44,15 +46,23 @@ impl DerefMut for Capture {
 }
 impl Capture {
     pub fn new(directory: &Path, package: &str, start_ms: u64) -> io::Result<Self> {
+        Self::with_source(directory, package, start_ms, false)
+    }
+    pub fn performance(directory: &Path, package: &str, start_ms: u64) -> io::Result<Self> {
+        Self::with_source(directory, package, start_ms, true)
+    }
+    fn with_source(directory: &Path, package: &str, start_ms: u64, performance: bool) -> io::Result<Self> {
         let started = Instant::now();
-        let mut recording = Recording::create(directory, package, start_ms, false)?;
+        let source = if performance { "performance" } else { "auto" };
+        let minimum_ms = if performance { 0 } else { MIN_FOREGROUND_MS };
+        let mut recording = Recording::create_source(directory, package, start_ms, false, source)?;
         let capture_id = recording
             .path
             .file_stem()
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        metadata(&mut recording, &capture_id, 0)?;
+        metadata(&mut recording, &capture_id, 0, minimum_ms)?;
         Ok(Self {
             recording,
             capture_id,
@@ -62,6 +72,8 @@ impl Capture {
             },
             segment_started_ms: 0,
             admitted: false,
+            minimum_ms,
+            source,
             pending: Vec::new(),
         })
     }
@@ -78,11 +90,11 @@ impl Capture {
         // 预留下一个有界暂存位置前，达到入选条件可先发布较早分段；
         // 未达到条件的使用记录绝不淘汰旧历史。
         self.publish_pending(usage)?;
-        if usage > MIN_FOREGROUND_MS {
-            prune(directory, true)?;
+        if usage > self.minimum_ms {
+            prune(directory, start_ms)?;
         }
-        let mut next = Recording::create(directory, &self.recording.package, start_ms, false)?;
-        metadata(&mut next, &self.capture_id, usage)?;
+        let mut next = Recording::create_source(directory, &self.recording.package, start_ms, false, self.source)?;
+        metadata(&mut next, &self.capture_id, usage, self.minimum_ms)?;
         next.device(&self.recording.device_fields)?;
         write_usage(&mut self.recording, usage)?;
         let old = std::mem::replace(&mut self.recording, next);
@@ -136,7 +148,7 @@ impl Capture {
         Ok(rotate)
     }
     fn publish_pending(&mut self, usage: u64) -> io::Result<()> {
-        if usage <= MIN_FOREGROUND_MS {
+        if usage <= self.minimum_ms {
             return Ok(());
         }
         if !self.admitted {
@@ -160,7 +172,7 @@ impl Capture {
                     .path
                     .parent()
                     .unwrap_or_else(|| Path::new(".")),
-                false,
+                self.recording.last_ms,
             )?;
         }
         Ok(())
@@ -184,9 +196,9 @@ impl Capture {
         if let Some(sealed) = self.recording.seal(end_ms, Some(duration))? {
             self.pending.push(sealed);
         }
-        if usage <= MIN_FOREGROUND_MS {
+        if usage <= self.minimum_ms {
             // 这里只移除为本次前台使用创建的路径，不处理旧的完整历史，
-            // 也不执行七条记录的保留策略。
+            // 也不改变已有历史的保留期限。
             for (path, _) in self.pending {
                 fs::remove_file(path)?;
             }
@@ -194,7 +206,7 @@ impl Capture {
             for (path, _) in self.pending {
                 publish_sealed(&path, usage)?;
             }
-            prune(&directory, false)?;
+            prune(&directory, end_ms)?;
         }
         Ok(())
     }
@@ -214,9 +226,9 @@ fn publish_sealed(path: &Path, usage: u64) -> io::Result<()> {
     compression::publish(path)
 }
 
-fn metadata(recording: &mut Recording, capture_id: &str, usage: u64) -> io::Result<()> {
+fn metadata(recording: &mut Recording, capture_id: &str, usage: u64, minimum_ms: u64) -> io::Result<()> {
     let text = format!(
-        "minimum_usage_ms\t{MIN_FOREGROUND_MS}\ncapture_id\t{capture_id}\nforeground_ms\t{usage}\n"
+        "minimum_usage_ms\t{minimum_ms}\ncapture_id\t{capture_id}\nforeground_ms\t{usage}\n"
     );
     recording.output.write_all(text.as_bytes())?;
     recording.bytes += text.len() as u64;
@@ -232,14 +244,13 @@ fn write_usage(recording: &mut Recording, usage: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// 即使临时采集耗尽有限磁盘额度，也要保留现有记录。
-/// 只有达到入选条件后才允许淘汰历史，不能在应用启动时就淘汰。
+/// 仅约束尚未发布的临时分段；已完成的七天内历史不占用临时采集额度。
 pub(super) fn check_staging_budget(directory: &Path) -> io::Result<()> {
     let mut entries = fs::read_dir(directory)?;
     let mut bytes = 0u64;
-    for entry in entries.by_ref().take(1000).flatten() {
+    for entry in entries.by_ref().flatten() {
         let path = entry.path();
-        if owned_file(&path, "log") || owned_file(&path, "tmp") {
+        if owned_file(&path, "tmp") {
             let size = entry.metadata()?.len();
             bytes = bytes.saturating_add(if is_open(&path) {
                 size.max(MAX_BYTES)
@@ -248,7 +259,7 @@ pub(super) fn check_staging_budget(directory: &Path) -> io::Result<()> {
             });
         }
     }
-    if entries.next().is_some() || bytes.saturating_add(MAX_BYTES) > TOTAL_BYTES {
+    if bytes.saturating_add(MAX_BYTES) > STAGING_BYTES {
         return Err(io::Error::other(
             "auto history provisional storage budget exhausted",
         ));
@@ -299,7 +310,7 @@ pub(super) fn recovery_usage(directory: &Path) -> io::Result<BTreeMap<String, u6
         Err(error) => return Err(error),
     };
     let mut usage = BTreeMap::new();
-    for entry in entries.take(400).flatten() {
+    for entry in entries.flatten() {
         let path = entry.path();
         if !owned_file(&path, "tmp") || is_open(&path) {
             continue;
@@ -331,7 +342,8 @@ pub(super) fn proven_usage(text: &str, usage: &BTreeMap<String, u64>) -> Option<
 }
 pub(super) fn recoverable(text: &str, usage: &BTreeMap<String, u64>) -> bool {
     // 早于本策略生成的文件沿用原恢复行为。
-    !marked(text) || proven_usage(text, usage).is_some_and(|ms| ms > MIN_FOREGROUND_MS)
+    let minimum = if text.lines().any(|line| line == "source\tperformance") { 0 } else { MIN_FOREGROUND_MS };
+    !marked(text) || proven_usage(text, usage).is_some_and(|ms| ms > minimum)
 }
 
 #[cfg(test)]

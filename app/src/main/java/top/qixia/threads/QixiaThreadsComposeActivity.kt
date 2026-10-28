@@ -136,8 +136,8 @@ class QixiaThreadsComposeActivity : ComponentActivity() {
             AppToast.show(this, "Root、模块或守护进程尚未就绪")
             return
         }
-        if (viewModel.state.value.applications.configured.any {
-                it.packageName == pkg && it.automaticAffinityEnabled
+        if ((viewModel.state.value.applications.configured + viewModel.state.value.applications.addable).any {
+                it.packageName == pkg && (it.automaticAffinityEnabled || it.performanceRecordingEnabled)
             }) {
             val intent = packageManager.getLaunchIntentForPackage(pkg.substringBefore(':'))
             if (intent == null) AppToast.show(this, "请手动进入 $pkg，自动分配将在前台生效")

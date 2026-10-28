@@ -65,11 +65,11 @@ internal object AutoHistoryRecord {
         val end = metadata.getValue("end_ms").toLong().also { require(it >= start) }
         val duration = (metadata["duration_ms"]?.toLongOrNull() ?: (end - start))
             .also { require(it in 1..(24L * 60 * 60 * 1000)) }
-        require(metadata["source"] == "auto")
+        require(metadata["source"] in setOf("auto", "performance"))
         // 准入条件针对整次前台使用，不针对每个轮转分片。
         // 此策略之前的文件仍可读取，包括较短的记录。
         metadata["minimum_usage_ms"]?.let { minimum ->
-            val threshold = minimum.toLong().also { require(it > 0) }
+            val threshold = minimum.toLong().also { require(it > 0 || (it == 0L && metadata["source"] == "performance")) }
             require(metadata.getValue("foreground_ms").toLong() > threshold)
         }
         val captureId = metadata["capture_id"]?.also {
@@ -102,7 +102,7 @@ internal object AutoHistoryRecord {
         require(summaryOnly || expanded <= 64L * 1024 * 1024)
         val pkg = segments.first().pkg
         val captureId = segments.first().captureId
-        require(segments.all { it.pkg == pkg && it.captureId == captureId })
+        require(segments.all { it.pkg == pkg && it.captureId == captureId && it.metadata["source"] == segments.first().metadata["source"] })
         require(segments.size == 1 || captureId != null)
         val canonical = AutoHistoryIo.canonicalName(sourceName)
         if (grouped && captureId != null) require(canonical == "$captureId.log")
@@ -245,7 +245,7 @@ internal object AutoHistoryRecord {
             segments.map { it.metadata["samples"]?.toIntOrNull()?.coerceAtLeast(0) }.let { counts ->
                 if (counts.all { it != null }) counts.sumOf { it!! } else rounds
             }, identities.activeSize,
-            HistorySource.AUTO_ALLOCATION, start, duration, end)
+            if (segments.first().metadata["source"] == "performance") HistorySource.PERFORMANCE else HistorySource.AUTO_ALLOCATION, start, duration, end)
         val dropped = timelineParts.fold(0L) { sum, part ->
             if (Long.MAX_VALUE - sum < part.droppedEvents) Long.MAX_VALUE else sum + part.droppedEvents
         }

@@ -17,7 +17,6 @@ pub(super) const CALIB_MAIN_RESTART_GRACE: Duration = Duration::from_secs(8);
 pub(super) const CALIB_MAX_SERIES_POINTS: usize = 1200;
 pub(super) const CALIB_MAX_TRACKED_RECORDS: usize = 1024;
 pub(super) const CALIB_MAX_CHILD_THREAD_SUMMARIES: usize = 512;
-pub(super) const HISTORY_MAX_SESSIONS: usize = 10;
 
 #[derive(Debug, Clone)]
 pub(super) struct ProcInfo {

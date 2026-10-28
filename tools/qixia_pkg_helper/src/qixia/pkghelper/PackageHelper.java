@@ -14,12 +14,14 @@ import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.security.MessageDigest;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
@@ -53,7 +55,7 @@ public final class PackageHelper {
             String cmd = args[0];
             if ("app-info".equals(cmd)) {
                 requireArgs(args, 2);
-                helper.appInfo(args[1]);
+                helper.appInfo(args[1], args.length >= 3 ? new File(args[2]) : null);
             } else if ("component-state".equals(cmd)) {
                 requireArgs(args, 2);
                 int userId = args.length >= 3 ? (int) parseLong(args[2], 0) : 0;
@@ -100,19 +102,28 @@ public final class PackageHelper {
 
     private static void usage() {
         System.err.println("\u7528\u6cd5:");
-        System.err.println("  app-info <package>");
+        System.err.println("  app-info <package> [apk]");
         System.err.println("  component-state <package/component> [userId]");
         System.err.println("  install <apk>");
         System.err.println("  toast <message>");
     }
 
-    private void appInfo(String packageName) throws Exception {
+    private void appInfo(String packageName, File candidate) throws Exception {
         PackageInfo info = getPackageInfo(packageName);
         print("ok", "1");
         print("package", packageName);
         if (info != null) {
             print("installed", "1");
             printPackageInfo(info);
+            if (candidate != null) {
+                try {
+                    print("apk_same", installedApkMatches(info, sha256File(candidate)) ? "1" : "0");
+                } catch (Exception e) {
+                    // 无法比较不等于相同：由安装入口继续尝试覆盖，不误删待安装文件。
+                    print("apk_same", "unknown");
+                    print("comparison_error", limit(e.toString()));
+                }
+            }
         } else {
             print("installed", "0");
         }
@@ -181,20 +192,24 @@ public final class PackageHelper {
             return;
         }
 
+        String expectedApkDigest = sha256File(file);
         CommandResult result = installByCommands(file);
         if (!result.success) {
             print("ok", "0");
-            print("error", "\u5b89\u88c5\u547d\u4ee4\u6267\u884c\u5931\u8d25");
+            print("error", isStorageFailure(result.output)
+                ? "系统可用于安装的存储空间不足，请释放空间后重试 App 更新（系统保留空间不计入可用安装空间）"
+                : "安装命令执行失败");
             print("command", result.command);
             print("exit", String.valueOf(result.exitCode));
             print("output", limit(result.output));
             return;
         }
 
-        boolean matched = waitForVersion(
+        boolean matched = waitForInstalledApk(
             packageName,
             expectedVersionCode,
-            expectedVersionName
+            expectedVersionName,
+            expectedApkDigest
         );
         print("ok", matched ? "1" : "0");
         print("package", packageName);
@@ -206,19 +221,19 @@ public final class PackageHelper {
             print("installed", "1");
             printPackageInfo(installed);
         } else {
-            print("error", "\u5b89\u88c5\u547d\u4ee4\u5df2\u6267\u884c\uff0c\u4f46\u7b49\u5f85\u7248\u672c\u53d8\u66f4\u8d85\u65f6");
+            print("error", "安装命令已执行，但未确认已安装 APK 与随附文件一致，保留安装包供重试");
             print("output", limit(result.output));
         }
     }
 
     private CommandResult installByCommands(File file) {
         CommandResult last = installByCmdSession(file);
-        if (last.success || last.timedOut()) {
+        if (last.success || last.timedOut() || isStorageFailure(last.output)) {
             return last;
         }
 
         CommandResult direct = runIfExecutable("/system/bin/pm", "install", "-r", file.getAbsolutePath());
-        if (direct.success || direct.timedOut()) {
+        if (direct.success || direct.timedOut() || isStorageFailure(direct.output)) {
             return direct;
         }
         last = direct;
@@ -228,6 +243,16 @@ public final class PackageHelper {
             return direct;
         }
         return direct.exitCode == CommandResult.MISSING ? last : direct;
+    }
+
+    static boolean isStorageFailure(String output) {
+        // 不用 df 的剩余容量猜测安装配额；以包管理器的实际拒绝原因判定。
+        String message = safe(output).toLowerCase(Locale.ROOT);
+        return message.contains("install_failed_insufficient_storage")
+            || message.contains("insufficient storage")
+            || message.contains("not enough space")
+            || message.contains("no space left on device")
+            || (message.contains("failed to allocate") && message.contains("allocatable"));
     }
 
     private CommandResult installByCmdSession(File file) {
@@ -417,18 +442,38 @@ public final class PackageHelper {
         return new String(out);
     }
 
-    private boolean waitForVersion(
+    // 同版本号可对应不同构建，安装前后均比较 APK 内容，不用版本名或 debug 标记代替。
+    static String sha256File(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] buffer = new byte[64 * 1024];
+        try (InputStream input = new FileInputStream(file)) {
+            int count;
+            while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+        }
+        return toHex(digest.digest());
+    }
+
+    static boolean installedApkMatches(PackageInfo info, String expectedDigest) throws Exception {
+        if (info == null || info.applicationInfo == null || info.applicationInfo.sourceDir == null) return false;
+        // 模块随附的是完整单 APK，不能把额外带 split 的安装状态误认为完全一致。
+        String[] splits = info.applicationInfo.splitSourceDirs;
+        if (splits != null && splits.length > 0) return false;
+        return expectedDigest.equals(sha256File(new File(info.applicationInfo.sourceDir)));
+    }
+
+    private boolean waitForInstalledApk(
             String packageName,
             long expectedVersionCode,
-            String expectedVersionName) {
-        long end = System.currentTimeMillis() + INSTALL_WAIT_MS;
-        while (System.currentTimeMillis() < end) {
+            String expectedVersionName,
+            String expectedApkDigest) {
+        long end = android.os.SystemClock.elapsedRealtime() + INSTALL_WAIT_MS;
+        while (android.os.SystemClock.elapsedRealtime() < end) {
             try {
                 PackageInfo info = getPackageInfo(packageName);
                 if (info != null) {
                     boolean nameMatches = expectedVersionName == null || expectedVersionName.length() == 0 ||
                         expectedVersionName.equals(info.versionName);
-                    if (versionCode(info) == expectedVersionCode && nameMatches) {
+                    if (versionCode(info) == expectedVersionCode && nameMatches && installedApkMatches(info, expectedApkDigest)) {
                         return true;
                     }
                 }

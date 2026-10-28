@@ -41,6 +41,10 @@ mod policy;
 mod history;
 use history::*;
 
+pub(crate) fn prune_expired_history(storage: &crate::private_storage::Storage, now_ms: u64) -> io::Result<()> {
+    history::prune_expired(storage, now_ms / 1000)
+}
+
 #[path = "calibration_core/policy_lock.rs"]
 mod policy_lock;
 use policy_lock::*;

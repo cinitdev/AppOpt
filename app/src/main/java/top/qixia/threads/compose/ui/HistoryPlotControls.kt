@@ -53,7 +53,7 @@ internal fun ReportStatistics(series: List<HistoryPlotSeries>, expanded: Boolean
                         fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 }
                 listOf(item.data.maximum, item.data.minimum, item.data.average).forEachIndexed { index, value ->
-                    Text(historyNumber(value), color = if (index == 2) item.color else OceanText, fontSize = 11.sp,
+                    Text(historyNumber(value), color = if (index == 2) item.labelColor else OceanText, fontSize = 11.sp,
                         fontWeight = if (index == 2) FontWeight.SemiBold else FontWeight.Normal,
                         modifier = Modifier.weight(1f), textAlign = TextAlign.End)
                 }

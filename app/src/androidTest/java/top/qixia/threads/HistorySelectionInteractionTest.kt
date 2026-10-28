@@ -2,6 +2,7 @@ package top.qixia.threads
 
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.unit.dp
@@ -34,7 +35,7 @@ class HistorySelectionInteractionTest {
         HistoryPackageModel(packageName, label, null, sessions.maxOfOrNull { it.epoch } ?: 0,
             sessions.size, sessions = sessions)
 
-    private fun show() {
+    private fun show(selecting: Boolean = true) {
         compose.setContent {
             QixiaThreadsTheme {
                 HistoryScreen(state.value, PaddingValues(0.dp), onRefresh = {},
@@ -43,7 +44,25 @@ class HistorySelectionInteractionTest {
                     onExportSession = {}, onNewCalibration = {}, onDeleteSessions = { deleted += it })
             }
         }
-        compose.onNodeWithContentDescription("批量管理记录").performClick()
+        if (selecting) compose.onNodeWithContentDescription("批量管理记录").performClick()
+    }
+
+    @Test fun mergedListPreviewShowsBothSources() {
+        val now = System.currentTimeMillis() / 1000L
+        val manual = first.copy(epoch = now - 3600, rounds = 480)
+        val auto = automatic.copy(epoch = now - 600, rounds = 1200)
+        state.value = HistoryUiState(loading = false, packages = listOf(
+            app("示例游戏 · 测试数据", "demo.history", listOf(manual, auto))))
+        show(selecting = false)
+        compose.onNodeWithText("保留最近 7 天 · 不限条数").assertIsDisplayed()
+        compose.onNodeWithTag("history-record-${auto.id}").assert(hasText("自动分配记录", substring = true))
+        compose.waitForIdle()
+        val bitmap = compose.onRoot().captureToImage().asAndroidBitmap()
+        val context = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext
+        java.io.File(context.cacheDir, "history-merged-seven-days.png").outputStream().use {
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+        }
+        bitmap.recycle()
     }
 
     @Test fun selectingDoesNotOpenAReportAndDeletionRequiresConfirmation() {
@@ -59,45 +78,45 @@ class HistorySelectionInteractionTest {
         compose.onNodeWithContentDescription("批量管理记录").assertExists()
     }
 
-    @Test fun changingCategoryOrSearchClearsHiddenSelections() {
+    @Test fun mergedSourcesCanBeSelectedTogetherAndSearchClearsHiddenSelections() {
         show()
+        compose.onNodeWithTag("history-source-AUTO_ALLOCATION").assertDoesNotExist()
+        compose.onNodeWithTag("history-source-CALIBRATION").assertDoesNotExist()
+        compose.onNodeWithTag("history-records").performScrollToKey(automatic.id)
+        compose.onNodeWithTag("history-record-${automatic.id}").assert(hasText("自动分配记录", substring = true))
+        compose.onNodeWithTag("history-records").performScrollToKey(first.id)
+        compose.onNodeWithTag("history-record-${first.id}").assert(hasText("校准记录", substring = true))
         compose.onNodeWithText("全选当前结果").performClick()
-        compose.onNodeWithText("删除所选 · 2").assertIsEnabled()
-        compose.onNodeWithTag("history-source-AUTO_ALLOCATION").performClick()
-        compose.onNodeWithText("删除所选 · 0").assertIsNotEnabled()
-        compose.onNodeWithText("全选当前结果").performClick()
-        compose.onNodeWithText("删除所选 · 1").assertIsEnabled()
-        compose.onNodeWithTag("history-source-CALIBRATION").performClick()
-        compose.onNodeWithText("删除所选 · 0").assertIsNotEnabled()
-        compose.onNodeWithText("全选当前结果").performClick()
+        compose.onNodeWithText("删除所选 · 3").assertIsEnabled()
+        compose.onNodeWithTag("history-records").performScrollToKey("search")
         compose.onNode(hasSetTextAction()).performScrollTo().performTextReplacement("Alpha")
         compose.onNodeWithText("删除所选 · 0").assertIsNotEnabled()
         compose.onNodeWithText("全选当前结果").performClick()
-        compose.onNodeWithText("删除所选 · 1").performClick()
-        compose.onNodeWithText("删除 1 条").performClick()
-        compose.runOnIdle { assertEquals(listOf(setOf(first.id)), deleted) }
+        compose.onNodeWithText("删除所选 · 2").performClick()
+        compose.onNodeWithText("删除 2 条").performClick()
+        compose.runOnIdle { assertEquals(listOf(setOf(first.id, automatic.id)), deleted) }
     }
 
     @Test fun confirmationNeverAddsNewRecordsWhenHistoryRefreshes() {
         show()
         compose.onNodeWithText("全选当前结果").performClick()
-        compose.onNodeWithText("删除所选 · 2").performClick()
+        compose.onNodeWithText("删除所选 · 3").performClick()
         compose.runOnIdle {
             state.value = snapshot(firstSessions = listOf(automatic),
                 secondSessions = listOf(second, second.copy(id = 3, epoch = second.epoch + 1)))
         }
-        compose.onNodeWithText("删除 1 条记录？").assertIsDisplayed()
-        compose.onNodeWithText("删除 1 条").performClick()
-        compose.runOnIdle { assertEquals(listOf(setOf(second.id)), deleted) }
+        compose.onNodeWithText("删除 2 条记录？").assertIsDisplayed()
+        compose.onNodeWithText("删除 2 条").performClick()
+        compose.runOnIdle { assertEquals(listOf(setOf(second.id, automatic.id)), deleted) }
     }
 
     @Test fun busyOrMissingSelectionsCannotBeDeletedTwice() {
-        state.value = state.value.copy(busySessionIds = setOf(first.id))
+        state.value = state.value.copy(busySessionIds = setOf(first.id, automatic.id))
         show()
         compose.onNodeWithText("全选当前结果").performClick()
         compose.onNodeWithText("删除所选 · 1").performClick()
         compose.runOnIdle {
-            state.value = state.value.copy(busySessionIds = setOf(first.id, second.id))
+            state.value = state.value.copy(busySessionIds = setOf(first.id, second.id, automatic.id))
         }
         compose.onNodeWithText("所选记录已更新").assertIsDisplayed()
         compose.onNodeWithText("删除 0 条").assertIsNotEnabled()

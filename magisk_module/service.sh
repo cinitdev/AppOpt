@@ -1,9 +1,12 @@
 #!/system/bin/sh
-# 后期启动服务：单实例看门狗管理 Rust 守护与前台助手，并处理延后安装。
+# 后期启动服务：单实例看门狗管理 Rust、前台与刷新率服务，并处理延后安装。
 
 MODDIR=${0%/*}
+# 只在本次启动消费事务标记，不把标记留在命令行或传给子进程。
+SERVICE_HOT_UPDATE=${QIXIA_SERVICE_HOT_UPDATE:-0}
+unset QIXIA_SERVICE_HOT_UPDATE
 # 更新中断后先恢复完整运行文件；正常热启动由事务工作进程负责检查。
-if [ "$1" != --hot-update ] && [ "$1" != --install-app ] &&
+if [ "$SERVICE_HOT_UPDATE" != 1 ] && [ "$1" != --install-app ] &&
 	[ -f /data/adb/qixia_hot_update/worker.sh ]; then
 	sh /data/adb/qixia_hot_update/worker.sh --recover || exit 1
 fi
@@ -16,6 +19,7 @@ WATCHDOG_DAEMON_PID=""
 WATCHDOG_DAEMON_STARTTIME=""
 WATCHDOG_STOPPING=0
 FOREGROUND_HELPER="$MODDIR/config/tools/qixia_foreground_helper.sh"
+REFRESH_HELPER="$MODDIR/config/tools/qixia_refresh_helper.sh"
 LOG="$MODDIR/logs/QixiaThreads.log"
 
 service_watchdog_starttime() {
@@ -194,6 +198,9 @@ stop_orphan_daemons() {
 cleanup_watchdog() {
 	[ "$WATCHDOG_STOPPING" = 0 ] || return
 	WATCHDOG_STOPPING=1
+	if [ -f "$REFRESH_HELPER" ]; then
+		sh "$REFRESH_HELPER" stop >/dev/null 2>&1 || true
+	fi
 	if [ -f "$FOREGROUND_HELPER" ]; then
 		sh "$FOREGROUND_HELPER" stop >/dev/null 2>&1 || true
 	fi
@@ -309,7 +316,7 @@ cleanup_deferred_app_files() {
 	return 1
 }
 
-# 热更新的 APK 在用户离开刷入页面后安装；普通开机仍可完成失败重试。
+# 热更新的 APK 由用户明确确认、退出 App 后安装；普通开机仍可完成失败重试。
 install_deferred_embedded_app() {
 	local APP_DIR="$MODDIR/config/app"
 	local APP_META="$APP_DIR/app.prop"
@@ -324,7 +331,6 @@ install_deferred_embedded_app() {
 	APP_APK="$APP_DIR/$(read_app_prop apk "$APP_META")"
 	APP_VERSION_CODE="$(read_app_prop versionCode "$APP_META")"
 	APP_VERSION_NAME="$(read_app_prop versionName "$APP_META")"
-	APP_VARIANT="$(read_app_prop variant "$APP_META")"
 	APP_HELPER_DIR="$MODDIR/config/tools"
 	APP_HELPER="$APP_HELPER_DIR/qixia_pkg_helper.sh"
 	[ -n "$APP_PKG" ] || APP_PKG="top.qixia.threads"
@@ -343,15 +349,13 @@ install_deferred_embedded_app() {
 	local INSTALLED_VERSION_CODE INSTALLED_VERSION_NAME
 
 	echo "- 检测到延后 App 更新：$APP_NAME $APP_VERSION_NAME ($APP_VERSION_CODE)" >> "$LOG"
-	if run_app_helper "$APP_INFO" app-info "$APP_PKG" && [ "$(read_app_prop ok "$APP_INFO")" = "1" ]; then
+	if run_app_helper "$APP_INFO" app-info "$APP_PKG" "$APP_APK" && [ "$(read_app_prop ok "$APP_INFO")" = "1" ]; then
 		if [ "$(read_app_prop installed "$APP_INFO")" = "1" ]; then
 			INSTALLED_VERSION_CODE="$(read_app_prop versionCode "$APP_INFO")"
 			INSTALLED_VERSION_NAME="$(read_app_prop versionName "$APP_INFO")"
 			echo "- 当前已安装 App：${INSTALLED_VERSION_NAME:-未知} ($INSTALLED_VERSION_CODE)" >> "$LOG"
-			if [ "$APP_VARIANT" != "debug" ] &&
-				[ "$INSTALLED_VERSION_CODE" = "$APP_VERSION_CODE" ] &&
-				{ [ -z "$INSTALLED_VERSION_NAME" ] || [ "$INSTALLED_VERSION_NAME" = "$APP_VERSION_NAME" ]; }; then
-				echo "- App 已是随附版本，清理延后安装文件" >> "$LOG"
+			if [ "$(read_app_prop apk_same "$APP_INFO")" = 1 ]; then
+				echo "- 已安装 APK 与随附文件完全相同，清理延后安装文件" >> "$LOG"
 				cleanup_deferred_app_files
 				return
 			fi
@@ -359,6 +363,9 @@ install_deferred_embedded_app() {
 				echo "- 已安装 App 版本高于随附版本，清理延后安装文件" >> "$LOG"
 				cleanup_deferred_app_files
 				return
+			fi
+			if [ "$INSTALLED_VERSION_CODE" = "$APP_VERSION_CODE" ]; then
+				echo "- 版本号相同，但 APK 内容不同或尚未确认一致，继续覆盖安装" >> "$LOG"
 			fi
 		fi
 	else
@@ -375,11 +382,12 @@ install_deferred_embedded_app() {
 }
 
 if [ "$1" = --install-app ]; then
+	# 显式安装与开机重试共用 APK 内容比较，兼容同版本号的不同构建。
 	install_deferred_embedded_app
 	[ ! -d "$MODDIR/config/app" ]
 	exit $?
 fi
-if [ "$1" != --hot-update ] &&
+if [ "$SERVICE_HOT_UPDATE" != 1 ] &&
 	[ "$(cat "$MODDIR/config/app/.defer_boot" 2>/dev/null)" != "$CURRENT_BOOT_ID" ]; then
 	install_deferred_embedded_app
 	# 开机补装 APK 成功后收尾；热更新工作进程会自行完成清理。
@@ -393,6 +401,43 @@ rm -f "$QIXIA_IN_APP_UPDATE_FLAG" 2>/dev/null || true
 start_foreground_helper() {
 	[ -f "$FOREGROUND_HELPER" ] || return 1
 	sh "$FOREGROUND_HELPER" start
+}
+
+# 高频检查只用 Shell 内建读取，一次取得状态和启动时间，避免派生短命 sh/sed/awk。
+read_process_identity() {
+    local stat
+    PROCESS_STATE=""; PROCESS_START=""
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    { IFS= read -r stat < "/proc/$1/stat"; } 2>/dev/null || return 1
+    stat=${stat##*) }
+    set -- $stat
+    [ "$#" -ge 20 ] || return 1
+    PROCESS_STATE=$1
+    shift 19
+    PROCESS_START=$1
+    case "$PROCESS_START" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$PROCESS_STATE" != Z ] && [ "$PROCESS_STATE" != X ]
+}
+
+foreground_helper_healthy() {
+    java_service_healthy "$MODDIR/config/foreground_task.state" && [ "$JAVA_SERVICE_STATUS" != error ]
+}
+
+java_service_healthy() {
+    local key value pid="" start="" boot="" status=""
+    JAVA_SERVICE_STATUS=""
+    [ -r "$1" ] || return 1
+    while IFS='=' read -r key value; do
+        case "$key" in
+            pid) pid=$value ;;
+            start_ticks) start=$value ;;
+            boot_id) boot=$value ;;
+            status) status=$value ;;
+        esac
+    done < "$1"
+    JAVA_SERVICE_STATUS=$status
+    [ -n "$boot" ] && [ "$boot" = "$CURRENT_BOOT_ID" ] && [ "$status" != stopped ] &&
+        read_process_identity "$pid" && [ "$PROCESS_START" = "$start" ]
 }
 
 # 只检查由本模块路径启动的守护进程，避免误判其他同名进程。
@@ -429,8 +474,7 @@ is_our_daemon_running() {
     return 1
 }
 
-# 一个看门狗统一管理两个长期运行的子进程，避免留下两个 service.sh shell，
-# 同时仍然可以独立重启前台助手和 Rust 守护进程。
+# 共用一个看门狗，各服务独立重启，不增加永久 Shell。
 daemon_restart_delay() {
 	case "$1" in
 		1) echo 5 ;;
@@ -441,12 +485,24 @@ daemon_restart_delay() {
 }
 
 watch_services() {
-    local failure_logged=0 helper_tick=0 daemon_start_ts="" daemon_failures=0 daemon_next_start=0
-    local daemon_alive daemon_state current_start exit_code end_ts runtime requested delay now_ts
+    local failure_logged=0 helper_tick=0 helper_checked=0 refresh_failure_logged=0 daemon_start_ts="" daemon_failures=0 daemon_next_start=0
+    local daemon_alive exit_code end_ts runtime requested delay now_ts uptime_idle
     while true; do
+        # 用单调时钟计算重启间隔，避免每轮派生 date，也不受用户调整系统时间影响。
+        IFS=' ' read -r now_ts uptime_idle < /proc/uptime || now_ts=0
+        now_ts=${now_ts%%.*}
         if [ "$helper_tick" -eq 0 ]; then
-            if start_foreground_helper >/dev/null 2>&1; then
+            if java_service_healthy "$MODDIR/config/state/refresh_rate.state" ||
+                sh "$REFRESH_HELPER" start >/dev/null 2>&1; then
+                refresh_failure_logged=0
+            elif [ "$refresh_failure_logged" = 0 ]; then
+                echo '- 独立刷新率服务启动失败，请查看 RefreshRate.log' >> "$LOG"
+                refresh_failure_logged=1
+            fi
+            if { [ "$helper_checked" = 1 ] && foreground_helper_healthy; } ||
+                start_foreground_helper >/dev/null 2>&1; then
                 failure_logged=0
+                helper_checked=1
             elif [ "$failure_logged" -eq 0 ]; then
                 echo "- 前台助手启动失败：App 使用 UsageStats/cgroup/焦点检测降级，规则健康负向观察暂停" >> "$LOG"
                 failure_logged=1
@@ -458,18 +514,16 @@ watch_services() {
 
         daemon_alive=0
         if [ -n "$WATCHDOG_DAEMON_PID" ]; then
-            if [ -r "/proc/$WATCHDOG_DAEMON_PID/stat" ]; then
-                daemon_state="$(sed 's/^.*) //' "/proc/$WATCHDOG_DAEMON_PID/stat" 2>/dev/null | awk '{print $1}')"
-                current_start="$(service_watchdog_starttime "$WATCHDOG_DAEMON_PID")"
-                if [ "$daemon_state" != "Z" ] && [ -n "$WATCHDOG_DAEMON_STARTTIME" ] &&
-                    [ "$current_start" = "$WATCHDOG_DAEMON_STARTTIME" ]; then
+            if read_process_identity "$WATCHDOG_DAEMON_PID"; then
+                if [ -n "$WATCHDOG_DAEMON_STARTTIME" ] &&
+                    [ "$PROCESS_START" = "$WATCHDOG_DAEMON_STARTTIME" ]; then
                     daemon_alive=1
                 fi
             fi
             if [ "$daemon_alive" -eq 0 ]; then
                 exit_code=0
                 wait "$WATCHDOG_DAEMON_PID" 2>/dev/null || exit_code=$?
-                end_ts="$(date +%s 2>/dev/null || echo 0)"
+                end_ts=$now_ts
                 runtime=$((end_ts - daemon_start_ts))
                 [ "$runtime" -lt 0 ] && runtime=0
                 requested=0
@@ -494,14 +548,13 @@ watch_services() {
             fi
         fi
 
-        now_ts="$(date +%s 2>/dev/null || echo 0)"
         if [ "$daemon_alive" -eq 0 ] && [ "$now_ts" -ge "$daemon_next_start" ]; then
             if is_our_daemon_running; then
                 [ -n "$WATCHDOG_DAEMON_PID" ] && [ -z "$daemon_start_ts" ] && daemon_start_ts="$now_ts"
             else
                 CPUSET_NAME="$(read_cpuset_name)"
                 echo "- 启动 Rust 守护进程: $BIN cpuset=/dev/cpuset/$CPUSET_NAME" >>"$LOG"
-                daemon_start_ts="$(date +%s 2>/dev/null || echo 0)"
+                daemon_start_ts=$now_ts
                 "$BIN" -c "$CONF" -s 2 -b "$CPUSET_NAME" >>"$LOG" 2>&1 &
                 WATCHDOG_DAEMON_PID=$!
                 WATCHDOG_DAEMON_STARTTIME="$(service_watchdog_starttime "$WATCHDOG_DAEMON_PID")"

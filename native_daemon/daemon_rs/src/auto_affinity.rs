@@ -1,6 +1,6 @@
 //! 仅在前台为活跃线程分配 QixiaThreads 自有 cpuset，不写入频率、
 //! 优先级或 core_ctl。负载采样不依赖 FPS 采集器。
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 mod accounting;
 pub(crate) mod calibration;
 mod demand;
@@ -18,14 +18,25 @@ use topology::Core;
 pub const CONFIG: &str = "/data/adb/modules/QixiaThreads/config/auto_affinity.conf";
 pub const STATUS: &str = "/data/adb/modules/QixiaThreads/config/auto_affinity.state";
 
-/// 每应用一行，只读取有效包名并去重。
-pub fn packages(text: &str) -> BTreeSet<String> {
-    text.lines().filter_map(|line| {
-        let pkg = line.split('#').next()?.trim();
+/// 每应用一行；fallback 仅启用主进程兜底，核心范围仍来自 applist.conf。
+pub fn modes(text: &str) -> BTreeMap<String, bool> {
+    let mut result = BTreeMap::new();
+    for line in text.lines() {
+        let parts: Vec<_> = line.split('#').next().unwrap_or_default().trim().split(',').map(str::trim).collect();
+        let pkg = parts[0];
         let valid = pkg.len() < 128 && pkg.contains('.') && pkg.split('.').all(|part|
             !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
-        valid.then(|| pkg.to_owned())
-    }).collect()
+        if valid && (parts.len() == 1 || (parts.len() == 2 && parts[1] == "fallback")) {
+            let fallback = parts.len() == 2;
+            result.entry(pkg.to_owned()).and_modify(|value| *value |= fallback).or_insert(fallback);
+        }
+    }
+    result
+}
+
+/// 各调用方仅使用包名，不把选项传给进程查询或黑名单。
+pub fn packages(text: &str) -> BTreeSet<String> {
+    modes(text).into_keys().collect()
 }
 
 pub fn foreground_package(text: &str, now_ms: u64, boot: &str) -> Option<String> {
@@ -80,6 +91,15 @@ pub mod platform;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fallback_option_is_separate_from_package_and_duplicate_order() {
+        for text in ["com.game\ncom.game,fallback", "com.game,fallback\ncom.game"] {
+            assert_eq!(modes(text), BTreeMap::from([("com.game".into(), true)]));
+            assert_eq!(packages(text), BTreeSet::from(["com.game".into()]));
+        }
+        assert_eq!(modes("com.game , fallback # 主进程\ncom.light\ncom.bad,fallback,extra\ncom.a:child,fallback"),
+            BTreeMap::from([("com.game".into(), true), ("com.light".into(), false)]));
+    }
     #[test]
     fn only_plain_packages_are_selected_and_deduplicated() {
         let parsed = packages("com.game\ncom.game # 重复\ncom.light\ncom.bad,fast\ncom.bad,unknown,extra\nbad..name\ncom.a:worker\n");

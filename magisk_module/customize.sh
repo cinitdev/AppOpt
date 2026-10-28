@@ -168,15 +168,13 @@ install_or_update_app() {
 		return
 	fi
 
-	local APP_PKG APP_NAME APP_APK APP_VERSION_CODE APP_VERSION_NAME APP_VARIANT APP_DISPLAY INSTALLED_VERSION_CODE INSTALLED_VERSION_NAME
-	local FORCE_APP_INSTALL=0
+	local APP_PKG APP_NAME APP_APK APP_VERSION_CODE APP_VERSION_NAME APP_DISPLAY INSTALLED_VERSION_CODE INSTALLED_VERSION_NAME
 	local APP_INFO INSTALL_INFO
 	APP_PKG="$(grep_prop package "$APP_META")"
 	APP_NAME="$(grep_prop name "$APP_META")"
 	APP_APK="$MODPATH/config/app/$(grep_prop apk "$APP_META")"
 	APP_VERSION_CODE="$(grep_prop versionCode "$APP_META")"
 	APP_VERSION_NAME="$(grep_prop versionName "$APP_META")"
-	APP_VARIANT="$(grep_prop variant "$APP_META")"
 	[ -n "$APP_NAME" ] || APP_NAME="柒夏线程"
 	APP_DISPLAY="$APP_NAME $APP_VERSION_NAME ($APP_VERSION_CODE)"
 
@@ -195,7 +193,7 @@ install_or_update_app() {
 	APP_INFO="${TMPDIR:-/dev/tmp}/qixia_app_info.prop"
 	INSTALL_INFO="${TMPDIR:-/dev/tmp}/qixia_install_info.prop"
 
-	if run_pkg_helper "$APP_INFO" app-info "$APP_PKG" && [ "$(grep_prop ok "$APP_INFO")" = "1" ]; then
+	if run_pkg_helper "$APP_INFO" app-info "$APP_PKG" "$APP_APK" && [ "$(grep_prop ok "$APP_INFO")" = "1" ]; then
 		if [ "$(grep_prop installed "$APP_INFO")" = "1" ]; then
 			INSTALLED_VERSION_CODE="$(grep_prop versionCode "$APP_INFO")"
 			INSTALLED_VERSION_NAME="$(grep_prop versionName "$APP_INFO")"
@@ -210,34 +208,23 @@ install_or_update_app() {
 		return
 	fi
 
-	if [ -n "$INSTALLED_VERSION_CODE" ] &&
-		[ "$INSTALLED_VERSION_CODE" = "$APP_VERSION_CODE" ] &&
-		{ [ -z "$INSTALLED_VERSION_NAME" ] || [ "$INSTALLED_VERSION_NAME" = "$APP_VERSION_NAME" ]; }; then
-		if [ "$APP_VARIANT" = "debug" ]; then
-			FORCE_APP_INSTALL=1
-			ui_print "- Debug 应用包：版本相同，仍然执行覆盖安装"
-		else
-			ui_print "- 应用已是最新版本，跳过安装"
-			EMBEDDED_APP_CLEANUP_ALLOWED=1
-			return
-		fi
+	if [ "$(grep_prop apk_same "$APP_INFO")" = 1 ]; then
+		ui_print "- 已安装 APK 与随附文件完全相同，跳过重复安装"
+		EMBEDDED_APP_CLEANUP_ALLOWED=1
+		return
 	fi
 
 	if [ -n "$INSTALLED_VERSION_CODE" ]; then
-		if [ "$FORCE_APP_INSTALL" = "1" ]; then
-			ui_print "- 覆盖安装 App：$APP_VERSION_NAME ($APP_VERSION_CODE)"
-		elif [ "$INSTALLED_VERSION_CODE" -lt "$APP_VERSION_CODE" ] 2>/dev/null; then
+		if [ "$INSTALLED_VERSION_CODE" -lt "$APP_VERSION_CODE" ] 2>/dev/null; then
 			ui_print "- $APP_NAME 版本过低，准备更新"
 		elif [ "$INSTALLED_VERSION_CODE" -gt "$APP_VERSION_CODE" ] 2>/dev/null; then
 			ui_print "- $APP_NAME 已安装版本高于随附版本，跳过安装"
 			EMBEDDED_APP_CLEANUP_ALLOWED=1
 			return
 		else
-			ui_print "- $APP_NAME 已安装版本不同，准备更新"
+			ui_print "- 版本号相同，但 APK 内容不同或尚未确认一致，准备覆盖安装"
 		fi
-		if [ "$FORCE_APP_INSTALL" != "1" ]; then
-			ui_print "- 更新 App：${INSTALLED_VERSION_NAME:-未知} ($INSTALLED_VERSION_CODE) -> $APP_VERSION_NAME ($APP_VERSION_CODE)"
-		fi
+		ui_print "- 更新 App：${INSTALLED_VERSION_NAME:-未知} ($INSTALLED_VERSION_CODE) -> $APP_VERSION_NAME ($APP_VERSION_CODE)"
 	else
 		ui_print "- 安装 App：$APP_DISPLAY"
 	fi
@@ -247,7 +234,8 @@ install_or_update_app() {
 		EMBEDDED_APP_CLEANUP_ALLOWED=1
 	else
 		print_helper_error "内置安装器执行失败" "$INSTALL_INFO"
-		ui_print "! App 安装未完成，请手动安装模块内的 $APP_NAME.apk"
+		ui_print "! App 安装未完成；模块刷入结果不代表 App 已更新。"
+		ui_print "! 处理上述错误后，可重新刷入或手动安装模块内的 $APP_NAME.apk。"
 	fi
 }
 cleanup_embedded_app() {
@@ -559,6 +547,7 @@ EOF
 # 模块升级时保留自动核心分配的应用选择。
 prepare_auto_affinity_config() {
 	preserve_config auto_affinity.conf "自动分配应用列表" || true
+	preserve_config refresh_rate.conf "刷新率管理" || true
 }
 
 # 记录设置共用策略文件，升级时保留当前模块的记录开关。
@@ -604,7 +593,7 @@ prepare_runtime_state_dir() {
 		"$MODPATH/config/state/pid_cache.tsv" "$MODPATH/config/state/pid_cache.tsv."*.tmp
 	[ -n "$QIXIA_UPGRADE_SOURCE" ] || return 0
 	local FILE
-	for FILE in rule_health.tsv managed_tids.tsv auto_affinity.restore app_storage.conf; do
+	for FILE in rule_health.tsv managed_tids.tsv auto_affinity.restore app_storage.conf refresh_rate.state; do
 		[ -f "$QIXIA_UPGRADE_SOURCE/config/state/$FILE" ] || continue
 		cp -pf "$QIXIA_UPGRADE_SOURCE/config/state/$FILE" "$MODPATH/config/state/" \
 			|| abort "! 模块运行状态保留失败：$FILE"
@@ -655,60 +644,28 @@ relocate_current_collection_files() {
 	done
 }
 
-normalize_calib_rule_output_format() {
-	local POLICY_FILE="$MODPATH/config/calib_policy.conf"
-	local OLD_FORMAT TMP_FILE
-	[ -f "$POLICY_FILE" ] || return
-	OLD_FORMAT="$(sed -n 's/^[[:space:]]*rule_output_format[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*$/\1/p' "$POLICY_FILE" | tail -n 1)"
-	case "$OLD_FORMAT" in
-		compact_header_block|separate_fallback_block|compact_separate_fallback_block|extended_block)
-			TMP_FILE="$POLICY_FILE.format.tmp"
-			if awk -v old_format="$OLD_FORMAT" '
-			BEGIN { migrated = 0 }
-			{
-				trimmed = $0
-				sub(/^[[:space:]]*/, "", trimmed)
-				if (trimmed ~ /^rule_output_format_migration[[:space:]]*=/) next
-				if (trimmed ~ /^rule_output_format[[:space:]]*=/) {
-					comment = ""
-					hash = index($0, "#")
-					if (hash > 0) comment = substr($0, hash)
-					if (!migrated) printf "rule_output_format_migration=%s\n", old_format
-					printf "rule_output_format=author_block"
-					if (comment != "") printf " %s", comment
-					printf "\n"
-					migrated = 1
-					next
-				}
-				print
-			}' "$POLICY_FILE" > "$TMP_FILE" && mv -f "$TMP_FILE" "$POLICY_FILE"; then
-				ui_print "- 校准规则格式：旧区块生成策略已迁移为原作者格式"
-			else
-				rm -f "$TMP_FILE"
-				ui_print "! 校准规则格式迁移失败，守护进程将使用原作者格式兼容处理"
-			fi
-			;;
-	esac
-}
 print_install_result() {
 	local HOT_UPDATE="$MODPATH/config/tools/qixia_hot_update.sh"
+	local HOT_RESULT
 	ui_print ""
 	ui_print "============================================"
 	if [ -z "$QIXIA_UPGRADE_SOURCE" ] || [ ! -s "$QIXIA_UPGRADE_SOURCE/service.sh" ] ||
 		[ ! -x "$QIXIA_UPGRADE_SOURCE/config/bin/QiXiaRs" ]; then
 		ui_print "【首次安装完成】请重启手机生效"
 		ui_print "首次安装需要重启，完成模块初始化后再使用。"
-	elif is_qixia_in_app_update; then
-		ui_print "【模块刷入完成】即将进行热更新"
-		ui_print "当前页面会继续验证，并显示是否无需重启。"
-	elif [ -f "$HOT_UPDATE" ] && sh "$HOT_UPDATE" --queue-installer "$$" >/dev/null; then
-		ui_print "【模块刷入完成】热更新已排队"
-		ui_print "安装器退出后开始切换，请等待屏幕上的结果提示。"
-		ui_print "成功后会弹出带应用图标的 Toast：热更新成功，无需重启手机。"
-		ui_print "也可打开柒夏线程查看生效状态。"
 	else
-		ui_print "【模块刷入完成】请重启手机生效"
-		ui_print "热更新任务未能启动，重启后应用本次更新。"
+		ui_print "- 正在热更新并检查服务，请稍候……"
+		if [ -f "$HOT_UPDATE" ] && HOT_RESULT=$(sh "$HOT_UPDATE" --sync-installer "$$"); then
+			ui_print "【热更新成功】无需重启手机"
+			ui_print "新版 Rust 守护与前台助手已通过检查，模块已生效。"
+		else
+			ui_print "【需要重启】请重启手机使本次更新生效"
+			[ -z "$HOT_RESULT" ] || ui_print "! $HOT_RESULT"
+		fi
+	fi
+	if [ -f "$MODPATH/config/app/app.prop" ] && [ "$EMBEDDED_APP_CLEANUP_ALLOWED" != 1 ]; then
+		ui_print "【App 尚未更新】已保留安装包，当前应用可能仍是旧版。"
+		ui_print "请按上方安装提示处理后重试；模块与 App 的更新结果分别确认。"
 	fi
 	ui_print "============================================"
 	ui_print ""
@@ -727,7 +684,6 @@ prepare_auto_affinity_config
 prepare_auto_history
 prepare_runtime_state_dir
 relocate_current_collection_files
-normalize_calib_rule_output_format
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 for SCRIPT in "$MODPATH"/*.sh; do
 	[ -f "$SCRIPT" ] && set_perm "$SCRIPT" 0 2000 0755 u:object_r:magisk_file:s0

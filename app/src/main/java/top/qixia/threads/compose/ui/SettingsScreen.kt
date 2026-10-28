@@ -16,6 +16,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.semantics.Role
@@ -24,6 +25,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import top.qixia.threads.CalibPolicy
 import top.qixia.threads.ModuleUpdateDownloadViewModel
+import top.qixia.threads.ModuleHotUpdate
+import top.qixia.threads.UpdateInstallActivity
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import top.qixia.threads.compose.QixiaThreadsUiState
 
 import top.qixia.threads.compose.theme.*
@@ -36,8 +41,14 @@ fun SettingsScreen(
     onCheckModuleUpdate: () -> Unit,
     moduleDownloadState: ModuleUpdateDownloadViewModel.State,
     onOpenModuleUpdate: () -> Unit,
-    onAutoHistoryChange: (Boolean) -> Unit = {}
+    onAutoHistoryChange: (Boolean) -> Unit = {},
+    onRefreshRate: () -> Unit = {}
 ) {
+    val context = LocalContext.current
+    val pendingApp by produceState(false, state.environment.hasRoot, state.environment.pendingModuleUpdate) {
+        value = state.environment.hasRoot && !state.environment.pendingModuleUpdate &&
+            withContext(Dispatchers.IO) { ModuleHotUpdate.hasPendingApp() }
+    }
     val settings = state.settings
     val p = settings.policy
     val enabled = settings.editable && !settings.saving && !settings.autoHistorySaving && !settings.loading
@@ -62,6 +73,9 @@ fun SettingsScreen(
             item(key = "module-update") {
                 SettingsModuleUpdateCard(state.environment, state.updates, moduleDownloadState,
                     onCheckModuleUpdate, onOpenUpdate = onOpenModuleUpdate)
+            }
+            if (pendingApp) item(key = "pending-app-update") {
+                PendingAppUpdateCard { context.startActivity(UpdateInstallActivity.pendingAppIntent(context)) }
             }
             item(key = "auto-history") {
                 Column {
@@ -106,6 +120,9 @@ fun SettingsScreen(
                     Column {
                         SettingsSectionLabel("设备与运行")
                         SettingsCard {
+                            SettingsEntry("刷新率管理", "应用／游戏刷新率与每应用规则", null,
+                                Icons.Outlined.Refresh, enabled, onRefreshRate)
+                            HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = OceanDivider)
                             SettingsEntry("cpuset 根目录", if (settings.cpusetSupported) "修改后将安全重启守护进程" else "设备暂不支持自定义 cpuset",
                                 "/dev/cpuset/${p.cpusetName}", Icons.Outlined.FolderOpen, enabled && settings.cpusetSupported) { dialog = "cpuset" }
                             HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = OceanDivider)

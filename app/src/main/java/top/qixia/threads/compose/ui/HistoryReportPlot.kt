@@ -15,7 +15,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.isTraversalGroup
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -35,11 +38,17 @@ internal val ReportRose = Color(HistoryChartPalette.battery)
 
 internal data class HistoryPlotSeries(val data: HistoryMetrics.Series, val label: String, val unit: String,
     val color: Color, val rightAxis: Boolean = false, val legendKey: String = data.key, val legendLabel: String = label,
-    val valueScale: Float = 1f) {
+    val valueScale: Float = 1f,
+    val sampleAt: ((Float) -> HistoryMetrics.Point?)? = null,
+    val plotSamples: List<HistoryMetrics.Point>? = null) {
     init { require(valueScale.isFinite() && valueScale > 0f) { "Plot value scale must be positive and finite" } }
-    val points = data.points.map { HistoryCurvePoint(it.progress, it.value, it.breakBefore) }
+    val points = (plotSamples ?: data.points).map { HistoryCurvePoint(it.progress, it.value, it.breakBefore) }
+    val labelColor = Color(HistoryChartPalette.label(color.toArgb()))
     // 单位换算只影响图形，读数和统计保留记录原值。
     fun plotValue(value: Float): Float = value * valueScale
+    fun at(progress: Float, durationMs: Long): HistoryCurvePoint? = if (sampleAt != null) {
+        sampleAt.invoke(progress)?.let { HistoryCurvePoint(it.progress, it.value, it.breakBefore) }
+    } else HistoryPlotMath.at(points, progress, durationMs)
 }
 
 /** QixiaThreads 分析面板，缓存图形与共享游标独立于卡片布局。 */
@@ -57,16 +66,11 @@ internal fun HistoryReportPlotCard(title: String, series: List<HistoryPlotSeries
     var showOptions by remember { mutableStateOf(false) }
     var showInfo by remember { mutableStateOf(false) }
     val visible = remember(series, hidden) { series.filterNot { it.data.key in hidden } }
-    HistorySurface {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 10.dp, bottom = 14.dp)) {
-            Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(width = 3.dp, height = 28.dp).background(OceanPrimary, RoundedCornerShape(3.dp)))
-                Column(Modifier.weight(1f).padding(start = 10.dp)) {
-                    Text(title, color = OceanText, fontSize = 15.sp, fontWeight = FontWeight.Bold,
-                        maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    Text("${historyDuration(durationMs)} · ${if (content != null) "样本分布" else "时间曲线"}",
-                        color = OceanTextSecondary, fontSize = 10.sp, modifier = Modifier.padding(top = 3.dp))
-                }
+    HistorySurface(Modifier.semantics { isTraversalGroup = true }) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(top = 2.dp, bottom = 6.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(title, color = OceanTextSecondary, fontSize = 12.sp,
+                    maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                 options()
                 if (showSeriesOptions && series.size > 1) IconButton({ showOptions = true }, Modifier.size(44.dp)) {
                     Icon(Icons.Outlined.Tune, "$title 图表选项", tint = PorcelainOnTonal, modifier = Modifier.size(18.dp))
@@ -92,7 +96,7 @@ internal fun HistoryReportPlotCard(title: String, series: List<HistoryPlotSeries
                             HistoryLegendMark(item.color, shown > 0)
                             Spacer(Modifier.width(5.dp))
                             Text(item.legendLabel + if (state == ToggleableState.Indeterminate) " · 部分" else "",
-                                color = OceanText, fontSize = 10.sp)
+                                color = item.labelColor, fontSize = 10.sp)
                         }
                     }
                 }

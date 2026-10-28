@@ -73,6 +73,7 @@ data class AppItemModel(
     val cpuSummary: String = "CPU --",
     val state: AppRuleState = AppRuleState.CONFIGURED,
     val automaticAffinityEnabled: Boolean = false,
+    val performanceRecordingEnabled: Boolean = false,
     val automaticAffinityDetail: String = "等待所选游戏进入前台",
     val unhealthyRuleCount: Int = 0,
     val averageFps: Float? = null,
@@ -84,7 +85,10 @@ data class AppItemModel(
     val manualCpuSummary: String = cpuSummary,
     val manualUnhealthyRuleCount: Int = unhealthyRuleCount,
     val iconVersion: Long = 0L,
-    val componentKind: AppComponentKind = if (installed) AppComponentKind.APP else AppComponentKind.MISSING_APP
+    val componentKind: AppComponentKind = if (installed) AppComponentKind.APP else AppComponentKind.MISSING_APP,
+    val automaticFallbackSupported: Boolean = false,
+    val automaticFallbackEnabled: Boolean = false,
+    val mainFallbackCpus: String? = null
 ) {
     val stableKey: String = "${state.name}:$packageName"
     val isSystemComponent: Boolean get() = componentKind == AppComponentKind.SYSTEM_COMPONENT
@@ -114,6 +118,8 @@ data class EnvironmentUiState(
     val foregroundState: DaemonBridge.TaskForegroundState? = null,
     val overlayGranted: Boolean = false,
     val usageAccessGranted: Boolean = false,
+    val autoStartStatus: top.qixia.threads.AutoStartStatus = top.qixia.threads.AutoStartStatus.UNKNOWN,
+    val autoStartChecking: Boolean = false,
     val configuredAppCount: Int = 0,
     val ruleCount: Int = 0,
     val statusMessage: String? = null

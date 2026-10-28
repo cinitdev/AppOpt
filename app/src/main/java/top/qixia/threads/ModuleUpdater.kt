@@ -36,7 +36,7 @@ object ModuleUpdater {
     private const val READ_TIMEOUT_MS = 15000
     private const val DOWNLOAD_CONNECT_TIMEOUT_MS = 15000
     private const val DOWNLOAD_READ_TIMEOUT_MS = 30000
-    private const val INSTALL_TIMEOUT_SECONDS = 180L
+    private const val INSTALL_TIMEOUT_SECONDS = 360L
     private const val INSTALL_LOG_BATCH_MS = 200L
     private const val DOWNLOAD_TIMEOUT_MS = 30L * 60L * 1000L
     private const val DOWNLOAD_MISSING_LIMIT = 6
@@ -583,6 +583,7 @@ object ModuleUpdater {
                 }
 
                 progress("正在刷入模块", null)
+                val previousHotUpdateRequest = ModuleHotUpdate.currentRequest()
                 val result = DaemonBridge.runRootCommandStreaming(
                     manager.installCommand(zipPath, inAppUpdate),
                     INSTALL_TIMEOUT_SECONDS
@@ -591,7 +592,7 @@ object ModuleUpdater {
                         log(chunk)
                     }
                 }
-                val pendingReady = targetVersionCode?.let(::waitForPendingModuleUpdate)
+                val pendingReady = targetVersionCode?.let { waitForPendingModuleUpdate(it, previousHotUpdateRequest) }
                     ?: (result.success && DaemonBridge.hasPendingModuleUpdate())
                 if (result.success && pendingReady) {
                     // 管理器已经完成安装，先落盘，避免 App 在热切换期间被回收后重复刷入。
@@ -652,9 +653,13 @@ object ModuleUpdater {
         return detectRootManager()?.label
     }
 
-    private fun waitForPendingModuleUpdate(expectedVersionCode: Int): Boolean {
+    private fun waitForPendingModuleUpdate(expectedVersionCode: Int, previousHotUpdateRequest: String): Boolean {
         repeat(20) {
             if (pendingModuleIsComplete(expectedVersionCode)) return true
+            // 同步热更新可能已清理暂存目录；必须是本次新事务，不能把上次同版本成功当成本次结果。
+            val request = ModuleHotUpdate.currentRequest()
+            if (request.isNotBlank() && request != previousHotUpdateRequest &&
+                ModuleHotUpdate.isApplied(expectedVersionCode)) return true
             try {
                 Thread.sleep(250L)
             } catch (_: InterruptedException) {
@@ -1718,12 +1723,13 @@ object ModuleUpdater {
                 *APatch*|*apatch*)
                     [ -x '/data/adb/apd' ] && printf 'apatch'
                     exit ;;
+                # MAGISKSU 也包含 KSU，必须先匹配完整提供方名称。
+                *MAGISK*|*Magisk*|*magisk*)
+                    [ -x '/data/adb/magisk/magisk' ] && printf 'magisk'
+                    exit ;;
                 *KernelSU*|*kernelsu*|*KSU*)
                     if [ -x '/data/adb/ksud' ]; then printf 'kernelsu'
                     elif [ -x '/data/adb/ksu/bin/ksud' ]; then printf 'kernelsu-bin'; fi
-                    exit ;;
-                *MAGISK*|*Magisk*|*magisk*)
-                    [ -x '/data/adb/magisk/magisk' ] && printf 'magisk'
                     exit ;;
             esac
             if [ -x '/data/adb/ksud' ]; then

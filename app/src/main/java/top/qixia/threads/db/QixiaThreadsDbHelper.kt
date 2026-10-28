@@ -15,7 +15,7 @@ import java.util.zip.Inflater
  * QixiaThreads 数据库助手 (原生 SQLite)
  * 支持 Android 12-16 (API 31-36)
  */
-class QixiaThreadsDbHelper(context: Context) : SQLiteOpenHelper(
+class QixiaThreadsDbHelper(context: Context, private val clock: () -> Long = System::currentTimeMillis) : SQLiteOpenHelper(
     context.applicationContext,
     DATABASE_NAME,
     null,
@@ -26,7 +26,6 @@ class QixiaThreadsDbHelper(context: Context) : SQLiteOpenHelper(
         private const val DATABASE_VERSION = 7
         private const val RULE_HISTORY_RECENT_SESSIONS = 3
         private const val RULE_HISTORY_ROW_LIMIT = 900
-        private const val MAX_TOTAL_SESSIONS = HistoryRetention.CALIBRATION_LIMIT
 
         // 表名
         private const val TABLE_SESSIONS = "sessions"
@@ -175,6 +174,7 @@ class QixiaThreadsDbHelper(context: Context) : SQLiteOpenHelper(
         rounds: Int,
         threads: List<ThreadImport>
     ): Boolean {
+        if (epoch <= 0 || epoch < (HistoryRetention.cutoff(clock()) + 999L) / 1000L) return false
         val db = writableDatabase
         db.beginTransaction()
         return try {
@@ -454,14 +454,14 @@ class QixiaThreadsDbHelper(context: Context) : SQLiteOpenHelper(
     }
 
     /**
-     * 对已有数据库执行一次保留策略。所有应用合计保留最近 10 次校准；
+     * 对已有数据库执行一次七天保留策略；
      * threads 通过外键级联删除，避免长期校准后数据库无限增长。
      */
-    fun pruneHistory(): Int {
+    fun pruneHistory(nowMs: Long = clock()): Int {
         val db = writableDatabase
         db.beginTransaction()
         return try {
-            val deleted = pruneGlobalHistory(db)
+            val deleted = pruneGlobalHistory(db, nowMs)
             db.setTransactionSuccessful()
             deleted
         } finally {
@@ -525,17 +525,13 @@ class QixiaThreadsDbHelper(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_threads_session_avg ON $TABLE_THREADS($COL_THREAD_SESSION_ID, $COL_AVG DESC)")
     }
 
-    private fun pruneGlobalHistory(db: SQLiteDatabase): Int {
-        val where = """
-            $COL_SESSION_ID NOT IN (
-                SELECT $COL_SESSION_ID
-                FROM $TABLE_SESSIONS
-                ORDER BY $COL_EPOCH DESC, $COL_SESSION_ID DESC
-                LIMIT $MAX_TOTAL_SESSIONS
-            )
-            """.trimIndent()
-        markDeleted(db, where, emptyArray())
-        return db.delete(TABLE_SESSIONS, where, null)
+    private fun pruneGlobalHistory(db: SQLiteDatabase, nowMs: Long = clock()): Int {
+        val where = "$COL_EPOCH < ?"
+        val args = arrayOf(((HistoryRetention.cutoff(nowMs) + 999L) / 1000L).toString())
+        // 过期导入由时间直接拒绝，无需为自动过期累积永久删除标记。
+        val deleted = db.delete(TABLE_SESSIONS, where, args)
+        db.delete(TABLE_DELETED, where, args)
+        return deleted
     }
 
     private fun createDeletionMarkers(db: SQLiteDatabase) {
@@ -566,7 +562,7 @@ data class SessionWithThreads(
 /**
  * 历史列表卡片摘要, 不包含线程 series, 用于快速首屏渲染。
  */
-enum class HistorySource { CALIBRATION, AUTO_ALLOCATION }
+enum class HistorySource { CALIBRATION, AUTO_ALLOCATION, PERFORMANCE }
 
 data class SessionSummary(
     val id: Long,

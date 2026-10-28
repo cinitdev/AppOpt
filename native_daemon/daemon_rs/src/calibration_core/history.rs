@@ -1,6 +1,14 @@
 use super::*;
 #[path = "history_retention.rs"]
 mod retention;
+
+pub(super) fn prune_expired(storage: &crate::private_storage::Storage, now_secs: u64) -> io::Result<()> {
+    let directory = storage.directory("history");
+    if !directory.is_dir() { return Ok(()); }
+    let root = storage.prepare_root()?;
+    let _lock = retention::HistoryDirectoryLock::acquire(&root)?;
+    retention::prune(&directory, now_secs)
+}
 // 校准历史写入。
 //
 // history/<pkg>.log 是 App 历史记录页面的数据源，不只是调试日志。
@@ -81,13 +89,13 @@ pub(super) fn write_history(
     let directory = storage.prepare("history")?;
     let path = directory.join(format!("{}.log", safe_file_name(pkg)));
 
-    // 单文件先限量，发布后在同一锁内收敛到所有应用合计最近 10 次。
+    // 写入与过期清理共用同一把锁，七天内的历史不按数量截断。
     let old = match fs::read_to_string(&path) {
         Ok(old) => old,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err),
     };
-    let recent = recent_history_tail(&old, HISTORY_MAX_SESSIONS.saturating_sub(1));
+    let recent = retention::retained_text(&old, epoch);
     let tmp = path.with_extension("log.rust.tmp");
     let mut output = fs::File::create(&tmp)?;
     if !recent.is_empty() {
@@ -101,8 +109,8 @@ pub(super) fn write_history(
     output.sync_data()?;
     drop(output);
     fs::rename(tmp, path)?;
-    if let Err(error) = retention::prune(&directory, HISTORY_MAX_SESSIONS) {
-        log_warn!("[校准历史] 清理超额记录失败: {error}");
+    if let Err(error) = retention::prune(&directory, epoch) {
+        log_warn!("[校准历史] 清理过期记录失败: {error}");
     }
     Ok(written_rows)
 }
@@ -170,30 +178,6 @@ pub(super) fn append_sample_series(out: &mut String, samples: &VecDeque<f32>) ->
     Ok(())
 }
 
-pub(super) fn recent_history_tail(old: &str, max_sessions: usize) -> &str {
-    if old.trim().is_empty() || max_sessions == 0 {
-        return "";
-    }
-
-    let mut starts = Vec::new();
-    let mut line_start = 0usize;
-    for line in old.split_inclusive('\n') {
-        if line.starts_with('#') {
-            starts.push(line_start);
-        }
-        line_start += line.len();
-    }
-    if line_start < old.len() && old[line_start..].starts_with('#') {
-        starts.push(line_start);
-    }
-
-    if starts.len() <= max_sessions {
-        return old;
-    }
-    let keep_from = starts[starts.len() - max_sessions];
-    &old[keep_from..]
-}
-
 pub(super) fn fmt_to_io(_: std::fmt::Error) -> io::Error {
     io::Error::other("format history failed")
 }
@@ -248,13 +232,13 @@ mod process_history_marker_tests {
     }
 
     #[test]
-    pub(super) fn history_tail_keeps_only_requested_complete_sessions() {
-        let old = (0..8)
+    pub(super) fn history_retains_all_sessions_in_the_time_window() {
+        let old = (1..=16)
             .map(|index| format!("# {index} 60\n1.0 1.0 e1:t|1.0\n"))
             .collect::<String>();
-        let tail = recent_history_tail(&old, 6);
-        assert!(tail.starts_with("# 2 60\n"));
-        assert_eq!(tail.lines().filter(|line| line.starts_with('#')).count(), 6);
+        let tail = retention::retained_text(&old, crate::history_retention::MAX_AGE_MS / 1000 + 7);
+        assert!(tail.starts_with("# 7 60\n"));
+        assert_eq!(tail.lines().filter(|line| line.starts_with('#')).count(), 10);
     }
 
     #[test]

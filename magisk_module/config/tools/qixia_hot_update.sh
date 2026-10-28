@@ -47,21 +47,30 @@ runtime_cgroup_targets() {
 		}
 	}' "$1" "$2" "$3"
 }
-detach_runtime() {
-	local destinations destination
-	command -v setsid >/dev/null 2>&1 || return 1
-	[ -r /proc/1/cgroup ] && [ -r "/proc/$$/cgroup" ] || return 1
-	destinations=$(runtime_cgroup_targets /proc/1/cgroup "/proc/$$/cgroup" "/proc/$$/mountinfo") || return 1
+write_runtime_cgroup() { printf '%s\n' "$1" > "$2"; }
+align_runtime_cgroups() {
+	local pid=$1 target=$2 current=$3 mounts=$4 destinations destination failed=''
+	[ -r "$target" ] && [ -r "$current" ] || return 1
+	destinations=$(runtime_cgroup_targets "$target" "$current" "$mounts") || return 1
 	if [ -n "$destinations" ]; then
 		while IFS= read -r destination; do
 			# 只移动当前独立 Shell；不解冻管理器，也不更改其他应用的进程组。
 			destination=$(printf '%b' "$destination")
-			printf '%s\n' "$$" > "$destination" || return 1
+			# 部分 Android 12 内核在完成迁移后仍返回 EINVAL；以最终归属判定成功。
+			write_runtime_cgroup "$pid" "$destination" 2>/dev/null || failed="$failed $destination"
 		done <<EOF
 $destinations
 EOF
 	fi
-	cmp -s /proc/1/cgroup "/proc/$$/cgroup"
+	cmp -s "$target" "$current" && return 0
+	printf '后台控制组隔离未完成，写入失败路径：%s\n' "${failed:-无；归属校验不一致}" >&2
+	printf '目标控制组：\n' >&2; cat "$target" >&2
+	printf '实际控制组：\n' >&2; cat "$current" >&2
+	return 1
+}
+detach_runtime() {
+	command -v setsid >/dev/null 2>&1 || return 1
+	align_runtime_cgroups "$$" /proc/1/cgroup "/proc/$$/cgroup" "/proc/$$/mountinfo"
 }
 service_environment_healthy() {
 	local owner pid stamp
@@ -73,7 +82,13 @@ show_result() {
 	[ "${SHOW_RESULT:-0}" = 1 ] || return 0
 	local message root helper
 	case "$1" in
-		applied) message='热更新成功，无需重启手机' ;;
+		activated|applied)
+			[ "$1" != applied ] || [ "${LIVE_RESULT_SHOWN:-0}" != 1 ] || return 0
+			if [ -f "$ACTIVE/config/app/app.prop" ]; then
+				message='模块已热更新，无需重启；App 尚未更新，请完成 App 安装'
+			else
+				message='热更新成功，无需重启手机'
+			fi ;;
 		deferred|rollback_failed) message='更新需要重启，请打开柒夏线程查看结果' ;;
 		failed) message='热更新尚未完成，请打开柒夏线程查看结果' ;;
 		*) return 0 ;;
@@ -156,19 +171,53 @@ runtime_manifest() {
 		printf '%s %s\n' "$(sha256sum "$root/$file" | cut -d ' ' -f 1)" "$file"
 	done
 }
+boot_nodes() {
+	local source=$1 target=$2 node name hash
+	while IFS= read -r node; do
+		name="$target${node#"$source"}"
+		if [ -L "$node" ]; then printf 'L %s %s\n' "$name" "$(readlink "$node")"
+		elif [ -f "$node" ]; then
+			hash=$(sha256sum "$node") || return 1
+			printf 'F %s %s\n' "$name" "${hash%% *}"
+		elif [ -d "$node" ]; then printf 'D %s\n' "$name"
+		else return 1; fi
+	done
+}
 boot_manifest() {
-	# 将目录结构、链接目标、文件内容一起比较，不能忽略 vendor 重排或空覆盖文件。
-	(cd "$1" || exit 1
-	 for file in system vendor product system_ext odm oem system.prop sepolicy.rule \
-		post-fs-data.sh post-mount.sh boot-completed.sh skip_mount; do
-		[ -e "$file" ] || [ -L "$file" ] || continue
-		find "$file" | LC_ALL=C sort | while IFS= read -r node; do
-			if [ -L "$node" ]; then printf 'L %s %s\n' "$node" "$(readlink "$node")"
-			elif [ -f "$node" ]; then printf 'F %s %s\n' "$node" "$(sha256sum "$node" | cut -d ' ' -f 1)"
-			elif [ -d "$node" ]; then printf 'D %s\n' "$node"
-			else exit 1; fi
-		done || exit 1
-	 done)
+	# 管理器会把 system/vendor 搬到 vendor 或反向建立别名；统一为实际覆盖路径。
+	# 仅接受本模块内这两种等价布局，其他链接、空覆盖文件和启动策略仍严格比较。
+	local manifest
+	manifest=$(
+		cd "$1" || exit 1
+		[ ! -L system ] || exit 1
+		if [ -e system ]; then
+			find system \( -path system/vendor -o -path system/product -o -path system/system_ext \
+				-o -path system/odm -o -path system/oem \) -prune -o -print |
+				boot_nodes system system || exit 1
+		fi
+		for file in vendor product system_ext odm oem; do
+			inner="system/$file"
+			if [ -L "$file" ]; then
+				[ -d "$inner" ] && [ ! -L "$inner" ] &&
+					[ "$(readlink -f "$file")" = "$(readlink -f "$inner")" ] || exit 1
+			elif [ -L "$inner" ]; then
+				[ -d "$file" ] && [ ! -L "$file" ] &&
+					[ "$(readlink -f "$inner")" = "$(readlink -f "$file")" ] || exit 1
+			elif [ -e "$file" ] && [ -e "$inner" ]; then
+				# 两份独立目录可能有冲突，不能猜测管理器最终挂载哪一份。
+				exit 1
+			fi
+			if [ -e "$inner" ] && [ ! -L "$inner" ]; then source=$inner
+			elif [ -e "$file" ] && [ ! -L "$file" ]; then source=$file
+			else continue; fi
+			find "$source" | boot_nodes "$source" "$inner" || exit 1
+		done
+		for file in system.prop sepolicy.rule post-fs-data.sh post-mount.sh boot-completed.sh skip_mount; do
+			[ -e "$file" ] || [ -L "$file" ] || continue
+			find "$file" | boot_nodes "$file" "$file" || exit 1
+		done
+	) || return 1
+	printf '%s\n' "$manifest" | LC_ALL=C sort
 }
 eligible() {
 	[ "$(prop id "$ACTIVE/module.prop")" = QixiaThreads ] || { REASON='首次安装需要重启以完成模块初始化'; return 1; }
@@ -179,7 +228,8 @@ eligible() {
 	done
 	for file in service.sh config/bin/QiXiaRs config/ebpf/queuebuffer_probe.bpf.o \
 		config/ebpf/queuebuffer_probe_perf.bpf.o config/ebpf/queuebuffer_probe_stats.bpf.o \
-		config/tools/qixia_foreground_helper.sh config/tools/qixia_foreground_helper.jar; do
+		config/tools/qixia_foreground_helper.sh config/tools/qixia_foreground_helper.jar \
+		config/tools/qixia_java_service.sh config/tools/qixia_refresh_helper.sh config/tools/qixia_refresh_helper.jar; do
 		[ -s "$STAGED/$file" ] && [ ! -L "$STAGED/$file" ] || { REASON="暂存文件缺失或无效：$file"; return 1; }
 	done
 	boot_manifest "$ACTIVE" > "$TX/boot.old" && boot_manifest "$STAGED" > "$TX/boot.new" &&
@@ -210,10 +260,18 @@ stop_service() {
 		[ "$(readlink "/proc/$pid/exe" 2>/dev/null)" != "$ACTIVE/config/bin/QiXiaRs" ] || return 1
 	done
 	sh "$helper_root/config/tools/qixia_foreground_helper.sh" stop >/dev/null 2>&1 || true
+	if [ -f "$helper_root/config/tools/qixia_refresh_helper.sh" ]; then
+		sh "$helper_root/config/tools/qixia_refresh_helper.sh" stop >/dev/null 2>&1 || return 1
+	fi
 }
 start_service() {
 	detach_runtime || return 1
-	setsid sh "$ACTIVE/service.sh" --hot-update </dev/null >> "$ACTIVE/logs/HotUpdate.log" 2>&1 &
+	if grep -q 'QIXIA_SERVICE_HOT_UPDATE' "$ACTIVE/service.sh"; then
+		QIXIA_SERVICE_HOT_UPDATE=1 setsid sh "$ACTIVE/service.sh" </dev/null >> "$ACTIVE/logs/HotUpdate.log" 2>&1 &
+	else
+		# 回退到更新前的脚本时沿用其入口，避免回退服务再次进入事务恢复。
+		setsid sh "$ACTIVE/service.sh" --hot-update </dev/null >> "$ACTIVE/logs/HotUpdate.log" 2>&1 &
+	fi
 }
 copy_file() {
 	local source=$1 destination=$2
@@ -229,6 +287,10 @@ backup_runtime() {
 	done < "$TX/files"
 }
 merge_policy_defaults() {
+	# 首次引入刷新率功能时补入关闭状态的默认配置，不覆盖用户已有选择。
+	if [ ! -e "$ACTIVE/config/refresh_rate.conf" ] && [ -f "$STAGED/config/refresh_rate.conf" ]; then
+		copy_file "$STAGED/config/refresh_rate.conf" "$ACTIVE/config/refresh_rate.conf" || return 1
+	fi
 	if [ -f "$ACTIVE/config/calib_policy.conf" ] && [ -f "$STAGED/config/calib_policy.conf" ]; then
 		# 新版本只补缺失键；刷入前后的用户选择始终以生效目录为准。
 		awk '
@@ -253,7 +315,8 @@ healthy() {
 	local tries=0 stable=0
 	while [ "$tries" -lt 20 ]; do
 		if service_environment_healthy && timeout 5 "$ACTIVE/config/bin/QiXiaRs" --check-daemon &&
-			sh "$ACTIVE/config/tools/qixia_foreground_helper.sh" status | grep -q '^running '; then
+			sh "$ACTIVE/config/tools/qixia_foreground_helper.sh" status | grep -q '^running ' &&
+			sh "$ACTIVE/config/tools/qixia_refresh_helper.sh" status | grep -q '^running '; then
 			stable=$((stable + 1)); [ "$stable" -lt 3 ] || return 0
 		else stable=0; fi
 		tries=$((tries + 1)); sleep 1
@@ -275,7 +338,7 @@ old_healthy() {
 }
 recover() {
 	local state=$(state_file) previous_phase=$(phase)
-	case "$previous_phase" in switching|checking|committing|rollback_failed|deferred|applied|rebooted) ;;
+	case "$previous_phase" in switching|checking|committing|activated|rollback_failed|deferred|applied|rebooted) ;;
 		*) return 0 ;; esac
 	if [ "$(prop boot "$state")" != "$BOOT" ]; then
 		# 跨启动不能恢复旧备份；确认管理器已提升目标文件后，再允许收尾清理。
@@ -286,24 +349,40 @@ recover() {
 		fi
 		return 0
 	fi
-	case "$previous_phase" in switching|checking|committing|rollback_failed) ;; *) return 0 ;; esac
+	case "$previous_phase" in switching|checking|committing|activated|rollback_failed) ;; *) return 0 ;; esac
 	if [ -d "$TX/consumed" ] && [ ! -e "$STAGED" ]; then mv "$TX/consumed" "$STAGED" || return 1; fi
 	stop_service && restore_runtime || { publish rollback_failed '旧文件恢复失败，保留备份，请重启应用完整模块'; return 1; }
 	start_service
 	old_healthy || { publish rollback_failed '旧运行文件已恢复，但服务尚未恢复，请重启完成更新'; return 1; }
 	publish deferred '热更新被中断，已恢复旧运行文件；更新仍可重启生效'
 }
-apply_update() {
-	local waiters=$1 token waited=0 file
-	# 必须在等待安装器退出前脱离它的控制组，否则管理器退后台后整个事务都会被冻结。
-	detach_runtime || return 1
-	# customize 被 source 执行，必须等安装 shell 和所属管理器命令均结束。
-	for token in $waiters; do
+wait_installers() {
+	local token waited=0
+	for token in $1; do
 		while alive "$token"; do
 			[ "$waited" -lt 180 ] || return 1
 			sleep 1; waited=$((waited + 1))
 		done
 	done
+}
+finish_installer() {
+	local waiters=$1 staged_identity=$2
+	# 服务已验证后立即通知安装页和 Toast；只把管理器仍会写入的标记留到退出后收尾。
+	publish activated '热更新成功，无需重启手机' || return 1
+	LIVE_RESULT_SHOWN=1
+	wait_installers "$waiters" || return 1
+	# 安装器会删除 customize.sh，但其他程序文件必须仍属于本次事务。
+	[ "$(stat -c '%d:%i' "$STAGED")" = "$staged_identity" ] || return 1
+	runtime_manifest "$STAGED" | sed '\| customize.sh$|d' > "$TX/final.manifest"
+	sed '\| customize.sh$|d' "$TX/new.manifest" > "$TX/expected.manifest"
+	cmp -s "$TX/final.manifest" "$TX/expected.manifest" || return 1
+	boot_manifest "$STAGED" > "$TX/boot.final" && cmp -s "$TX/boot.new" "$TX/boot.final"
+}
+apply_update() {
+	local waiters=$1 mode=${2:-after} file staged_identity
+	# 工作进程先脱离管理器控制组；安装页只等服务检查，不负责托管长期服务。
+	detach_runtime || return 1
+	[ "$mode" = sync ] || wait_installers "$waiters" || return 1
 	mkdir -p "$TX" && chmod 0700 "$TX" || return 1
 	take_lock || return 0
 	[ -d "$STAGED" ] || { recover; return $?; }
@@ -311,6 +390,7 @@ apply_update() {
 	BUILD=$(sha256sum "$STAGED/config/bin/QiXiaRs" 2>/dev/null | cut -d ' ' -f 1)
 	recover || return 1
 	eligible || { publish deferred "$REASON"; return 0; }
+	staged_identity=$(stat -c '%d:%i' "$STAGED") || return 1
 	# 备份只含程序文件，不包括用户规则、状态、日志和历史。
 	rm -rf "$TX/backup"
 	runtime_manifest "$STAGED" > "$TX/new.manifest" || return 1
@@ -338,6 +418,10 @@ apply_update() {
 			runtime_manifest "$ACTIVE" > "$TX/active.manifest"
 			if cmp -s "$TX/new.manifest" "$TX/active.manifest"; then
 				publish committing '新版服务已通过检查，正在完成更新'
+				if [ "$mode" = sync ] && ! finish_installer "$waiters" "$staged_identity"; then
+					recover
+					return $?
+				fi
 				# 原子移走本模块暂存目录，避免下次重启用旧配置覆盖当前配置。
 				if mv "$STAGED" "$TX/consumed" && rm -f "$ACTIVE/update"; then
 					publish applied '模块热更新已生效，无需重启手机' || return 1
@@ -382,19 +466,75 @@ queue_update() {
 	# 排队命令本身就是独立 Shell，先同步完成隔离，失败时保留原服务和重启更新。
 	detach_runtime || { printf '%s\n' '无法建立独立后台环境，保留重启更新' >&2; return 1; }
 	if alive "$(readlink "$LOCK")"; then
-		printf 'request=%s\n' "$(prop request "$(state_file)")"
+		REQUEST=$(prop request "$(state_file)")
+		printf 'request=%s\n' "$REQUEST"
 		return 0
 	fi
 	cp "$0" "$TX/worker.$$.new" && mv -f "$TX/worker.$$.new" "$TX/worker.sh" || return 1
 	REQUEST="$BOOT-$$-$(starttime $$)"
-	setsid sh "$TX/worker.sh" --apply "$1" "$REQUEST" "${2:-0}" </dev/null >> "$TX/update.log" 2>&1 &
+	setsid sh "$TX/worker.sh" --apply "$1" "$REQUEST" "${2:-0}" "${3:-after}" </dev/null >> "$TX/update.log" 2>&1 &
+	WORKER="$!:$(starttime $!)"
 	printf 'request=%s\n' "$REQUEST"
+}
+
+sync_installer() {
+	local waiters elapsed=0 state_request state_phase reason key value
+	waiters=$(installer_waiters "$1") || return 1
+	alive "$(readlink "$LOCK")" && { echo '另一个更新任务尚未结束，请重启应用本次更新'; return 1; }
+	queue_update "$waiters" 1 sync >/dev/null || return 1
+	while [ "$elapsed" -lt 1200 ]; do
+		state_request=; state_phase=; reason=
+		if [ -f "$(state_file)" ]; then
+			while IFS='=' read -r key value; do
+				case "$key" in request) state_request=$value ;; phase) state_phase=$value ;; reason) reason=$value ;; esac
+			done < "$(state_file)"
+		fi
+		if [ "$state_request" = "$REQUEST" ]; then
+			case "$state_phase" in
+				activated|applied) printf '%s\n' "$reason"; return 0 ;;
+				deferred|failed|rollback_failed) printf '%s\n' "$reason"; return 1 ;;
+			esac
+		fi
+		alive "$WORKER" || { echo '热更新工作进程未完成，请重启手机生效'; return 1; }
+		sleep 0.25; elapsed=$((elapsed + 1))
+	done
+	echo '热更新检查超时，请重启手机生效'
+	return 1
+}
+
+wait_app_exit() {
+	local caller=$1 waited=0
+	[ -n "$caller" ] || return 1
+	while alive "$caller"; do
+		[ "$waited" -lt 30 ] || return 1
+		sleep 1; waited=$((waited + 1))
+	done
+}
+
+install_app_after_exit() {
+	# 不靠固定延时猜测页面是否退出；交接失败就保留 APK，不能杀掉仍在使用的界面。
+	wait_app_exit "$1" || { echo 'App 尚未退出，已取消本次安装，可在设置中重试'; return 1; }
+	local waited=0
+	while alive "$(readlink "$LOCK")" && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+	take_lock || return 1
+	case "$(phase)" in applied|rebooted) ;; *) return 1 ;; esac
+	[ ! -e "$STAGED" ] || return 1
+	local message result=0
+	if sh "$ACTIVE/service.sh" --install-app; then
+		message='柒夏线程 App 更新完成，可以重新打开'
+	else
+		message='柒夏线程 App 更新未完成，请在设置中重试'; result=1
+	fi
+	printf '%s\n' "$message"
+	timeout 12 sh "$ACTIVE/config/tools/qixia_pkg_helper.sh" toast "$message" || true
+	[ "$result" = 0 ] || return "$result"
+	cleanup_completed_update
 }
 
 case "$1" in
 	--apply)
 		REQUEST=$3; SHOW_RESULT=${4:-0}
-		if ! apply_update "$2"; then
+		if ! apply_update "$2" "${5:-after}"; then
 			# 等待安装器超时、状态写入失败等早期错误也需提示，不能沿用上次成功结果。
 			case "$(prop request "$(state_file)"):$(phase)" in
 				"$REQUEST:applied"|"$REQUEST:deferred"|"$REQUEST:rollback_failed") ;;
@@ -404,13 +544,14 @@ case "$1" in
 		fi
 		;;
 	--queue) queue_update "$2" 1 ;;
+	--sync-installer) sync_installer "$2" ;;
 	--queue-installer)
 		WAITERS=$(installer_waiters "$2") || exit 1
 		queue_update "$WAITERS" 1
 		;;
 	--recover)
 		[ -f "$(state_file)" ] || exit 0
-		# 普通服务不能在切换尚未完成时并发启动；工作进程使用 --hot-update 启动。
+		# 普通服务不能在切换尚未完成时并发启动；工作进程通过环境标记启动。
 		alive "$(readlink "$LOCK")" && exit 75
 		take_lock || exit 1
 		VERSION=$(prop version "$(state_file)"); BUILD=$(prop build "$(state_file)"); REQUEST=$(prop request "$(state_file)")
@@ -425,20 +566,18 @@ case "$1" in
 		cleanup_completed_update
 		;;
 	--queue-app)
-		[ "$(phase)" = applied ] && [ -f "$ACTIVE/config/app/app.prop" ] || exit 1
+		case "$(phase)" in applied|rebooted) ;; *) exit 1 ;; esac
+		[ ! -e "$STAGED" ] && [ -f "$ACTIVE/config/app/app.prop" ] || exit 1
+		case "$2" in ''|*[!0-9]*) exit 1 ;; esac
+		[ "$(tr '\000' '\n' < "/proc/$2/cmdline" | head -n 1)" = top.qixia.threads ] || exit 1
+		CALLER="$2:$(starttime "$2"):$BOOT"
+		alive "$CALLER" || exit 1
 		detach_runtime || exit 1
-		setsid sh "$0" --install-app </dev/null >> "$TX/app-update.log" 2>&1 &
+		mkdir -p "$TX" || exit 1
+		setsid sh "$0" --install-app "$CALLER" </dev/null >> "$TX/app-update.log" 2>&1 &
 		;;
 	--install-app)
-		sleep 3
-		# 用户可能在成功提示刚出现时立即点完成，等模块事务释放锁后再安装 APK。
-		WAITED=0
-		while alive "$(readlink "$LOCK")" && [ "$WAITED" -lt 30 ]; do sleep 1; WAITED=$((WAITED + 1)); done
-		take_lock || exit 1
-		[ "$(phase)" = applied ] && [ ! -e "$STAGED" ] || exit 1
-		sh "$ACTIVE/service.sh" --install-app || exit 1
-		echo 'App 已更新，请从桌面重新打开。'
-		cleanup_completed_update
+		install_app_after_exit "$2"
 		;;
-	*) echo '用法：--queue | --queue-installer 安装器PID | --status | --queue-app'; exit 2 ;;
+	*) echo '用法：--queue | --sync-installer 安装器PID | --status | --queue-app 应用PID'; exit 2 ;;
 esac

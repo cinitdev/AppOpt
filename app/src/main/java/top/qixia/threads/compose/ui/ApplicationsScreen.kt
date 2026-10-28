@@ -39,11 +39,13 @@ fun ApplicationsScreen(
     onAutoStartChange: (Boolean, Long?) -> Unit,
     onAutomaticAffinity: (AppItemModel, Boolean) -> Unit,
     onDiagnostics: (AppItemModel) -> Unit = {},
+    onAutomaticFallback: (AppItemModel, Boolean, String?) -> Unit = { _, _, _ -> },
+    onPerformanceRecording: (AppItemModel, Boolean) -> Unit = { _, _ -> },
 ) {
     val apps = state.applications
     val env = state.environment
     var managedPackage by rememberSaveable { mutableStateOf<String?>(null) }
-    val managed = apps.configured.firstOrNull { it.packageName == managedPackage }
+    val managed = (apps.configured + apps.addable).firstOrNull { it.packageName == managedPackage }
     var deleteTarget by remember { mutableStateOf<AppItemModel?>(null) }
     var showAutoStart by rememberSaveable { mutableStateOf(false) }
     var filterOpen by remember { mutableStateOf(false) }
@@ -171,7 +173,7 @@ fun ApplicationsScreen(
                     items(addableItems, key = { it.packageName }) { app ->
                         val busy = app.packageName in apps.busyPackages
                         ApplicationRow(app, added = false, available && !busy, busy,
-                            onManage = {}, onAction = { onAdd(app) })
+                            onManage = { managedPackage = app.packageName }, onAction = { onAdd(app) })
                     }
                 }
             }
@@ -195,7 +197,10 @@ fun ApplicationsScreen(
         onAutomaticAffinity = { onAutomaticAffinity(managed, it) },
         automaticSupported = env.automaticAffinitySupported,
         onDelete = { managedPackage = null; deleteTarget = managed },
-        onDiagnostics = { managedPackage = null; onDiagnostics(managed) }
+        onDiagnostics = { managedPackage = null; onDiagnostics(managed) },
+        onAutomaticFallback = { enabled, cpus -> onAutomaticFallback(managed, enabled, cpus) },
+        onPerformanceRecording = { onPerformanceRecording(managed, it) },
+        configured = managed.packageName in addedPackages
     )
     deleteTarget?.let { app ->
         AlertDialog(onDismissRequest = { deleteTarget = null }, title = { Text(if (app.isSystemComponent) "删除组件配置？" else "删除应用配置？") },
@@ -253,7 +258,7 @@ private fun RuntimeStatusPanel(env: EnvironmentUiState, onOpenEnvironment: () ->
 private fun ApplicationRow(app: AppItemModel, added: Boolean, enabled: Boolean, busy: Boolean, onManage: () -> Unit, onAction: () -> Unit) {
     val pending = added && app.state == AppRuleState.PENDING && !app.isSystemComponent
     Surface(modifier = Modifier.padding(bottom = 10.dp), color = OceanSurface, shape = RoundedCornerShape(17.dp), shadowElevation = 1.dp) {
-        Column(Modifier.fillMaxWidth().then(if (added) Modifier.clickable(onClick = onManage) else Modifier).padding(14.dp)) {
+        Column(Modifier.fillMaxWidth().clickable(onClick = onManage).padding(14.dp)) {
         Row(Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically) {
             AppPackageIcon(app, "${app.label} 图标")
@@ -289,7 +294,8 @@ private fun ApplicationRow(app: AppItemModel, added: Boolean, enabled: Boolean, 
                 }
                 !app.available -> "未安装 · ${app.ruleCount} 条规则"
                 app.unhealthyRuleCount > 0 -> "${app.unhealthyRuleCount} 条规则待复检"
-                !added -> "未添加"
+                app.performanceRecordingEnabled -> "性能记录已开启 · 点击应用可管理"
+                !added -> "点击应用可管理性能记录"
                 pending -> "待校准 · 点击应用可管理"
                 else -> "${app.ruleCount} 条规则 · ${app.cpuSummary}"
             }, color = color, fontSize = 11.sp, lineHeight = 17.sp, modifier = Modifier.weight(1f))

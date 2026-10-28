@@ -26,7 +26,6 @@ object HistoryFpsStore {
     }
 
     private const val MAX_FILE_BYTES = 8 * 1024 * 1024L
-    private const val MAX_TOTAL_BYTES = 64 * 1024 * 1024L
     private fun directory(filesDir: File) = File(filesDir, "history_fps")
     private fun prefix(pkg: String) = MessageDigest.getInstance("SHA-256")
         .digest(pkg.toByteArray()).joinToString("") { "%02x".format(it) }
@@ -125,42 +124,20 @@ object HistoryFpsStore {
             } finally { pending.delete() }
             // 调用方没有数据库快照时（例如旧版导入），
             // 无法安全判断哪些已完成曲线不再被引用。
-            if (retained != null) prune(filesDir, retained)
+            if (retained != null) prune(filesDir, retained, record.endedAtMs)
         }
     }
 
     @Synchronized
-    internal fun prune(filesDir: File, retained: Map<String, List<Pair<Long, Long>>>) {
-            val folder = directory(filesDir)
-            val summaries = retained.flatMap { (pkg, windows) -> windows.map { summaryName(pkg, it.first, it.second) } }.toSet()
-            folder.listFiles { file -> file.extension == "summary" && file.name !in summaries }.orEmpty().forEach { it.delete() }
-            val all = folder.listFiles().orEmpty().filter { it.extension == "csv" }
-                .sortedByDescending { it.name.substringAfterLast('_').removeSuffix(".csv").toLongOrNull() ?: 0L }
-            // 校准之外也可记录 FPS，一个 CSV 不等于一次历史会话。
-            val perApp = mutableMapOf<String, Int>()
-            var kept = 0
-            var bytes = 0L
-            var pendingCalibrations = 0
-            for (entry in all) {
-                val headers = runCatching { entry.useLines { lines -> lines.take(8)
-                    .filter { it.startsWith("# ") && '=' in it }
-                    .associate { it.substringAfter("# ").substringBefore('=') to it.substringAfter('=') } } }
-                    .getOrDefault(emptyMap())
-                val start = headers["started_at_ms"]?.toLongOrNull()
-                val end = headers["ended_at_ms"]?.toLongOrNull()
-                val referenced = start != null && end != null && headers["package"]?.let { retained[it] }.orEmpty().any { (epoch, duration) ->
-                    duration > 0 && start <= epoch * 1000L && end >= epoch * 1000L - duration
-                }
-                // 刚完成的校准会先归档，之后原生历史才进入 SQLite。
-                // 为这些记录提供独立且有界的保留额度，
-                // 期间不得被无关的手动 FPS 记录挤出。
-                val pending = headers["calibration"] == "1" && pendingCalibrations++ < HistoryRetention.CALIBRATION_LIMIT
-                if (referenced || pending) continue
-                val app = entry.name.substringBefore('_')
-                val count = perApp.getOrDefault(app, 0)
-                if (count >= 30 || kept >= 300 || bytes + entry.length() > MAX_TOTAL_BYTES) entry.delete()
-                else { perApp[app] = count + 1; kept++; bytes += entry.length() }
-            }
+    internal fun prune(filesDir: File, retained: Map<String, List<Pair<Long, Long>>>, nowMs: Long = System.currentTimeMillis()) {
+        val folder = directory(filesDir)
+        val summaries = retained.flatMap { (pkg, windows) -> windows.map { summaryName(pkg, it.first, it.second) } }.toSet()
+        folder.listFiles { file -> file.extension == "summary" && file.name !in summaries }.orEmpty().forEach { it.delete() }
+        for (file in folder.listFiles { file -> file.extension == "csv" }.orEmpty()) {
+            val end = runCatching { file.useLines { lines -> lines.take(8)
+                .firstOrNull { it.startsWith("# ended_at_ms=") }?.substringAfter('=')?.toLongOrNull() } }.getOrNull()
+            if (HistoryRetention.expired(end ?: file.lastModified(), nowMs)) file.delete()
+        }
     }
 
     @Synchronized

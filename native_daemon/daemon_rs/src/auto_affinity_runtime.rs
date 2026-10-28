@@ -34,6 +34,8 @@ fn work_delay(now: Instant, sampled: Option<Instant>, maintained: Option<Instant
 #[derive(Default)]
 pub struct Runtime {
     pub selected: BTreeSet<String>,
+    fallback_packages: BTreeSet<String>,
+    fallback_masks: BTreeMap<String, u64>,
     pub ready: bool,
     config_valid: bool,
     controller: Option<Controller>,
@@ -72,9 +74,9 @@ impl Runtime {
             return false;
         }
         self.config_stamp = stamp;
-        let selected = match fs::read_to_string(CONFIG) {
-            Ok(text) if text.len() <= 64 * 1024 => packages(&text),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeSet::new(),
+        let modes = match fs::read_to_string(CONFIG) {
+            Ok(text) if text.len() <= 64 * 1024 => modes(&text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             _ => {
                 self.config_valid = false;
                 self.config_stamp = None;
@@ -83,9 +85,14 @@ impl Runtime {
                 return false;
             }
         };
+        let selected: BTreeSet<String> = modes.keys().cloned().collect();
+        let fallback_packages = modes.into_iter().filter_map(|(pkg, on)| on.then_some(pkg)).collect();
         self.config_valid = true;
         if selected == self.selected {
-            return false;
+            if self.fallback_packages == fallback_packages { return false; }
+            self.fallback_packages = fallback_packages;
+            self.last_sample = None;
+            return true;
         }
         let reason = if self.controller.as_ref().is_some_and(|controller| !selected.contains(controller.package())) {
             "mode_disabled"
@@ -96,6 +103,7 @@ impl Runtime {
             return false;
         }
         self.selected = selected;
+        self.fallback_packages = fallback_packages;
         self.last_sample = None;
         self.ready = false;
         true
@@ -108,7 +116,7 @@ impl Runtime {
             let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
             let stat = fs::read_to_string("/proc/self/stat").unwrap_or_default();
             let start = stat.rsplit_once(") ").and_then(|(_, tail)| tail.split_whitespace().nth(19)).unwrap_or("0");
-            format!("version=1\npid={}\nboot_id={}\nstart_ticks={start}\n", std::process::id(), boot.trim())
+            format!("version=1\nfallback_version=1\npid={}\nboot_id={}\nstart_ticks={start}\n", std::process::id(), boot.trim())
         });
         let value = format!("{identity}package={pkg}\nstate={state}\ndetail={detail}\n");
         if self.status == value {
@@ -129,6 +137,14 @@ impl Runtime {
 
     pub fn wants_allocation(&self, pkg: &str) -> bool {
         self.selected.contains(pkg)
+    }
+
+    /// 静态规则循环解析一次后交接；自动分配线程不反复读取整份规则。
+    pub(crate) fn update_fallback_masks(&mut self, masks: BTreeMap<String, u64>) {
+        if self.fallback_masks != masks {
+            self.fallback_masks = masks;
+            self.last_sample = None;
+        }
     }
 
     pub fn next_sample_delay(&self) -> Duration {
@@ -257,6 +273,9 @@ impl Runtime {
             }
             self.controller = Some(Controller::new(pkg));
         }
+        let fallback_enabled = self.fallback_packages.contains(pkg);
+        let fallback_mask = if fallback_enabled { self.fallback_masks.get(pkg).copied().unwrap_or(0) } else { 0 };
+        if let Some(controller) = self.controller.as_mut() { controller.set_fallback(fallback_mask); }
         let now = Instant::now();
         if self.last_sample.is_some_and(|last| now.saturating_duration_since(last) < super::live_policy::SAMPLE_INTERVAL) {
             if self.last_maintenance.is_none_or(|last| now.saturating_duration_since(last) >= OWNERSHIP_INTERVAL) {
@@ -270,7 +289,10 @@ impl Runtime {
         let Some(controller) = self.controller.as_mut() else {
             return;
         };
-        let (state, detail) = controller.step(sample);
+        let (state, mut detail) = controller.step(sample);
+        if fallback_enabled && fallback_mask == 0 {
+            detail.push_str(" · 主进程兜底规则缺失，请选择兜底核心");
+        }
         controller.publish_diagnostics();
         self.publish(pkg, state, &detail);
     }

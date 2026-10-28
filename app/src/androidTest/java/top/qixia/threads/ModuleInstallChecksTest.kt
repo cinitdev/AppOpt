@@ -44,11 +44,79 @@ class ModuleInstallChecksTest {
         return result.output.trim()
     }
 
+    @Test fun embeddedApkDecisionsUseContentForManagerAndDeferredInstalls() {
+        val assets = InstrumentationRegistry.getInstrumentation().context.assets
+        val installer = assets.open("customize.sh").bufferedReader().use { it.readText() }
+            .substringAfter("install_or_update_app() {").substringBefore("\ncleanup_embedded_app() {")
+        val deferred = assets.open("service.sh").bufferedReader().use { it.readText() }
+            .substringAfter("install_deferred_embedded_app() {").substringBefore("\nif [ \"${'$'}1\" = --install-app ]; then")
+        file("config/app/app.prop", "package=top.qixia.threads\nname=柒夏线程\napk=test.apk\nversionCode=206\nversionName=v2.0.6\nvariant=release\n")
+        file("config/app/test.apk", "new apk")
+        file("config/tools/qixia_pkg_helper.sh", "fixture")
+        File(root, "logs").mkdirs()
+        val preamble = """
+            MODPATH='${root.path}'; MODDIR='${root.path}'; TMPDIR='${root.path}'; LOG='${root.path}/test.log'
+            grep_prop() { sed -n "s/^${'$'}1=//p" "${'$'}2" | head -n 1; }
+            read_app_prop() { grep_prop "${'$'}@"; }
+            ui_print() { :; }
+            print_helper_error() { :; }
+            is_qixia_in_app_update() { [ "${'$'}IN_APP" = 1 ]; }
+            cleanup_deferred_app_files() { CLEANED=1; }
+            run_pkg_helper() {
+                out=${'$'}1; command=${'$'}2
+                if [ "${'$'}command" = app-info ]; then
+                    [ "${'$'}4" = '${root.path}/config/app/test.apk' ] || return 1
+                    printf 'ok=1\ninstalled=1\nversionCode=%s\nversionName=v2.0.6\napk_same=%s\n' "${'$'}CODE" "${'$'}SAME" > "${'$'}out"
+                else
+                    INSTALLED=1
+                    printf 'ok=%s\n' "${'$'}INSTALL_OK" > "${'$'}out"
+                    [ "${'$'}INSTALL_OK" = 1 ]
+                fi
+            }
+            run_app_helper() { run_pkg_helper "${'$'}@"; }
+        """.trimIndent()
+        // 对两份实际安装函数跑同一组边界，不用另一套判断逻辑代替被测源码。
+        for ((name, body) in listOf("manager" to installer, "deferred" to deferred)) {
+            for ((same, code, ok, expected) in listOf(
+                listOf("0", "206", "1", "1:1"),
+                listOf("unknown", "206", "1", "1:1"),
+                listOf("1", "206", "1", "0:1"),
+                listOf("0", "207", "1", "0:1"),
+                listOf("0", "206", "0", "1:0")
+            )) {
+                val resultKey = if (name == "manager") "EMBEDDED_APP_CLEANUP_ALLOWED" else "CLEANED"
+                val script = preamble + "\nrun_install() {" + body + "\n" + """
+                    IN_APP=0; SAME=$same; CODE=$code; INSTALL_OK=$ok; INSTALLED=0; CLEANED=0
+                    run_install
+                    printf '%s:%s' "${'$'}INSTALLED" "${'$'}{$resultKey}"
+                """.trimIndent()
+                val process = ProcessBuilder("sh", "-c", script).redirectErrorStream(true).start()
+                val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+                assertEquals("$name / $same / $code / $ok: $output", 0, process.waitFor())
+                assertEquals("$name / $same / $code / $ok", expected, output)
+            }
+        }
+        val inApp = preamble + "\nrun_install() {" + installer + "\n" + """
+            IN_APP=1; INSTALLED=0
+            run_install
+            printf '%s:%s' "${'$'}INSTALLED" "${'$'}EMBEDDED_APP_CLEANUP_ALLOWED"
+        """.trimIndent()
+        val process = ProcessBuilder("sh", "-c", inApp).redirectErrorStream(true).start()
+        assertEquals("0:0", process.inputStream.bufferedReader().use { it.readText() }.trim())
+        assertEquals(0, process.waitFor())
+    }
+
     @Test fun activeProviderWinsOverOtherManagersLeftoverFiles() {
         listOf("apd", "magisk/magisk", "ksud").forEach { file(it).setExecutable(true) }
         assertEquals("apatch", detect("11142:APatch"))
         assertEquals("magisk", detect("28.0:MAGISK"))
+        assertEquals("magisk", detect("30.7:MAGISKSU"))
         assertEquals("kernelsu", detect("KernelSU"))
+    }
+
+    @Test fun magiskSuDoesNotRequireKernelSuBinary() {
+        file("magisk/magisk").setExecutable(true)
+        assertEquals("magisk", detect("30.7:MAGISKSU"))
     }
 
     @Test fun kernelSuAlternatePathAndUnknownProviderFallback() {

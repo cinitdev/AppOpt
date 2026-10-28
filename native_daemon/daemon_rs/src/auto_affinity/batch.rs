@@ -435,9 +435,7 @@ impl Batch {
     pub(super) fn take_events(&mut self) -> Vec<crate::auto_history::CoreEvent> {
         self.history.take()
     }
-    pub(super) fn records(&self) -> impl Iterator<Item = (&Identity, &Record)> {
-        self.entries.iter().map(|(key, entry)| (key, &entry.record))
-    }
+    pub(super) fn verified(&self, key: &Identity) -> bool { self.verified.contains(key) }
     pub(super) fn mask(&self, key: &Identity) -> Option<u64> {
         self.entries.get(key).map(|e| e.record.written)
     }

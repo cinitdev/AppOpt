@@ -27,6 +27,26 @@ fn usage(capture: &mut Capture, ms: u64) {
 }
 
 #[test]
+fn manual_recording_keeps_short_sessions_and_source_after_rotation() {
+    let dir = directory("manual-short");
+    let mut capture = Capture::performance(&dir, "com.game", 1_000).unwrap();
+    capture.fps(2_000, 59.0, 17.0).unwrap();
+    usage(&mut capture, 2_000);
+    capture.rotate(&dir, 3_000).unwrap();
+    capture.fps(4_000, 60.0, 16.7).unwrap();
+    usage(&mut capture, 4_000);
+    capture.finish(5_000).unwrap();
+    let completed = logs(&dir);
+    assert_eq!(completed.len(), 2);
+    for file in completed {
+        let text = read_text(&file).unwrap();
+        assert!(text.contains("source\tperformance\n"));
+        assert!(text.contains("minimum_usage_ms\t0\n"));
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn rotation_keeps_pending_short_lived_threads_in_the_original_segment() {
     let dir = directory("pending-window");
     let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
@@ -312,7 +332,7 @@ fn short_rotations_share_the_visit_gate_and_are_published_together() {
 fn short_visit_discards_all_staged_segments_without_rotating_old_history() {
     let dir = directory("no-eviction");
     let mut previous = Vec::new();
-    for index in 0..MAX_RECORDINGS {
+    for index in 0..12 {
         let path = dir.join(format!("auto_{}_1_0.log", index + 1));
         fs::write(&path, format!("old-{index}")).unwrap();
         previous.push((path, format!("old-{index}")));
@@ -324,8 +344,8 @@ fn short_visit_discards_all_staged_segments_without_rotating_old_history() {
     capture.fps(82_000, 60.0, 16.7).unwrap();
     usage(&mut capture, 180_000);
     capture.finish(184_000).unwrap();
-    assert_eq!(logs(&dir).len(), MAX_RECORDINGS);
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), MAX_RECORDINGS);
+    assert_eq!(logs(&dir).len(), 12);
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 12);
     for (path, expected) in previous {
         assert_eq!(read_text(path).unwrap(), expected);
     }
@@ -333,9 +353,9 @@ fn short_visit_discards_all_staged_segments_without_rotating_old_history() {
 }
 
 #[test]
-fn staging_budget_failure_never_prunes_existing_records() {
+fn completed_history_does_not_consume_staging_budget() {
     let dir = directory("budget");
-    for index in 0..MAX_RECORDINGS {
+    for index in 0..12 {
         let path = dir.join(format!("auto_{}_1_0.log", index + 1));
         File::create(path).unwrap().set_len(MAX_BYTES).unwrap();
     }
@@ -343,9 +363,9 @@ fn staging_budget_failure_never_prunes_existing_records() {
     capture.fps(2_000, 60.0, 16.7).unwrap();
     capture.output.flush().unwrap();
     usage(&mut capture, 60_000);
-    assert!(capture.rotate(&dir, 61_000).is_err());
+    assert!(capture.rotate(&dir, 61_000).is_ok());
     capture.finish(64_000).unwrap();
-    assert_eq!(logs(&dir).len(), MAX_RECORDINGS);
+    assert_eq!(logs(&dir).len(), 12);
     assert!(logs(&dir)
         .iter()
         .all(|path| path.metadata().unwrap().len() == MAX_BYTES));
@@ -469,7 +489,7 @@ fn more_than_seven_segments_of_one_capture_do_not_evict_its_beginning() {
 }
 
 #[test]
-fn retention_counts_captures_and_evicts_all_the_oldest_captures_segments() {
+fn retention_keeps_all_recent_captures_and_expires_whole_captures_by_end_time() {
     let dir = directory("capture-retention");
     let mut first = Vec::new();
     for visit in 0..8u64 {
@@ -488,6 +508,11 @@ fn retention_counts_captures_and_evicts_all_the_oldest_captures_segments() {
         usage(&mut capture, 182_000);
         capture.finish(start + 182_000).unwrap();
     }
+    assert_eq!(logs(&dir).len(), 16);
+    assert!(first.iter().all(|path| path.exists()));
+    prune(&dir, crate::history_retention::MAX_AGE_MS + 183_000).unwrap();
+    assert_eq!(logs(&dir).len(), 16); // 恰好七天仍保留整组，包括早结束的首段。
+    prune(&dir, crate::history_retention::MAX_AGE_MS + 183_001).unwrap();
     assert_eq!(logs(&dir).len(), 14);
     assert!(first.iter().all(|path| !path.exists()));
     let mut captures = BTreeMap::new();
@@ -515,7 +540,7 @@ fn segment_file(dir: &Path, stamp: u64, capture: &str, extension: &str, bytes: u
 }
 
 #[test]
-fn byte_budget_evicts_whole_old_captures_instead_of_only_enough_segments() {
+fn expiry_removes_whole_captures_without_byte_or_count_eviction() {
     let dir = directory("capture-byte-retention");
     let old_a = segment_file(&dir, 1_000, "old_capture", "log", MAX_BYTES / 2);
     let old_b = segment_file(&dir, 2_000, "old_capture", "log", MAX_BYTES / 2);
@@ -523,14 +548,16 @@ fn byte_budget_evicts_whole_old_captures_instead_of_only_enough_segments() {
         segment_file(&dir, 10_000 + index, "new_capture", "log", MAX_BYTES);
     }
     segment_file(&dir, 20_000, "latest_capture", "log", 0);
-    prune(&dir, false).unwrap();
+    prune(&dir, 30_000).unwrap();
+    assert_eq!(logs(&dir).len(), 10);
+    prune(&dir, crate::history_retention::MAX_AGE_MS + 3_001).unwrap();
     assert!(!old_a.exists() && !old_b.exists());
     assert_eq!(logs(&dir).len(), 8);
     fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
-fn a_full_active_capture_stops_rotation_without_erasing_its_saved_segments() {
+fn large_active_capture_keeps_all_completed_segments_while_rotating() {
     let dir = directory("active-capture-budget");
     let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
     capture.fps(2_000, 60.0, 16.7).unwrap();
@@ -545,7 +572,7 @@ fn a_full_active_capture_stops_rotation_without_erasing_its_saved_segments() {
         ));
     }
     usage(&mut capture, 200_000);
-    assert!(capture.rotate(&dir, 201_000).is_err());
+    assert!(capture.rotate(&dir, 201_000).is_ok());
     assert!(saved.iter().all(|path| path.exists()));
     // 运行时通过同一错误路径关闭未完整完成的采集。
     capture.core_loss(0, true);
@@ -555,11 +582,6 @@ fn a_full_active_capture_stops_rotation_without_erasing_its_saved_segments() {
     assert!(read_text(tail)
         .unwrap()
         .contains("core_events_incomplete\t1\n"));
-    let total: u64 = logs(&dir)
-        .iter()
-        .map(|path| path.metadata().unwrap().len())
-        .sum();
-    assert!(total <= TOTAL_BYTES);
     fs::remove_dir_all(dir).unwrap();
 }
 

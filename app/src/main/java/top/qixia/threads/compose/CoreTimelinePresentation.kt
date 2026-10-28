@@ -67,6 +67,7 @@ internal object CoreTimelinePresentation {
             "source_changed" -> "采样发现核心范围的管理归属变化。"
             "external_override" -> "允许范围被系统或其他调度策略改变，QixiaThreads 让出控制。"
             "cpuset_takeover" -> "已将线程移入 QixiaThreads 专属核心分组，并核对允许范围，完成接管。"
+            "process_fallback" -> "主进程线程的近期平均负载低于 5%，已接管至用户选择的兜底核心组；达到 5% 后转入动态分配。"
             "control_reasserted" -> "检测到核心范围或所属分组被改变，已重新接管并核对允许范围。"
             "cpuset_unavailable" -> "设备暂未提供可用的核心分组或核心信息，本次未完成接管，稍后重试。"
             "cpuset_failed" -> "创建或迁入 QixiaThreads 专属核心分组失败，尚未确认接管，稍后重试。"

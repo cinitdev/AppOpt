@@ -162,6 +162,7 @@ internal fun homeModeLabel(mode: HomeRecordMode): String = when (mode) {
     HomeRecordMode.CALIBRATION -> "校准"
     HomeRecordMode.AUTOMATIC -> "自动分配"
     HomeRecordMode.RULES -> "线程规则"
+    HomeRecordMode.PERFORMANCE -> "性能记录"
 }
 
 internal fun homeFpsText(value: Float?): String = value?.let { String.format(Locale.getDefault(), "%.1f", it) } ?: "—"

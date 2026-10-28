@@ -39,7 +39,7 @@ internal object HistoryPlotMath {
     private fun niceStep(raw: Float): Float {
         val power = 10.0.pow(floor(log10(raw.toDouble()))).toFloat()
         val normalized = raw / power
-        return (listOf(1f, 2f, 2.5f, 5f, 10f).first { it >= normalized }) * power
+        return (listOf(1f, 2f, 2.5f, 3f, 4f, 5f, 6f, 10f).first { it >= normalized }) * power
     }
 
     /** 不把充电空缺或丢失采样区间插值成看似真实的读数。 */

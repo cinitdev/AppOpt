@@ -15,8 +15,7 @@ pub(super) const MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 const MAX_ROWS: u64 = 120_000;
 // 与 CoreTimelineParser.MAX_EVENTS 一致，确保每个有效分段都能完整读取。
 const MAX_CORE_EVENTS: u64 = 20_000;
-const TOTAL_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RECORDINGS: usize = 7;
+const STAGING_BYTES: u64 = 64 * 1024 * 1024;
 const HEADER: &str = "QIXIA_AUTO_HISTORY\t1\n";
 #[path = "storage_compression.rs"]
 mod compression;
@@ -70,19 +69,23 @@ impl Recording {
     pub fn new(directory: &Path, package: &str, start_ms: u64) -> io::Result<Self> {
         Self::create(directory, package, start_ms, true)
     }
+    #[cfg(test)]
     fn create(
         directory: &Path,
         package: &str,
         start_ms: u64,
         prune_before_start: bool,
     ) -> io::Result<Self> {
+        Self::create_source(directory, package, start_ms, prune_before_start, "auto")
+    }
+    fn create_source(directory: &Path, package: &str, start_ms: u64, prune_before_start: bool, source: &str) -> io::Result<Self> {
         fs::create_dir_all(directory)?;
         // 记录器是唯一写入方，调用前上一分段已关闭。
         // 除了守护启动时，也在此重试恢复，避免反复同步或重命名失败
         // 不断积累未计入额度的 .tmp 文件。
         recover(directory)?;
         if prune_before_start {
-            prune(directory, true)?;
+            prune(directory, start_ms)?;
         } else {
             capture::check_staging_budget(directory)?;
         }
@@ -109,7 +112,7 @@ impl Recording {
             .insert(path.clone());
         let open = OpenFile(path.clone());
         let header = format!(
-            "{HEADER}source\tauto\npackage\t{package}\nstart_ms\t{start_ms}\ncore_events\t1\n"
+            "{HEADER}source\t{source}\npackage\t{package}\nstart_ms\t{start_ms}\ncore_events\t1\n"
         );
         let mut output = BufWriter::with_capacity(64 * 1024, file);
         output.write_all(header.as_bytes())?;
@@ -422,7 +425,7 @@ impl Recording {
         if let Some((path, open)) = self.seal(end_ms, None)? {
             compression::publish(&path)?;
             drop(open);
-            prune(path.parent().unwrap_or_else(|| Path::new(".")), false)?;
+            prune(path.parent().unwrap_or_else(|| Path::new(".")), end_ms)?;
         }
         Ok(())
     }
@@ -493,17 +496,14 @@ fn owned_file(path: &Path, extension: &str) -> bool {
 pub(super) fn recover(directory: &Path) -> io::Result<()> {
     compression::remove_abandoned_parts(directory)?;
     let capture_usage = capture::recovery_usage(directory)?;
-    let mut admitted_recovery = false;
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    for entry in entries.take(400).flatten() {
-        let path = entry.path();
-        if !owned_file(&path, "tmp") || is_open(&path) {
-            continue;
-        }
+    // 限制单轮恢复工作量，但已完成归档不占名额，避免记录多时遗漏待恢复文件。
+    for path in entries.flatten().map(|entry| entry.path())
+        .filter(|path| owned_file(path, "tmp") && !is_open(path)).take(400) {
         // 原子发布后、删除源文件前发生崩溃时，不能追加新的恢复行，
         // 也不能用两个名称发布同一分段。
         if compression::remove_published_source(&path)? { continue; }
@@ -590,101 +590,56 @@ pub(super) fn recover(directory: &Path) -> io::Result<()> {
             fs::remove_file(path)?;
         } else {
             compression::publish(&path)?;
-            admitted_recovery |= capture::proven_usage(&text, &capture_usage).is_some();
         }
-    }
-    if admitted_recovery {
-        prune(directory, false)?;
     }
     Ok(())
 }
 
-fn prune(directory: &Path, reserve_new_file: bool) -> io::Result<()> {
+/// 按完整会话的最新结束时间清理；任何活跃或无法确认时间的分段都保护整组。
+pub(super) fn prune(directory: &Path, now_ms: u64) -> io::Result<()> {
     #[derive(Default)]
-    struct Group {
-        files: Vec<PathBuf>,
-        bytes: u64,
-        latest: u64,
-        protected: bool,
-        recorded: bool,
-    }
+    struct Group { files: Vec<PathBuf>, latest: u64, protected: bool }
     let mut groups = BTreeMap::<String, Group>::new();
-    let mut entries = match fs::read_dir(directory) {
+    let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    for entry in entries.by_ref().take(1000).flatten() {
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
-        // 有界恢复流程尚未处理到的已关闭、不完整文件也要计入额度。
-        // 清理失败时停止新采集，不能继续扩大占用。
-        if !owned_file(&path, "log") && !owned_file(&path, "tmp") {
-            continue;
-        }
-        let size = match entry.metadata() {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let stamp = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("auto_"))
-            .and_then(|name| name.split('_').next())
-            .and_then(|stamp| stamp.parse::<u64>().ok())
-            .unwrap_or(0);
+        if !entry.file_type()?.is_file() || (!owned_file(&path, "log") && !owned_file(&path, "tmp")) { continue; }
         let key = match capture::retention_key(&path) {
             Ok(key) => key,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let open = is_open(&path);
         let group = groups.entry(key).or_default();
-        // 预留写入方一个完整有界分段的空间，防止多个并行关闭的采集
-        // 在检查后使占用超过全局额度。
-        group.bytes = group
-            .bytes
-            .saturating_add(if open { size.max(MAX_BYTES) } else { size });
-        group.latest = group.latest.max(stamp);
-        group.protected |= open;
-        group.recorded |= owned_file(&path, "log") || !open;
+        group.protected |= is_open(&path) || owned_file(&path, "tmp");
+        let start = path.file_name().and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("auto_"))
+            .and_then(|name| name.split('_').next()).and_then(|stamp| stamp.parse::<u64>().ok());
+        if let Some(start) = start.filter(|start| !crate::history_retention::expired(*start, now_ms)) {
+            // 七天内开始的分段必未过期，不解压整条历史。
+            group.latest = group.latest.max(start);
+        } else if !group.protected {
+            let bytes = read_prefix(&path, MAX_BYTES + 4096)?;
+            let end = String::from_utf8_lossy(&bytes).lines()
+                .filter_map(|line| line.strip_prefix("end_ms\t")?.parse::<u64>().ok()).max();
+            if let Some(end) = end.filter(|end| *end > 0) { group.latest = group.latest.max(end); }
+            else { group.protected = true; }
+        }
         group.files.push(path);
     }
-    if entries.next().is_some() {
-        return Err(io::Error::other(
-            "auto history directory exceeds entry limit",
-        ));
-    }
-    let mut groups: Vec<_> = groups.into_iter().collect();
-    groups.sort_by(|a, b| a.1.latest.cmp(&b.1.latest).then_with(|| a.0.cmp(&b.0)));
-    let mut total: u64 = groups.iter().map(|(_, group)| group.bytes).sum();
-    let mut count = groups.iter().filter(|(_, group)| group.recorded).count();
-    let reserved_bytes = if reserve_new_file { MAX_BYTES } else { 0 };
-    for (_, group) in groups {
-        // 一个活跃分段会保护同次前台使用的所有分段，
-        // 不能悄悄只保留长记录的尾部。
-        if group.protected {
-            continue;
-        }
-        if total.saturating_add(reserved_bytes) <= TOTAL_BYTES && count <= MAX_RECORDINGS {
-            continue;
-        }
+    for group in groups.into_values() {
+        if group.protected || !crate::history_retention::expired(group.latest, now_ms) { continue; }
         for path in group.files {
             match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(()) => {},
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
                 Err(error) => return Err(error),
             }
         }
-        total = total.saturating_sub(group.bytes);
-        count -= usize::from(group.recorded);
-    }
-    if total.saturating_add(reserved_bytes) > TOTAL_BYTES || count > MAX_RECORDINGS {
-        // 单次活跃使用也可能耗尽额度。调用方此时应写入不完整标记并结束采集，
-        // 而不是淘汰它较早的分段。
-        return Err(io::Error::other(
-            "auto history active capture storage budget exhausted",
-        ));
     }
     Ok(())
 }
@@ -778,7 +733,7 @@ mod tests {
             }
             run.finish(3000 + index).unwrap();
         }
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), MAX_RECORDINGS);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 35);
         let mut run = Recording::new(&dir, "com.other", 9000).unwrap();
         run.changes(9100, &[((1, 2, 3), 0)]).unwrap();
         run.device(&[("model".into(), "sample\tmodel\n".into())])
@@ -792,7 +747,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn retry_recovers_closed_incomplete_runs_and_prune_budgets_them() {
+    fn retry_recovers_closed_incomplete_runs_without_count_eviction() {
         let dir = directory("retry");
         for index in 0..35 {
             fs::write(
@@ -803,9 +758,9 @@ mod tests {
             )
             .unwrap();
         }
-        // 超出有界恢复轮次的文件同样占用额度。
-        prune(&dir, true).unwrap();
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), MAX_RECORDINGS);
+        // 尚未恢复的暂存文件不能因历史条数被删除。
+        prune(&dir, 3000).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 35);
         let run = Recording::new(&dir, "com.game", 3000).unwrap();
         assert_eq!(
             fs::read_dir(&dir)
@@ -813,13 +768,35 @@ mod tests {
                 .filter_map(Result::ok)
                 .filter(|e| owned_file(&e.path(), "log"))
                 .count(),
-            MAX_RECORDINGS
+            35
         );
         run.finish(4000).unwrap(); // 空重试不能生成可导入的记录。
+        recover(&dir).unwrap(); // 有界恢复的下一轮继续处理剩余临时文件。
         assert!(fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
             .all(|e| owned_file(&e.path(), "log")));
+        prune(&dir, crate::history_retention::MAX_AGE_MS + 2_000).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 35);
+        prune(&dir, crate::history_retention::MAX_AGE_MS + 2_001).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn many_completed_archives_do_not_block_new_recordings_or_recovery() {
+        let dir = directory("many-archives");
+        for index in 0..1001 {
+            fs::write(dir.join(format!("auto_1000_1_{index}.log")),
+                format!("{HEADER}package\tcom.game\nstart_ms\t1000\nend_ms\t2000\n")).unwrap();
+        }
+        let pending = dir.join("auto_3000_1_0.tmp");
+        fs::write(&pending, format!("{HEADER}package\tcom.game\nstart_ms\t3000\nF\t4000\t60\t17\n")).unwrap();
+        let run = Recording::new(&dir, "com.game", 5000).unwrap();
+        assert!(!pending.exists());
+        assert!(pending.with_extension("log.gz").exists());
+        run.finish(6000).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1002);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -845,7 +822,7 @@ mod tests {
                 .map(|entry| entry.path())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(completed().len(), 7);
+        assert_eq!(completed().len(), 9);
         assert!(completed().iter().all(|path| {
             path.file_stem()
                 .unwrap()
@@ -856,11 +833,11 @@ mod tests {
                 .unwrap()
                 .parse::<u64>()
                 .unwrap()
-                >= 8
+                >= 6
         }));
         let active = Recording::new(&dir, "com.three", 15).unwrap();
         let active_path = active.path.clone();
-        prune(&dir, false).unwrap();
+        prune(&dir, crate::history_retention::MAX_AGE_MS + 10).unwrap();
         assert!(active_path.exists());
         assert_eq!(completed().len(), 7);
         active.finish(16).unwrap(); // 空启动不能淘汰现有的完整记录。

@@ -39,6 +39,8 @@ class QixiaThreadsApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         PrivateCaptureStorage.initialize(this)
+        if (getProcessName().endsWith(":overlay")) return
         SceneBlacklistSync.initialize(this)
+        HistoryCleanupService.schedule(this)
     }
 }

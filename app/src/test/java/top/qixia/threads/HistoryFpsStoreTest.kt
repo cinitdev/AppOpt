@@ -105,7 +105,7 @@ class HistoryFpsStoreTest {
     @Test fun summaryRetentionTracksDatabaseWindowsWithoutDeletingOtherCurves() {
         run(100000, 60f); run(200000, 90f)
         HistoryFpsStore.prepareHomeSummaries(folder.root, pkg, listOf(120L to 20000L, 220L to 20000L))
-        HistoryFpsStore.prune(folder.root, mapOf(pkg to listOf(220L to 20000L)))
+        HistoryFpsStore.prune(folder.root, mapOf(pkg to listOf(220L to 20000L)), nowMs = 300000L)
         assertNull(HistoryFpsStore.cachedSummary(folder.root, pkg, 120, 20000))
         assertEquals(90f, HistoryFpsStore.cachedSummary(folder.root, pkg, 220, 20000)!!.average, .001f)
         assertEquals(2, folder.root.resolve("history_fps").listFiles()!!.count { it.extension == "csv" })
@@ -133,9 +133,14 @@ class HistoryFpsStoreTest {
         archive.appendText("119000,NaN\n")
         assertTrue(HistoryFpsStore.readReports(archive, pkg, listOf(120L to 20000L)).isEmpty())
     }
-    @Test fun archivesAreBoundedPerPackage() {
+    @Test fun archivesHaveNoCountLimitAndExpireAfterSevenDays() {
         repeat(35) { run(100000L + it * 30000L, 60f) }
-        assertEquals(30, folder.root.resolve("history_fps").listFiles()!!.count { it.extension == "csv" })
+        val archives = folder.root.resolve("history_fps")
+        assertEquals(35, archives.listFiles()!!.count { it.extension == "csv" })
+        HistoryFpsStore.prune(folder.root, emptyMap(), HistoryRetention.MAX_AGE_MS + 120000L)
+        assertEquals(35, archives.listFiles()!!.count { it.extension == "csv" })
+        HistoryFpsStore.prune(folder.root, emptyMap(), HistoryRetention.MAX_AGE_MS + 120001L)
+        assertEquals(34, archives.listFiles()!!.count { it.extension == "csv" })
     }
 
     @Test fun staleLegacyCsvCannotOccupyANewerRunsArchiveKey() {
@@ -156,9 +161,9 @@ class HistoryFpsStoreTest {
             recorder.record(pkg, 120f, start + 1000)
             recorder.finish(pkg, start + 20000)
         }
-        HistoryFpsStore.prune(folder.root, retained)
+        HistoryFpsStore.prune(folder.root, retained, nowMs = 2000000L)
         assertEquals(55f, HistoryFpsStore.reports(folder.root, pkg, retained.getValue(pkg)).getValue(120).average, .001f)
-        assertEquals(31, folder.root.resolve("history_fps").listFiles()!!.count { it.extension == "csv" })
+        assertEquals(36, folder.root.resolve("history_fps").listFiles()!!.count { it.extension == "csv" })
     }
 
     @Test fun calibrationAwaitingNativeImportSurvivesUnrelatedFpsRuns() {
@@ -180,7 +185,7 @@ class HistoryFpsStoreTest {
         assertEquals(48f, HistoryFpsStore.reports(folder.root, pkg, listOf(119L to 19000L)).getValue(119).average, .001f)
     }
 
-    @Test fun unreferencedPendingAllowanceRemainsBounded() {
+    @Test fun recentPendingCalibrationsHaveNoCountLimit() {
         repeat(45) { index ->
             val start = 100000L + index * 30000L
             val recorder = FpsSessionRecorder(folder.root) { start }
@@ -188,6 +193,6 @@ class HistoryFpsStoreTest {
             recorder.record(pkg, 60f, start + 1000)
             recorder.finish(pkg, start + 2000)
         }
-        assertEquals(40, folder.root.resolve("history_fps").listFiles()!!.count { it.extension == "csv" })
+        assertEquals(45, folder.root.resolve("history_fps").listFiles()!!.count { it.extension == "csv" })
     }
 }

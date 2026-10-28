@@ -74,9 +74,12 @@ internal class HistoryMetricsSampler(private val context: Context) {
 
     private fun deviceInfo(): Map<String, String> {
         val display = context.getSystemService(android.hardware.display.DisplayManager::class.java)?.getDisplay(0)
+        val mode = display?.mode
         return mapOf("platform" to android.os.Build.SOC_MODEL, "model" to android.os.Build.MODEL,
             "os" to "Android ${android.os.Build.VERSION.RELEASE}",
-            "resolution" to (display?.mode?.let { "${it.physicalWidth} × ${it.physicalHeight}" } ?: "未读取"),
-            "refresh" to (display?.refreshRate?.toInt()?.let { "$it Hz" } ?: "未读取"))
+            "resolution" to (mode?.let { "${it.physicalWidth} × ${it.physicalHeight}" } ?: "未读取"),
+            "refresh" to (mode?.refreshRate?.takeIf { it.isFinite() && it > 0f }?.let {
+                "${String.format(java.util.Locale.ROOT, "%.1f", it).removeSuffix(".0")} Hz"
+            } ?: "未读取"))
     }
 }

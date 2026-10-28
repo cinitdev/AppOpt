@@ -158,11 +158,18 @@ pub(crate) struct FpsRequest {
 pub(crate) enum FpsCommand {
     Start(FpsRequest),
     Stop,
+    StopOwned { socket: String, token: String },
 }
 
 impl FpsCommand {
     pub(crate) fn parse(command: &str) -> Option<Self> {
         let command = command.trim();
+        if let Some(rest) = command.strip_prefix("stop_owned ") {
+            let mut parts = rest.split_whitespace();
+            let socket = parts.next()?.to_owned();
+            let token = parts.next()?.to_owned();
+            return parts.next().is_none().then_some(Self::StopOwned { socket, token });
+        }
         if command == "stop" || command.starts_with("stop ") {
             // 旧版 FPS 的 stop 是全局命令，不像校准命令那样归属于指定包名。
             return Some(Self::Stop);
@@ -179,6 +186,15 @@ impl FpsCommand {
             socket: parts.next().map(str::to_owned),
             token: parts.next().map(str::to_owned),
         }))
+    }
+
+    pub(crate) fn stops(&self, request: &FpsRequest) -> bool {
+        match self {
+            Self::Stop => true,
+            Self::StopOwned { socket, token } =>
+                request.socket.as_ref() == Some(socket) && request.token.as_ref() == Some(token),
+            Self::Start(_) => false,
+        }
     }
 }
 

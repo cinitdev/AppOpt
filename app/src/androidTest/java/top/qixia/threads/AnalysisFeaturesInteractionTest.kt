@@ -8,6 +8,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.unit.dp
@@ -45,6 +46,56 @@ class AnalysisFeaturesInteractionTest {
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
         }
         bitmap.recycle()
+    }
+
+    @Test fun continuousReportKeepsOriginalCursorReadingsAfterAnHour() {
+        val duration = 3_600_000L
+        val start = end - duration
+        val longSession = session.copy(startedAtMs = start, recordedDurationMs = duration)
+        val report = HistoryMetricsStore.summarize((1..1800).map { index ->
+            HistoryMetrics.Sample(start + index * 2000L, false, buildMap {
+                put("cpu_usage", 42f); put("gpu_usage", 65f); put("gpu_mhz", 680f)
+                put("cpu_c", 62f); put("battery_c", 37f); put("power_w", 4.8f)
+                put("battery_ma", 1250f); put("battery_pct", 90f - index / 150f)
+                put("cpu_mhz.0_1_2_3", 1200f); put("cpu_mhz.4_5_6", 2200f); put("cpu_mhz.7", 2800f)
+                (0..7).forEach { core -> put("cpu_core.$core", if (core == 7) 78f else 15f + (index * (core + 1) % 50)) }
+            })
+        }, start, duration).copy(device = mapOf("platform" to "SM8550", "model" to "K70 · 测试数据", "os" to "Android 15",
+            "resolution" to "1440 × 3200", "refresh" to "120 Hz"))
+        val rawFps = HistorySampleSeries.Builder(start, duration, gapMs = 2500).apply {
+            (1..3600).forEach { add(start + it * 1000L, if (it % 71 == 0) 96f else 120f) }
+        }.build()!!
+        val longFps = HistoryFpsStore.summary(rawFps.points().map { it.value },
+            rawFps.points().filterIndexed { index, _ -> index % 15 == 0 }
+                .map { HistoryFpsStore.Point(it.progress, it.value) }).copy(analysisSamples = rawFps)
+        compose.setContent { QixiaThreadsTheme {
+            HistoryReportScreen(detail.copy(sessions = listOf(longSession),
+                sessionFps = mapOf(session.id to longFps), sessionMetrics = mapOf(session.id to report)),
+                PaddingValues(top = 24.dp, bottom = 24.dp), {}, {}, {}, {}, emptySet())
+        } }
+        compose.onNodeWithText("数据图表").assertIsDisplayed()
+        capture("history-scene-overview.png")
+        val list = compose.onNode(hasScrollToIndexAction())
+        list.performScrollToIndex(3)
+        capture("history-scene-fps.png")
+        compose.onNodeWithContentDescription("切换帧率辅助指标").performClick()
+        compose.onNodeWithText("CPU / GPU").assertIsDisplayed()
+        compose.onNodeWithContentDescription("切换帧率辅助指标").performClick()
+        compose.onNodeWithText("累计耗电").assertIsDisplayed()
+        compose.onNodeWithText("耗电%", substring = true).assertExists()
+        list.performScrollToIndex(5)
+        val chart = compose.onNode(hasContentDescription("总使用率", substring = true) and hasContentDescription("趋势图", substring = true))
+        chart.performSemanticsAction(SemanticsActions.SetProgress) { it(1_606_000f / duration) }
+        chart.assertTextContains("CPU 7：78.0 %", substring = true)
+        capture("history-scene-cpu-cursor.png")
+        chart.performSemanticsAction(SemanticsActions.SetProgress) { it(0f) }
+        chart.assertTextContains("CPU 7：78.0 %", substring = true)
+        chart.performSemanticsAction(SemanticsActions.SetProgress) { it(1f) }
+        chart.assertTextContains("CPU 7：78.0 %", substring = true)
+        list.performScrollToIndex(10)
+        capture("history-scene-energy.png")
+        compose.onNodeWithText("掉帧与线程").performClick()
+        compose.onNodeWithText("掉帧位置分析").assertIsDisplayed()
     }
 
     @Test fun dropTimeSelectionLoadsNearbySamplesAndCanCollapse() {

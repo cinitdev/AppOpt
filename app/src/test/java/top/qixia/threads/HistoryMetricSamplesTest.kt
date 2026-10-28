@@ -9,6 +9,34 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 class HistoryMetricSamplesTest {
+    @Test fun chartCursorKeepsEveryMetricAcrossAnHourWithoutUsingReducedVertices() {
+        val duration = 3_600_000L
+        val values = mapOf("cpu_core.7" to 78f, "cpu_cycles_core.7" to 1600f, "cpu_c" to 65f,
+            "battery_c" to 39f, "battery_ma" to 1500f, "battery_pct" to 72f, "ddr_mhz" to 1600f)
+        val report = HistoryMetricsStore.summarize((1..1800).map {
+            HistoryMetrics.Sample(it * 2000L, false, values)
+        }, 0, duration)
+        val progress = 1_606_000f / duration
+        values.forEach { (key, value) ->
+            assertFalse(report.series.getValue(key).points.any { abs(it.progress - progress) * duration < 1500 })
+            assertEquals(value, report.analysisSamples!!.pointAt(key, progress)!!.value)
+        }
+        assertEquals(78f, report.analysisSamples!!.pointAt("cpu_core.7", 0f)!!.value)
+        assertEquals(78f, report.analysisSamples!!.pointAt("cpu_core.7", 1f)!!.value)
+    }
+
+    @Test fun chartCursorDoesNotFillMissingFieldsChargingOrLongSamplingGaps() {
+        val builder = HistoryMetricSamples.Builder(0, 20_000)
+        builder.add(HistoryMetrics.Sample(2000, false, mapOf("cpu_core.0" to 20f, "power_w" to 4f)))
+        builder.add(HistoryMetrics.Sample(4000, true, mapOf("power_w" to 4f)))
+        builder.add(HistoryMetrics.Sample(14000, false, mapOf("cpu_core.0" to 40f)))
+        val samples = builder.build()!!
+        assertNull(samples.pointAt("power_w", .2f))
+        assertNull(samples.pointAt("cpu_core.0", .2f))
+        assertNull(samples.pointAt("cpu_core.0", .45f))
+        // 真实采样就在 14 秒，前面的空洞不能遮掉邻近读数。
+        assertEquals(40f, samples.pointAt("cpu_core.0", .699f)!!.value)
+    }
     @get:Rule val temp = TemporaryFolder()
     private val start = 1_791_000_000_000L
     private val duration = 2_040_000L

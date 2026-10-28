@@ -10,6 +10,17 @@ import org.junit.rules.TemporaryFolder
 class AutoHistoryStoreTest {
     @get:Rule val temp = TemporaryFolder()
 
+    @Test fun performanceSourceAndShortSessionSurviveMetadataCache() {
+        val file = run("auto_1000_12_0.log")
+        file.writeText(file.readText().replace("source\tauto", "source\tperformance") + "\nminimum_usage_ms\t0\nforeground_ms\t1000\n")
+        val entry = requireNotNull(AutoHistoryRecord.summary(file))
+        assertEquals(top.qixia.threads.db.HistorySource.PERFORMANCE, entry.session.source)
+        assertEquals(entry.session.source, AutoHistoryStore.entries(temp.root).single().session.source)
+        assertEquals(entry.session.source, AutoHistoryStore.cachedEntriesForHome(temp.root).single().session.source)
+        file.writeText(file.readText().replace("source\tperformance", "source\tauto"))
+        assertNull(AutoHistoryRecord.summary(file))
+    }
+
     @Test fun homeUsesOnlyVerifiedMetadataAndNeverParsesOrWritesAnUncachedArchive() {
         val file = run("auto_1000_12_0.log")
         assertTrue(AutoHistoryStore.cachedEntriesForHome(temp.root).isEmpty())
@@ -167,11 +178,12 @@ class AutoHistoryStoreTest {
         assertNull(AutoHistoryStore.record(temp.root, AutoHistoryRecord.sessionId("auto_1000_12_0.log")))
     }
 
-    @Test fun retentionKeepsSevenNewestAcrossPackagesAndPreservesActiveFiles() {
+    @Test fun retentionExpiresByEndTimeAcrossPackagesAndPreservesActiveFiles() {
         (0..11).forEach { index -> run("auto_${1000 + index}_12_0.log", 20_000L + index, "app.${index % 3}") }
         val active = run("auto_2000_12_0.tmp", 30_000L)
         val acknowledged = mutableListOf<String>()
-        AutoHistoryStore.pruneHistory(temp.root) { names -> acknowledged += names; false }
+        assertEquals(12, AutoHistoryStore.entries(temp.root).size)
+        AutoHistoryStore.pruneHistory(temp.root, HistoryRetention.MAX_AGE_MS + 20_005L) { names -> acknowledged += names; false }
         val entries = AutoHistoryStore.entries(temp.root)
         assertEquals(7, entries.size)
         assertEquals((20_005L..20_011L).toList().reversed(), entries.map { it.session.endedAtMs })
@@ -261,7 +273,7 @@ class AutoHistoryStoreTest {
         assertNull(AutoHistoryStore.record(temp.root, entry.session.id))
     }
 
-    @Test fun retentionCountsVisitsAndDeletesTheirSegmentsTogether() {
+    @Test fun retentionExpiresWholeVisitsAndKeepsEveryRecentVisit() {
         (0..7).forEach { index ->
             val start = 1_000L + index * 300_000L
             val capture = "auto_${start}_12_0"
@@ -269,7 +281,10 @@ class AutoHistoryStoreTest {
             segment(capture, "auto_${start + 200_000}_12_0.log", start + 200_000, start + 214_000, 214_000)
         }
         val acknowledged = mutableListOf<String>()
-        AutoHistoryStore.pruneHistory(temp.root) { acknowledged += it; false }
+        AutoHistoryStore.pruneHistory(temp.root, HistoryRetention.MAX_AGE_MS + 215_000L) { acknowledged += it; false }
+        assertEquals(8, AutoHistoryStore.entries(temp.root).size)
+        assertTrue(acknowledged.isEmpty())
+        AutoHistoryStore.pruneHistory(temp.root, HistoryRetention.MAX_AGE_MS + 215_001L) { acknowledged += it; false }
         val retained = AutoHistoryStore.entries(temp.root)
         assertEquals(7, retained.size)
         assertTrue(retained.all { it.memberFileNames.size == 2 })

@@ -76,6 +76,47 @@ object DaemonBridge {
         result.success && readAutomaticHistory().let { it.supported && it.enabled == enabled }
     }
 
+    fun performanceRecordingApps(): Set<String> = readRootCommandResult("cat '$POLICY_FILE'")
+        .takeIf { it.success }?.output.orEmpty().lineSequence()
+        .map { it.substringBefore('#').trim() }.filter { it.substringBefore('=').trim() == "performance_recording_apps" }
+        .singleOrNull()?.substringAfter('=')?.split(',')?.filter { it.matches(Regex("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+")) }?.toSet().orEmpty()
+
+    fun setPerformanceRecording(pkg: String, enabled: Boolean): Boolean = synchronized(configMutationLock) {
+        if (!pkg.matches(Regex("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+")) || hasPendingModuleUpdate()) return@synchronized false
+        if (enabled && !PrivateCaptureStorage.register()) return@synchronized false
+        runRootCommand(policyMutationScript("""
+            [ -f "${'$'}target" ] || exit 1
+            awk -v pkg='$pkg' -v enabled='${if (enabled) 1 else 0}' '
+            {
+                clean=${'$'}0; sub(/#.*/, "", clean); pos=index(clean,"=")
+                key=substr(clean,1,pos-1); gsub(/^[[:space:]]+|[[:space:]]+${'$'}/,"",key)
+                if (pos && key=="performance_recording_apps") {
+                    count=split(substr(clean,pos+1),apps,",")
+                    for(i=1;i<=count;i++) { gsub(/^[[:space:]]+|[[:space:]]+${'$'}/,"",apps[i]); if(apps[i]!="" && apps[i]!=pkg) saved[apps[i]]=1 }
+                    next
+                }
+                print
+            }
+            END {
+                if(enabled) saved[pkg]=1
+                value=""; for(app in saved) value=value (value=="" ? "" : ",") app
+                print "performance_recording_apps=" value
+            }' "${'$'}target" > "${'$'}tmp" || exit 1
+            chmod 0644 "${'$'}tmp" && mv -f "${'$'}tmp" "${'$'}target"
+        """.trimIndent())).success
+    }
+
+    fun performanceRecordingCommand(pkg: String, token: String, start: Boolean): Boolean {
+        if (!pkg.matches(Regex("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+")) || !token.matches(Regex("[A-Za-z0-9-]{1,80}"))) return false
+        return runRootCommand("""
+            umask 077
+            target='$CONFIG_DIR/performance_recording.cmd'
+            tmp="${'$'}target.$token.tmp"
+            trap 'rm -f "${'$'}tmp"' EXIT
+            printf '%s\n' '${if (start) "start" else "stop"} $pkg $token' > "${'$'}tmp" && mv -f "${'$'}tmp" "${'$'}target"
+        """.trimIndent()).success
+    }
+
     internal fun automaticHistoryMutationScript(enabled: Boolean): String = policyMutationScript("""
         [ ! -e '$POLICY_UPDATE_FILE' ] || exit 1
         [ -f "${'$'}target" ] || exit 1
@@ -105,7 +146,9 @@ object DaemonBridge {
         val packages: Set<String> = emptySet(),
         val activePackage: String = "",
         val state: String = "idle",
-        val detail: String = "等待所选游戏进入前台"
+        val detail: String = "等待所选游戏进入前台",
+        val fallbackSupported: Boolean = false,
+        val fallbackPackages: Set<String> = emptySet()
     )
 
     fun readAutomaticAffinity(): AutomaticAffinityState {
@@ -141,22 +184,56 @@ object DaemonBridge {
             val i = it.indexOf('='); if (i > 0) it.take(i) to it.drop(i + 1) else null
         }.toMap()
         if (fields["version"] != "1" || fields.size != lines.size) return AutomaticAffinityState()
-        val selected = parseAutomaticAffinityPackages(raw.substringAfter("__PACKAGES__").substringBefore("__LIVE__"))
+        val modes = AutomaticAffinityConfig.modes(raw.substringAfter("__PACKAGES__").substringBefore("__LIVE__"))
+        val selected = modes.keys
+        val fallbackSupported = fields["fallback_version"] == "1"
+        val fallbackPackages = modes.filterValues { it }.keys
         if (raw.substringAfter("__LIVE__").trim() != "1") {
-            return AutomaticAffinityState(true, selected, state = "stopped", detail = "自动分配守护尚未运行")
+            return AutomaticAffinityState(true, selected, state = "stopped", detail = "自动分配守护尚未运行",
+                fallbackSupported = fallbackSupported, fallbackPackages = fallbackPackages)
         }
         return AutomaticAffinityState(true, selected, fields["package"].orEmpty(),
-            fields["state"] ?: "idle", fields["detail"] ?: "等待所选游戏进入前台")
+            fields["state"] ?: "idle", fields["detail"] ?: "等待所选游戏进入前台", fallbackSupported, fallbackPackages)
     }
 
     /** 与 Rust 一致；每行只读取有效包名，重复包名合并。 */
-    internal fun parseAutomaticAffinityPackages(raw: String): Set<String> = buildSet {
-        raw.lineSequence().forEach { rawLine ->
-            val pkg = rawLine.substringBefore('#').trim()
-            if (isValidBasePackage(pkg) && pkg.split('.').all { it.isNotEmpty() }) {
-                add(pkg)
+    internal fun parseAutomaticAffinityPackages(raw: String): Set<String> = AutomaticAffinityConfig.modes(raw).keys
+
+    data class AutomaticFallbackResult(val cpus: String?, val ruleCount: Int)
+
+    /** 先保存或复用规则，再开启模式；任何一步失败均明确反馈，不触发静态规则模式切换。 */
+    fun setAutomaticFallback(pkg: String, enabled: Boolean, chosenCpus: String?): AutomaticFallbackResult = synchronized(configMutationLock) {
+        require(isValidBasePackage(pkg))
+        val automatic = readAutomaticAffinity()
+        check(pkg in automatic.packages) { "请先开启自动分配" }
+        check(!enabled || automatic.fallbackSupported) { "当前守护不支持主进程兜底，请先更新模块" }
+        val originals = readPkgRulesOrNull(listOf(pkg)) ?: error("读取主进程规则失败，请重试")
+        val rules = originals.mapNotNull(RuleSyntax::parseLegacyRule)
+        val present = RuleConfigLogic.readPresentCpuSet()
+        var cpus = AutomaticAffinityConfig.fallbackCpus(rules, pkg, present)
+        var count = originals.size
+        if (enabled && chosenCpus != null) {
+            val selected = RuleConfigLogic.parseNativeCpuRangeList(chosenCpus)
+            require(!selected.isNullOrEmpty() && present != null && present.containsAll(selected) && selected.all { it < 64 }) {
+                "请选择设备上有效的兜底核心"
             }
+            cpus = RuleConfigLogic.formatCpuRangeList(selected)
+            val replacements = originals.withIndex().filter { (_, line) ->
+                RuleSyntax.parseLegacyRule(line)?.let { it.owner == pkg && it.thread == null } != true
+            }.associate { it.index to it.value }
+            val result = replaceConfigRulesPreservingLayout(listOf(pkg), originals, replacements, listOf("$pkg=$cpus"), present)
+            check(result == ConfigReplaceResult.SUCCESS) {
+                if (result == ConfigReplaceResult.SOURCE_CHANGED) "规则已变化，请刷新后重新选择" else "兜底规则保存失败，请重试"
+            }
+            count = replacements.size + 1
         }
+        check(!enabled || cpus != null) { "尚无主进程兜底规则，请先选择核心组" }
+        val token = UUID.randomUUID().toString()
+        val result = runRootCommand(automaticAffinityMutationScript(pkg, true, token, fallback = enabled))
+        check(result.success && result.output.trim() == token) {
+            if (enabled && chosenCpus != null) "兜底规则已保存，但开关未开启，请重试" else "主进程兜底开关保存失败，请重试"
+        }
+        AutomaticFallbackResult(cpus, count)
     }
 
     /** 只改变应用模式，手动规则仍保留在磁盘上。 */
@@ -169,12 +246,13 @@ object DaemonBridge {
 
     internal fun automaticAffinityMutationScript(
         pkg: String, enabled: Boolean, token: String,
-        configPath: String = AUTO_AFFINITY_FILE, statePath: String = "$CONFIG_DIR/auto_affinity.state"
+        configPath: String = AUTO_AFFINITY_FILE, statePath: String = "$CONFIG_DIR/auto_affinity.state",
+        fallback: Boolean? = null
     ): String {
         require(isValidBasePackage(pkg) && token.matches(Regex("[a-zA-Z0-9-]+")))
         val tmp = "$configPath.$token.tmp"
         return """
-            ${if (enabled) automaticAffinitySupportCheck(statePath) else ":"}
+            ${if (enabled) automaticAffinitySupportCheck(statePath, fallback == true) else ":"}
             lock=${shellQuote("$configPath.lock")}
             waited=0
             while ! { [ ! -e "${'$'}lock" ] && mkdir "${'$'}lock" 2>/dev/null &&
@@ -191,16 +269,21 @@ object DaemonBridge {
             done
             tmp=${shellQuote(tmp)}
             trap 'rm -f "${'$'}tmp"; if [ "${'$'}(cat "${'$'}lock/owner" 2>/dev/null)" = "$token" ]; then rm -f "${'$'}lock/owner"; rmdir "${'$'}lock" 2>/dev/null; fi' EXIT
-            if [ -f ${shellQuote(configPath)} ]; then
-                awk -v pkg='$pkg' '
+            source=${shellQuote(configPath)}
+            [ -f "${'$'}source" ] || source=/dev/null
+                awk -v pkg='$pkg' -v enabled='${if (enabled) 1 else 0}' -v mode='${fallback?.let { if (it) 1 else 0 } ?: -1}' '
                     { line=${'$'}0; sub(/#.*/, "", line)
                       gsub(/^[ \t]+|[ \t\r]+${'$'}/, "", line)
-                      if (line != pkg) print ${'$'}0 }
-                ' ${shellQuote(configPath)} > "${'$'}tmp" || exit 1
-            else
-                : > "${'$'}tmp" || exit 1
-            fi
-            ${if (enabled) "printf '%s\\n' '$pkg' >> \"${'$'}tmp\" || exit 1" else ":"}
+                      split(line, parts, ","); gsub(/^[ \t]+|[ \t]+${'$'}/, "", parts[1])
+                      if (parts[1] == pkg) {
+                        found=1; gsub(/[ \t]/, "", line)
+                        if (line == pkg ",fallback") oldfallback=1
+                      } else print ${'$'}0 }
+                    END {
+                      if (mode >= 0 && !found) exit 2
+                      if (enabled) print pkg ((mode == 1 || (mode < 0 && oldfallback)) ? ",fallback" : "")
+                    }
+                ' "${'$'}source" > "${'$'}tmp" || exit 1
             chmod 0644 "${'$'}tmp" || exit 1
             mv -f "${'$'}tmp" ${shellQuote(configPath)} || exit 1
             printf '%s' '$token'
@@ -208,7 +291,7 @@ object DaemonBridge {
     }
 
     /** 在同一次 Root 操作中检查能力；保存模式无需依赖实时运行状态。 */
-    internal fun automaticAffinitySupportCheck(path: String): String = """
+    internal fun automaticAffinitySupportCheck(path: String, fallback: Boolean = false): String = """
         awk '
             /^[[:space:]]*${'$'}/ { next }
             {
@@ -218,8 +301,9 @@ object DaemonBridge {
                 key=substr(${'$'}0, 1, equal-1)
                 if (seen[key]++) invalid=1
                 if (key == "version") version=substr(${'$'}0, equal+1)
+                if (key == "fallback_version") fallback=substr(${'$'}0, equal+1)
             }
-            END { exit (invalid || version != "1") }
+            END { exit (invalid || version != "1" ${if (fallback) "|| fallback != \"1\"" else ""}) }
         ' ${shellQuote(path)} || exit 1
     """.trimIndent()
     private const val CONFIG_LOCK_DIR = "$CONFIG_DIR/applist.conf.lock"
@@ -236,8 +320,8 @@ object DaemonBridge {
     private const val FOREGROUND_TASK_MAX_AGE_MS = 25_000L
     private const val DAEMON_SOCKET_CALLBACK_PREFIX = "qixia.callback top.qixia.threads v1 "
     private const val ROOT_TIMEOUT_SECONDS = 15L
-    const val REQUIRED_MODULE_VERSION_CODE = 205
-    const val REQUIRED_MODULE_VERSION_NAME = "2.0.5"
+    const val REQUIRED_MODULE_VERSION_CODE = 206
+    const val REQUIRED_MODULE_VERSION_NAME = "2.0.6"
     private val configMutationLock = Any()
 
     /** 检测设备是否有可用 root；首次调用可能触发 Magisk 授权弹窗。 */
@@ -932,6 +1016,14 @@ object DaemonBridge {
     /** 通知守护进程停止帧率监测。 */
     fun stopFpsMonitor(): Boolean {
         return runAsRoot("mkdir -p '$CONFIG_DIR'; printf '%s' 'stop' > $FPS_CMD_FILE").isNotErrored()
+    }
+
+    /** 按通道身份停止，防止旧胶囊的退出回调关闭后来启动的校准通道。 */
+    fun stopFpsMonitor(socketName: String, socketToken: String): Boolean {
+        val socket = cleanCommandArg(socketName, allowColon = false)
+        val token = cleanCommandArg(socketToken, allowColon = false)
+        if (socket.isBlank() || token.isBlank()) return false
+        return runAsRoot("mkdir -p '$CONFIG_DIR'; printf '%s' 'stop_owned $socket $token' > $FPS_CMD_FILE").isNotErrored()
     }
 
     /** 读取守护进程当前状态；读不到时返回空字符串。 */

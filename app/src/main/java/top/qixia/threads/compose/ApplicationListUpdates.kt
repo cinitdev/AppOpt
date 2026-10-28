@@ -35,6 +35,7 @@ internal fun AppItemModel.withAutomaticAffinity(
     enabled: Boolean, detail: String = "等待所选游戏进入前台"
 ): AppItemModel = copy(
     automaticAffinityEnabled = enabled,
+    automaticFallbackEnabled = enabled && automaticFallbackEnabled,
     automaticAffinityDetail = detail,
     state = if (enabled) {
         if (available) AppRuleState.CONFIGURED else AppRuleState.MISSING

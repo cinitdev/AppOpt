@@ -1,4 +1,4 @@
-//! 有界的前台线程采样；休眠线程不写入亲和性。
+//! 有界的前台线程采样；可选主进程兜底与动态分配共用接管和恢复基线。
 use super::super::{
     accounting, demand,
     live_policy::{self, Activity, Placement},
@@ -61,6 +61,18 @@ impl Tracked {
         }
     }
 
+    fn fallback_eligible(&self, now: Instant) -> bool {
+        // 新线程先取得有效样本；异常读数不能把已有动态分配降为兜底。
+        // 为轮换采样保留一轮扫描的时效，避免低负载线程反复释放。
+        !self.activity.eligible() && self.last_valid_sample.is_some_and(|last|
+            now.saturating_duration_since(last) <= Duration::from_secs(12))
+    }
+
+    fn fallback_target(&self, now: Instant, main: bool, configured: u64, available: u64) -> Option<u64> {
+        let mask = configured & available;
+        (main && mask != 0 && self.fallback_eligible(now)).then_some(mask)
+    }
+
     fn keep_owned(&self, now: Instant) -> bool {
         self.last_valid_sample.is_some_and(|last|
             self.activity.keep_owned_without_sample(now.saturating_duration_since(last)))
@@ -73,6 +85,10 @@ pub(super) struct Controller {
     policies: Vec<demand::Policy>,
     hz: f64,
     pids: BTreeSet<i32>,
+    main_pids: BTreeSet<i32>,
+    fallback_mask: u64,
+    fallback_requests: BTreeSet<Identity>,
+    last_fallback_check: Option<Instant>,
     process_scan: Option<Instant>,
     full_process_scan: Option<Instant>,
     tracked: BTreeMap<Identity, Tracked>,
@@ -92,6 +108,8 @@ pub(super) struct Controller {
 }
 
 impl Controller {
+    pub(super) fn set_fallback(&mut self, mask: u64) { self.fallback_mask = mask; }
+
     pub(super) fn package(&self) -> &str {
         &self.pkg
     }
@@ -99,7 +117,7 @@ impl Controller {
         use super::super::diagnostics::{self, Row};
         if !diagnostics::due(&self.pkg) { return; }
         let requests: BTreeMap<_, _> = self.requests.iter().map(|r| (r.identity, r.mask)).collect();
-        let rows = self.tracked.iter().filter(|(_, entry)| entry.activity.average() > 0.0)
+        let rows = self.tracked.iter().filter(|(key, entry)| entry.activity.average() > 0.0 || requests.contains_key(*key))
             .map(|(key, entry)| {
                 let desired = requests.get(key).copied();
                 Row { key: *key, name: entry.name.clone(), average: entry.activity.average() * 100.0, desired,
@@ -116,6 +134,10 @@ impl Controller {
             policies,
             hz: unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64,
             pids: BTreeSet::new(),
+            main_pids: BTreeSet::new(),
+            fallback_mask: 0,
+            fallback_requests: BTreeSet::new(),
+            last_fallback_check: None,
             process_scan: None,
             full_process_scan: None,
             tracked: BTreeMap::new(),
@@ -142,6 +164,7 @@ impl Controller {
             self.core_history.record((0, 0, 0), "error", "unknown", None, None, "recovery_failed");
         }
         self.tracked.clear();
+        self.fallback_requests.clear();
         self.cpu_previous.clear();
         self.frame_reference = None;
         self.bad_frames = 0;
@@ -157,9 +180,16 @@ impl Controller {
         self.capture_core_history();
         let now = Instant::now();
         self.requests.retain(|request| self.tracked.get(&request.identity).is_some_and(|entry|
-            entry.keep_owned(now)));
-        if self.requests.is_empty() { return; }
-        let result = self.batch.maintain(&self.requests);
+            entry.keep_owned(now) || (self.fallback_requests.contains(&request.identity)
+                && self.fallback_mask != 0 && self.main_pids.contains(&request.identity.0)
+                && entry.fallback_eligible(now))));
+        // 低负载兜底已在完整采样轮次复核；不把整个休眠线程池额外提升到 250 ms 复核。
+        let check_fallback = self.last_fallback_check.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1));
+        let requests: Vec<_> = self.requests.iter().filter(|request|
+            check_fallback || !self.fallback_requests.contains(&request.identity)).copied().collect();
+        if requests.is_empty() { return; }
+        if check_fallback { self.last_fallback_check = Some(now); }
+        let result = self.batch.maintain(&requests);
         self.collect_core_events(None, &BTreeSet::new());
         // 完整负载轮次发布所有请求的状态，包括维护流程不能触碰的
         // 待接纳项与退出项。如果发布这个局部轮次，
@@ -199,9 +229,9 @@ impl Controller {
         let full = self
             .full_process_scan
             .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(30));
-        self.pids = crate::package_processes::discover(&self.pkg, self.pids.iter().copied(), full)
-            .into_keys()
-            .collect();
+        let processes = crate::package_processes::discover(&self.pkg, self.pids.iter().copied(), full);
+        self.main_pids = processes.iter().filter(|(_, name)| *name == &self.pkg).map(|(pid, _)| *pid).collect();
+        self.pids = processes.into_keys().collect();
         if full {
             self.full_process_scan = Some(now);
         }
@@ -210,6 +240,7 @@ impl Controller {
         let observe_history = crate::auto_history::recording_for(&self.pkg);
         self.refresh_processes(now);
         self.pids.retain(|pid| owner_matches(*pid, &self.pkg));
+        self.main_pids.retain(|pid| self.pids.contains(pid));
         let mut threads = Vec::new();
         let mut fully_scanned = BTreeSet::new();
         for &pid in &self.pids {
@@ -242,7 +273,7 @@ impl Controller {
             .iter()
             .filter(|(key, t)| {
                 present.contains(&(key.0, key.1))
-                    && (self.batch.mask(key).is_some() || t.activity.eligible())
+                    && ((self.batch.mask(key).is_some() && !self.fallback_requests.contains(key)) || t.activity.eligible())
             })
             .map(|(key, entry)| ((key.0, key.1), self.batch.mask(key).is_some(), entry.activity.peak())))
             .into_iter()
@@ -420,9 +451,8 @@ impl Controller {
         // 系统迁移不会取消符合条件线程的期望分配。
         // Batch 会验证归属，并对各次写入进行退避重试。
         let mut current_masks = BTreeMap::new();
-        for (key, _) in self.batch.records() {
-            let current = affinity(key.1).ok();
-            current_masks.insert(*key, current);
+        for key in &active {
+            current_masks.insert(*key, affinity(key.1).ok());
         }
         if !active.is_empty() && !self.policies.is_empty() {
             let details = sampling::oldest_details(
@@ -502,7 +532,9 @@ impl Controller {
         let mut requests = Vec::new();
         for (key, original, demand) in &demands {
             let before = budget.clone();
-            let held = self.batch.mask(key).unwrap_or(0);
+            // 从兜底转入动态时立即重新规划，不沿用低负载核心池的驻留期。
+            let promoting = self.fallback_requests.contains(key);
+            let held = if promoting { 0 } else { self.batch.mask(key).unwrap_or(0) };
             if !sampled.contains(key) && held != 0 && held & !available == 0 {
                 budget.reserve_placement(demand, held);
                 requests.push(Request { identity: *key, original: *original, mask: held });
@@ -536,6 +568,18 @@ impl Controller {
             // 都会反复提议同一颗首选核心，
             // 导致每个预热窗口只能接纳一个线程。
         }
+
+        let fallback = self.fallback_mask & available;
+        let mut fallback_requests = BTreeSet::new();
+        if fallback != 0 {
+            for (key, entry) in &self.tracked {
+                let Some(mask) = entry.fallback_target(now, self.main_pids.contains(&key.0), self.fallback_mask, available) else { continue; };
+                let Some(original) = self.batch.original(key).or_else(|| affinity(key.1).ok()) else { continue; };
+                requests.push(Request { identity: *key, original, mask });
+                fallback_requests.insert(*key);
+            }
+        }
+        self.fallback_requests = fallback_requests;
 
         // 只有已经为用户采集 FPS 时，才将其作为可选反馈。
         // 视频帧率、缺帧和 Surface 变化都不能阻塞负载采样。
@@ -579,6 +623,7 @@ impl Controller {
             }
         }
         self.requests = requests;
+        self.last_fallback_check = Some(now);
         let result = self.batch.apply(&self.requests);
         self.collect_core_events(None, &BTreeSet::new());
         let changes = match result {
@@ -626,13 +671,15 @@ impl Controller {
             );
         }
         let placed = self.batch.len();
-        if placed > 0 {
+        let result = if placed > 0 {
             (
                 "active",
                 if pending > 0 {
-                    format!("已分配 {placed} 个活跃线程 · {pending} 个线程等待重新接管")
+                    format!("已接管 {placed} 个线程（含 {} 个主进程兜底）· {pending} 个等待重试", self.fallback_requests.iter().filter(|key| self.batch.verified(key)).count())
                 } else {
-                    format!("已分配 {placed} 个活跃线程 · 持续按负载评估")
+                    if self.fallback_mask != 0 {
+                        format!("已接管 {placed} 个线程 · 主进程兜底 {} 个", self.fallback_requests.iter().filter(|key| self.batch.verified(key)).count())
+                    } else { format!("已分配 {placed} 个活跃线程 · 持续按负载评估") }
                 },
             )
         } else if pending > 0 {
@@ -653,7 +700,10 @@ impl Controller {
                     active.len()
                 ),
             )
-        }
+        };
+        if self.fallback_mask != 0 && fallback == 0 {
+            (result.0, format!("{} · 所选兜底核心当前不可用，低负载线程暂由系统调度", result.1))
+        } else { result }
     }
 
     pub(super) fn take_history(&mut self) -> Option<crate::auto_history::ThreadBatch> {
@@ -674,6 +724,9 @@ impl Controller {
         for event in &mut events {
             let key = (event.pid, event.tid, event.start);
             let entry = self.tracked.get_mut(&key);
+            if self.fallback_requests.contains(&key) && event.kind == "assign" {
+                event.reason = "process_fallback".into();
+            }
             if event.kind == "release" && event.reason == "released" {
                 event.reason = core_history::release_reason(release_reason,
                     entry.as_ref().map(|entry| entry.activity.average() * 100.0),
@@ -710,6 +763,77 @@ fn owner_matches(pid: i32, pkg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "仅在无自动分配恢复日志的 Android 测试设备运行，只操作测试线程"]
+    fn fallback_dynamic_fallback_and_disable_restore_original_cpuset() {
+        assert!(!std::path::Path::new(super::super::JOURNAL).exists());
+        assert!(std::env::var_os("QIXIA_TEST_GUARD_EXE").is_some());
+        let (send, recv) = std::sync::mpsc::channel();
+        let (stop, wait) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let pid = std::process::id() as i32;
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+            send.send((pid, tid, super::super::thread_stat(pid, tid).unwrap().start)).unwrap();
+            let _ = wait.recv();
+        });
+        let key = recv.recv().unwrap();
+        let original = affinity(key.1).unwrap();
+        let original_group = super::super::cpuset::current(key.0, key.1).unwrap();
+        let available = super::super::cpuset::available(online_mask().unwrap()).unwrap();
+        assert!(available.count_ones() >= 2);
+        let low_mask = available & available.wrapping_neg();
+        let rest = available & !low_mask;
+        let high_mask = rest & rest.wrapping_neg();
+        let start = Instant::now();
+        let mut entry = Tracked::new(0, start);
+        let mut batch = Batch::default();
+        assert!(entry.observe_ticks(2, start + Duration::from_secs(1), 100.0));
+        let low = entry.fallback_target(start + Duration::from_secs(1), true, low_mask, available).unwrap();
+        let apply = |batch: &mut Batch, mask| {
+            let original = batch.original(&key).unwrap_or(original);
+            assert_eq!(batch.apply(&[Request { identity: key, original, mask }]).unwrap().written, vec![key]);
+            assert_eq!(affinity(key.1).unwrap(), mask);
+            assert!(batch.owns(&key));
+        };
+        apply(&mut batch, low);
+        assert!(entry.observe_ticks(22, start + Duration::from_secs(2), 100.0));
+        assert!(entry.activity.eligible());
+        assert!(entry.fallback_target(start + Duration::from_secs(2), true, low_mask, available).is_none());
+        apply(&mut batch, high_mask);
+        assert!(entry.observe_ticks(22, start + Duration::from_secs(8), 100.0));
+        apply(&mut batch, entry.fallback_target(start + Duration::from_secs(8), true, low_mask, available).unwrap());
+        assert_eq!(batch.original(&key), Some(original));
+        batch.apply(&[]).unwrap();
+        assert_eq!(super::super::cpuset::current(key.0, key.1).unwrap(), original_group);
+        super::super::cpuset::assert_restored_for_test(original, affinity(key.1).unwrap());
+        assert!(batch.release());
+        drop(stop);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn main_fallback_routes_only_valid_low_samples_and_promotes_at_five_percent() {
+        let start = Instant::now();
+        let mut entry = Tracked::new(0, start);
+        assert_eq!(entry.fallback_target(start, true, 3, 255), None);
+        let low = start + Duration::from_secs(1);
+        assert!(entry.observe_ticks(4, low, 100.0));
+        assert_eq!(entry.fallback_target(low, true, 3, 255), Some(3));
+        assert_eq!(entry.fallback_target(low, false, 3, 255), None);
+        assert_eq!(entry.fallback_target(low, true, 0, 255), None);
+        assert_eq!(entry.fallback_target(low, true, 3, 254), Some(2));
+        assert_eq!(entry.fallback_target(low, true, 3, 252), None);
+        let high = start + Duration::from_secs(2);
+        assert!(entry.observe_ticks(10, high, 100.0));
+        assert!(entry.activity.eligible(), "平均值恰好达到 5% 必须进入动态分配");
+        assert_eq!(entry.fallback_target(high, true, 3, 255), None);
+        assert!(!entry.observe_ticks(10000, high + Duration::from_millis(500), 100.0));
+        assert_eq!(entry.fallback_target(high, true, 3, 255), None, "异常值不能把高负载线程降入兜底");
+        assert!(entry.observe_ticks(10000, start + Duration::from_secs(8), 100.0));
+        assert_eq!(entry.fallback_target(start + Duration::from_secs(8), true, 3, 255), Some(3));
+        assert_eq!(entry.fallback_target(start + Duration::from_secs(21), true, 3, 255), None);
+    }
 
     #[test]
     fn changing_scan_latency_uses_each_threads_read_time() {

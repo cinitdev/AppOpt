@@ -108,7 +108,8 @@ fun RuleEditorScreen(state: RuleEditorUiState, onDraftChange: (String) -> Unit,
                         }
                     }
                     if (automatic) {
-                        Text("自动分配已开启 · 原有规则与检测已暂停", color = PorcelainOnTonal,
+                        Text(if (state.app.automaticFallbackEnabled) "自动分配已开启 · 主进程范围用于低负载兜底，其余规则与检测暂停"
+                            else "自动分配已开启 · 原有规则与检测已暂停", color = PorcelainOnTonal,
                             fontSize = 12.sp, lineHeight = 18.sp, modifier = Modifier.padding(bottom = 12.dp))
                     }
                     if (!rawMode) {

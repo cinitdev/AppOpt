@@ -3,7 +3,7 @@ package top.qixia.threads.compose
 import top.qixia.threads.db.SessionSummary
 
 enum class HomeRecordMode(val label: String) {
-    CALIBRATION("校准"), AUTOMATIC("自动分配"), RULES("规则应用")
+    CALIBRATION("校准"), AUTOMATIC("自动分配"), RULES("规则应用"), PERFORMANCE("性能记录")
 }
 
 /** 使用摘要不表示已经采集或导入完整报告。 */

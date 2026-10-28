@@ -64,6 +64,15 @@ pub(crate) fn run_daemon_round(
     }
     let applied = execute_round(args, state, runtime, &prepared, &scanned);
     #[cfg(any(target_os = "android", target_os = "linux"))]
+    let fallback_masks = runtime.rules.iter()
+        .filter(|rule| rule.thread.is_none() && !rule.auto && automatic.selected.contains(&rule.owner))
+        .filter_map(|rule| crate::CpuMask::parse(&rule.cpus).map(|cpus| {
+            let mask = (0..64).filter(|cpu| cpus.contains(*cpu)).fold(0u64, |mask, cpu| mask | (1u64 << cpu));
+            (rule.owner.clone(), mask)
+        })).collect();
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    automatic.update_fallback_masks(fallback_masks);
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     if let Err(error) = crate::affinity::cleanup_owned_cpuset_dirs_after_scan(state, &args.cpuset_name,
         scanned.scan_complete && scanned.health_incomplete_packages.is_empty()) {
         log_warn!("[RS] 扫描后旧 cpuset 回收暂缓: {error}");

@@ -1,6 +1,6 @@
 package top.qixia.threads
 
-/** 安装命令返回后交给独立 Root 工作进程，页面退出不打断文件切换或回退。 */
+/** 复用安装器的热更新事务；页面退出不打断文件切换或回退。 */
 internal object ModuleHotUpdate {
     private const val ACTIVE = "/data/adb/modules/QixiaThreads"
     private const val STAGED = "/data/adb/modules_update/QixiaThreads"
@@ -10,10 +10,18 @@ internal object ModuleHotUpdate {
 
     data class Result(val applied: Boolean, val message: String)
 
+    fun currentRequest(): String = fields(DaemonBridge.runRootCommand(
+        "cat '$JOURNAL' 2>/dev/null || cat '$STATUS'", timeoutSeconds = 5L
+    ).output)["request"].orEmpty()
+
     fun apply(versionCode: Int, progress: (String) -> Unit): Result {
-        val launch = DaemonBridge.runRootCommand("sh '$STAGED/$SCRIPT' --queue", timeoutSeconds = 10L)
+        if (isApplied(versionCode)) return Result(true, "模块已热更新生效，无需重启手机")
+        val launch = DaemonBridge.runRootCommand("sh '$STAGED/$SCRIPT' --queue 2>&1", timeoutSeconds = 10L)
         val request = fields(launch.output)["request"].orEmpty()
         if (!launch.success || request.isBlank()) {
+            // 安装器可能刚完成收尾并删除暂存脚本，此时直接验证当前服务。
+            if (isApplied(versionCode)) return Result(true, "模块已热更新生效，无需重启手机")
+            launch.output.trim().takeIf { it.isNotEmpty() }?.let(progress)
             return Result(false, "模块已刷入；无法启动热更新，重启后生效")
         }
         var lastMessage = ""
@@ -32,6 +40,7 @@ internal object ModuleHotUpdate {
                         return Result(true, "模块已热更新生效，无需重启手机")
                     } else return Result(false, "新版运行检查未通过，请重启完成更新")
                     "deferred", "rollback_failed" -> return Result(false, "$message；重启后生效")
+                    "failed" -> return Result(false, message.ifBlank { "热更新未完成，请查看刷入日志" })
                 }
             }
             Thread.sleep(1000L)
@@ -59,9 +68,12 @@ internal object ModuleHotUpdate {
         "test -f '$ACTIVE/config/app/app.prop' && test ! -e '$STAGED'", timeoutSeconds = 5L
     ).success
 
-    fun queueAppInstall(): Boolean = DaemonBridge.runRootCommand(
-        "sh '$ACTIVE/$SCRIPT' --queue-app", timeoutSeconds = 5L
-    ).success
+    fun queueAppInstall(callerPid: Int): Boolean {
+        require(callerPid > 1)
+        return DaemonBridge.runRootCommand(
+            "sh '$ACTIVE/$SCRIPT' --queue-app '$callerPid'", timeoutSeconds = 5L
+        ).success
+    }
 
     private fun fields(text: String): Map<String, String> = text.lineSequence().mapNotNull {
         val separator = it.indexOf('=')

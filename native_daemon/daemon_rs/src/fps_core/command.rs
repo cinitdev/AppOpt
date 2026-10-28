@@ -6,6 +6,7 @@ use crate::command_protocol::{CommandFile, FpsCommand, FpsRequest};
 // App 写入 fps.cmd，daemon 原子认领后读取并删除：
 // - start <pkg> [socket token]
 // - stop
+// - stop_owned <socket> <token>（只结束对应胶囊的实时输出）
 //
 // socket/token 是 App 侧实时 FPS 通道；如果没有提供或连接失败，就回落到 files/fps。
 // 这里不解析更多复杂参数，避免命令文件变成半套 IPC 协议。
@@ -39,6 +40,11 @@ pub(super) fn fps_loop() -> io::Result<()> {
             }
         };
         if let Some(command) = command {
+            if matches!(&command, FpsCommand::StopOwned { .. })
+                && manual.as_ref().is_none_or(|request| !command.stops(request)) {
+                // 过期胶囊不能清除新通道，也不重置当前帧源的前台判定。
+                continue;
+            }
             manual_fallback.reset();
             calibration_checked = None;
             match command {
@@ -50,7 +56,7 @@ pub(super) fn fps_loop() -> io::Result<()> {
                     }
                     manual = Some(request);
                 }
-                FpsCommand::Stop => {
+                FpsCommand::Stop | FpsCommand::StopOwned { .. } => {
                     manual = None;
                 }
             }

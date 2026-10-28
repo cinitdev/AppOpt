@@ -207,12 +207,12 @@ pub(super) fn publish(source: &Path) -> io::Result<()> {
 /// 只有遗弃的 gzip 工作文件可直接删除。对应的 .tmp 才是可信源，
 /// 仍由现有入选检查和恢复流程验证。
 pub(super) fn remove_abandoned_parts(directory: &Path) -> io::Result<()> {
-    let mut entries = match fs::read_dir(directory) {
+    let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    for entry in entries.by_ref().take(1000).flatten() {
+    for entry in entries.flatten() {
         let path = entry.path();
         if !owned_file(&path, "gz.part") {
             continue;
@@ -222,11 +222,6 @@ pub(super) fn remove_abandoned_parts(directory: &Path) -> io::Result<()> {
         if !is_open(&source) {
             unlink_if_present(&path)?;
         }
-    }
-    if entries.next().is_some() {
-        return Err(io::Error::other(
-            "auto history directory exceeds entry limit",
-        ));
     }
     Ok(())
 }

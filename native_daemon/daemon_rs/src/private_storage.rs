@@ -60,8 +60,17 @@ impl Storage {
 
     pub(crate) fn write_recent_usage(&self, data: &[u8]) -> io::Result<()> {
         if data.len() > crate::recent_usage::MAX_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidInput, "recent usage file too large")); }
+        self.write_app_state("recent_usage.tsv", data, true)
+    }
+
+    pub(crate) fn write_performance_state(&self, data: &[u8]) -> io::Result<()> {
+        if data.len() > 4096 { return Err(io::Error::other("performance state too large")); }
+        self.write_app_state("performance_recording.state", data, false)
+    }
+
+    fn write_app_state(&self, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
         let root = self.prepare_root()?;
-        atomic_recent_usage(&root, data, |file| {
+        atomic_app_state(&root, name, data, durable, |file| {
             #[cfg(unix)] {
                 use std::os::fd::AsRawFd;
                 if unsafe { libc::fchown(file.as_raw_fd(), self.uid, self.uid) } != 0
@@ -144,9 +153,14 @@ impl Storage {
     }
 }
 
+#[cfg(test)]
 fn atomic_recent_usage(root: &Path, data: &[u8], prepare: impl FnOnce(&fs::File) -> io::Result<()>) -> io::Result<()> {
+    atomic_app_state(root, "recent_usage.tsv", data, true, prepare)
+}
+
+fn atomic_app_state(root: &Path, name: &str, data: &[u8], durable: bool, prepare: impl FnOnce(&fs::File) -> io::Result<()>) -> io::Result<()> {
     use std::io::Write;
-    let temporary = root.join(".recent_usage.tsv.tmp");
+    let temporary = root.join(format!(".{name}.tmp"));
     // 只有当前守护写入方拥有此固定临时文件名。上次崩溃可能留下文件，
     // 但 create_new 仍能防止跟随外部插入的符号链接。
     match fs::symlink_metadata(&temporary) {
@@ -159,11 +173,11 @@ fn atomic_recent_usage(root: &Path, data: &[u8], prepare: impl FnOnce(&fs::File)
     let result = (|| {
         prepare(&file)?;
         file.write_all(data)?;
-        file.sync_all()?;
+        if durable { file.sync_all()?; }
         drop(file);
-        fs::rename(&temporary, root.join("recent_usage.tsv"))?;
+        fs::rename(&temporary, root.join(name))?;
         #[cfg(unix)]
-        fs::File::open(root)?.sync_all()?;
+        if durable { fs::File::open(root)?.sync_all()?; }
         Ok(())
     })();
     if result.is_err() { let _ = fs::remove_file(temporary); }

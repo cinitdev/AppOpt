@@ -9,6 +9,9 @@ mod recent_usage;
 use runtime_clock::elapsed_realtime_ms;
 mod auto_affinity;
 mod auto_history;
+mod history_retention;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+mod android_dump;
 mod fps;
 #[path = "daemon_core/rule_health/mod.rs"]
 mod rule_health;
