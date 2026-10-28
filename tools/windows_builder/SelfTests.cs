@@ -91,11 +91,17 @@ namespace Qixia.Builder
         {
             string directory = Path.Combine(project, "build", "builder-tests", "版本 fixture & spaces");
             foreach (var file in new[] { "app/build.gradle.kts", "app/src/main/java/top/qixia/threads/DaemonBridge.kt",
-                "native_daemon/daemon_rs/src/daemon_core/preamble.rs", "magisk_module/module.prop", "modules_update/QixiaThreads.json" }) {
+                "native_daemon/daemon_rs/src/daemon_core/preamble.rs", "magisk_module/module.prop" }) {
                 string target = Path.Combine(directory, file);
                 Directory.CreateDirectory(Path.GetDirectoryName(target));
                 File.Copy(Path.Combine(project, file), target, true);
             }
+            // 测试清单独立生成，避免依赖开发者未提交的发布配置。
+            string manifest = Path.Combine(directory, "modules_update/QixiaThreads.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(manifest));
+            File.WriteAllText(manifest, "{\"version\":\"v1.0.0\",\"versionCode\":100," +
+                "\"zipUrl\":\"https://example.com/releases/download/v1.0.0/QixiaThreads.zip\"," +
+                "\"changelog\":\"https://example.com/changelog.md\"}", new UTF8Encoding(false));
             return directory;
         }
 
@@ -132,6 +138,15 @@ namespace Qixia.Builder
             refused = false;
             try { ProjectVersion.Validate("v2.0.2\"; execute", "202"); } catch (ArgumentException) { refused = true; }
             Check(refused, "拒绝非法版本文本");
+
+            directory = VersionFixture(project);
+            manifest = Path.Combine(directory, "modules_update/QixiaThreads.json");
+            File.Delete(manifest);
+            original = ProjectVersion.Read(directory);
+            ProjectVersion.Save(directory, "v9.8.9", "989", original);
+            Check(ProjectVersion.Read(directory).Code == 989 &&
+                File.ReadAllText(Path.Combine(directory, "magisk_module/module.prop")).Contains("versionCode=989") &&
+                !File.Exists(manifest), "无发布清单的源码可保存版本，不创建发布配置");
         }
 
         public static int Worker()

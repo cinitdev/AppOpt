@@ -109,7 +109,7 @@
         <StackPanel VerticalAlignment="Center"><TextBlock Text="构建版本" FontWeight="SemiBold" FontSize="16"/><TextBlock Text="APK / 模块 / Rust" Style="{StaticResource Note}" Margin="0,4,0,0"/></StackPanel>
         <StackPanel Grid.Column="1" Margin="0,0,12,0"><TextBlock Text="版本名" FontSize="11" Foreground="#60718B" Margin="0,0,0,5"/><TextBox x:Name="VersionName" AutomationProperties.Name="版本名" ToolTip="例如 v2.0.2"/></StackPanel>
         <StackPanel Grid.Column="2" Margin="0,0,12,0"><TextBlock Text="版本编号" FontSize="11" Foreground="#60718B" Margin="0,0,0,5"/><TextBox x:Name="VersionCode" AutomationProperties.Name="版本编号" ToolTip="发布新版时递增，例如 202"/></StackPanel>
-        <TextBlock x:Name="VersionNote" Grid.Column="3" Style="{StaticResource Note}" FontSize="11" VerticalAlignment="Center" Margin="8,0,16,0" Text="保存或开始构建时，同步 APK、模块、Rust 和更新配置。"/>
+        <TextBlock x:Name="VersionNote" Grid.Column="3" Style="{StaticResource Note}" FontSize="11" VerticalAlignment="Center" Margin="8,0,16,0" Text="同步 APK、模块、Rust；已有发布配置也会同步。"/>
         <Button x:Name="SaveVersion" Grid.Column="4" Content="保存版本" VerticalAlignment="Center" Padding="10,9" Background="#2563EB" BorderBrush="#2563EB" Foreground="White" Margin="0,0,10,0"/>
         <Button x:Name="ReloadVersion" Grid.Column="5" Content="重新载入" VerticalAlignment="Center" Padding="10,9"/>
       </Grid>

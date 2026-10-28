@@ -50,3 +50,7 @@ target/
 !/FPS_EBPF_INTEGRATION.md
 !/SOURCE_ATTRIBUTION.md
 !/native_daemon/fps_monitor/README.md
+!/tools/windows_builder/README.md
+
+# 仅分发已验证的可视化构建工具，其他 EXE 继续忽略。
+!/tools/windows_builder/QixiaBuilder.exe

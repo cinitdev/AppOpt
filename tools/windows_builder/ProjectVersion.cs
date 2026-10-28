@@ -49,8 +49,11 @@ namespace Qixia.Builder
         public static void SaveLocked(string project, string name, string code, ProjectVersion expected)
         {
             int number = Validate(name, code);
-            var paths = new[] { "app/build.gradle.kts", "app/src/main/java/top/qixia/threads/DaemonBridge.kt",
-                "native_daemon/daemon_rs/src/daemon_core/preamble.rs", "magisk_module/module.prop", "modules_update/QixiaThreads.json" };
+            var paths = new List<string> { "app/build.gradle.kts", "app/src/main/java/top/qixia/threads/DaemonBridge.kt",
+                "native_daemon/daemon_rs/src/daemon_core/preamble.rs", "magisk_module/module.prop" };
+            // GitHub 源码不附带发布配置；本地编译无需此文件，存在时才同步。
+            const string updateManifest = "modules_update/QixiaThreads.json";
+            if (File.Exists(Path.Combine(project, updateManifest))) paths.Add(updateManifest);
             var files = new List<FileStream>();
             var original = new List<byte[]>();
             var output = new List<byte[]>();

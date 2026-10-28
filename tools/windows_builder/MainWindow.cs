@@ -116,7 +116,7 @@ namespace Qixia.Builder
                 Field("VersionName").Text = loadedVersion.Name;
                 Field("VersionCode").Text = loadedVersion.Code.ToString();
                 Label("VersionLabel").Text = loadedVersion.Name + "  /  " + loadedVersion.Code;
-                Label("VersionNote").Text = "保存或开始构建时，同步 APK、模块、Rust 和更新配置。";
+                Label("VersionNote").Text = "同步 APK、模块、Rust；已有发布配置也会同步。";
             } catch {
                 loadedVersion = null; loadedProject = null;
                 Field("VersionName").Text = ""; Field("VersionCode").Text = "";
@@ -137,7 +137,7 @@ namespace Qixia.Builder
                 throw new IOException("请先选择项目并重新载入版本。");
             ProjectVersion.Save(loadedProject, Field("VersionName").Text.Trim(), Field("VersionCode").Text.Trim(), loadedVersion);
             ReadVersion();
-            Label("VersionNote").Text = "已保存 · APK、模块、Rust、更新配置的版本已同步。";
+            Label("VersionNote").Text = "已保存 · APK、模块、Rust 的版本已同步。";
         }
 
         async System.Threading.Tasks.Task Start(bool check)

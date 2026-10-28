@@ -320,18 +320,29 @@ app/build/outputs/apk/release/app-release.apk
 
 ### Windows 可视化构建
 
-双击 `build/QixiaBuilder.exe` 打开「柒夏线程 · 构建中心」。首次生成或修改工具后，在项目根目录运行：
+[下载可视化编译工具 EXE](https://github.com/cinitdev/AppOpt/raw/refs/heads/master/tools/windows_builder/QixiaBuilder.exe) · [查看工具源码](tools/windows_builder/) · [使用说明与依赖](tools/windows_builder/README.md)
+
+标准 Windows 10/11 通常可以直接打开工具，界面只依赖系统自带的 .NET Framework/WPF，无需安装 .NET SDK、Node 或 Python。
+**全新系统能打开界面，不代表已具备项目编译环境。** 编译模块仍需 Git for Windows、Python 3、JDK 17、Android SDK 36 / Build-Tools / NDK，以及 Rust 和四个 Android target；Windows Rust 工具链还需 Visual Studio C++ Build Tools 与 Windows SDK。
+首次构建需联网下载 Gradle、Cargo 依赖及子模块；EXE 不包含这些工具，也不会自动安装它们。完整准备步骤见上文及[工具说明](tools/windows_builder/README.md)。
+
+克隆完整源码后，双击 `tools/windows_builder/QixiaBuilder.exe`，选择项目目录，先点「检查构建环境」，再选择正式版／调试版并开始构建。
+EXE 可以移动到其他位置，但构建时仍需包含 `build_module.sh` 的完整源码目录。
+
+若要从源码重新生成 EXE，在项目根目录运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1
 # 同时验证参数、日志、项目锁和停止进程树
 powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1 -Test
+# 更新仓库内分发的 EXE 与 SHA-256 校验文件
+powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1 -Test -Package
 ```
 
-工具使用 Windows 自带的 .NET Framework，不需要 Node 或额外安装 .NET SDK；编译项目仍需下文所述的 Git Bash、Python、JDK、Android SDK / NDK 和 Rust。EXE 可以移动到其他位置，打开后选择包含 `build_module.sh` 的完整源码目录。
+仅编译工具自身使用 Windows .NET Framework 自带的 C# 编译器；普通构建输出 `build/QixiaBuilder.exe`，加 `-Package` 才更新仓库内的分发文件。
 
 - 支持正式版、调试版、仅模块，以及 Gitee / GitHub 发布和发布预演，直接调用原有脚本。
-- 顶部可编辑版本名和版本编号，点击「保存版本」或开始构建时，统一写入 App、模块、Rust 守护和更新清单，并同步下载链接中的版本标签。重新载入可读取外部编辑；构建期间不能修改版本。
+- 顶部可编辑版本名和版本编号，点击「保存版本」或开始构建时，统一写入 App、模块、Rust 守护；本地已有更新清单时一并同步版本与下载标签，没有清单也能本地构建。重新载入可读取外部编辑；构建期间不能修改版本。
 - 默认更新 Aya 子模块；可取消更新，也可临时指定 JDK / NDK。SDK 优先读取项目 `local.properties`。
 - 实时显示构建日志、当前步骤和耗时；停止或退出会终止本次构建的进程树。同一项目不能同时从两个构建窗口启动，使用工具时也请避免另行运行构建脚本。
 - 日志固定写入 `build/build-gui.log`，下次任务覆盖；可在界面手动导出。界面只保留最近输出，完整内容以导出日志为准。
@@ -481,7 +492,7 @@ BPF 对象需要保留 BTF。当前脚本已经给 BPF 编译保留 `-g`，同�
 - `build/`、`app/build/`、`*.log` 和模块 zip 属于生成产物，不应提交到仓库。
 - Rust `target/`、本机 IDE 配置、`design/` 内的草稿与测试截图也不提交。
 - `modules_update/` 在本地和更新分支单独维护，不随 GitHub `master` 源码提交。已有跟踪文件仍需在暂存时排除，不能仅依赖 `.gitignore`。
-- 主分支保留源码、测试、构建工具及必要资源；APK、模块 ZIP 和编译工具 EXE 由构建生成。
+- 主分支保留源码、测试、构建工具及必要资源；仅额外分发 `tools/windows_builder/QixiaBuilder.exe` 与校验文件，APK、模块 ZIP 和其他构建产物仍不提交。
 
 ## 文档
 

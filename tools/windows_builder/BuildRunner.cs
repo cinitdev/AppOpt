@@ -67,7 +67,9 @@ namespace Qixia.Builder
                         emit(options.CommandPreview());
                         if (options.Action != "check" && options.VersionName != null) {
                             ProjectVersion.SaveLocked(options.Project, options.VersionName, options.VersionCode, options.ExpectedVersion);
-                            emit("- 已同步版本：" + options.VersionName + "（" + options.VersionCode + "）· APK / 模块 / Rust / 更新配置");
+                            emit("- 已同步版本：" + options.VersionName + "（" + options.VersionCode + "）· APK / 模块 / Rust");
+                            emit(File.Exists(Path.Combine(options.Project, "modules_update/QixiaThreads.json"))
+                                ? "- 本地更新清单已同步。" : "- 未附带发布清单，仅进行本地版本同步。");
                         }
                         var info = new ProcessStartInfo(Program.Executable, workerMode) {
                             WorkingDirectory = options.Project, UseShellExecute = false, CreateNoWindow = true,
