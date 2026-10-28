@@ -6,22 +6,26 @@
 
 模块兼容 Magisk / KernelSU / APatch，规则修改可热重载，普通模块更新支持刷入后热生效。
 首次安装及启动策略变化仍需重启，刷入结果会明确说明。
-模块只维护 Rust 守护进程 `QiXiaRs`；异常退出时由看门狗继续拉起 Rust 守护进程。
+线程分配与性能采集由 Rust 守护进程 `QiXiaRs` 负责，前台监听和刷新率控制使用配套 Java 助手；模块看门狗负责服务恢复。
 
 ## 主要功能
 
 - 按包名、线程名配置 CPU affinity / cpuset 规则。
 - `auto` 校准：采样线程负载，生成核心建议与待确认结果，由用户确认后保存规则。
 - 自动分配：平均负载达到 5% 的活跃线程参与分配，按核心能力与争用持续调整。
+- 主进程兜底：自动分配应用可选择兜底核心组，主进程低于 5% 平均负载的线程使用该范围，达标后继续动态分配。
 - FPS 监测：优先使用 eBPF uprobe 捕获 `libgui.so` BLAST 帧合成完成回调。
 - eBPF 不可用时自动降级到 SurfaceFlinger fallback。
-- 历史记录：区分校准记录与自动分配记录，保留活跃线程、FPS、功率、电流、电量、温度、CPU/GPU 使用率及频率等可用数据，支持游标联动、指标展开和批量删除。
-- 自动分配记录默认关闭，开启后仅保存使用超过 3 分钟的会话；规则应用及未开启记录的自动分配应用只保留最近使用摘要，不生成详细历史。
-- 报告分析：FPS 图标出疑似掉帧区间，点击关联附近的线程负载、CPU/GPU 指标和核心事件；报告右上角可选择同应用的另一条校准或自动分配记录，对比完整会话的 FPS、功率与电量。
+- 历史记录：统一展示校准、自动分配与性能记录并标明来源，保留 FPS、功率、电流、电量、温度、CPU/GPU 等可用数据，支持游标联动、指标展开和批量删除；保留七天，不限条数。
+- 性能记录：在应用管理或历史页“开始记录”中开启，进入目标应用显示半透明黄色 FPS 胶囊，点击变红开始记录，再次点击结束，长按关闭该应用的持久开关；短记录也可保存，不校准、不改变线程分配，结束后仅以 Toast 提示。
+- 自动分配记录默认关闭，开启后仅保存使用超过 3 分钟的会话；未主动开启性能记录时，规则应用及未开启自动记录的应用只保留最近使用摘要。
+- 报告分析：FPS 图标出疑似掉帧区间，点击关联附近的线程负载、CPU/GPU 指标和核心事件；报告右上角可选择同应用的另一条记录，对比完整会话的 FPS、功率与电量，未采集的指标不补零。
 - 核心接管诊断：在已开启自动分配的应用管理中打开，核对最近目标、实际允许范围、cpuset 和最近操作结果；关闭历史记录也能使用，不新增运行数据文件。
 - 配套 Android App：蓝白圆角界面，首页、应用、历史、日志和设置；支持启动检查更新、Markdown 更新日志与模块刷入。
+- 运行环境：检查 Root、悬浮窗、使用情况访问、自启动与后台服务；自启动状态无法可靠读取时提示手动确认，检查本身不修改权限。
 - 模块热更新：保留配置和历史，核验新守护与看门狗状态，失败时回退；完成后通过 Toast 提示，关闭应用通知时使用带应用名称的系统文字提示。
 - 可与 Scene 核心分配共存：App 启动或返回前台时，把已安装的配置应用与自动分配应用包名去重同步到 Scene 黑名单。
+- 刷新率管理：应用与游戏统一使用活动、闲置两档，支持每应用规则、锁屏、低电量和低亮度策略；默认关闭，停用时恢复原显示设置。
 - ActivityTaskManager 前台助手：`qixia_foreground_helper.jar` 常驻监听前台任务，并生成
   `package_uid.map` 供 Rust 守护进程做 UID 预过滤。
 - 守护进程看门狗：Rust daemon 异常退出后自动拉起。
@@ -30,6 +34,7 @@
 
 应用管理中开启自动分配后，`config/auto_affinity.conf` 每行保存一个包名，
 关闭自动分配则删除该行。同一应用只保留一条配置，已有线程规则和规则检测暂停，原规则保留。
+启用主进程兜底时写为 `包名,fallback`，复用 `applist.conf` 中的主进程核心范围。
 Rust 持续采样线程负载，依据核心拓扑和联合容量预算接管 cpuset；不锁频、不强制停核，也不将温度作为调度条件。
 校准建议继续使用平均负载 5% 门槛，自动分配历史仍由原有记录开关独立控制。
 
@@ -75,8 +80,23 @@ eBPF 使用完成回调携带的合成时间计算帧率，不使用缓冲区提
 ActivityTaskManager/TaskStackListener 写入 `foreground_task.state`。App 侧在 helper
 不可用时再回退到 UsageStats、cgroup 前台组和 dumpsys 组合判断。
 
+性能胶囊由 APK 的 `:overlay` 独立进程显示，前台助手按已启用的应用配置通知它出现或收起。
+独立进程仍受厂商后台启动策略约束；当前恢复路径在拉起被拒绝且设备提供对应接口时，
+会通过 Root 允许柒夏线程的自启动并重试。运行环境中的自启动检查为只读，无法检测不等于未授权。
+
+刷新率管理位于「设置」，在其中的「应用规则」按应用设置活动与闲置档位。配置保存于 `config/refresh_rate.conf`，
+由独立 `qixia_refresh_helper.jar` 监听触摸、读取前台状态，前台助手不再包含刷新率代码。
+共用模块现有看门狗；关闭时停止输入监听与显示评估，仅保留配置变更监听和低频检查。
+档位来自当前分辨率的屏幕模式，不预设 60／90／120 Hz 上限。按接口能力选择物理模式或显示范围控制，
+兼容模式分别处理通用、小米、vivo 与特定 Flyme 设置；Oplus 新系统补充物理模式解析。
+`strict`、`compatible` 默认 `auto`：Android 15 及更新的天玑默认启用，显式 `0`／`1` 始终优先。
+读不到物理刷新率时仍可提交兼容设置，并显示未验证；厂商、温控与 LTPO 策略仍可能限制实际执行。
+DisplayModes 默认 `-1 -1 -1`（自动匹配），自定义 ID 以空格分隔，按当前分辨率的真实刷新率从高到低对应。
+恢复基线保存在 `config/state/refresh_rate.state`，模块更新时保留，关闭、停用和卸载时用于还原。
+本功能控制屏幕刷新率，与线程分配及 FPS 采集独立。
+
 校准草稿和历史暂存数据位于 App 私有目录，按需创建；历史成功导入数据库后清理对应源文件及空目录。
-历史保留全部活跃线程，不受分配建议的 5% 门槛影响。自动分配操作逐次记录，系统实际运行核心变化
+校准与自动分配历史保留全部活跃线程，不受分配建议的 5% 门槛影响。自动分配操作逐次记录，系统实际运行核心变化
 按采样观察记录，界面区分两种来源。长会话数据分段并压缩，列表按生成时间倒序展示。
 
 ## 目录结构
@@ -88,8 +108,10 @@ native_daemon/fps_monitor/        FPS/eBPF 监测与 Aya 子模块
 native_daemon/history_probe/      Rust 性能指标采集
 native_daemon/kernel_info/        CPU 与内核信息识别
 tools/qixia_foreground_helper/    ActivityTaskManager 前台助手源码
+tools/qixia_refresh_helper/       独立刷新率服务源码
 tools/qixia_pkg_helper/           APK 安装助手源码
 tools/windows_builder/           Windows 可视化编译工具源码
+shared/refresh/                  App 与刷新率服务共用的策略
 magisk_module/                   模块基础文件
 build_module.sh                  Rust / Magisk 模块构建脚本
 FPS_EBPF_INTEGRATION.md          eBPF 集成说明
@@ -398,6 +420,7 @@ Release tag 会自动读取当前模块版本，优先使用 `magisk_module/modu
 - 编译 App 安装辅助工具，并打包到模块的 `config/tools/`。
 - 编译 ActivityTaskManager 前台助手 `qixia_foreground_helper.jar`，并打包到模块的
   `config/tools/`。
+- 编译独立刷新率服务 `qixia_refresh_helper.jar`，共用 Java 服务启动器和模块看门狗。
 - 复制 `magisk_module/` 基础文件。
 - 打包 Magisk 模块 zip。
 
@@ -407,6 +430,7 @@ Release tag 会自动读取当前模块版本，优先使用 `magisk_module/modu
 build/module/                         模块工作目录
 build/module/config/bin/<abi>/QiXiaRs 各 ABI Rust 守护进程
 build/module/config/tools/qixia_foreground_helper.jar
+build/module/config/tools/qixia_refresh_helper.jar
 build/module/config/ebpf/queuebuffer_probe.bpf.o   eBPF 对象
 build/module/config/ebpf/queuebuffer_probe_perf.bpf.o   eBPF PerfEvent 备用对象
 build/QixiaThreads.zip                       可刷入模块包
@@ -443,8 +467,11 @@ BPF 对象需要保留 BTF。当前脚本已经给 BPF 编译保留 `-g`，同�
 2. 在 Magisk / KernelSU / APatch 中刷入模块。
 3. 首次安装按提示重启；普通更新显示热更新成功后无需重启，失败或启动策略变化时按结果提示处理。
 4. 按刷入提示完成配套 App 安装；从 App 内更新时，可在模块刷入完成后单独更新 APK。
+
 5. 在 App 中授予 Root、悬浮窗、使用情况访问等权限。
 6. 进入游戏后可通过悬浮窗查看 FPS，并进行 `auto` 校准；再次点击悬浮窗或退出目标应用前台时，会停止采样并显示校准结果与生成规则。
+
+同版本号的 debug、正式版或重新构建的 APK 也支持覆盖安装：只有已安装 APK 与随附文件内容完全相同时才跳过，安装后再次核对文件内容。已安装版本号更高时仍不自动降级。
 
 ## 源码提交与注意事项
 
