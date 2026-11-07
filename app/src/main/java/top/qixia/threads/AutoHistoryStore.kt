@@ -16,7 +16,8 @@ import top.qixia.threads.db.SessionSummary
 internal object AutoHistoryStore {
     private val ROOT_DIRECTORY: String get() = PrivateCaptureStorage.automatic.absolutePath
     private const val MAX_IMPORTS = 24
-    private const val META_VERSION = 7
+    // v8：摘要里的 threadCount 改为“持续活跃”口径，旧缓存需要重建。
+    private const val META_VERSION = 8
     private const val MAX_MEMBERS = 400
     private const val MAX_REPORT_BYTES = 24L * 1024 * 1024
     private const val WINDOW_BYTES = 16L * 1024 * 1024

@@ -14,6 +14,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import top.qixia.threads.db.QixiaThreadsDbHelper
 import top.qixia.threads.db.ThreadImport
+import top.qixia.threads.compose.HistoryExportText
 
 /** 使用缓存目录下的独立数据库，不访问用户历史数据库。 */
 @RunWith(AndroidJUnit4::class)
@@ -71,5 +72,24 @@ class HistoryRetentionDatabaseTest {
         }
         assertEquals(3, database.getPackagesWithHistory().sumOf { it.sessionCount })
         assertTrue(add("app.0", 7))
+    }
+
+    @Test fun lowAverageThreadsRemainInHistoryDetailsAndExport() {
+        assertTrue(database.insertSessionWithThreadsIfAbsent(
+            "app.low", 10L, 20,
+            listOf(
+                ThreadImport("low-load", 0.1f, 0.3f, "0.1,0.2"),
+                ThreadImport("regular", 2f, 4f, "2,4")
+            )
+        ))
+
+        val summary = database.getSessionSummariesByPackage("app.low").single()
+        val threads = database.getThreadsBySessionId(summary.id, preserveOriginalOrder = true)
+        assertEquals(2, summary.threadCount)
+        assertEquals(listOf("low-load", "regular"), threads.map { it.name })
+
+        val exported = HistoryExportText.session("app.low", "Low load app", summary, threads)
+        assertTrue(exported.contains("名称: low-load"))
+        assertTrue(exported.contains("AVG: 0.1%"))
     }
 }

@@ -94,6 +94,8 @@ impl Capture {
             prune(directory, start_ms)?;
         }
         let mut next = Recording::create_source(directory, &self.recording.package, start_ms, false, self.source)?;
+        // 轮转只换文件，活跃确认口径必须延续到下一个分段。
+        next.policy = self.recording.policy;
         metadata(&mut next, &self.capture_id, usage, self.minimum_ms)?;
         next.device(&self.recording.device_fields)?;
         write_usage(&mut self.recording, usage)?;

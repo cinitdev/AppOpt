@@ -13,6 +13,46 @@ use std::{
 pub(super) const MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub(super) const MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 const MAX_ROWS: u64 = 120_000;
+/// 线程身份上限：已确认的线程与正在观察的候选共用这个额度。
+const MAX_IDENTITIES: usize = 4096;
+
+/// 线程进入历史记录的确认门槛。
+///
+/// 采样是轮换的，线程越多单个线程被采到的间隔越长，因此这里用“它自己被采到的
+/// 次数”做分母（等价于占空比），而不是整段轮数。运行期间只活跃几下的线程
+/// （线程池临时线程、GC、加载解压）不会进历史；长时间反复有负载的线程才写行。
+#[derive(Clone, Copy)]
+pub(super) struct GatePolicy {
+    /// 有负载的采样次数下限（约 3 秒）。
+    pub min_samples: u32,
+    /// 有负载采样占比下限（百分比）。
+    pub min_percent: u32,
+    /// 存在期下限（毫秒）。
+    pub min_span_ms: u64,
+}
+
+/// 生产口径：6 次有负载采样、占比 20%、存在期 30 秒。
+pub(super) const HISTORY_GATE: GatePolicy = GatePolicy {
+    min_samples: 6,
+    min_percent: 20,
+    min_span_ms: 30_000,
+};
+
+/// 测试口径：任何一次有负载采样都立即确认，用于与活跃策略无关的容量/轮转测试。
+#[cfg(test)]
+pub(super) const OPEN_GATE: GatePolicy = GatePolicy {
+    min_samples: 1,
+    min_percent: 0,
+    min_span_ms: 0,
+};
+
+#[derive(Clone, Copy)]
+struct ThreadGate {
+    observed: u32,
+    positive: u32,
+    /// 第一次观测到有负载的时刻；存在期从这里开始算。
+    first_ms: Option<u64>,
+}
 // 与 CoreTimelineParser.MAX_EVENTS 一致，确保每个有效分段都能完整读取。
 const MAX_CORE_EVENTS: u64 = 20_000;
 const STAGING_BYTES: u64 = 64 * 1024 * 1024;
@@ -55,7 +95,11 @@ pub(super) struct Recording {
     bytes: u64,
     rows: u64,
     samples: u64,
+    /// 已确认持续活跃的身份；确认后每轮都写行（含 0%），保证曲线连续。
     active: BTreeSet<(i32, i32, u64)>,
+    /// 尚未确认的候选身份及其活跃证据。
+    gates: BTreeMap<(i32, i32, u64), ThreadGate>,
+    policy: GatePolicy,
     device_fields: Vec<(String, String)>,
     observed: BTreeMap<(i32, i32, u64), (String, String, Option<u64>, Option<u32>)>,
     core_dropped: u64,
@@ -128,6 +172,8 @@ impl Recording {
             rows: 0,
             samples: 0,
             active: BTreeSet::new(),
+            gates: BTreeMap::new(),
+            policy: HISTORY_GATE,
             device_fields: Vec::new(),
             observed: BTreeMap::new(),
             core_dropped: 0,
@@ -147,6 +193,8 @@ impl Recording {
     #[cfg(test)]
     pub fn rotate(&mut self, directory: &Path, start_ms: u64) -> io::Result<()> {
         let mut next = Recording::new(directory, &self.package, start_ms)?;
+        // 轮转只换文件，不重置活跃确认口径。
+        next.policy = self.policy;
         next.device(&self.device_fields)?;
         let old = std::mem::replace(self, next);
         if let Err(error) = old.finish(start_ms) {
@@ -242,26 +290,46 @@ impl Recording {
             return Ok(());
         }
         self.samples += 1;
-        for thread in threads.iter().take(4096) {
-            if !include_thread(thread, &mut self.active) {
+        for thread in threads.iter().take(MAX_IDENTITIES) {
+            if !self.confirm_thread(thread, timestamp_ms) {
                 continue;
             }
             self.row(timestamp_ms, &thread_row(timestamp_ms, thread))?;
         }
         Ok(())
     }
+    /// 记录一次采样证据，并在达到门槛后把线程加入持续活跃集合。
+    fn confirm_thread(&mut self, thread: &ThreadSample, timestamp_ms: u64) -> bool {
+        confirm_thread(
+            &mut self.gates,
+            &mut self.active,
+            thread,
+            timestamp_ms,
+            self.policy,
+        )
+    }
     fn threads_fit(&self, timestamp_ms: u64, threads: &[ThreadSample]) -> bool {
         let mut active = self.active.clone();
+        let mut gates = self.gates.clone();
         let mut bytes = self.bytes;
         let mut rows = self.rows;
-        for thread in threads.iter().take(4096) {
-            if valid_thread(thread) && thread.percent > 0.0
-                && !active.contains(&(thread.pid, thread.tid, thread.start))
-                && active.len() >= 4096
+        for thread in threads.iter().take(MAX_IDENTITIES) {
+            let id = (thread.pid, thread.tid, thread.start);
+            if valid_thread(thread)
+                && thread.percent > 0.0
+                && !active.contains(&id)
+                && !gates.contains_key(&id)
+                && gates.len() + active.len() >= MAX_IDENTITIES
             {
                 return false;
             }
-            if include_thread(thread, &mut active) {
+            if confirm_thread(
+                &mut gates,
+                &mut active,
+                thread,
+                timestamp_ms,
+                self.policy,
+            ) {
                 bytes = bytes.saturating_add(thread_row(timestamp_ms, thread).len() as u64);
                 rows = rows.saturating_add(1);
                 if bytes > MAX_BYTES - 1024 || rows > MAX_ROWS {
@@ -455,15 +523,50 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn include_thread(thread: &ThreadSample, active: &mut BTreeSet<(i32, i32, u64)>) -> bool {
+/// 采样证据累积与确认。
+///
+/// 线程必须同时满足样本数、占比与存在期三个条件才会被写进历史；确认前
+/// 不写任何行，确认后由调用方每轮写行（含 0%）以保持曲线连续。
+fn confirm_thread(
+    gates: &mut BTreeMap<(i32, i32, u64), ThreadGate>,
+    active: &mut BTreeSet<(i32, i32, u64)>,
+    thread: &ThreadSample,
+    timestamp_ms: u64,
+    policy: GatePolicy,
+) -> bool {
     if !valid_thread(thread) {
         return false;
     }
     let id = (thread.pid, thread.tid, thread.start);
-    if thread.percent > 0.0 && active.len() < 4096 {
-        active.insert(id);
+    if active.contains(&id) {
+        return true;
     }
-    active.contains(&id)
+    // 只有新身份才受额度限制：已在候选表里的线程必须能继续累积证据。
+    if !gates.contains_key(&id) && gates.len() + active.len() >= MAX_IDENTITIES {
+        return false;
+    }
+    let gate = gates.entry(id).or_insert(ThreadGate {
+        observed: 0,
+        positive: 0,
+        first_ms: None,
+    });
+    gate.observed = gate.observed.saturating_add(1);
+    if thread.percent > 0.0 {
+        gate.positive = gate.positive.saturating_add(1);
+        gate.first_ms.get_or_insert(timestamp_ms);
+    }
+    // 存在期从第一次有负载开始算，不能因记录刚启动而缩短门槛。
+    let span_ok = gate
+        .first_ms
+        .is_some_and(|first_ms| timestamp_ms.saturating_sub(first_ms) >= policy.min_span_ms);
+    let share_ok =
+        gate.positive.saturating_mul(100) >= policy.min_percent.saturating_mul(gate.observed);
+    if gate.positive >= policy.min_samples && share_ok && span_ok {
+        gates.remove(&id);
+        active.insert(id);
+        return true;
+    }
+    false
 }
 
 fn valid_thread(thread: &ThreadSample) -> bool {
@@ -664,29 +767,60 @@ mod tests {
         dir
     }
     #[test]
-    fn inactive_threads_are_not_saved_but_low_load_and_later_zero_are() {
-        let dir = directory("active");
-        let mut run = Recording::new(&dir, "com.game", 1000).unwrap();
-        let mut t = ThreadSample {
+    fn history_keeps_sustained_threads_and_drops_short_activity() {
+        let dir = directory("gate");
+        let mut run = Recording::new(&dir, "com.game", 1_000).unwrap();
+        let steady = ThreadSample {
             pid: 1,
             tid: 2,
             start: 3,
             name: "worker\t汉".into(),
+            percent: 12.0,
+        };
+        let early_burst = ThreadSample {
+            pid: 1,
+            tid: 4,
+            start: 5,
+            name: "early burst".into(),
             percent: 0.0,
         };
-        run.threads(1100, &[t.clone()]).unwrap();
-        t.percent = 0.1;
-        run.threads(2200, &[t.clone()]).unwrap();
-        t.percent = 0.0;
-        run.threads(3300, &[t]).unwrap();
+        let middle_burst = ThreadSample {
+            pid: 1,
+            tid: 6,
+            start: 7,
+            name: "middle burst".into(),
+            percent: 0.0,
+        };
+        // 40 秒记录：开局和中段各有一次 3 秒突发，都不能越过固定 30 秒门槛。
+        for round in 0..80u64 {
+            let early_percent = if (0..6).contains(&round) { 40.0 } else { 0.0 };
+            let middle_percent = if (40..46).contains(&round) { 40.0 } else { 0.0 };
+            run.threads(
+                1_000 + round * 500,
+                &[
+                    steady.clone(),
+                    ThreadSample {
+                        percent: early_percent,
+                        ..early_burst.clone()
+                    },
+                    ThreadSample {
+                        percent: middle_percent,
+                        ..middle_burst.clone()
+                    },
+                ],
+            )
+            .unwrap();
+        }
         let path = run.path.with_extension("log.gz");
-        assert!(!path.exists());
-        run.finish(4000).unwrap();
+        run.finish(41_000).unwrap();
         let text = read_text(&path).unwrap();
-        assert_eq!(text.lines().filter(|l| l.starts_with("T\t")).count(), 2);
-        assert!(text.contains("0.1000"));
-        assert!(text.contains("thread_count\t1\n"));
         assert!(text.contains(&hex("worker\t汉".as_bytes())));
+        assert!(!text.contains(&hex("early burst".as_bytes())));
+        assert!(!text.contains(&hex("middle burst".as_bytes())));
+        // 固定 30 秒存在期满足后才开始写行，之后每轮都保留（含 0%）。
+        assert_eq!(text.lines().filter(|l| l.starts_with("T\t")).count(), 20);
+        assert!(text.contains("\t12.0000\n"));
+        assert!(text.contains("thread_count\t1\n"));
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

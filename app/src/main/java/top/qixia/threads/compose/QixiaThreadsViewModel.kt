@@ -40,7 +40,6 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
     private var dashboardJob: Job? = null
     private var autoStartJob: Job? = null
     private var dashboardRefreshPending = false
-    private var catalogJob: Job? = null
     private var historyLoaded = false
     private var historyImportJob: Job? = null
     private var historyListJob: Job? = null
@@ -59,12 +58,39 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
     private var homeGeneration = 0L
     private var uiVisible = false
     private var visibleDestination = MainDestination.HOME
+    // 共享目录最近一次已合并性能记录标记的快照，避免刷新标记变化时重复查 Root。
+    private var publishedCatalogApps: List<AppItemModel>? = null
+    private var publishedPerformanceFlags: Set<String> = emptySet()
     val calibrationReviews = CalibrationReviewController(application, viewModelScope) { refreshDashboard() }
-    val refreshRates = RefreshRateSettingsController(application, viewModelScope)
+    /** 应用 Tab 与刷新率规则共享的桌面应用目录，只查询一次。 */
+    private val appCatalog = AppCatalogStore(application, viewModelScope)
+    val refreshRates = RefreshRateSettingsController(application, viewModelScope, appCatalog)
 
     init {
         viewModelScope.launch {
             moduleUpdateChecks.state.collect { updates -> _state.update { it.copy(updates = updates) } }
+        }
+        viewModelScope.launch {
+            appCatalog.state.collect { catalog ->
+                val apps = catalog.apps
+                // 目录内容没变时（例如 refreshing 标记变化）不重复执行 Root 查询。
+                if (apps !== publishedCatalogApps) {
+                    val performance = if (apps.isEmpty()) emptySet() else runCatching {
+                        withContext(Dispatchers.IO) { DaemonBridge.performanceRecordingApps() }
+                    }.getOrDefault(emptySet())
+                    publishedCatalogApps = apps
+                    publishedPerformanceFlags = performance
+                }
+                val performance = publishedPerformanceFlags
+                _state.update { current ->
+                    current.copy(applications = current.applications.copy(
+                        addable = apps.map {
+                            it.copy(performanceRecordingEnabled = it.packageName in performance)
+                        },
+                        catalogLoading = !catalog.loaded
+                    ))
+                }
+            }
         }
         // 隔离的设置回归测试可跳过无关的历史导入。
         if (autoRefreshOnInit) refreshDashboard()
@@ -139,7 +165,8 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
         }
         calibrationReviews.refresh()
         loadHome()
-        if (visibleDestination == MainDestination.APPLICATIONS) loadApplicationCatalog()
+        // 应用 Tab 的刷新同时刷新共享目录，刷新率页会自动跟随同一份数据。
+        if (visibleDestination == MainDestination.APPLICATIONS) appCatalog.refresh()
         _state.update {
             it.copy(
                 refreshing = true,
@@ -244,16 +271,8 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
     }
 
     fun loadApplicationCatalog() {
-        if (catalogJob?.isActive == true) return
-        _state.update { it.copy(applications = it.applications.copy(catalogLoading = true)) }
-        catalogJob = viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { runCatching(repository::loadInstalledApps) }
-            _state.update { current -> current.copy(
-                applications = current.applications.copy(catalogLoading = false,
-                    addable = result.getOrDefault(current.applications.addable)),
-                message = result.exceptionOrNull()?.let { "应用目录读取失败，请刷新重试" } ?: current.message
-            ) }
-        }
+        // 应用目录由共享缓存提供：有快照先展示，过期才后台刷新，进入页面不再等待查询。
+        appCatalog.ensureFresh()
     }
 
     private fun loadHome() {

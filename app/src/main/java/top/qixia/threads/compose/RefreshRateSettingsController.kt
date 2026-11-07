@@ -15,20 +15,49 @@ data class RefreshRateUiState(
     val loading: Boolean = true, val saving: Boolean = false, val available: Boolean = false,
     val policy: RefreshPolicy = RefreshPolicy.parse(""), val rates: List<Float> = emptyList(),
     val runtime: Map<String, String> = emptyMap(), val apps: List<RefreshApp> = emptyList(),
+    val appsRefreshing: Boolean = false,
     val message: String? = null
 )
 
-/** 进入页面才读取，修改单项原子保存；不增加首页启动工作量。 */
-class RefreshRateSettingsController(private val app: Application, private val scope: CoroutineScope) {
+/** 进入页面才读取配置；应用列表由 AppCatalogStore 提供，不重复查询桌面入口。 */
+class RefreshRateSettingsController(
+    private val app: Application,
+    private val scope: CoroutineScope,
+    private val catalog: AppCatalogStore
+) {
     private val mutable = MutableStateFlow(RefreshRateUiState())
     val state = mutable.asStateFlow()
     private var job: Job? = null
+
+    init {
+        scope.launch {
+            catalog.state.collect { snapshot ->
+                mutable.update { current ->
+                    current.copy(
+                        apps = snapshot.apps.map { RefreshApp(it.packageName, it.label) },
+                        appsRefreshing = snapshot.refreshing
+                    )
+                }
+            }
+        }
+    }
+
     fun load() {
         if (mutable.value.saving || job?.isActive == true) return
         job = scope.launch {
+            // 应用列表来自缓存；只在过期时后台刷新，不阻塞配置读取。
+            catalog.ensureFresh()
             mutable.update { it.copy(loading = true, message = null) }
-            mutable.value = withContext(Dispatchers.IO) { read() }
+            val next = withContext(Dispatchers.IO) { read() }
+            mutable.update { current ->
+                next.copy(apps = current.apps, appsRefreshing = current.appsRefreshing)
+            }
         }
+    }
+
+    /** 应用规则列表下拉刷新：只刷新共享目录，不改变当前配置。 */
+    fun refreshApps() {
+        catalog.refresh()
     }
     private fun readRates(): List<Float> = runCatching {
         val display = app.getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
@@ -61,11 +90,8 @@ class RefreshRateSettingsController(private val app: Application, private val sc
         """.trimIndent(), 5)
         val parts = result.output.split("__QIXIA_REFRESH_STATE__", limit = 2)
         val runtime = properties(parts.getOrNull(1).orEmpty())
-        val apps = runCatching {
-            launchableAppCatalog(app).map { RefreshApp(it.packageName, it.label) }
-        }.getOrDefault(emptyList())
         return RefreshRateUiState(false, available = result.success && runtime["version"] == "1",
-            policy = RefreshPolicy.parse(parts.firstOrNull().orEmpty()), rates = withRuntimeRates(rates,runtime), runtime = runtime, apps = apps,
+            policy = RefreshPolicy.parse(parts.firstOrNull().orEmpty()), rates = withRuntimeRates(rates,runtime), runtime = runtime,
             message = if (!result.success) "无法读取刷新率配置，请检查 Root 授权。" else if (runtime["version"] != "1") "刷新率服务尚未就绪，请确认新版模块已启动。" else null)
     }
     fun change(key: String, value: String?) {

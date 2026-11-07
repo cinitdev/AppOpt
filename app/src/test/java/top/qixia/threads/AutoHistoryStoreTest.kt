@@ -122,7 +122,9 @@ class AutoHistoryStoreTest {
                 "QIXIA_AUTO_HISTORY\t1\nsource\tauto\npackage\tapp.one\nstart_ms\t$start\n" +
                     "minimum_usage_ms\t180000\ncapture_id\tauto_1000_12_0\nforeground_ms\t900000\n" +
                     (1..3500).joinToString("\n") { tid ->
-                        "T\t${start + 1000}\t12\t$tid\t${index + 1}\t776f726b6572\t0.5"
+                        (0..5).joinToString("\n") { sample ->
+                            "T\t${start + 1000 + sample * 6000}\t12\t$tid\t${index + 1}\t776f726b6572\t0.5"
+                        }
                     } + "\nend_ms\t${start + 190000}\nduration_ms\t190000\n")
         }
         val visit = AutoHistoryStore.entries(temp.root).single()
@@ -136,17 +138,22 @@ class AutoHistoryStoreTest {
     }
     private fun run(name: String, end: Long = 11_000, pkg: String = "app.one"): File {
         val folder = File(temp.root, "auto_history").apply { mkdirs() }
+        // 均匀生成 6 个有负载采样；短记录是否满足持续门槛由具体用例决定。
+        val step = ((end - 2500) / 5).coerceAtLeast(1)
+        val threads = (0..5).joinToString("\n") { index ->
+            "T\t${2000 + index * step}\t1\t2\t3\t776f726b6572\t0.1"
+        }
         return File(folder, name).apply { writeText("QIXIA_AUTO_HISTORY\t1\nsource\tauto\npackage\t$pkg\n" +
-            "start_ms\t1000\nT\t2000\t1\t2\t3\t776f726b6572\t0.1\nF\t2000\t60\t16.7\n" +
+            "start_ms\t1000\n$threads\nF\t2000\t60\t16.7\n" +
             "end_ms\t$end\nduration_ms\t${end - 1000}\nsamples\t1\n") }
     }
 
     @Test fun archivesHaveStableIdsAndListSummariesWithoutDroppingSameSecondRuns() {
-        run("auto_1000_12_0.log", 10_100)
-        run("auto_1001_12_0.log", 10_900)
+        run("auto_1000_12_0.log", 41_100)
+        run("auto_1001_12_0.log", 41_900)
         val entries = AutoHistoryStore.entries(temp.root)
         assertEquals(2, entries.size)
-        assertEquals(10_900L, entries.first().session.endedAtMs)
+        assertEquals(41_900L, entries.first().session.endedAtMs)
         assertNotEquals(entries.first().session.id, entries.last().session.id)
         assertTrue(entries.all { it.fps!!.points.size in 1..80 && it.fps!!.average == 60f })
         assertEquals(2, File(temp.root, "auto_history").listFiles()!!.count { it.extension == "meta" })
@@ -164,16 +171,16 @@ class AutoHistoryStoreTest {
     }
 
     @Test fun packageDeletionWatermarkRetainsRunsCompletedLaterWithinSameSecondAndOtherPackages() {
-        run("auto_1000_12_0.log", 10_100)
-        run("auto_1001_12_0.log", 10_900)
-        run("auto_1002_12_0.log", 10_100, "app.two")
-        // 在 10.200 秒删除不能误删 10.900 秒才完成的记录。
+        run("auto_1000_12_0.log", 41_100)
+        run("auto_1001_12_0.log", 41_900)
+        run("auto_1002_12_0.log", 41_100, "app.two")
+        // 在 41.200 秒删除不能误删 41.900 秒才完成的记录。
         val key = MessageDigest.getInstance("SHA-256").digest("app.one".toByteArray())
             .joinToString("") { "%02x".format(it) }
-        File(File(temp.root, "auto_history"), "package_$key.deleted").writeText("10200")
+        File(File(temp.root, "auto_history"), "package_$key.deleted").writeText("41200")
         val entries = AutoHistoryStore.entries(temp.root)
         assertEquals(2, entries.size)
-        assertEquals(10_900L, entries.single { it.pkg == "app.one" }.session.endedAtMs)
+        assertEquals(41_900L, entries.single { it.pkg == "app.one" }.session.endedAtMs)
         assertEquals("app.two", entries.last().pkg)
         assertNull(AutoHistoryStore.record(temp.root, AutoHistoryRecord.sessionId("auto_1000_12_0.log")))
     }
@@ -216,10 +223,15 @@ class AutoHistoryStoreTest {
 
     private fun segment(capture: String, name: String, start: Long, end: Long, foreground: Long): File {
         val folder = File(temp.root, "auto_history").apply { mkdirs() }
+        // 每段内均匀铺 6 个有负载采样，合起来满足“持续活跃”的样本数与存在期。
+        val step = ((end - start - 2000) / 5).coerceAtLeast(1)
+        val threads = (0..5).joinToString("\n") { index ->
+            "T\t${start + 1 + index * step}\t1\t2\t3\t776f726b6572\t12.0"
+        }
         return File(folder, name).apply {
             writeText("QIXIA_AUTO_HISTORY\t1\nsource\tauto\npackage\tapp.one\nstart_ms\t$start\n" +
                 "core_events\t1\nminimum_usage_ms\t180000\ncapture_id\t$capture\nforeground_ms\t$foreground\n" +
-                "T\t${start + 1}\t1\t2\t3\t776f726b6572\t12.0\nF\t${start + 1}\t60\t16.7\n" +
+                "$threads\nF\t${start + 1}\t60\t16.7\n" +
                 "E\t${start + 1}\t1\t2\t3\t776f726b6572\tassign\tqixia\t0,1\t1\t1\t12.0\tdemand\n" +
                 "end_ms\t$end\nduration_ms\t${end - start}\nsamples\t1\nforeground_ms\t$foreground\n")
         }

@@ -12,11 +12,37 @@ import top.qixia.threads.db.SessionSummary
 class AutoHistoryRecordTest {
     @get:Rule val temp = TemporaryFolder()
     private fun hex(name: String) = name.toByteArray().joinToString("") { "%02x".format(it) }
+    // 这些用例只验证解析本身（曲线、改名、身份合并、FPS），不验证活跃口径，
+    // 因此显式使用“一次采样即算持续活跃”的宽松策略。
+    private val lenient = SustainedThreadPolicy(minSamples = 1, minPercent = 0, minSpanMs = 0)
+    private fun readRecord(file: File) = requireNotNull(AutoHistoryRecord.read(file, policy = lenient))
+    private fun readRecord(files: List<File>, name: String = files.firstOrNull()?.name.orEmpty()) =
+        requireNotNull(AutoHistoryRecord.read(files, name, policy = lenient))
+    private fun summaryOf(file: File) = AutoHistoryRecord.summary(file, policy = lenient)
+    private fun summaryOf(files: List<File>, name: String) = AutoHistoryRecord.summary(files, name, policy = lenient)
     private fun write(body: String, name: String = "auto_1000_12.log", duration: Long = 10_000): File =
         File(temp.root, name).also { it.writeText("QIXIA_AUTO_HISTORY\t1\npackage\tapp.one\nstart_ms\t1000\nsource\tauto\n" +
             body.trimIndent() + "\nend_ms\t${1000 + duration}\nduration_ms\t$duration\nsamples\t5\n") }
 
-    @Test fun keepsAllObservedActiveThreadsAndDoesNotApplyAllocationFivePercentThreshold() {
+    @Test fun defaultPolicyDropsShortBurstsAndKeepsSustainedThreads() {
+        fun rows(pid: Int, tid: Int, start: Long, name: String, first: Long, step: Long, percent: Int) =
+            (0..5).joinToString("\n") { index ->
+                "T\t${first + index * step}\t$pid\t$tid\t$start\t${hex(name)}\t$percent"
+            }
+        val file = write(
+            rows(12, 13, 100, "worker", 2000, 6000, 8) + "\n" +
+                rows(12, 15, 102, "burst", 40_000, 500, 40),
+            duration = 120_000,
+        )
+        val record = AutoHistoryRecord.read(file)!!
+        // worker 有 6 个采样、跨度 30 秒；burst 只有 2.5 秒的突发。
+        assertEquals(listOf("worker"), record.threads.map { it.name })
+        assertEquals(1, record.entry.session.threadCount)
+        // 身份总数仍然保留，用于容量与缓存校验。
+        assertEquals(2, record.entry.identityCount)
+    }
+
+    @Test fun lenientParserPolicyKeepsEveryObservedActiveThreadRegardlessOfTheAllocationThreshold() {
         val file = write("""
             T	2000	12	13	100	${hex("worker")}	0.5
             T	4000	12	13	100	${hex("worker")}	0
@@ -25,8 +51,8 @@ class AutoHistoryRecordTest {
             T	2000	12	15	102	${hex("render")}	50
             T	4000	12	15	102	${hex("render")}	70
         """)
-        val record = AutoHistoryRecord.read(file)!!
-        assertEquals(record.entry, AutoHistoryRecord.summary(file))
+        val record = readRecord(file)
+        assertEquals(record.entry, summaryOf(file))
         assertEquals(listOf("render", "worker"), record.threads.map { it.name })
         assertEquals(.25f, record.threads.last().avg, .001f)
         assertEquals(HistorySource.AUTO_ALLOCATION, record.entry.session.source)
@@ -46,7 +72,7 @@ class AutoHistoryRecordTest {
 
     @Test fun realRunDurationIsIndependentOfCalibrationRoundsAndLegacyRowsStayCompatible() {
         assertEquals(2500L, SessionSummary(1, 100, 5, 2).durationMs)
-        val record = AutoHistoryRecord.read(write("F\t2000\t60\t16.7", duration = 12_345))!!
+        val record = readRecord(write("F\t2000\t60\t16.7", duration = 12_345))
         assertEquals(12_345L, record.entry.session.durationMs)
         assertEquals(60f, record.fps!!.average, .001f)
         assertEquals(16.7f, record.metrics!!.series.getValue("frame_max_ms").average, .001f)
@@ -56,7 +82,7 @@ class AutoHistoryRecordTest {
         assertTrue(AutoHistoryRecord.sessionId("auto_1000_12.log") < 0)
         assertEquals(AutoHistoryRecord.sessionId("auto_1000_12.log"), AutoHistoryRecord.sessionId("auto_1000_12.log"))
         assertNotEquals(AutoHistoryRecord.sessionId("auto_1000_12.log"), AutoHistoryRecord.sessionId("auto_1001_12.log"))
-        val record = AutoHistoryRecord.read(write("""
+        val record = readRecord(write("""
             T	2000	12	13	100	${hex("worker")}	1
             T	4000	12	13	200	${hex("worker")}	20
         """))!!
@@ -65,12 +91,12 @@ class AutoHistoryRecordTest {
     }
 
     @Test fun preservesNativeUnitsDropsChargingPowerAndDoesNotFillMissingMetricsWithZero() {
-        val record = AutoHistoryRecord.read(write("""
+        val record = readRecord(write("""
             M	2000	0	power_w=4	battery_ma=1000	battery_pct=70	cpu_core.7=60	cpu_mhz.4_5_6=2400
             M	4000	1	power_w=6	battery_ma=1500	battery_pct=70	cpu_core.7=40
             M	6000	-1	power_w=8	battery_ma=2000	cpu_core.7=20
             M	8000	0	power_w=5	battery_ma=1200	battery_pct=69
-        """))!!
+        """))
         val metrics = record.metrics!!
         assertEquals(4.5f, metrics.series.getValue("power_w").average, .001f)
         assertEquals(1100f, metrics.series.getValue("battery_ma").average, .001f)
@@ -82,7 +108,7 @@ class AutoHistoryRecordTest {
     }
 
     @Test fun threadCurvesKeepTimelineGapsWithoutTreatingUnobservedThreadsAsIdle() {
-        val record = AutoHistoryRecord.read(write("""
+        val record = readRecord(write("""
             T	2000	12	13	100	${hex("轻线程")}	1
             T	9000	12	13	100	${hex("轻线程")}	3
         """))!!
@@ -95,7 +121,7 @@ class AutoHistoryRecordTest {
     }
 
     @Test fun acceptsSmallNativeTimingOvershootWithoutLosingTheWholeRun() {
-        val record = AutoHistoryRecord.read(write("T\t2000\t12\t13\t100\t${hex("worker")}\t101"))!!
+        val record = readRecord(write("T\t2000\t12\t13\t100\t${hex("worker")}\t101"))
         assertEquals(100f, record.threads.single().avg, .001f)
     }
 
@@ -103,7 +129,7 @@ class AutoHistoryRecordTest {
         val text = (1..10_000).filter { it !in 7000..7010 }.joinToString("\n") { sample ->
             "T\t${1000 + sample * 2000L}\t12\t13\t100\t${hex("worker")}\t${if (sample == 9500) 99 else 1}"
         }
-        val record = AutoHistoryRecord.read(write(text, duration = 20_000_000))!!
+        val record = readRecord(write(text, duration = 20_000_000))
         val points = HistoryPresentation.curve(record.threads.single().series)
         assertTrue(points.size <= 240)
         assertEquals(99f, points.maxOf { it.value }, .001f)
@@ -122,20 +148,20 @@ class AutoHistoryRecordTest {
     }
 
     @Test fun affinityChangesRemainIndependentFromThreadMetricsAndCanBeExported() {
-        val record = AutoHistoryRecord.read(write("A\t2000\t12\t13\t100\t4-6\nA\t4000\t12\t13\t100\trestore"))!!
+        val record = readRecord(write("A\t2000\t12\t13\t100\t4-6\nA\t4000\t12\t13\t100\trestore"))
         assertEquals(listOf("4-6", "restore"), record.affinityChanges.map { it.cpus })
         assertEquals(100L, record.affinityChanges.first().startTicks)
     }
 
     @Test fun fpsMeasurementGapsRemainMissingInsteadOfZeroOrConnectedLines() {
-        val record = AutoHistoryRecord.read(write("F\t2000\t60\t16.7\nF\t9000\t58\t18.0"))!!
+        val record = readRecord(write("F\t2000\t60\t16.7\nF\t9000\t58\t18.0"))
         assertEquals(59f, record.fps!!.average, .001f)
         assertEquals(2, record.fps!!.samples)
         assertTrue(record.fps!!.points.last().breakBefore)
     }
 
     @Test fun newCapturesMustStrictlyExceedThreeMinutesButLegacyShortRunsStayReadable() {
-        assertNotNull(AutoHistoryRecord.read(write("F\t2000\t60\t16.7")))
+        assertNotNull(readRecord(write("F\t2000\t60\t16.7")))
         for (usage in listOf(179_999L, 180_000L, 180_001L)) {
             val file = write("minimum_usage_ms\t180000\nforeground_ms\t0\nF\t2000\t60\t16.7")
             file.appendText("foreground_ms\t$usage\n")
@@ -148,7 +174,7 @@ class AutoHistoryRecordTest {
             (1..1500).joinToString("\n") { "F\t${1000 + it}\t60\t16.7" }, duration = 10_000)
         file.appendText("foreground_ms\t180001\n")
         assertTrue(file.length() > 16_384)
-        val record = AutoHistoryRecord.read(file)!!
+        val record = readRecord(file)
         assertEquals(10_000L, record.entry.session.durationMs)
         assertEquals(1500, record.fps!!.samples)
     }
@@ -172,8 +198,8 @@ class AutoHistoryRecordTest {
         val tail = segment("auto_181001_12_0.log", 181001, 182001, 181001,
             "T\t181200\t12\t13\t100\t${hex("worker")}\t90\nT\t181800\t12\t13\t100\t${hex("worker")}\t90\n" +
                 "F\t181200\t60\t16\nF\t181800\t120\t8\nM\t181200\t0\tpower_w=9\nM\t181800\t0\tpower_w=9")
-        val record = AutoHistoryRecord.read(listOf(tail, first), first.name)!!
-        assertEquals(record.entry, AutoHistoryRecord.summary(listOf(tail, first), first.name))
+        val record = readRecord(listOf(tail, first), first.name)
+        assertEquals(record.entry, summaryOf(listOf(tail, first), first.name))
         assertEquals(181001L, record.entry.session.durationMs)
         assertEquals(1000L, record.entry.session.startedAtMs)
         assertEquals(182001L, record.entry.session.endedAtMs)
@@ -193,7 +219,7 @@ class AutoHistoryRecordTest {
                     "T\t${start + 1000}\t12\t$tid\t${index + 1}\t776f726b6572\t0.5"
                 } + "\nT\t${start + 2000}\t12\t1\t${index + 1}\t776f726b6572\t0")
         }
-        val summary = AutoHistoryRecord.summary(files, files.first().name)!!
+        val summary = AutoHistoryRecord.summary(files, files.first().name, policy = lenient)!!
         assertEquals(10500, summary.session.threadCount)
         assertEquals(10500, summary.identityCount)
         assertEquals(3, summary.memberFileNames.size)
@@ -203,7 +229,7 @@ class AutoHistoryRecordTest {
         val file = write("T\t2000\t12\t13\t100\t${hex("zygote")}\t10\n" +
             "T\t4000\t12\t13\t100\t${hex("RenderThread")}\t30\n" +
             "T\t6000\t12\t13\t100\t20\t20\nA\t7000\t12\t13\t100\t5")
-        val record = AutoHistoryRecord.read(file)!!
+        val record = readRecord(file)
         assertEquals("RenderThread", record.threads.single().name)
         assertEquals(20f, record.threads.single().avg, .001f)
         assertEquals(30f, record.threads.single().max, .001f)
@@ -213,8 +239,8 @@ class AutoHistoryRecordTest {
     @Test fun anEarlyPublishedSegmentUsesItsActualTimeRangeEvenWithWholeCaptureUsage() {
         val first = segment("auto_1000_12_0.log", 1000, 61000, 180001, "F\t2000\t60\t16")
         assertEquals(60_000L, AutoHistoryRecord.read(first)!!.entry.session.durationMs)
-        assertEquals(60_000L, AutoHistoryRecord.read(listOf(first))!!.entry.session.durationMs)
-        assertEquals(180_001L, AutoHistoryRecord.read(listOf(first))!!.entry.foregroundMs)
+        assertEquals(60_000L, readRecord(listOf(first)).entry.session.durationMs)
+        assertEquals(180_001L, readRecord(listOf(first)).entry.foregroundMs)
     }
 
     @Test fun groupedEventsKeepThePerSegmentLimitWithoutDroppingEventsAfterTwentyThousand() {
@@ -222,7 +248,7 @@ class AutoHistoryRecordTest {
         val first = segment("auto_1000_12_0.log", 1000, 181001, 180001,
             (1..20_000).joinToString("\n") { event(1000L + it) })
         val tail = segment("auto_181001_12_0.log", 181001, 182001, 181001, event(181500))
-        val report = AutoHistoryRecord.read(listOf(first, tail), first.name)!!.coreTimeline
+        val report = readRecord(listOf(first, tail), first.name).coreTimeline
         assertEquals(20_001, report.events.size)
         assertEquals(181500L, report.events.last().timestampMs)
         assertEquals(0L, report.droppedEvents)
@@ -235,7 +261,7 @@ class AutoHistoryRecordTest {
         val other = segment("auto_181001_12_0.log", 181001, 182001, 181001,
             "F\t181500\t60\t16", capture = "auto_181001_12_0")
         assertNull(AutoHistoryRecord.read(listOf(first, other), first.name))
-        assertNull(AutoHistoryRecord.summary(listOf(first, other), first.name))
+        assertNull(summaryOf(listOf(first, other), first.name))
         val legacy = write("F\t2000\t60\t16")
         assertNull(AutoHistoryRecord.read(listOf(first, legacy), first.name))
         assertNull(AutoHistoryRecord.read(emptyList()))
@@ -247,13 +273,13 @@ class AutoHistoryRecordTest {
                 "T\t${1000 + index * 10}\t12\t13\t${index / 50}\t${hex("worker")}\t0.5\n" +
                 "T\t${1000 + index * 10}\t12\t14\t1\t${hex("idle")}\t0"
         })
-        val full = AutoHistoryRecord.read(file)!!
+        val full = readRecord(file)
         assertEquals(4, full.entry.session.threadCount)
         assertNotNull(full.entry.fps!!.low5)
-        assertEquals(full.entry, AutoHistoryRecord.summary(file))
+        assertEquals(full.entry, summaryOf(file))
         val original = file.readText()
         file.writeText(original.replace("F\t1010\t31", "F\t1010\tNaN"))
-        assertNull(AutoHistoryRecord.summary(file))
+        assertNull(summaryOf(file))
         assertNull(AutoHistoryRecord.read(file))
     }
 }

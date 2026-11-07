@@ -18,7 +18,9 @@ class CoreTimelineTest {
         val file = File(temp.root, "auto_1000_12.log")
         file.writeText("QIXIA_AUTO_HISTORY\t1\npackage\tapp.one\nstart_ms\t$startMs\nsource\tauto\n" +
             header + body + "\nend_ms\t${startMs + 10000}\nduration_ms\t10000\nsamples\t5\n" + footer)
-        return requireNotNull(AutoHistoryRecord.read(file))
+        // 这些用例只验证调度事件解析，线程列表使用宽松的活跃口径。
+        return requireNotNull(AutoHistoryRecord.read(file,
+            policy = SustainedThreadPolicy(minSamples = 1, minPercent = 0, minSpanMs = 0)))
     }
 
     @Test fun stableIdentityKeepsSameNamesAndReusedTidsSeparateAndPreservesRenames() {

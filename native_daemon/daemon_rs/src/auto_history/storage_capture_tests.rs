@@ -25,6 +25,13 @@ fn logs(directory: &Path) -> Vec<PathBuf> {
 fn usage(capture: &mut Capture, ms: u64) {
     capture.usage.stopped_ms = Some(ms);
 }
+/// 这些测试验证容量、轮转和发布时机，不验证活跃确认策略，
+/// 因此用“一次采样即确认”的测试口径，保持它们原本的语义。
+fn open_capture(dir: &Path, pkg: &str, start_ms: u64) -> Capture {
+    let mut capture = Capture::new(dir, pkg, start_ms).unwrap();
+    capture.recording.policy = OPEN_GATE;
+    capture
+}
 
 #[test]
 fn manual_recording_keeps_short_sessions_and_source_after_rotation() {
@@ -49,7 +56,7 @@ fn manual_recording_keeps_short_sessions_and_source_after_rotation() {
 #[test]
 fn rotation_keeps_pending_short_lived_threads_in_the_original_segment() {
     let dir = directory("pending-window");
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     let mut pending = crate::auto_history::window::Window::default();
     pending.observe(
         180_900,
@@ -81,7 +88,7 @@ fn rotation_keeps_pending_short_lived_threads_in_the_original_segment() {
 fn nearly_full_segment_preserves_all_4096_pending_threads_in_the_next_segment() {
     for force_rotation in [false, true] {
         let dir = directory(&format!("pending-hard-limit-{force_rotation}"));
-        let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+        let mut capture = open_capture(&dir, "com.game", 1_000);
         let filler = ThreadSample {
             pid: 1,
             tid: 2,
@@ -151,7 +158,7 @@ fn identity_capacity_preserves_the_entire_new_batch_during_both_flush_paths() {
             let dir = directory(&format!(
                 "identities-{old_count}-{new_count}-{force_rotation}"
             ));
-            let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+            let mut capture = open_capture(&dir, "com.game", 1_000);
             let old: Vec<_> = (0..old_count)
                 .map(|index| ThreadSample {
                     pid: 10,
@@ -214,7 +221,7 @@ fn identity_capacity_preserves_the_entire_new_batch_during_both_flush_paths() {
 #[test]
 fn capacity_rotation_keeps_known_zero_samples_without_carrying_absent_identities() {
     let dir = directory("identities-known-zero");
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     let old: Vec<_> = (1..=4096)
         .map(|tid| ThreadSample {
             pid: 10,
@@ -264,7 +271,7 @@ fn close_grace_does_not_qualify_a_short_visit_or_extend_its_duration() {
     assert_eq!(clock.at(started + Duration::from_secs(203)), 179_999);
 
     let dir = directory("grace");
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     capture.fps(2_000, 60.0, 16.7).unwrap();
     usage(&mut capture, 179_999);
     // 应用离开前台后，释放操作仍可能到达。
@@ -281,7 +288,7 @@ fn close_grace_does_not_qualify_a_short_visit_or_extend_its_duration() {
 fn admission_is_strictly_more_than_three_minutes_and_keeps_the_beginning() {
     for elapsed in [179_999, 180_000, 180_001] {
         let dir = directory(&format!("boundary-{elapsed}"));
-        let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+        let mut capture = open_capture(&dir, "com.game", 1_000);
         capture.fps(2_000, 60.0, 16.7).unwrap();
         usage(&mut capture, elapsed);
         capture.finish(1_000 + elapsed).unwrap();
@@ -303,7 +310,7 @@ fn admission_is_strictly_more_than_three_minutes_and_keeps_the_beginning() {
 #[test]
 fn short_rotations_share_the_visit_gate_and_are_published_together() {
     let dir = directory("segments");
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     capture.fps(2_000, 60.0, 16.7).unwrap();
     usage(&mut capture, 60_000);
     capture.rotate(&dir, 61_000).unwrap();
@@ -337,7 +344,7 @@ fn short_visit_discards_all_staged_segments_without_rotating_old_history() {
         fs::write(&path, format!("old-{index}")).unwrap();
         previous.push((path, format!("old-{index}")));
     }
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     capture.fps(2_000, 60.0, 16.7).unwrap();
     usage(&mut capture, 80_000);
     capture.rotate(&dir, 81_000).unwrap();
@@ -359,7 +366,7 @@ fn completed_history_does_not_consume_staging_budget() {
         let path = dir.join(format!("auto_{}_1_0.log", index + 1));
         File::create(path).unwrap().set_len(MAX_BYTES).unwrap();
     }
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     capture.fps(2_000, 60.0, 16.7).unwrap();
     capture.output.flush().unwrap();
     usage(&mut capture, 60_000);
@@ -376,7 +383,7 @@ fn completed_history_does_not_consume_staging_budget() {
 fn recovery_uses_persisted_foreground_evidence_across_short_segments() {
     for elapsed in [179_999, 180_000, 180_001] {
         let dir = directory(&format!("recovery-{elapsed}"));
-        let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+        let mut capture = open_capture(&dir, "com.game", 1_000);
         capture.fps(2_000, 60.0, 16.7).unwrap();
         usage(&mut capture, 60_000);
         capture.rotate(&dir, 61_000).unwrap();
@@ -402,7 +409,7 @@ fn recovery_uses_persisted_foreground_evidence_across_short_segments() {
 #[test]
 fn recovery_does_not_infer_usage_from_wall_clock_or_shutdown_release_events() {
     let dir = directory("recovery-clock");
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     // 系统校时或延迟释放不能凭空增加前台时长。
     capture.fps(2_000_000, 60.0, 16.7).unwrap();
     write_usage(&mut capture.recording, 179_999).unwrap();
@@ -416,7 +423,7 @@ fn recovery_does_not_infer_usage_from_wall_clock_or_shutdown_release_events() {
 #[test]
 fn interrupted_finish_keeps_the_proof_when_the_last_segment_is_empty() {
     let dir = directory("finish-proof");
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     capture.fps(2_000, 60.0, 16.7).unwrap();
     usage(&mut capture, 60_000);
     capture.rotate(&dir, 61_000).unwrap();
@@ -447,7 +454,7 @@ fn interrupted_finish_keeps_the_proof_when_the_last_segment_is_empty() {
 #[test]
 fn retry_after_published_archive_does_not_append_to_its_retained_source() {
     let dir = directory("published-retry");
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     capture.fps(2_000, 60.0, 16.7).unwrap();
     usage(&mut capture, 60_000);
     capture.rotate(&dir, 61_000).unwrap();
@@ -469,7 +476,7 @@ fn retry_after_published_archive_does_not_append_to_its_retained_source() {
 #[test]
 fn more_than_seven_segments_of_one_capture_do_not_evict_its_beginning() {
     let dir = directory("long-capture");
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     for segment in 0..10u64 {
         capture.fps(2_000 + segment * 200_000, 60.0, 16.7).unwrap();
         usage(&mut capture, (segment + 1) * 200_000);
@@ -494,7 +501,7 @@ fn retention_keeps_all_recent_captures_and_expires_whole_captures_by_end_time() 
     let mut first = Vec::new();
     for visit in 0..8u64 {
         let start = 1_000 + visit * 1_000_000;
-        let mut capture = Capture::new(&dir, "com.game", start).unwrap();
+        let mut capture = open_capture(&dir, "com.game", start);
         capture.fps(start + 1_000, 60.0, 16.7).unwrap();
         if visit == 0 {
             first.push(capture.path.with_extension("log.gz"));
@@ -559,7 +566,7 @@ fn expiry_removes_whole_captures_without_byte_or_count_eviction() {
 #[test]
 fn large_active_capture_keeps_all_completed_segments_while_rotating() {
     let dir = directory("active-capture-budget");
-    let mut capture = Capture::new(&dir, "com.game", 1_000).unwrap();
+    let mut capture = open_capture(&dir, "com.game", 1_000);
     capture.fps(2_000, 60.0, 16.7).unwrap();
     let mut saved = Vec::new();
     for index in 0..7 {

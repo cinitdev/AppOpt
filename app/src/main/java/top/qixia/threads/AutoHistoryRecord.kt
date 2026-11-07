@@ -9,6 +9,16 @@ import top.qixia.threads.db.HistorySource
 import top.qixia.threads.db.SessionSummary
 import top.qixia.threads.db.ThreadData
 
+/** 报告线程列表的“持续活跃”口径，与守护进程的写入门槛一致。 */
+internal data class SustainedThreadPolicy(
+    /** 有负载的采样次数下限（约 3 秒）。 */
+    val minSamples: Int = 6,
+    /** 有负载采样占比下限（百分比）。 */
+    val minPercent: Int = 20,
+    /** 存在期下限（毫秒）；生产默认固定为 30 秒。 */
+    val minSpanMs: Long = 30_000,
+)
+
 /** 带版本的 Rust 运行记录文件，解析不会修改规则或启动采集器。 */
 internal object AutoHistoryRecord {
     const val MAX_FILE_BYTES = 16L * 1024 * 1024
@@ -79,22 +89,29 @@ internal object AutoHistoryRecord {
         return Segment(file, sourceName, metadata, device, pkg, start, end, duration, captureId, foreground, expanded)
     }
 
-    fun read(file: File, sourceName: String = file.name): Record? =
-        readSegments(listOf(file to sourceName), sourceName, grouped = false)
+    fun read(file: File, sourceName: String = file.name,
+        policy: SustainedThreadPolicy = SustainedThreadPolicy()): Record? =
+        readSegments(listOf(file to sourceName), sourceName, grouped = false, policy = policy)
 
     /** 每个物理分片保留独立的校验和事件限制，统计包含所有原始样本。 */
-    fun read(files: List<File>, sourceName: String = files.firstOrNull()?.name.orEmpty(), windowed: Boolean = false): Record? =
-        readSegments(files.map { it to it.name }, sourceName, grouped = true, windowed = windowed)
+    fun read(files: List<File>, sourceName: String = files.firstOrNull()?.name.orEmpty(),
+        windowed: Boolean = false, policy: SustainedThreadPolicy = SustainedThreadPolicy()): Record? =
+        readSegments(files.map { it to it.name }, sourceName, grouped = true, windowed = windowed, policy = policy)
 
     /** 列表和导入保留精确统计及有界 FPS 预览，不保留完整调度事件。 */
-    fun summary(file: File, sourceName: String = file.name): Entry? =
-        readSegments(listOf(file to sourceName), sourceName, grouped = false, summaryOnly = true)?.entry
+    fun summary(file: File, sourceName: String = file.name,
+        policy: SustainedThreadPolicy = SustainedThreadPolicy()): Entry? =
+        readSegments(listOf(file to sourceName), sourceName, grouped = false,
+            summaryOnly = true, policy = policy)?.entry
 
-    fun summary(files: List<File>, sourceName: String): Entry? =
-        readSegments(files.map { it to it.name }, sourceName, grouped = true, summaryOnly = true)?.entry
+    fun summary(files: List<File>, sourceName: String,
+        policy: SustainedThreadPolicy = SustainedThreadPolicy()): Entry? =
+        readSegments(files.map { it to it.name }, sourceName, grouped = true,
+            summaryOnly = true, policy = policy)?.entry
 
     private fun readSegments(files: List<Pair<File, String>>, sourceName: String, grouped: Boolean,
-        summaryOnly: Boolean = false, windowed: Boolean = false): Record? = runCatching {
+        summaryOnly: Boolean = false, windowed: Boolean = false,
+        policy: SustainedThreadPolicy = SustainedThreadPolicy()): Record? = runCatching {
         require(fileName.matches(sourceName) && files.isNotEmpty() && files.size <= 400)
         require(files.map { AutoHistoryIo.canonicalName(it.second) }.distinct().size == files.size)
         val segments = files.map { (file, name) -> segment(file, name) }.sortedBy { it.start }
@@ -156,8 +173,9 @@ internal object AutoHistoryRecord {
                         val ticks = fields[4].toLong().also { require(it >= 0) }
                         val percent = fields[6].toFloat().also { require(it.isFinite() && it in 0f..105f) }.coerceAtMost(100f)
                         if (time != lastThreadTime) { rounds++; lastThreadTime = time }
-                        val firstInSegment = segmentIdentities.add(pid, tid, ticks, percent > 0f)
-                        identities.add(pid, tid, ticks, percent > 0f)
+                        val atSecond = (time - start) / 1000L
+                        val firstInSegment = segmentIdentities.add(pid, tid, ticks, percent > 0f, atSecond)
+                        identities.add(pid, tid, ticks, percent > 0f, atSecond)
                         if (summaryOnly && firstInSegment) decodeName(fields[5])
                         if (!summaryOnly) {
                             val key = "$pid:$tid:$ticks"
@@ -211,7 +229,9 @@ internal object AutoHistoryRecord {
             } }
             timeline?.let { timelineParts += it.finish() }
         }
-        val activeThreads = threadSamples.values.filter { it.maximum > 0f }
+        // 只保留持续活跃的线程：长时间反复有负载才进报告。运行期间只活跃
+        // 几下的线程（线程池临时线程、GC、加载解压）不再出现在线程列表里。
+        val activeThreads = threadSamples.values.filter { it.sustained(policy) }
         val threads = (if (summaryOnly) emptyList() else activeThreads.map { it.toThread() })
             .sortedWith(compareByDescending<ThreadData> { it.avg }.thenByDescending { it.max }.thenBy { it.name })
         val statistics = fpsSummary.report()
@@ -244,7 +264,9 @@ internal object AutoHistoryRecord {
         val summary = SessionSummary(sessionId(sourceName), end / 1000L,
             segments.map { it.metadata["samples"]?.toIntOrNull()?.coerceAtLeast(0) }.let { counts ->
                 if (counts.all { it != null }) counts.sumOf { it!! } else rounds
-            }, identities.activeSize,
+            },
+            // 报告统一显示“持续活跃”的线程数，短时线程不再计入。
+            identities.sustained(policy),
             if (segments.first().metadata["source"] == "performance") HistorySource.PERFORMANCE else HistorySource.AUTO_ALLOCATION, start, duration, end)
         val dropped = timelineParts.fold(0L) { sum, part ->
             if (Long.MAX_VALUE - sum < part.droppedEvents) Long.MAX_VALUE else sum + part.droppedEvents
@@ -286,16 +308,31 @@ internal object AutoHistoryRecord {
         }
         private var total = 0.0
         private var count = 0
+        private var positive = 0
+        private var firstPositiveMs = Long.MIN_VALUE
+        private var lastPositiveMs = Long.MIN_VALUE
         private var lastTime = Long.MIN_VALUE
         var maximum = 0f
             private set
         fun add(progress: Float, percent: Float, time: Long) {
             analysis.add(time, percent)
             total += percent; count++; maximum = maxOf(maximum, percent)
+            if (percent > 0f) {
+                positive++
+                if (firstPositiveMs == Long.MIN_VALUE) firstPositiveMs = time
+                lastPositiveMs = time
+            }
             val index = (progress * CURVE_BUCKETS).toInt().coerceIn(0, CURVE_BUCKETS - 1)
             val point = Point(progress, percent, lastTime != Long.MIN_VALUE && time - lastTime > 3500)
             lastTime = time
             buckets[index]?.add(point) ?: run { buckets[index] = Bucket(point) }
+        }
+        /** 与守护进程一致：≥6 次有负载采样、占比 ≥20%、存在期 ≥30 秒。 */
+        fun sustained(policy: SustainedThreadPolicy): Boolean {
+            if (count == 0 || positive < policy.minSamples) return false
+            if (positive * 100L < policy.minPercent.toLong() * count) return false
+            if (firstPositiveMs == Long.MIN_VALUE) return false
+            return lastPositiveMs - firstPositiveMs >= policy.minSpanMs.coerceAtLeast(0L)
         }
         fun toThread(): ThreadData {
             var previous = -1f
