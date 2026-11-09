@@ -49,8 +49,9 @@ fn finish_session_inner(session: CalibSession, interrupted: bool) -> io::Result<
         return Ok(());
     }
 
-    // 历史保留活跃线程，不受核心建议的平均负载 5% 门槛影响。
-    let history_records = select_history_records(&records);
+    // 历史只保留持续活跃的线程（占比 + 存在期 + 平均负载），不受核心建议的
+    // 5% 门槛影响；短时活跃线程仍然可以生成规则建议。
+    let history_records = select_history_records(&records, rounds);
 
     // 历史记录优先落盘；即使规则生成或写回失败，App 仍可导入这次采样数据辅助排查。
     let history_rounds = ((sampled_duration.as_secs_f64() * 2.0).round() as usize).max(1);

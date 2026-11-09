@@ -36,6 +36,7 @@ pub struct Runtime {
     pub selected: BTreeSet<String>,
     fallback_packages: BTreeSet<String>,
     fallback_masks: BTreeMap<String, u64>,
+    custom_rules: BTreeMap<String, Vec<custom::Rule>>,
     pub ready: bool,
     config_valid: bool,
     controller: Option<Controller>,
@@ -74,8 +75,8 @@ impl Runtime {
             return false;
         }
         self.config_stamp = stamp;
-        let modes = match fs::read_to_string(CONFIG) {
-            Ok(text) if text.len() <= 64 * 1024 => modes(&text),
+        let options = match fs::read_to_string(CONFIG) {
+            Ok(text) if text.len() <= 64 * 1024 => app_options(&text),
             Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             _ => {
                 self.config_valid = false;
@@ -85,12 +86,15 @@ impl Runtime {
                 return false;
             }
         };
-        let selected: BTreeSet<String> = modes.keys().cloned().collect();
-        let fallback_packages = modes.into_iter().filter_map(|(pkg, on)| on.then_some(pkg)).collect();
+        let selected: BTreeSet<String> = options.iter().filter(|(_, opt)| opt.automatic).map(|(pkg, _)| pkg.clone()).collect();
+        let fallback_packages = options.iter().filter(|(_, opt)| opt.automatic && opt.fallback).map(|(pkg, _)| pkg.clone()).collect();
+        let custom_rules = options.into_iter().filter(|(_, opt)| opt.automatic && !opt.custom.is_empty())
+            .map(|(pkg, opt)| (pkg, opt.custom)).collect();
         self.config_valid = true;
         if selected == self.selected {
-            if self.fallback_packages == fallback_packages { return false; }
+            if self.fallback_packages == fallback_packages && self.custom_rules == custom_rules { return false; }
             self.fallback_packages = fallback_packages;
+            self.custom_rules = custom_rules;
             self.last_sample = None;
             return true;
         }
@@ -104,6 +108,7 @@ impl Runtime {
         }
         self.selected = selected;
         self.fallback_packages = fallback_packages;
+        self.custom_rules = custom_rules;
         self.last_sample = None;
         self.ready = false;
         true
@@ -116,7 +121,7 @@ impl Runtime {
             let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
             let stat = fs::read_to_string("/proc/self/stat").unwrap_or_default();
             let start = stat.rsplit_once(") ").and_then(|(_, tail)| tail.split_whitespace().nth(19)).unwrap_or("0");
-            format!("version=1\nfallback_version=1\npid={}\nboot_id={}\nstart_ticks={start}\n", std::process::id(), boot.trim())
+            format!("version=1\nfallback_version=1\nrecording_version=1\ncustom_version=1\npid={}\nboot_id={}\nstart_ticks={start}\n", std::process::id(), boot.trim())
         });
         let value = format!("{identity}package={pkg}\nstate={state}\ndetail={detail}\n");
         if self.status == value {
@@ -275,7 +280,10 @@ impl Runtime {
         }
         let fallback_enabled = self.fallback_packages.contains(pkg);
         let fallback_mask = if fallback_enabled { self.fallback_masks.get(pkg).copied().unwrap_or(0) } else { 0 };
-        if let Some(controller) = self.controller.as_mut() { controller.set_fallback(fallback_mask); }
+        if let Some(controller) = self.controller.as_mut() {
+            controller.set_fallback(fallback_mask);
+            controller.set_custom(self.custom_rules.get(pkg).map(Vec::as_slice).unwrap_or_default());
+        }
         let now = Instant::now();
         if self.last_sample.is_some_and(|last| now.saturating_duration_since(last) < super::live_policy::SAMPLE_INTERVAL) {
             if self.last_maintenance.is_none_or(|last| now.saturating_duration_since(last) >= OWNERSHIP_INTERVAL) {

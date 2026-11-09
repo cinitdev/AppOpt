@@ -11,7 +11,7 @@ import androidx.compose.material.icons.automirrored.outlined.FactCheck
 import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,9 +38,12 @@ internal fun AppManageSheet(
     onDiagnostics: () -> Unit = {},
     onAutomaticFallback: (Boolean, String?) -> Unit = { _, _ -> },
     onPerformanceRecording: (Boolean) -> Unit = {},
-    configured: Boolean = true
+    configured: Boolean = true,
+    onAutomaticCustom: (List<top.qixia.threads.AutomaticCustomRule>) -> Unit = {},
+    operationMessage: String? = null
 ) {
     val automatic = app.automaticAffinityEnabled && !app.isSystemComponent
+    var customEditing by remember(app.packageName) { mutableStateOf(false) }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -74,7 +77,7 @@ internal fun AppManageSheet(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text("自动分配", color = OceanText, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-                                Text(if (automatic) "平均负载达到 5% 的线程参与"
+                                Text(if (automatic) "平均负载达到 ${app.automaticMinimumLoad}% 的线程参与"
                                     else "按线程负载，自动安排核心",
                                     color = OceanTextSecondary, fontSize = 11.sp, lineHeight = 16.sp,
                                     modifier = Modifier.padding(top = 3.dp))
@@ -90,6 +93,8 @@ internal fun AppManageSheet(
                         }
                         if (automatic) {
                             HorizontalDivider(Modifier.padding(vertical = 6.dp), color = OceanOutline.copy(alpha = .6f))
+                            if (configured) AutomaticCustomControls(app, enabled, onAutomaticCustom,
+                                onEditingChange = { customEditing = it })
                             MainProcessFallbackControls(app, enabled, onAutomaticFallback)
                             HorizontalDivider(Modifier.padding(top = 6.dp), color = OceanOutline.copy(alpha = .6f))
                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -126,7 +131,7 @@ internal fun AppManageSheet(
                         }
                     }
                 }
-                if (configured && (app.isSystemComponent || app.state != AppRuleState.PENDING)) {
+                if (configured && !app.automaticOnly && (app.isSystemComponent || app.state != AppRuleState.PENDING)) {
                     if (!app.isSystemComponent) Spacer(Modifier.height(12.dp))
                     Surface(onClick = onEditRules, enabled = enabled, color = OceanSurface,
                         shape = RoundedCornerShape(22.dp), border = BorderStroke(1.dp, OceanOutline)) {
@@ -180,7 +185,10 @@ internal fun AppManageSheet(
 
             Column(Modifier.fillMaxWidth().padding(start = 22.dp, end = 22.dp, top = 8.dp, bottom = 6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally) {
-                if (!app.isSystemComponent) Button(onClick = onLaunch, enabled = enabled && app.installed && (configured || automatic || app.performanceRecordingEnabled),
+                if (!operationMessage.isNullOrBlank()) Text(operationMessage,
+                    color = PorcelainOnTonal, fontSize = 12.sp, lineHeight = 18.sp,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
+                if (!customEditing && !app.isSystemComponent) Button(onClick = onLaunch, enabled = enabled && app.installed && (configured || automatic || app.performanceRecordingEnabled),
                     modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp), shape = RoundedCornerShape(17.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = PorcelainAction),
                     contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)) {
@@ -188,7 +196,7 @@ internal fun AppManageSheet(
                     Spacer(Modifier.width(9.dp))
                     Text(if (automatic || app.performanceRecordingEnabled) "打开应用" else if (!configured) "开启性能记录后打开应用" else "启动悬浮校准", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                 }
-                if (configured) TextButton(onClick = onDelete, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp),
+                if (!customEditing && configured) TextButton(onClick = onDelete, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp),
                     colors = ButtonDefaults.textButtonColors(contentColor = OceanError)) {
                     Icon(Icons.Outlined.DeleteOutline, null, Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))

@@ -62,17 +62,9 @@ final class PerformanceOverlayController {
             File calibration = new File(config, "calibrate.state");
             if (calibration.isFile() && calibration.length() <= 4096 &&
                 new String(Files.readAllBytes(calibration.toPath()), StandardCharsets.UTF_8).trim().startsWith("sampling ")) return false;
-            File file = new File(config, "calib_policy.conf");
+            File file = new File(config, "auto_affinity.conf");
             if (file.length() > 65536) return false;
-            String match = null;
-            for (String row : Files.readAllLines(file.toPath(), StandardCharsets.UTF_8)) {
-                String clean = row.split("#", 2)[0].trim();
-                int split = clean.indexOf('=');
-                if (split < 0 || !clean.substring(0, split).trim().equals("performance_recording_apps")) continue;
-                if (match != null) return false;
-                match = clean.substring(split + 1);
-            }
-            if (match != null) for (String entry : match.split(",")) if (entry.trim().equals(pkg)) return true;
+            return PerformanceRecordingConfig.enabled(new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8), pkg);
         } catch (Exception ignored) { }
         return false;
     }

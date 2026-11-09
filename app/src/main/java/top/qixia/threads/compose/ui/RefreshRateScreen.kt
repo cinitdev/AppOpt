@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -61,10 +62,11 @@ internal fun refreshChoice(raw: String, rates: List<Float>): String {
     return if (tier == null) label else "$tier (${label.replace(" ", "")})"
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun RefreshRateScreen(
     state: RefreshRateUiState, padding: PaddingValues, initialPackage: String?,
-    onBack: () -> Unit, onChange: (String, String?) -> Unit
+    onBack: () -> Unit, onChange: (String, String?) -> Unit, onRefreshApps: () -> Unit
 ) {
     var tab by rememberSaveable(initialPackage) { mutableIntStateOf(if (initialPackage == null) 0 else 1) }
     var query by rememberSaveable(initialPackage) { mutableStateOf(initialPackage.orEmpty()) }
@@ -134,21 +136,37 @@ internal fun RefreshRateScreen(
                 RefreshDisplayModes(modeRates,modesDraft,validModes,enabled,{modesDraft=it},::saveModes)
             } }
         } else {
-            Box(Modifier.padding(horizontal=20.dp).padding(bottom=10.dp)) { SearchField(query,{query=it}) }
             val apps = remember(state.apps,query) { state.apps.filter { it.name.contains(query,true) || it.packageName.contains(query,true) } }
-            LazyColumn(Modifier.weight(1f),contentPadding=PaddingValues(start=20.dp,end=20.dp,bottom=24.dp),verticalArrangement=Arrangement.spacedBy(9.dp)) {
-                item { Text("${apps.size} 个应用 · 点按设置闲置／活动档位",fontSize=11.sp,color=OceanTextSecondary) }
-                items(apps,key={it.packageName}) { app ->
-                    val rule=p.values["app."+app.packageName]?.split(',')
-                    Surface(onClick={selectedApp=app.packageName},enabled=enabled,color=OceanSurface,shape=RoundedCornerShape(20.dp)) {
-                        Column(Modifier.fillMaxWidth().padding(16.dp)) {
-                            Row(verticalAlignment=Alignment.CenterVertically) {
-                                RefreshAppIcon(app)
-                                Spacer(Modifier.width(10.dp)); Text(app.name,color=OceanText,fontSize=15.sp,fontWeight=FontWeight.SemiBold,modifier=Modifier.weight(1f))
-                                Icon(Icons.Outlined.ChevronRight,null,tint=OceanTextSecondary,modifier=Modifier.size(18.dp))
+            // 已配置每应用规则的排在最上面；组内仍保持目录顺序（按安装时间排序）。
+            val configuredPackages = remember(p) {
+                p.values.keys.filter { it.startsWith("app.") }.mapTo(HashSet()) { it.removePrefix("app.") }
+            }
+            val grouped = remember(apps, configuredPackages) {
+                apps.partition { it.packageName in configuredPackages }
+            }
+            PullToRefreshBox(state.appsRefreshing, onRefreshApps, Modifier.weight(1f)) {
+                Column(Modifier.fillMaxSize()) {
+                    Box(Modifier.padding(horizontal=20.dp).padding(bottom=10.dp)) { SearchField(query,{query=it}) }
+                    LazyColumn(Modifier.weight(1f),contentPadding=PaddingValues(start=20.dp,end=20.dp,bottom=24.dp),verticalArrangement=Arrangement.spacedBy(9.dp)) {
+                        when {
+                            state.apps.isEmpty() && state.appsRefreshing -> item { LoadingState("正在读取应用") }
+                            state.apps.isEmpty() -> item { Text("没有可设置的应用，下拉重试",
+                                color=OceanTextSecondary, fontSize=12.sp, modifier=Modifier.padding(horizontal=20.dp)) }
+                            else -> {
+                                item { Text("${apps.size} 个应用 · 点按设置闲置／活动档位",fontSize=11.sp,color=OceanTextSecondary) }
+                                if (grouped.first.isNotEmpty()) {
+                                    item { RefreshAppGroupTitle("已配置规则（${grouped.first.size}）") }
+                                    items(grouped.first,key={it.packageName}) { app ->
+                                        RefreshAppRow(app,p.values["app."+app.packageName],state.rates,enabled) { selectedApp=app.packageName }
+                                    }
+                                }
+                                if (grouped.second.isNotEmpty()) {
+                                    if (grouped.first.isNotEmpty()) item { RefreshAppGroupTitle("其他应用（${grouped.second.size}）") }
+                                    items(grouped.second,key={it.packageName}) { app ->
+                                        RefreshAppRow(app,p.values["app."+app.packageName],state.rates,enabled) { selectedApp=app.packageName }
+                                    }
+                                }
                             }
-                            Text(app.packageName,color=OceanTextSecondary,fontSize=10.sp,modifier=Modifier.padding(top=5.dp))
-                            Text(if(rule==null) "跟随全局策略" else "闲置 ${refreshHz(rule[0],state.rates)}  /  活动 ${refreshHz(rule[1],state.rates)}",color=PorcelainOnTonal,fontSize=12.sp,modifier=Modifier.padding(top=10.dp))
                         }
                     }
                 }
@@ -165,6 +183,25 @@ internal fun RefreshRateScreen(
 @Composable private fun RefreshAppIcon(app: RefreshApp) {
     val model = remember(app.packageName, app.name) { AppItemModel(app.packageName, app.name, installed=true, icon=null) }
     AppPackageIcon(model, "${app.name}图标", Modifier.size(40.dp))
+}
+@Composable private fun RefreshAppGroupTitle(text:String) {
+    Text(text,fontSize=11.sp,fontWeight=FontWeight.SemiBold,color=OceanTextSecondary,
+        modifier=Modifier.padding(start=4.dp,top=4.dp))
+}
+@Composable private fun RefreshAppRow(app:RefreshApp, rule:String?, rates:List<Float>, enabled:Boolean, onClick:()->Unit) {
+    // 已配置的规则只有合法的两档/三档值，异常内容按“跟随全局策略”显示。
+    val parts = remember(rule) { rule?.split(',')?.takeIf { it.size >= 2 } }
+    Surface(onClick=onClick,enabled=enabled,color=OceanSurface,shape=RoundedCornerShape(20.dp)) {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment=Alignment.CenterVertically) {
+                RefreshAppIcon(app)
+                Spacer(Modifier.width(10.dp)); Text(app.name,color=OceanText,fontSize=15.sp,fontWeight=FontWeight.SemiBold,modifier=Modifier.weight(1f))
+                Icon(Icons.Outlined.ChevronRight,null,tint=OceanTextSecondary,modifier=Modifier.size(18.dp))
+            }
+            Text(app.packageName,color=OceanTextSecondary,fontSize=10.sp,modifier=Modifier.padding(top=5.dp))
+            Text(if(parts==null) "跟随全局策略" else "闲置 ${refreshHz(parts[0],rates)}  /  活动 ${refreshHz(parts[1],rates)}",color=PorcelainOnTonal,fontSize=12.sp,modifier=Modifier.padding(top=10.dp))
+        }
+    }
 }
 @Composable private fun RefreshSection(title:String,content:@Composable ColumnScope.()->Unit) {
     Column { Text(title,fontSize=12.sp,fontWeight=FontWeight.SemiBold,color=OceanTextSecondary,modifier=Modifier.padding(start=4.dp,bottom=8.dp));RefreshGroup(content) }
@@ -237,11 +274,34 @@ internal fun RefreshRateScreen(
         Text(description,color=OceanTextSecondary,fontSize=11.sp,lineHeight=16.sp,modifier=Modifier.padding(top=7.dp))
     }
 }
+/** 应用规则弹窗“完成”要执行的动作；没有实际改动时不写配置。 */
+internal sealed interface AppRuleEdit {
+    data object None : AppRuleEdit
+    data object Clear : AppRuleEdit
+    data class Save(val value: String) : AppRuleEdit
+}
+
+/** 两档都跟随全局等价于没有规则：已有规则则删除，没有则什么都不写。 */
+internal fun appRuleEdit(existing: String?, idle: String, active: String): AppRuleEdit = when {
+    idle == "-2" && active == "-2" -> if (existing != null) AppRuleEdit.Clear else AppRuleEdit.None
+    existing == "$idle,$active" -> AppRuleEdit.None
+    else -> AppRuleEdit.Save("$idle,$active")
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun RefreshAppSheet(app:RefreshApp,p:RefreshPolicy,rates:List<Float>,enabled:Boolean,onDismiss:()->Unit,onSave:(String?)->Unit) {
-    val original=p.values["app."+app.packageName]?.split(',')?:listOf("-2","-2")
+    val key = "app." + app.packageName
+    val existing = p.values[key]
+    val original=existing?.split(',')?:listOf("-2","-2")
     var idle by rememberSaveable(app.packageName) {mutableStateOf(original[0])}
     var active by rememberSaveable(app.packageName) {mutableStateOf(original[1])}
+    fun save() {
+        when (val edit = appRuleEdit(existing, idle, active)) {
+            AppRuleEdit.None -> onDismiss()
+            AppRuleEdit.Clear -> onSave(null)
+            is AppRuleEdit.Save -> onSave(edit.value)
+        }
+    }
     ModalBottomSheet(onDismissRequest=onDismiss,containerColor=OceanBackground,
         sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=true),sheetGesturesEnabled=false,
         dragHandle=null,shape=RoundedCornerShape(topStart=28.dp,topEnd=28.dp)) {
@@ -266,9 +326,9 @@ internal fun RefreshRateScreen(
                     color=OceanTextSecondary,modifier=Modifier.padding(vertical=14.dp))
             }
             Column(Modifier.fillMaxWidth().padding(horizontal=20.dp).padding(top=8.dp,bottom=8.dp),horizontalAlignment=Alignment.CenterHorizontally) {
-                Button({onSave("$idle,$active")},enabled=enabled,modifier=Modifier.fillMaxWidth().heightIn(min=48.dp),
+                Button({save()},enabled=enabled,modifier=Modifier.fillMaxWidth().heightIn(min=48.dp),
                     shape=RoundedCornerShape(16.dp),colors=ButtonDefaults.buttonColors(containerColor=PorcelainAction)) {Text("完成")}
-                TextButton({onSave(null)},enabled=enabled) {Text("清除该应用规则",color=OceanTextSecondary)}
+                if (existing != null) TextButton({onSave(null)},enabled=enabled) {Text("清除该应用规则",color=OceanTextSecondary)}
             }
         }
     }

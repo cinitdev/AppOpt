@@ -129,6 +129,10 @@ mod tests {
             eligible_target(ENABLED, "idle", foreground, "com.game", 2000, "abc"),
             Some("com.game".into())
         );
+        assert!(eligible_target(ENABLED, "idle", foreground, "com.game,record", 2000, "abc").is_none());
+        for selected in ["com.game,auto,record", "com.game,fallback,record"] {
+            assert_eq!(eligible_target(ENABLED, "idle", foreground, selected, 2000, "abc"), Some("com.game".into()));
+        }
         assert!(
             eligible_target(DISABLED, "idle", foreground, "com.game", 2000, "abc").is_none()
         );

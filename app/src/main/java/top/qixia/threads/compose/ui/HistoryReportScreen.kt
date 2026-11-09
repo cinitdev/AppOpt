@@ -205,7 +205,7 @@ internal fun HistoryReportScreen(state: HistoryDetailUiState, padding: PaddingVa
                                         Spacer(Modifier.width(12.dp))
                                         Column(Modifier.weight(1f)) {
                                             Text("分析活跃线程", color = OceanText, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                                            Text("${session.threadCount} 条记录 · ${if (hasWindows) "本区间曲线" else "完整曲线"}与子线程明细",
+                                            Text("${session.threadCount} 个持续活跃线程 · ${if (hasWindows) "本区间曲线" else "完整曲线"}与子线程明细",
                                                 color = OceanTextSecondary, fontSize = 11.sp, lineHeight = 18.sp)
                                         }
                                         Icon(Icons.Outlined.ChevronRight, "查看全部线程曲线", tint = PorcelainOnTonal)

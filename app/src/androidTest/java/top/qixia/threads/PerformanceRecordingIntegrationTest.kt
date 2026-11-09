@@ -62,7 +62,8 @@ class PerformanceRecordingIntegrationTest {
         assumeTrue(Build.HARDWARE.contains("ranchu") || Build.FINGERPRINT.contains("emulator"))
         assertTrue("模拟器中的柒夏线程需要 Root 授权", DaemonBridge.hasRoot())
         val config = "/data/adb/modules/QixiaThreads/config"
-        fun scheduling() = DaemonBridge.runRootCommand("sha256sum '$config/applist.conf' '$config/auto_affinity.conf'").output
+        fun scheduling() = DaemonBridge.runRootCommand("sha256sum '$config/applist.conf'").output to
+            AutomaticAffinityConfig.modes(DaemonBridge.readRootFile("$config/auto_affinity.conf").orEmpty())
         val before = scheduling()
         val enabledBefore = pkg in DaemonBridge.performanceRecordingApps()
         val info = automation.serviceInfo

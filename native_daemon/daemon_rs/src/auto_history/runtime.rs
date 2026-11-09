@@ -394,7 +394,7 @@ impl Session {
 
 struct Manual { command: performance::Command, started_ms: u64, departed: Option<Instant> }
 fn manual_allowed(package: &str, boot: &str) -> bool {
-    performance::enabled(&read_small(CONFIG, 64 * 1024).unwrap_or_default(), package)
+    performance::enabled(&read_small(crate::auto_affinity::CONFIG, 64 * 1024).unwrap_or_default(), package)
         && !read_small(CALIBRATION, 4096).unwrap_or_default().trim_start().starts_with("sampling ")
         && crate::auto_affinity::foreground_package(&read_small(FOREGROUND, 16 * 1024).unwrap_or_default(), crate::elapsed_realtime_ms(), boot).as_deref() == Some(package)
 }

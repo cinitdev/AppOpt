@@ -18,10 +18,24 @@ pub(super) fn prune_expired(storage: &crate::private_storage::Storage, now_secs:
 //
 // 子进程线程明细跟在子进程整体负载后面，方便 App 展开查看“哪个线程贡献了子进程负载”，
 // 规则建议与历史各自筛选，子进程活跃线程同样可以生成建议。
-pub(super) fn select_history_records(records: &[LoadRecord]) -> Vec<&LoadRecord> {
+//
+// 历史只保留“持续活跃”的线程：长时间反复有负载的才写盘，运行期间只活跃几下
+// 就休眠的线程不再占满报告。规则候选与待确认弹窗沿用原来的宽松口径
+// （Activity::worth_saving），不受这里的筛选影响。
+pub(super) fn select_history_records(
+    records: &[LoadRecord],
+    session_rounds: usize,
+) -> Vec<&LoadRecord> {
     let mut rows = records
         .iter()
-        .filter(|record| record.sample_count > 0 && record.activity.worth_saving(record.avg()))
+        .filter(|record| {
+            record.sample_count > 0
+                && record.activity.sustained(
+                    record.sample_count,
+                    session_rounds,
+                    record.avg(),
+                )
+        })
         .collect::<Vec<_>>();
     rows.sort_by(|a, b| {
         // 先过滤再分配容量，休眠子进程不能挤掉真正活跃的主进程线程。
@@ -49,7 +63,15 @@ pub(super) fn select_history_child_threads<'a>(
     let mut rows = child_threads
         .values()
         .filter(|summary| owners.contains(summary.owner.as_str()))
-        .filter(|summary| summary.activity.worth_saving(summary.avg(total_samples)))
+        .filter(|summary| {
+            // 子进程线程没有单独的存在期计数：整段轮次就是它的观察窗口，
+            // 晚出现的线程会被平均与占比自然稀释。
+            summary.activity.sustained(
+                total_samples,
+                total_samples,
+                summary.avg(total_samples),
+            )
+        })
         .collect::<Vec<_>>();
     rows.sort_by(|a, b| {
         b.avg(total_samples)
@@ -128,7 +150,11 @@ pub(super) fn format_history(
     writeln!(&mut current, "# {epoch} {history_rounds}").map_err(fmt_to_io)?;
     let mut written_rows = 0usize;
     for record in records.iter().copied() {
-        if !record.activity.worth_saving(record.avg()) {
+        if !record.activity.sustained(
+            record.sample_count,
+            sample_rounds,
+            record.avg(),
+        ) {
             continue;
         }
         let name = if record.is_process {

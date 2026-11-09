@@ -4,6 +4,27 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class AutomaticFallbackTest {
+    @Test fun recordingOnlyNeverEnablesAutomaticRulesOrSceneBlacklist() {
+        val raw = "com.video,record\ncom.game,auto,record\ncom.full,fallback,record\ncom.plain\n"
+        assertEquals(setOf("com.video", "com.game", "com.full"), AutomaticAffinityConfig.recordingPackages(raw))
+        assertEquals(mapOf("com.game" to false, "com.full" to true, "com.plain" to false), AutomaticAffinityConfig.modes(raw))
+        assertEquals(setOf("com.game", "com.full", "com.plain"), SceneBlacklistSync.collectPackages("", raw))
+        val state = DaemonBridge.parseAutomaticAffinity("version=1\nfallback_version=1\nrecording_version=1\n__PACKAGES__\n$raw\n__LIVE__\n1")
+        assertEquals(setOf("com.game", "com.full", "com.plain"), state.packages)
+        assertEquals(setOf("com.full"), state.fallbackPackages)
+    }
+
+    @Test fun combinedFlagsMergeWithoutDependingOnOrderAndRejectUnknownOptions() {
+        for (raw in listOf("com.game\ncom.game,record", "com.game,record\ncom.game", "com.game,record,auto")) {
+            assertEquals(AutomaticAffinityConfig.Options(true, false, true), AutomaticAffinityConfig.entries(raw)["com.game"])
+        }
+        assertEquals(AutomaticAffinityConfig.Options(true, true, true),
+            AutomaticAffinityConfig.entries("com.game , record , fallback # 组合")["com.game"])
+        for (raw in listOf("com.game,record,unknown", "com.game,record,", "com.game:child,record", "bad..name,record")) {
+            assertTrue(raw, AutomaticAffinityConfig.entries(raw).isEmpty())
+        }
+    }
+
     @Test fun optionNeverLeaksIntoPackageNamesAndDuplicatesMerge() {
         val raw = "com.game,fallback\ncom.other\ncom.game # 重复\ncom.child:remote,fallback\ncom.bad,eco\n"
         assertEquals(mapOf("com.game" to true, "com.other" to false), AutomaticAffinityConfig.modes(raw))

@@ -2,15 +2,8 @@
 use std::{fs, io::Read};
 
 pub(super) const COMMAND: &str = "/data/adb/modules/QixiaThreads/config/performance_recording.cmd";
-pub(super) const KEY: &str = "performance_recording_apps";
-
 pub(super) fn enabled(config: &str, package: &str) -> bool {
-    let mut values = config.lines().filter_map(|line| {
-        let (key, value) = line.split('#').next()?.split_once('=')?;
-        (key.trim() == KEY).then_some(value.trim())
-    });
-    let Some(value) = values.next() else { return false };
-    values.next().is_none() && value.split(',').any(|entry| entry.trim() == package)
+    crate::auto_affinity::app_options(config).get(package).is_some_and(|options| options.recording)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,9 +31,10 @@ pub(super) fn take_command() -> Option<Command> {
 mod tests {
     use super::*;
     #[test] fn switch_and_commands_are_strict_and_manual() {
-        assert!(enabled("performance_recording_apps=com.game,com.other", "com.game"));
-        assert!(!enabled("performance_recording_apps=com.game\nperformance_recording_apps=com.game", "com.game"));
-        assert!(!enabled("performance_recording_apps=com.game", "com.gam"));
+        assert!(enabled("com.game,record\ncom.other", "com.game"));
+        assert!(enabled("com.game,fallback,record", "com.game"));
+        assert!(!enabled("com.game,fallback", "com.game"));
+        assert!(!enabled("com.game,record", "com.gam"));
         assert!(parse("start com.game record-1").unwrap().start);
         assert!(!parse("stop com.game record-1").unwrap().start);
         for text in ["start com.game", "auto com.game abc", "start com.game abc extra", "start com.game;id abc"] {

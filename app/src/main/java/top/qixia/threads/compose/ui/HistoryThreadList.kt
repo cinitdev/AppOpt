@@ -38,7 +38,7 @@ internal fun ColumnScope.HistoryThreadList(threads: List<ThreadData>, loading: B
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
             Column(Modifier.weight(1f)) {
                 Text("线程表现", color = OceanText, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                Text("保留本次全部活跃线程", color = OceanTextSecondary, fontSize = 11.sp,
+                Text("仅显示持续活跃线程", color = OceanTextSecondary, fontSize = 11.sp,
                     modifier = Modifier.padding(top = 4.dp))
             }
             Surface(color = OceanSurfaceHigh, shape = RoundedCornerShape(10.dp)) {

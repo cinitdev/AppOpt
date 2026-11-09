@@ -60,6 +60,9 @@ internal object CoreTimelinePresentation {
         return when (event.reason) {
             "initial" -> if (event.kind == CoreEventKind.ASSIGN) "根据当前负载与核心余量开始分配。" else "本次首次观察到此线程，建立核心状态基线。"
             "low_average" -> "最近采样平均使用率低于 5%，解除 QixiaThreads 限制，交回系统调度。"
+            "custom_low_average" -> "近期平均负载低于自定义最低门槛，解除 QixiaThreads 限制，交回系统调度。"
+            "custom_load" -> "按近期平均负载匹配最高达标档位，使用该档指定的核心范围。"
+            "custom_process_fallback" -> "主进程线程低于自定义最低门槛，使用主进程兜底核心；达到门槛后转入自定义分配。"
             "inactive" -> "最近连续低负载或不活跃，解除 QixiaThreads 限制；不代表线程已经结束。"
             "unrestricted" -> "恢复线程原本允许使用的核心范围。"
             "affinity_changed", "migration" -> if (event.kind == CoreEventKind.ASSIGN) "负载或核心余量变化，更新允许使用的核心。" else "采样发现允许核心范围发生变化。"

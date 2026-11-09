@@ -78,6 +78,10 @@ check_root_version() {
 }
 
 check_required_files() {
+	for REQUIRED_FILE in service_joyose.sh service_watchdog.sh service_app_install.sh service_runtime.sh; do
+		[ -s "$MODPATH/tools/$REQUIRED_FILE" ] && [ ! -L "$MODPATH/tools/$REQUIRED_FILE" ] ||
+			abort "! 模块服务文件缺失或无效：tools/$REQUIRED_FILE"
+	done
 	REQUIRED_FILE_LIST="/sys/devices/system/cpu/present /proc/loadavg"
 	for REQUIRED_FILE in $REQUIRED_FILE_LIST; do
 		if [ ! -e "$REQUIRED_FILE" ]; then
@@ -262,70 +266,18 @@ cleanup_embedded_app() {
 }
 
 configure_joyose_smartop() {
-	local MIUI_VERSION JOYOSE_INFO ORIGINAL_STATE ACTIVE_UNINSTALL UNINSTALL_FILE TEMP_FILE RESTORE_COMMAND
-	local JOYOSE_COMPONENT="com.xiaomi.joyose/.smartop.SmartOpService"
-	MIUI_VERSION="$(getprop ro.miui.ui.version.code)"
-	[ -n "$MIUI_VERSION" ] || return
-
-	# 柒夏线程模块更新时继承已记录的恢复责任。
-	ACTIVE_UNINSTALL="$QIXIA_UPGRADE_SOURCE/uninstall.sh"
-	ORIGINAL_STATE=""
-	if [ -n "$QIXIA_UPGRADE_SOURCE" ]; then
-		ORIGINAL_STATE="$(sed -n 's/^# QIXIA_JOYOSE_SMARTOP_ORIGINAL=\(default\|enabled\)$/\1/p' \
-			"$ACTIVE_UNINSTALL" 2>/dev/null | head -n 1)"
-	fi
-	if [ -z "$ORIGINAL_STATE" ]; then
-		JOYOSE_INFO="${TMPDIR:-/dev/tmp}/qixia_joyose_info.prop"
-		if ! run_pkg_helper "$JOYOSE_INFO" component-state "$JOYOSE_COMPONENT" 0 ||
-			[ "$(grep_prop ok "$JOYOSE_INFO")" != "1" ]; then
-			ui_print "! 无法读取 Joyose SmartOpService 原始状态，本次不修改"
-			return
+	local RESULT
+	# 同一个服务入口处理首次默认值、已有选择和卸载恢复基线，不依赖安装助手 JAR。
+	if RESULT=$(sh "$MODPATH/service.sh" --joyose-init "$QIXIA_UPGRADE_SOURCE"); then
+		if printf '%s\n' "$RESULT" | grep -q '^available=1$'; then
+			if printf '%s\n' "$RESULT" | grep -q '^disabled=1$'; then
+				ui_print '- Joyose SmartOpService：已禁用，可在设置中切换；卸载恢复接管前状态'
+			else
+				ui_print '- Joyose SmartOpService：已按用户选择启用'
+			fi
 		fi
-		ORIGINAL_STATE="$(grep_prop state "$JOYOSE_INFO")"
-		case "$ORIGINAL_STATE" in
-			default|enabled) ;;
-			disabled|disabled-user|disabled-until-used)
-				ui_print "- Joyose SmartOpService 原本已禁用，保持用户状态"
-				return
-				;;
-			*)
-				ui_print "! Joyose SmartOpService 状态未知，本次不修改"
-				return
-				;;
-		esac
-	fi
-
-	UNINSTALL_FILE="$MODPATH/uninstall.sh"
-	if ! grep -q '^# QIXIA_JOYOSE_SMARTOP_ORIGINAL=' "$UNINSTALL_FILE" 2>/dev/null; then
-		TEMP_FILE="$MODPATH/uninstall.sh.joyose.tmp.$$"
-		if [ -f "$UNINSTALL_FILE" ]; then
-			cp -pf "$UNINSTALL_FILE" "$TEMP_FILE" || {
-				ui_print "! 无法复制模块卸载脚本，本次不修改 Joyose"
-				return
-			}
-		else
-			printf '#!/system/bin/sh\n' > "$TEMP_FILE" || {
-				ui_print "! 无法创建模块卸载脚本，本次不修改 Joyose"
-				return
-			}
-		fi
-		if [ "$ORIGINAL_STATE" = default ]; then
-			RESTORE_COMMAND='pm default-state --user 0 com.xiaomi.joyose/.smartop.SmartOpService >/dev/null 2>&1 || true'
-		else
-			RESTORE_COMMAND='pm enable --user 0 com.xiaomi.joyose/.smartop.SmartOpService >/dev/null 2>&1 || true'
-		fi
-		if ! printf '# QIXIA_JOYOSE_SMARTOP_ORIGINAL=%s\n%s\n' \
-			"$ORIGINAL_STATE" "$RESTORE_COMMAND" >> "$TEMP_FILE" ||
-			! mv -f "$TEMP_FILE" "$UNINSTALL_FILE"; then
-			rm -f "$TEMP_FILE"
-			ui_print "! 无法记录 Joyose 原始状态，本次不修改 SmartOpService"
-			return
-		fi
-	fi
-	if pm disable --user 0 "$JOYOSE_COMPONENT" >/dev/null 2>&1; then
-		ui_print "- Joyose SmartOpService：已禁用，卸载时恢复为 $ORIGINAL_STATE"
 	else
-		ui_print "! Joyose SmartOpService 禁用失败，已保留原状态恢复记录"
+		ui_print '! Joyose 策略暂未生效，已保留配置；服务启动后重试，可在设置中检查'
 	fi
 }
 
@@ -674,12 +626,12 @@ print_install_result() {
 check_root_version
 check_required_files
 extract_bin
-configure_joyose_smartop
 remove_sys_perf_config
 module_instructions
 add_default_rules
 rm -f "$MODPATH/rules.sh"
 prepare_calib_policy
+configure_joyose_smartop
 prepare_auto_affinity_config
 prepare_auto_history
 prepare_runtime_state_dir

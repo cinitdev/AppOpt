@@ -283,7 +283,8 @@ class QixiaThreadsDbHelper(context: Context, private val clock: () -> Long = Sys
         val sessions = mutableListOf<SessionSummary>()
         val cursor = db.rawQuery(
             """
-            SELECT s.$COL_SESSION_ID, s.$COL_EPOCH, s.$COL_ROUNDS, COUNT(t.$COL_THREAD_ID) AS thread_count
+            SELECT s.$COL_SESSION_ID, s.$COL_EPOCH, s.$COL_ROUNDS,
+                   COUNT(t.$COL_THREAD_ID) AS thread_count
             FROM $TABLE_SESSIONS s
             LEFT JOIN $TABLE_THREADS t ON t.$COL_THREAD_SESSION_ID = s.$COL_SESSION_ID
             WHERE s.$COL_PKG = ?

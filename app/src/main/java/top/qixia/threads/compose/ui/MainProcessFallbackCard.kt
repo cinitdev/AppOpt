@@ -33,7 +33,7 @@ internal fun MainProcessFallbackControls(app: AppItemModel, enabled: Boolean,
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("主进程兜底", color = OceanText, fontWeight = FontWeight.Medium, fontSize = 14.sp)
-                    Text("接管主进程中负载低于 5% 的线程", color = OceanTextSecondary,
+                    Text("接管主进程中负载低于 ${app.automaticMinimumLoad}% 的线程", color = OceanTextSecondary,
                         fontSize = 11.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 3.dp))
                 }
                 Switch(app.automaticFallbackEnabled, { on ->
@@ -62,7 +62,8 @@ internal fun MainProcessFallbackControls(app: AppItemModel, enabled: Boolean,
                     modifier = Modifier.padding(top = 5.dp))
             }
         }
-    if (choosing) MainProcessFallbackDialog(app.mainFallbackCpus, { choosing = false }) { cpus ->
+    if (choosing) MainProcessFallbackDialog(app.mainFallbackCpus, { choosing = false },
+        minimumLoad = app.automaticMinimumLoad, custom = app.automaticCustomRules.isNotEmpty()) { cpus ->
         choosing = false
         onChange(true, cpus)
     }
@@ -70,7 +71,8 @@ internal fun MainProcessFallbackControls(app: AppItemModel, enabled: Boolean,
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun MainProcessFallbackDialog(initial: String?, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+internal fun MainProcessFallbackDialog(initial: String?, onDismiss: () -> Unit,
+    minimumLoad: Int = 5, custom: Boolean = false, onConfirm: (String) -> Unit) {
     var cpus by rememberSaveable { mutableStateOf(initial.orEmpty()) }
     var allowed by remember { mutableStateOf<Set<Int>>(emptySet()) }
     var groups by remember { mutableStateOf<List<SettingsTopologyPresentation.Group>>(emptyList()) }
@@ -90,7 +92,7 @@ internal fun MainProcessFallbackDialog(initial: String?, onDismiss: () -> Unit, 
         title = { Text("选择主进程兜底核心", color = OceanText, fontSize = 20.sp, fontWeight = FontWeight.Bold) },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                Text("主进程中平均负载低于 5% 的线程使用这里的核心。达到 5% 后仍由自动分配算法选择核心。",
+                Text("主进程中平均负载低于 $minimumLoad% 的线程使用这里的核心。达到 $minimumLoad% 后${if (custom) "按自定义档位分配" else "由自动分配算法选择核心"}。",
                     color = OceanTextSecondary, fontSize = 12.sp, lineHeight = 19.sp)
                 if (loading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = PorcelainAction)
                 if (groups.isNotEmpty()) {

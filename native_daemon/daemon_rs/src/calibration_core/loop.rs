@@ -262,7 +262,7 @@ mod shutdown_tests {
             let records: Vec<_> = done.records.into_values().collect();
             assert_eq!(records[0].sample_count, 80);
             assert_eq!(records[0].sum_pct, 2_000.0);
-            let rows = select_history_records(&records);
+            let rows = select_history_records(&records, done.rounds);
             output = format_history(1_700_000_000, 80, done.rounds, &rows, &done.child_threads)?;
             Ok(())
         }).unwrap();

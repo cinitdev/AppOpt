@@ -36,6 +36,7 @@ internal fun AppItemModel.withAutomaticAffinity(
 ): AppItemModel = copy(
     automaticAffinityEnabled = enabled,
     automaticFallbackEnabled = enabled && automaticFallbackEnabled,
+    automaticCustomRules = if (enabled) automaticCustomRules else emptyList(),
     automaticAffinityDetail = detail,
     state = if (enabled) {
         if (available) AppRuleState.CONFIGURED else AppRuleState.MISSING
@@ -55,6 +56,33 @@ internal fun ApplicationsUiState.applicationDeleted(pkg: String): ApplicationsUi
     configured = configured.filterNot { it.packageName == pkg }
 )
 
-internal fun ApplicationsUiState.automaticModeChanged(pkg: String, enabled: Boolean): ApplicationsUiState = copy(
-    configured = configured.map { if (it.packageName == pkg) it.withAutomaticAffinity(enabled) else it }
-)
+internal fun ApplicationsUiState.automaticModeChanged(
+    pkg: String, enabled: Boolean, source: AppItemModel? = null
+): ApplicationsUiState {
+    val configuredApp = configured.firstOrNull { it.packageName == pkg }
+    val existing = configuredApp ?: addable.firstOrNull { it.packageName == pkg } ?: source ?: return this
+
+    if (enabled) {
+        val updated = existing.withAutomaticAffinity(true, "自动分配已启用，等待所选应用进入前台").copy(
+            automaticOnly = configuredApp?.automaticOnly ?: (configuredApp == null)
+        )
+        return copy(configured = if (configuredApp == null) configured + updated else configured.map {
+            if (it.packageName == pkg) updated else it
+        })
+    }
+
+    if (configuredApp?.automaticOnly == true) {
+        val restored = configuredApp.withAutomaticAffinity(false).copy(automaticOnly = false)
+        return copy(
+            configured = configured.filterNot { it.packageName == pkg },
+            addable = if (addable.any { it.packageName == pkg }) addable.map {
+                if (it.packageName == pkg) restored else it
+            } else addable + restored
+        )
+    }
+
+    return copy(
+        configured = configured.map { if (it.packageName == pkg) it.withAutomaticAffinity(false) else it },
+        addable = addable.map { if (it.packageName == pkg) it.withAutomaticAffinity(false) else it }
+    )
+}

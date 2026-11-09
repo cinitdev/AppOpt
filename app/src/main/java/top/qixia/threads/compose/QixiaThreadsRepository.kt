@@ -89,13 +89,24 @@ class QixiaThreadsRepository(private val application: Application) {
         val parsedRules = rawConfig?.let { RuleSyntax.parse(it).rules }.orEmpty()
         val presentCpus = RuleConfigLogic.readPresentCpuSet()
         stage("cpu_ranges")
-        val configured = buildConfiguredApps(safeConfig, health, cpuRanges).map { app ->
+        val manuallyConfiguredOwners = (safeConfig.autoPackages + safeConfig.configuredPackages)
+            .map(::ownerPackage).toSet()
+        val automaticOnlyPackages = automatic.packages.filterNot { it in manuallyConfiguredOwners }.toSet()
+        val effectiveConfig = safeConfig.copy(
+            autoPackages = (safeConfig.autoPackages + automatic.packages).distinct()
+        )
+        val configured = buildConfiguredApps(effectiveConfig, health, cpuRanges).map { app ->
             app.withAutomaticAffinity(app.packageName in automatic.packages,
-                if (automatic.activePackage == app.packageName) automatic.detail else "等待所选游戏进入前台")
+                if (automatic.activePackage == app.packageName) automatic.detail
+                else if (app.packageName in automatic.packages) "自动分配已启用，等待所选应用进入前台"
+                else "等待所选游戏进入前台")
                 .copy(performanceRecordingEnabled = app.packageName in performance,
                     automaticFallbackSupported = automatic.fallbackSupported,
+                    automaticCustomSupported = automatic.customSupported,
+                    automaticCustomRules = automatic.customRules[app.packageName].orEmpty(),
                     automaticFallbackEnabled = app.packageName in automatic.fallbackPackages,
-                    mainFallbackCpus = AutomaticAffinityConfig.fallbackCpus(parsedRules, app.packageName, presentCpus))
+                    mainFallbackCpus = AutomaticAffinityConfig.fallbackCpus(parsedRules, app.packageName, presentCpus),
+                    automaticOnly = app.packageName in automaticOnlyPackages)
         }
         stage("configured")
         val foreground = if (usable) {
@@ -631,7 +642,8 @@ class QixiaThreadsRepository(private val application: Application) {
             cpusetSupported = snapshot.cpusetSupported,
             presentCpus = snapshot.presentCpus,
             autoHistoryEnabled = automaticHistory.enabled,
-            autoHistorySupported = automaticHistory.supported
+            autoHistorySupported = automaticHistory.supported,
+            joyose = if (snapshot.hasRoot) DaemonBridge.readJoyoseSmartOp() else top.qixia.threads.JoyoseSmartOpState()
         )
     }
 

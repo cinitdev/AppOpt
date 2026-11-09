@@ -2,6 +2,7 @@
 //! 优先级或 core_ctl。负载采样不依赖 FPS 采集器。
 use std::collections::{BTreeMap, BTreeSet};
 mod accounting;
+pub mod custom;
 pub(crate) mod calibration;
 mod demand;
 pub(crate) mod diagnostics;
@@ -18,20 +19,43 @@ use topology::Core;
 pub const CONFIG: &str = "/data/adb/modules/QixiaThreads/config/auto_affinity.conf";
 pub const STATUS: &str = "/data/adb/modules/QixiaThreads/config/auto_affinity.state";
 
-/// 每应用一行；fallback 仅启用主进程兜底，核心范围仍来自 applist.conf。
-pub fn modes(text: &str) -> BTreeMap<String, bool> {
-    let mut result = BTreeMap::new();
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppOptions {
+    pub automatic: bool,
+    pub fallback: bool,
+    pub recording: bool,
+    pub custom: Vec<custom::Rule>,
+}
+
+/// 空选项沿用自动分配；record 单独使用时只记录，fallback 包含自动分配。
+pub fn app_options(text: &str) -> BTreeMap<String, AppOptions> {
+    let mut result: BTreeMap<String, AppOptions> = BTreeMap::new();
     for line in text.lines() {
         let parts: Vec<_> = line.split('#').next().unwrap_or_default().trim().split(',').map(str::trim).collect();
         let pkg = parts[0];
         let valid = pkg.len() < 128 && pkg.contains('.') && pkg.split('.').all(|part|
             !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
-        if valid && (parts.len() == 1 || (parts.len() == 2 && parts[1] == "fallback")) {
-            let fallback = parts.len() == 2;
-            result.entry(pkg.to_owned()).and_modify(|value| *value |= fallback).or_insert(fallback);
+        let flags = &parts[1..];
+        let custom_flags: Vec<_> = flags.iter().filter_map(|flag| flag.strip_prefix("custom=")).collect();
+        if custom_flags.len() > 1 { continue; }
+        let custom = match custom_flags.first() {
+            Some(value) => match custom::parse(value) { Some(rules) => Some(rules), None => continue },
+            None => None,
+        };
+        if valid && flags.iter().all(|flag| matches!(*flag, "auto" | "fallback" | "record") || flag.starts_with("custom=")) {
+            let options = result.entry(pkg.to_owned()).or_default();
+            options.automatic |= flags.is_empty() || flags.contains(&"auto") || flags.contains(&"fallback") || custom.is_some();
+            options.fallback |= flags.contains(&"fallback");
+            options.recording |= flags.contains(&"record");
+            if let Some(custom) = custom { options.custom = custom; }
         }
     }
     result
+}
+
+pub fn modes(text: &str) -> BTreeMap<String, bool> {
+    app_options(text).into_iter().filter(|(_, options)| options.automatic)
+        .map(|(pkg, options)| (pkg, options.fallback)).collect()
 }
 
 /// 各调用方仅使用包名，不把选项传给进程查询或黑名单。
@@ -91,6 +115,32 @@ pub mod platform;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_flags_merge_with_independent_modes_and_last_valid_custom_wins() {
+        let text = "com.game,custom=2:0-3|30:4-7,record\ncom.game,fallback\ncom.video,record";
+        let options = app_options(text);
+        let game = &options["com.game"];
+        assert!(game.automatic && game.fallback && game.recording);
+        assert_eq!(game.custom, custom::parse("2:0-3|30:4-7").unwrap());
+        assert_eq!(packages(text), BTreeSet::from(["com.game".into()]));
+        assert!(!options["com.video"].automatic);
+        assert!(app_options("com.game,custom=2:0,custom=5:1,record").is_empty());
+        assert_eq!(app_options("com.game,custom=2:0\ncom.game,record\ncom.game,custom=10:1\ncom.game,custom=broken")["com.game"].custom,
+            custom::parse("10:1").unwrap());
+    }
+    #[test]
+    fn recording_is_independent_and_all_combinations_keep_scheduling_scope() {
+        let text = "com.video,record\ncom.game,auto,record\ncom.full,fallback,record\ncom.plain";
+        assert_eq!(packages(text), BTreeSet::from(["com.game".into(), "com.full".into(), "com.plain".into()]));
+        assert_eq!(modes(text).get("com.full"), Some(&true));
+        assert_eq!(app_options(text).get("com.video"), Some(&AppOptions { automatic: false, fallback: false, recording: true, custom: vec![] }));
+        for text in ["com.game\ncom.game,record", "com.game,record\ncom.game", "com.game,record,auto"] {
+            assert_eq!(app_options(text).get("com.game"), Some(&AppOptions { automatic: true, fallback: false, recording: true, custom: vec![] }));
+        }
+        for text in ["com.game,record,unknown", "com.game,record,", "com.game:child,record", "bad..name,record"] {
+            assert!(app_options(text).is_empty(), "{text}");
+        }
+    }
     #[test]
     fn fallback_option_is_separate_from_package_and_duplicate_order() {
         for text in ["com.game\ncom.game,fallback", "com.game,fallback\ncom.game"] {

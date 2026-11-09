@@ -41,6 +41,7 @@ fun ApplicationsScreen(
     onDiagnostics: (AppItemModel) -> Unit = {},
     onAutomaticFallback: (AppItemModel, Boolean, String?) -> Unit = { _, _, _ -> },
     onPerformanceRecording: (AppItemModel, Boolean) -> Unit = { _, _ -> },
+    onAutomaticCustom: (AppItemModel, List<top.qixia.threads.AutomaticCustomRule>) -> Unit = { _, _ -> },
 ) {
     val apps = state.applications
     val env = state.environment
@@ -200,7 +201,9 @@ fun ApplicationsScreen(
         onDiagnostics = { managedPackage = null; onDiagnostics(managed) },
         onAutomaticFallback = { enabled, cpus -> onAutomaticFallback(managed, enabled, cpus) },
         onPerformanceRecording = { onPerformanceRecording(managed, it) },
-        configured = managed.packageName in addedPackages
+        configured = managed.packageName in addedPackages,
+        onAutomaticCustom = { onAutomaticCustom(managed, it) },
+        operationMessage = state.message
     )
     deleteTarget?.let { app ->
         AlertDialog(onDismissRequest = { deleteTarget = null }, title = { Text(if (app.isSystemComponent) "删除组件配置？" else "删除应用配置？") },

@@ -30,7 +30,7 @@ internal fun HistorySessionSummary(fps: HistoryFpsStore.Report?, metrics: Histor
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text("本次表现", color = OceanText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                        Text("采集 ${historyDuration(duration)} · $threadCount 条线程记录",
+                        Text("采集 ${historyDuration(duration)} · $threadCount 个持续活跃线程",
                             color = OceanTextSecondary, fontSize = 10.sp)
                     }
                     IconButton({ explanation = true }, Modifier.size(44.dp)) {

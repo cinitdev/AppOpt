@@ -3,6 +3,7 @@ package top.qixia.threads.compose.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.selection.selectable
@@ -30,10 +31,12 @@ import top.qixia.threads.UpdateInstallActivity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import top.qixia.threads.compose.QixiaThreadsUiState
+import top.qixia.threads.compose.SettingsTopologyPresentation
 
 import top.qixia.threads.compose.theme.*
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 fun SettingsScreen(
     state: QixiaThreadsUiState, contentPadding: PaddingValues, onRefresh: () -> Unit,
     onPolicyChange: ((CalibPolicy) -> CalibPolicy) -> Unit,
@@ -42,7 +45,8 @@ fun SettingsScreen(
     moduleDownloadState: ModuleUpdateDownloadViewModel.State,
     onOpenModuleUpdate: () -> Unit,
     onAutoHistoryChange: (Boolean) -> Unit = {},
-    onRefreshRate: () -> Unit = {}
+    onRefreshRate: () -> Unit = {},
+    onJoyoseChange: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val pendingApp by produceState(false, state.environment.hasRoot, state.environment.pendingModuleUpdate) {
@@ -54,12 +58,17 @@ fun SettingsScreen(
     val enabled = settings.editable && !settings.saving && !settings.autoHistorySaving && !settings.loading
     val canRefresh = !settings.saving && !settings.autoHistorySaving && !settings.loading
     var dialog by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    val generalListState = rememberLazyListState()
+    val topology = remember(p.detectedTopologyBlock, settings.presentCpus) {
+        SettingsTopologyPresentation.parse(p.detectedTopologyBlock, settings.presentCpus)
+    }
     Column(Modifier.fillMaxSize()
         .background(Brush.verticalGradient(listOf(OceanBackground, ClearTechBackgroundEnd)))
         .padding(contentPadding)) {
-        ScreenHeader("设置", subtitle = "更新、规则与设备管理",
-            status = when { settings.loading -> "读取中"; settings.saving -> "保存中"; settings.editable -> "即时保存"; else -> "只读模式" },
-            statusColor = if (settings.editable) OceanSuccess else OceanTextSecondary,
+        ScreenHeader("设置", subtitle = if (selectedTab == 0) "运行配置与记录偏好" else "设备功能，按需开启",
+            status = when { settings.loading -> "读取中"; settings.saving || settings.autoHistorySaving -> "保存中"; settings.editable -> "自动保存"; else -> "只读模式" },
+            statusColor = if (settings.editable) PorcelainOnTonal else OceanTextSecondary,
             extraAction = {
                 IconButton(onClick = onRefresh, enabled = canRefresh,
                     modifier = Modifier.clip(RoundedCornerShape(14.dp)).background(PorcelainHeader)) {
@@ -67,7 +76,10 @@ fun SettingsScreen(
                         modifier = Modifier.size(22.dp))
                 }
             })
-        LazyColumn(Modifier.weight(1f).fillMaxWidth(),
+        PorcelainTabs(listOf("常规", "扩展"), selectedTab, { selectedTab = it },
+            Modifier.padding(start = 20.dp, end = 20.dp, bottom = 18.dp))
+        if (selectedTab == 1) SettingsExtensionsContent(onRefreshRate, Modifier.weight(1f))
+        else LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = generalListState,
             contentPadding = PaddingValues(start = 20.dp, top = 2.dp, end = 20.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp)) {
             item(key = "module-update") {
@@ -76,12 +88,6 @@ fun SettingsScreen(
             }
             if (pendingApp) item(key = "pending-app-update") {
                 PendingAppUpdateCard { context.startActivity(UpdateInstallActivity.pendingAppIntent(context)) }
-            }
-            item(key = "auto-history") {
-                Column {
-                    SettingsSectionLabel("历史记录")
-                    SettingsAutoHistoryCard(settings, onAutoHistoryChange)
-                }
             }
             if (settings.loading) item(key = "loading") { LoadingState("正在读取设置") }
             else {
@@ -104,41 +110,37 @@ fun SettingsScreen(
                     }
                 }
                 item(key = "rules") {
-                    Column {
-                        SettingsSectionLabel("规则与校准")
-                        SettingsCard {
-                            SettingsEntry("规则保存格式", "选择后同步转换现有规则", formatLabel(p.ruleOutputFormat),
-                                Icons.Outlined.DataObject, enabled) { dialog = "format" }
-                            SettingsCalibrationNote()
-                        }
-                        Text("更改后自动保存，无需额外确认。", color = OceanTextSecondary,
-                            fontSize = 11.sp, lineHeight = 17.sp,
-                            modifier = Modifier.padding(start = 4.dp, end = 4.dp, top = 8.dp))
+                    SettingsGroup("运行配置", "更改即时生效") {
+                        SettingsEntry("规则保存格式", "选择后同步转换现有规则", formatLabel(p.ruleOutputFormat),
+                            Icons.Outlined.DataObject, enabled) { dialog = "format" }
+                        SettingsRowDivider()
+                        SettingsEntry("cpuset 根目录", if (settings.cpusetSupported) "修改后安全重启守护进程" else "设备暂不支持自定义 cpuset",
+                            "/dev/cpuset/${p.cpusetName}", Icons.Outlined.FolderOpen, enabled && settings.cpusetSupported) { dialog = "cpuset" }
                     }
                 }
-                item(key = "device") {
+                item(key = "auto-history") {
                     Column {
-                        SettingsSectionLabel("设备与运行")
-                        SettingsCard {
-                            SettingsEntry("刷新率管理", "应用／游戏刷新率与每应用规则", null,
-                                Icons.Outlined.Refresh, enabled, onRefreshRate)
-                            HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = OceanDivider)
-                            SettingsEntry("cpuset 根目录", if (settings.cpusetSupported) "修改后将安全重启守护进程" else "设备暂不支持自定义 cpuset",
-                                "/dev/cpuset/${p.cpusetName}", Icons.Outlined.FolderOpen, enabled && settings.cpusetSupported) { dialog = "cpuset" }
-                            HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = OceanDivider)
-                            SettingsTopologyContent(p.detectedTopologyBlock, settings.presentCpus)
-                        }
+                        SettingsSectionLabel("记录偏好")
+                        SettingsAutoHistoryCard(settings, onAutoHistoryChange)
                     }
                 }
                 item(key = "support") {
-                    Column {
-                        SettingsSectionLabel("帮助与维护")
-                        SettingsCard {
-                            SettingsEntry("导出诊断包", "日志、规则和系统状态保存到 Download/QixiaThreads", null,
-                                Icons.Outlined.FilePresent, onClick = onExportDiagnostics)
-                            HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = OceanDivider)
-                            SettingsEntry("恢复默认设置", "立即恢复，保留核心识别结果", null, Icons.Outlined.RestartAlt, enabled) { dialog = "defaults" }
+                    SettingsGroup("设备与维护") {
+                        SettingsEntry("核心拓扑", when {
+                            settings.presentCpus.isEmpty() -> "查看核心分组与调频域"
+                            !topology.confirmed -> "${settings.presentCpus.size} 个核心 · 分组待确认"
+                            else -> "${settings.presentCpus.size} 个核心 · ${topology.groups.size} 个性能组"
+                        }, null, Icons.Outlined.Memory) { dialog = "topology" }
+                        if (settings.joyose.available) {
+                            SettingsRowDivider()
+                            SettingsJoyoseToggle(settings, onJoyoseChange)
                         }
+                        SettingsRowDivider()
+                        SettingsEntry("导出诊断包", "导出日志、规则与系统状态", null,
+                            Icons.Outlined.FilePresent, onClick = onExportDiagnostics)
+                        SettingsRowDivider()
+                        SettingsEntry("恢复默认设置", "保留核心识别结果与记录开关", null,
+                            Icons.Outlined.RestartAlt, enabled) { dialog = "defaults" }
                     }
                 }
             }
@@ -146,6 +148,20 @@ fun SettingsScreen(
     }
     when (val key = dialog) {
         null -> Unit
+        "topology" -> ModalBottomSheet(
+            onDismissRequest = { dialog = null },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            sheetGesturesEnabled = false, dragHandle = null, containerColor = OceanSurface,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+        ) {
+            Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("设备核心", Modifier.weight(1f), color = OceanText, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                IconButton(onClick = { dialog = null }) { Icon(Icons.Outlined.Close, "关闭核心拓扑", tint = OceanTextSecondary) }
+            }
+            Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(bottom = 20.dp)) {
+                SettingsTopologyContent(p.detectedTopologyBlock, settings.presentCpus)
+            }
+        }
         "defaults" -> AlertDialog(onDismissRequest = { dialog = null }, containerColor = OceanSurface,
             title = { Text("恢复默认设置？", fontSize = 20.sp, fontWeight = FontWeight.Bold) },
             text = { Text("规则格式和 cpuset 名称将立即恢复默认并写入设备，保留设备拓扑及历史记录开关。") },

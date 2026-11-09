@@ -47,20 +47,20 @@ fn ten_minute_thread_churn_saves_active_threads_and_keeps_rule_statistics() {
         .iter()
         .map(|r| (r.sum_pct, r.max_pct, r.sample_count))
         .collect::<Vec<_>>();
-    let saved = select_history_records(&records);
-    assert_eq!(saved.len(), 17);
-    assert!(saved
-        .iter()
-        .all(|r| r.name.starts_with("active-") || r.name == "scene-loader"));
+    let saved = select_history_records(&records, 1200);
+    // 16 条持续线程；scene-loader 只有 6 个 40% 的采样（3 秒突发）不再进历史。
+    assert_eq!(saved.len(), 16);
+    assert!(saved.iter().all(|r| r.name.starts_with("active-")));
     let active = saved.iter().find(|r| r.name == "active-00").unwrap();
     assert_eq!(
         (active.avg(), active.max_pct, active.sample_count),
         (10.0, 10.0, 1200)
     );
-    let burst = saved.iter().find(|r| r.name == "scene-loader").unwrap();
-    assert_eq!(
-        (burst.avg(), burst.max_pct, burst.sample_count),
-        (0.2, 40.0, 1200)
+    assert!(
+        records
+            .iter()
+            .any(|r| r.name == "scene-loader" && r.max_pct == 40.0),
+        "短时高负载线程仍会作为规则候选保留"
     );
     assert_eq!(
         before,
@@ -76,9 +76,10 @@ fn ten_minute_thread_churn_saves_active_threads_and_keeps_rule_statistics() {
     let (history, count) = format_history(123, 1200, 1200, &saved, &HashMap::new())
         .unwrap()
         .unwrap();
-    assert_eq!(count, 17);
-    assert_eq!(history.lines().count(), 18);
+    assert_eq!(count, 16);
+    assert_eq!(history.lines().count(), 17);
     assert!(!history.contains("wake-") && !history.contains("sleep-"));
+    assert!(!history.contains("scene-loader"));
     assert!(history.len() < 120_000);
 }
 
@@ -99,6 +100,8 @@ fn late_activity_retains_zero_baseline_and_sleep_afterwards() {
     assert_eq!(record.sample_count, 104);
     assert_eq!(record.avg(), 90.0 / 104.0);
     assert!(record.activity.worth_saving(record.avg()));
+    // 只有 3 个采样点（1.5 秒）不足以进历史，但仍是规则候选。
+    assert!(!record.activity.sustained(record.sample_count, 104, record.avg()));
     let series = record.series_values();
     assert!(series.iter().take(100).all(|v| *v == 0.0));
     assert_eq!(series.back(), Some(&0.0));
@@ -123,7 +126,7 @@ fn filter_precedes_capacity_and_selection_is_stable() {
             60,
         ));
     }
-    let names = select_history_records(&records)
+    let names = select_history_records(&records, 60)
         .iter()
         .map(|r| r.name.clone())
         .collect::<Vec<_>>();
@@ -132,7 +135,7 @@ fn filter_precedes_capacity_and_selection_is_stable() {
     records.reverse();
     assert_eq!(
         names,
-        select_history_records(&records)
+        select_history_records(&records, 60)
             .iter()
             .map(|r| r.name.clone())
             .collect::<Vec<_>>()
@@ -175,7 +178,7 @@ fn child_history_filters_incidental_wakes_and_preserves_all_active_members() {
         summary.push(100.0);
         children.insert(key, summary);
     }
-    let saved = select_history_records(&records);
+    let saved = select_history_records(&records, 1200);
     let selected = select_history_child_threads(&saved, &children, 1200);
     assert_eq!(selected.len(), 200);
     assert!(selected
@@ -202,7 +205,7 @@ fn child_history_filters_incidental_wakes_and_preserves_all_active_members() {
 #[test]
 fn idle_session_produces_no_empty_history() {
     let records = [loaded_record(&thread_key("occasional-wake"), 2.0, 1)];
-    assert!(select_history_records(&records).is_empty());
+    assert!(select_history_records(&records, 60).is_empty());
     assert!(format_history(123, 60, 60, &[&records[0]], &HashMap::new())
         .unwrap()
         .is_none());

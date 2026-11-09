@@ -457,7 +457,7 @@ mod draft_tests {
             .collect::<HashSet<_>>();
         assert_eq!(names, HashSet::from(["MainBoundary", "ChildBoundary"]));
 
-        let saved = select_history_records(&records);
+        let saved = select_history_records(&records, 60);
         assert_eq!(saved.len(), 4);
         assert_eq!(select_history_child_threads(&saved, &children, 60).len(), 3);
         let (history, _) = format_history(123, 60, 60, &saved, &children)

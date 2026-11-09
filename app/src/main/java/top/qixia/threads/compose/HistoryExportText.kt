@@ -26,7 +26,7 @@ object HistoryExportText {
         appendLine("记录类型: ${HistoryPresentation.sourceLabel(session.source)}")
         appendLine("采集时长 (ms): ${session.durationMs}")
         appendLine("采样轮数: ${session.rounds}")
-        appendLine("负载记录数: ${threads.size}")
+        appendLine("持续活跃线程数: ${threads.size}")
         appendLine("本节为 CPU 负载记录，不是实时 FPS。")
         for (thread in threads) {
             appendLine()

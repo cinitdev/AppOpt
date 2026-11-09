@@ -6,6 +6,34 @@ import org.junit.Test
 import java.io.File
 
 class AutomaticAffinityCapabilityTest {
+    @Test fun independentSwitchesPreserveRecordingFallbackAndOtherApps() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val config = File.createTempFile("combined-modes-", ".conf", context.cacheDir)
+        val state = File.createTempFile("combined-modes-", ".state", context.cacheDir)
+        try {
+            val untouched = "# 保留\ncom.other,fallback,record\n"
+            config.writeText(untouched)
+            state.writeText("version=1\nfallback_version=1\nrecording_version=1\n")
+            fun change(auto: Boolean? = null, fallback: Boolean? = null, record: Boolean? = null): Boolean =
+                runFixtureScript(DaemonBridge.applicationModesMutationScript("com.game", "combined-test", auto, fallback, record, config.path, state.path))
+            fun row(expected: String) = assertEquals(untouched + expected, config.readText())
+            org.junit.Assert.assertTrue(change(record = true)); row("com.game,record\n")
+            org.junit.Assert.assertFalse(change(auto = true, fallback = true)); row("com.game,record\n")
+            org.junit.Assert.assertTrue(change(auto = true)); row("com.game,auto,record\n")
+            org.junit.Assert.assertTrue(change(auto = true, fallback = true)); row("com.game,fallback,record\n")
+            org.junit.Assert.assertTrue(change(record = false)); row("com.game,fallback\n")
+            org.junit.Assert.assertTrue(change(record = true)); row("com.game,fallback,record\n")
+            org.junit.Assert.assertTrue(change(auto = true, fallback = false)); row("com.game,auto,record\n")
+            org.junit.Assert.assertTrue(change(auto = false)); row("com.game,record\n")
+            org.junit.Assert.assertTrue(change(record = false)); row("")
+            config.appendText("com.game\ncom.game,record\n")
+            org.junit.Assert.assertTrue(change(auto = true, fallback = true)); row("com.game,fallback,record\n")
+            state.writeText("version=1\nfallback_version=1\n")
+            org.junit.Assert.assertFalse(change(record = true)); row("com.game,fallback,record\n")
+            org.junit.Assert.assertTrue(change(record = false)); row("com.game,fallback\n")
+        } finally { config.delete(); state.delete() }
+    }
+
     @Test fun fallbackSwitchPreservesOtherAppsAndRequiresNewCapability() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val config = File.createTempFile("fallback-mode-", ".conf", context.cacheDir)

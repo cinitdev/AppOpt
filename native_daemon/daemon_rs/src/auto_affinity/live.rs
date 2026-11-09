@@ -1,6 +1,6 @@
 //! 有界的前台线程采样；可选主进程兜底与动态分配共用接管和恢复基线。
 use super::super::{
-    accounting, demand,
+    accounting, custom, demand,
     live_policy::{self, Activity, Placement},
     planner, Sample,
 };
@@ -61,21 +61,21 @@ impl Tracked {
         }
     }
 
-    fn fallback_eligible(&self, now: Instant) -> bool {
+    fn fallback_eligible(&self, now: Instant, threshold: f64) -> bool {
         // 新线程先取得有效样本；异常读数不能把已有动态分配降为兜底。
         // 为轮换采样保留一轮扫描的时效，避免低负载线程反复释放。
-        !self.activity.eligible() && self.last_valid_sample.is_some_and(|last|
+        !self.activity.eligible_at(threshold) && self.last_valid_sample.is_some_and(|last|
             now.saturating_duration_since(last) <= Duration::from_secs(12))
     }
 
-    fn fallback_target(&self, now: Instant, main: bool, configured: u64, available: u64) -> Option<u64> {
+    fn fallback_target(&self, now: Instant, main: bool, configured: u64, available: u64, threshold: f64) -> Option<u64> {
         let mask = configured & available;
-        (main && mask != 0 && self.fallback_eligible(now)).then_some(mask)
+        (main && mask != 0 && self.fallback_eligible(now, threshold)).then_some(mask)
     }
 
-    fn keep_owned(&self, now: Instant) -> bool {
+    fn keep_owned(&self, now: Instant, threshold: f64) -> bool {
         self.last_valid_sample.is_some_and(|last|
-            self.activity.keep_owned_without_sample(now.saturating_duration_since(last)))
+            self.activity.keep_owned_at(now.saturating_duration_since(last), threshold))
     }
 }
 
@@ -87,6 +87,8 @@ pub(super) struct Controller {
     pids: BTreeSet<i32>,
     main_pids: BTreeSet<i32>,
     fallback_mask: u64,
+    custom_rules: Vec<custom::Rule>,
+    mode_changed: bool,
     fallback_requests: BTreeSet<Identity>,
     last_fallback_check: Option<Instant>,
     process_scan: Option<Instant>,
@@ -109,6 +111,17 @@ pub(super) struct Controller {
 
 impl Controller {
     pub(super) fn set_fallback(&mut self, mask: u64) { self.fallback_mask = mask; }
+
+    pub(super) fn set_custom(&mut self, rules: &[custom::Rule]) {
+        if self.custom_rules == rules { return; }
+        self.custom_rules = rules.to_vec();
+        self.mode_changed = true;
+        self.requests.clear();
+        self.feedback_pressure = live_policy::FeedbackPressure::default();
+        for entry in self.tracked.values_mut() {
+            entry.placement = Placement::default();
+        }
+    }
 
     pub(super) fn package(&self) -> &str {
         &self.pkg
@@ -136,6 +149,8 @@ impl Controller {
             pids: BTreeSet::new(),
             main_pids: BTreeSet::new(),
             fallback_mask: 0,
+            custom_rules: Vec::new(),
+            mode_changed: false,
             fallback_requests: BTreeSet::new(),
             last_fallback_check: None,
             process_scan: None,
@@ -179,10 +194,11 @@ impl Controller {
     pub(super) fn maintain(&mut self) {
         self.capture_core_history();
         let now = Instant::now();
+        let threshold = custom::threshold(&self.custom_rules);
         self.requests.retain(|request| self.tracked.get(&request.identity).is_some_and(|entry|
-            entry.keep_owned(now) || (self.fallback_requests.contains(&request.identity)
+            entry.keep_owned(now, threshold) || (self.fallback_requests.contains(&request.identity)
                 && self.fallback_mask != 0 && self.main_pids.contains(&request.identity.0)
-                && entry.fallback_eligible(now))));
+                && entry.fallback_eligible(now, threshold))));
         // 低负载兜底已在完整采样轮次复核；不把整个休眠线程池额外提升到 250 ms 复核。
         let check_fallback = self.last_fallback_check.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1));
         let requests: Vec<_> = self.requests.iter().filter(|request|
@@ -273,7 +289,7 @@ impl Controller {
             .iter()
             .filter(|(key, t)| {
                 present.contains(&(key.0, key.1))
-                    && ((self.batch.mask(key).is_some() && !self.fallback_requests.contains(key)) || t.activity.eligible())
+                    && ((self.batch.mask(key).is_some() && !self.fallback_requests.contains(key)) || t.activity.eligible_at(custom::threshold(&self.custom_rules)))
             })
             .map(|(key, entry)| ((key.0, key.1), self.batch.mask(key).is_some(), entry.activity.peak())))
             .into_iter()
@@ -353,8 +369,10 @@ impl Controller {
             return ("cooldown", "暂由系统调度，稍后重新评估活跃线程".into());
         }
         self.paused_until = None;
+        let custom_mode = !self.custom_rules.is_empty();
+        let threshold = custom::threshold(&self.custom_rules);
         let Some(online) = online_mask()
-            .filter(|mask| super::super::topology::has_capacity_info(&self.cores, *mask))
+            .filter(|mask| custom_mode || super::super::topology::has_capacity_info(&self.cores, *mask))
         else {
             self.cores = topology();
             self.policies = accounting::policies(&self.cores).unwrap_or_default();
@@ -363,12 +381,12 @@ impl Controller {
         if self.hz <= 0.0 {
             return self.pause("线程计时信息不可用，正在重试", 2);
         }
-        let limits = accounting::limits(&self.policies);
-        if self.policies.is_empty()
+        let limits = if custom_mode { [Some(1.0); 64] } else { accounting::limits(&self.policies) };
+        if !custom_mode && (self.policies.is_empty()
             || self
                 .cores
                 .iter()
-                .any(|c| online & (1 << c.id) != 0 && limits[c.id].is_none())
+                .any(|c| online & (1 << c.id) != 0 && limits[c.id].is_none()))
         {
             self.policies = accounting::policies(&self.cores).unwrap_or_default();
             return self.pause("核心频率信息暂不可用，正在重试", 2);
@@ -408,7 +426,7 @@ impl Controller {
         }
         // 历史探测独立于 500 ms 分配器：活跃或已接管线程每 2 秒探测，
         // 此前见过的休眠且未接管线程每 5 秒探测。
-        // 任何正活跃度都计入，包括低于 5% 门槛的线程。
+        // 任何正活跃度都计入，包括低于分配门槛的线程。
         if self.core_history.enabled() && crate::auto_history::recording_for(&self.pkg) {
             for key in &sampled {
                 let entry = self.tracked.get_mut(key).unwrap();
@@ -422,7 +440,7 @@ impl Controller {
             }
         }
         if crate::auto_history::wants_threads() {
-            // 复用执行 5% 分配过滤前的原始观测窗口。
+            // 复用执行分配过滤前的原始观测窗口。
             // 发布在 worker.rs 中释放分配互斥锁后进行。
             self.history = Some(crate::auto_history::ThreadBatch {
                 package: self.pkg.clone(),
@@ -441,139 +459,151 @@ impl Controller {
         let active = live_policy::select_active(self.tracked.iter().filter_map(|(key, entry)| {
             let managed = self.batch.mask(key).is_some();
             let eligible = if sampled.contains(key) {
-                entry.activity.eligible()
+                entry.activity.eligible_at(threshold)
             } else {
-                managed && entry.keep_owned(now)
+                managed && entry.keep_owned(now, threshold)
             };
             eligible.then_some((*key, managed, entry.activity.peak()))
         }));
 
-        // 系统迁移不会取消符合条件线程的期望分配。
-        // Batch 会验证归属，并对各次写入进行退避重试。
-        let mut current_masks = BTreeMap::new();
-        for key in &active {
-            current_masks.insert(*key, affinity(key.1).ok());
-        }
-        if !active.is_empty() && !self.policies.is_empty() {
-            let details = sampling::oldest_details(
-                active.iter().filter(|key| sampled.contains(*key)
-                    && self.tracked[*key].last_detail.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1)))
-                    .map(|key| (*key, self.tracked[key].last_detail)),
-                live_policy::MAX_DETAILS,
-            );
-            for key in details {
-                let entry = self.tracked.get_mut(&key).unwrap();
-                entry.last_detail = Some(now);
-                if let Ok(residency) = accounting::residency(key.0, key.1) {
-                    let stat = super::ThreadStat {
-                        start: key.2,
-                        ticks: entry.ticks,
-                    };
-                    if let Some(measured) =
-                        entry
-                            .demand
-                            .push(now, stat, residency, &self.policies, self.hz)
-                    {
-                        entry.measured = Some((now, measured));
+        let mut requests = if custom_mode {
+            // 自定义范围直接生成请求，复用同一接管、重试、恢复与历史链路。
+            // 不经过默认选核、帧反馈或驻留期，达标后在本轮采样立即切换。
+            active.iter().filter_map(|key| {
+                let mask = custom::target(&self.custom_rules, &self.tracked[key].activity, available)?;
+                let original = self.batch.original(key).or_else(|| affinity(key.1).ok())?;
+                Some(Request { identity: *key, original, mask })
+            }).collect::<Vec<_>>()
+        } else {
+            // 系统迁移不会取消符合条件线程的期望分配。
+            // Batch 会验证归属，并对各次写入进行退避重试。
+            let mut current_masks = BTreeMap::new();
+            for key in &active {
+                current_masks.insert(*key, affinity(key.1).ok());
+            }
+            if !active.is_empty() && !self.policies.is_empty() {
+                let details = sampling::oldest_details(
+                    active.iter().filter(|key| sampled.contains(*key)
+                        && self.tracked[*key].last_detail.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1)))
+                        .map(|key| (*key, self.tracked[key].last_detail)),
+                    live_policy::MAX_DETAILS,
+                );
+                for key in details {
+                    let entry = self.tracked.get_mut(&key).unwrap();
+                    entry.last_detail = Some(now);
+                    if let Ok(residency) = accounting::residency(key.0, key.1) {
+                        let stat = super::ThreadStat {
+                            start: key.2,
+                            ticks: entry.ticks,
+                        };
+                        if let Some(measured) =
+                            entry
+                                .demand
+                                .push(now, stat, residency, &self.policies, self.hz)
+                        {
+                            entry.measured = Some((now, measured));
+                        }
                     }
                 }
             }
-        }
-        let maximum = self.cores.iter().map(|c| c.capacity).max().unwrap_or(0) as f64;
-        let mut demands = Vec::new();
-        let mut current_union = 0;
-        let mut current_busy = 0.0;
-        let mut pinned_busy = [0.0; 64];
-        for key in &active {
-            let current = *current_masks
-                .entry(*key)
-                .or_insert_with(|| affinity(key.1).ok());
-            let Some(original) = self.batch.original(key).or(current) else { continue; };
-            // 继承的掩码只是恢复基线，不能成为
-            // QixiaThreads 专用 cpuset 的永久上限。
-            let allowed = available;
-            let entry = &self.tracked[key];
-            let measured = entry
-                .measured
-                .filter(|(time, _)| now.duration_since(*time) <= Duration::from_secs(8))
-                .map(|(_, d)| d);
-            // 仅在完整区间内被我们固定到单核时，扣除该核上已确认的自身负载。
-            // /proc/stat 的最后运行核心不能证明整个区间都在那颗 CPU 上。
-            let settled_pin = current.filter(|mask| mask.count_ones() == 1
-                && self.batch.mask(key) == Some(*mask)
-                && entry.placement.settled_before(entry.interval_start) && self.batch.owns(key));
-            let scale = measured.map_or(maximum,
-                |d| (d.units / d.busy.max(0.01)).min(maximum));
-            let units = self.feedback_pressure.workload(now, planner::workload(entry.activity.average(),
-                entry.activity.peak(), maximum, scale, measured.map_or(0.0, |d| d.units)));
-            if let Some(current) = current.filter(|_| sampled.contains(key)) {
-                if settled_pin == Some(current) {
-                    pinned_busy[current.trailing_zeros() as usize] += entry.latest_busy;
-                } else {
-                    current_union |= current;
-                    current_busy += entry.latest_busy;
+            let maximum = self.cores.iter().map(|c| c.capacity).max().unwrap_or(0) as f64;
+            let mut demands = Vec::new();
+            let mut current_union = 0;
+            let mut current_busy = 0.0;
+            let mut pinned_busy = [0.0; 64];
+            for key in &active {
+                let current = *current_masks
+                    .entry(*key)
+                    .or_insert_with(|| affinity(key.1).ok());
+                let Some(original) = self.batch.original(key).or(current) else { continue; };
+                // 继承的掩码只是恢复基线，不能成为
+                // QixiaThreads 专用 cpuset 的永久上限。
+                let allowed = available;
+                let entry = &self.tracked[key];
+                let measured = entry
+                    .measured
+                    .filter(|(time, _)| now.duration_since(*time) <= Duration::from_secs(8))
+                    .map(|(_, d)| d);
+                // 仅在完整区间内被我们固定到单核时，扣除该核上已确认的自身负载。
+                // /proc/stat 的最后运行核心不能证明整个区间都在那颗 CPU 上。
+                let settled_pin = current.filter(|mask| mask.count_ones() == 1
+                    && self.batch.mask(key) == Some(*mask)
+                    && entry.placement.settled_before(entry.interval_start) && self.batch.owns(key));
+                let scale = measured.map_or(maximum,
+                    |d| (d.units / d.busy.max(0.01)).min(maximum));
+                let units = self.feedback_pressure.workload(now, planner::workload(entry.activity.average(),
+                    entry.activity.peak(), maximum, scale, measured.map_or(0.0, |d| d.units)));
+                if let Some(current) = current.filter(|_| sampled.contains(key)) {
+                    if settled_pin == Some(current) {
+                        pinned_busy[current.trailing_zeros() as usize] += entry.latest_busy;
+                    } else {
+                        current_union |= current;
+                        current_busy += entry.latest_busy;
+                    }
                 }
+                demands.push((
+                    *key,
+                    original,
+                    planner::Demand {
+                        serial: units,
+                        total: units,
+                        parallel: 1,
+                        allowed,
+                    },
+                ));
             }
-            demands.push((
-                *key,
-                original,
-                planner::Demand {
-                    serial: units,
-                    total: units,
-                    parallel: 1,
-                    allowed,
-                },
-            ));
-        }
-        demands.sort_by(|a, b| b.2.serial.total_cmp(&a.2.serial).then(a.0.cmp(&b.0)));
-        let external = live_policy::external_with_pinned(raw_loads, &pinned_busy, current_union, current_busy);
-        let mut budget = planner::Budget::new(&self.cores, &limits);
-        budget.reserve_external(&external);
-        let mut requests = Vec::new();
-        for (key, original, demand) in &demands {
-            let before = budget.clone();
-            // 从兜底转入动态时立即重新规划，不沿用低负载核心池的驻留期。
-            let promoting = self.fallback_requests.contains(key);
-            let held = if promoting { 0 } else { self.batch.mask(key).unwrap_or(0) };
-            if !sampled.contains(key) && held != 0 && held & !available == 0 {
-                budget.reserve_placement(demand, held);
-                requests.push(Request { identity: *key, original: *original, mask: held });
-                continue;
-            }
-            let current_fits = budget.fits(demand, held);
-            let desired = budget.assign_preferred(demand, held).0;
-            let materially_better = before.materially_better(demand, held, desired);
-            // 需求突增时可立即离开容量不足的窄核心池；
-            // 驻留期结束后再依据稳定证据选择新核心池。
-            let entry = self.tracked.get_mut(key).unwrap();
-            if entry.placement.wait_for_accounting(entry.interval_start, held, available,
-                before.stronger_lane(available, held, desired)) {
-                budget = before;
-                budget.reserve_placement(demand, held);
-                requests.push(Request { identity: *key, original: *original, mask: held });
-                continue;
-            }
-            if let Some(mask) = entry.placement.choose_available(now, held, desired, available, current_fits, materially_better) {
-                if mask != desired {
+            demands.sort_by(|a, b| b.2.serial.total_cmp(&a.2.serial).then(a.0.cmp(&b.0)));
+            let external = live_policy::external_with_pinned(raw_loads, &pinned_busy, current_union, current_busy);
+            let mut budget = planner::Budget::new(&self.cores, &limits);
+            budget.reserve_external(&external);
+            let mut requests = Vec::new();
+            for (key, original, demand) in &demands {
+                let before = budget.clone();
+                // 从兜底转入动态时立即重新规划，不沿用低负载核心池的驻留期。
+                let promoting = self.fallback_requests.contains(key);
+                let held = if promoting || self.mode_changed { 0 } else { self.batch.mask(key).unwrap_or(0) };
+                if !sampled.contains(key) && held != 0 && held & !available == 0 {
+                    budget.reserve_placement(demand, held);
+                    requests.push(Request { identity: *key, original: *original, mask: held });
+                    continue;
+                }
+                let current_fits = budget.fits(demand, held);
+                let desired = budget.assign_preferred(demand, held).0;
+                let materially_better = before.materially_better(demand, held, desired);
+                // 需求突增时可立即离开容量不足的窄核心池；
+                // 驻留期结束后再依据稳定证据选择新核心池。
+                let entry = self.tracked.get_mut(key).unwrap();
+                if entry.placement.wait_for_accounting(entry.interval_start, held, available,
+                    before.stronger_lane(available, held, desired)) {
                     budget = before;
-                    budget.reserve_placement(demand, mask);
+                    budget.reserve_placement(demand, held);
+                    requests.push(Request { identity: *key, original: *original, mask: held });
+                    continue;
                 }
-                requests.push(Request {
-                    identity: *key,
-                    original: *original,
-                    mask: mask & available,
-                });
+                if let Some(mask) = entry.placement.choose_available(now, held, desired, available, current_fits, materially_better) {
+                    if mask != desired {
+                        budget = before;
+                        budget.reserve_placement(demand, mask);
+                    }
+                    requests.push(Request {
+                        identity: *key,
+                        original: *original,
+                        mask: mask & available,
+                    });
+                }
+                // 待生效分配仍占用所提议核心池的预算。否则每个新线程
+                // 都会反复提议同一颗首选核心，
+                // 导致每个预热窗口只能接纳一个线程。
             }
-            // 待生效分配仍占用所提议核心池的预算。否则每个新线程
-            // 都会反复提议同一颗首选核心，
-            // 导致每个预热窗口只能接纳一个线程。
-        }
+
+            requests
+        };
 
         let fallback = self.fallback_mask & available;
         let mut fallback_requests = BTreeSet::new();
         if fallback != 0 {
             for (key, entry) in &self.tracked {
-                let Some(mask) = entry.fallback_target(now, self.main_pids.contains(&key.0), self.fallback_mask, available) else { continue; };
+                let Some(mask) = entry.fallback_target(now, self.main_pids.contains(&key.0), self.fallback_mask, available, threshold) else { continue; };
                 let Some(original) = self.batch.original(key).or_else(|| affinity(key.1).ok()) else { continue; };
                 requests.push(Request { identity: *key, original, mask });
                 fallback_requests.insert(*key);
@@ -592,7 +622,7 @@ impl Controller {
             .saturating_mul(1_000_000_000)
             .saturating_add(ts.tv_nsec as u64);
         if let Some(s) = sample
-            .filter(|s| clock_ok && s.feedback_valid(now_ns) && s.timestamp_ns > self.last_frame_ns)
+            .filter(|s| !custom_mode && clock_ok && s.feedback_valid(now_ns) && s.timestamp_ns > self.last_frame_ns)
         {
             self.last_frame_ns = s.timestamp_ns;
             if let Some(base) = self
@@ -634,6 +664,7 @@ impl Controller {
                 return self.pause("亲和性写入或恢复监督异常，正在重试", 2);
             }
         };
+        self.mode_changed = false;
         let written_count = changes.written.len();
         let pending = changes.pending;
         if let Some(history) = self.history.as_mut() {
@@ -690,7 +721,7 @@ impl Controller {
         } else if active.is_empty() {
             (
                 "observing",
-                "正在观察线程负载，仅分配平均占用达到 5% 的活跃线程".into(),
+                format!("正在观察线程负载，仅分配平均占用达到 {:.0}% 的活跃线程", threshold * 100.0),
             )
         } else {
             (
@@ -701,9 +732,19 @@ impl Controller {
                 ),
             )
         };
+        let mut detail = result.1;
+        if custom_mode {
+            detail = format!("自定义 {} 档 · {detail}", self.custom_rules.len());
+            let unavailable = active.iter().filter(|key|
+                custom::target(&self.custom_rules, &self.tracked[key].activity, available).is_none()).count();
+            if unavailable > 0 {
+                detail.push_str(&format!(" · {unavailable} 个线程的指定核心暂不可用，待恢复后重试"));
+            }
+        }
         if self.fallback_mask != 0 && fallback == 0 {
-            (result.0, format!("{} · 所选兜底核心当前不可用，低负载线程暂由系统调度", result.1))
-        } else { result }
+            detail.push_str(" · 所选兜底核心当前不可用，低负载线程暂由系统调度");
+        }
+        (result.0, detail)
     }
 
     pub(super) fn take_history(&mut self) -> Option<crate::auto_history::ThreadBatch> {
@@ -725,13 +766,18 @@ impl Controller {
             let key = (event.pid, event.tid, event.start);
             let entry = self.tracked.get_mut(&key);
             if self.fallback_requests.contains(&key) && event.kind == "assign" {
-                event.reason = "process_fallback".into();
+                event.reason = if self.custom_rules.is_empty() { "process_fallback" } else { "custom_process_fallback" }.into();
+            } else if !self.custom_rules.is_empty() && event.kind == "assign" {
+                event.reason = "custom_load".into();
             }
             if event.kind == "release" && event.reason == "released" {
                 event.reason = core_history::release_reason(release_reason,
                     entry.as_ref().map(|entry| entry.activity.average() * 100.0),
                     entry.as_ref().is_some_and(|entry| entry.activity.dormant()),
-                    unrestricted.contains(&key)).into();
+                    unrestricted.contains(&key), custom::threshold(&self.custom_rules) * 100.0).into();
+                if !self.custom_rules.is_empty() && event.reason == "low_average" {
+                    event.reason = "custom_low_average".into();
+                }
             }
             if let Some(entry) = entry {
                 event.name = entry.name.clone();
@@ -789,7 +835,7 @@ mod tests {
         let mut entry = Tracked::new(0, start);
         let mut batch = Batch::default();
         assert!(entry.observe_ticks(2, start + Duration::from_secs(1), 100.0));
-        let low = entry.fallback_target(start + Duration::from_secs(1), true, low_mask, available).unwrap();
+        let low = entry.fallback_target(start + Duration::from_secs(1), true, low_mask, available, 0.05).unwrap();
         let apply = |batch: &mut Batch, mask| {
             let original = batch.original(&key).unwrap_or(original);
             assert_eq!(batch.apply(&[Request { identity: key, original, mask }]).unwrap().written, vec![key]);
@@ -799,10 +845,10 @@ mod tests {
         apply(&mut batch, low);
         assert!(entry.observe_ticks(22, start + Duration::from_secs(2), 100.0));
         assert!(entry.activity.eligible());
-        assert!(entry.fallback_target(start + Duration::from_secs(2), true, low_mask, available).is_none());
+        assert!(entry.fallback_target(start + Duration::from_secs(2), true, low_mask, available, 0.05).is_none());
         apply(&mut batch, high_mask);
         assert!(entry.observe_ticks(22, start + Duration::from_secs(8), 100.0));
-        apply(&mut batch, entry.fallback_target(start + Duration::from_secs(8), true, low_mask, available).unwrap());
+        apply(&mut batch, entry.fallback_target(start + Duration::from_secs(8), true, low_mask, available, 0.05).unwrap());
         assert_eq!(batch.original(&key), Some(original));
         batch.apply(&[]).unwrap();
         assert_eq!(super::super::cpuset::current(key.0, key.1).unwrap(), original_group);
@@ -816,23 +862,23 @@ mod tests {
     fn main_fallback_routes_only_valid_low_samples_and_promotes_at_five_percent() {
         let start = Instant::now();
         let mut entry = Tracked::new(0, start);
-        assert_eq!(entry.fallback_target(start, true, 3, 255), None);
+        assert_eq!(entry.fallback_target(start, true, 3, 255, 0.05), None);
         let low = start + Duration::from_secs(1);
         assert!(entry.observe_ticks(4, low, 100.0));
-        assert_eq!(entry.fallback_target(low, true, 3, 255), Some(3));
-        assert_eq!(entry.fallback_target(low, false, 3, 255), None);
-        assert_eq!(entry.fallback_target(low, true, 0, 255), None);
-        assert_eq!(entry.fallback_target(low, true, 3, 254), Some(2));
-        assert_eq!(entry.fallback_target(low, true, 3, 252), None);
+        assert_eq!(entry.fallback_target(low, true, 3, 255, 0.05), Some(3));
+        assert_eq!(entry.fallback_target(low, false, 3, 255, 0.05), None);
+        assert_eq!(entry.fallback_target(low, true, 0, 255, 0.05), None);
+        assert_eq!(entry.fallback_target(low, true, 3, 254, 0.05), Some(2));
+        assert_eq!(entry.fallback_target(low, true, 3, 252, 0.05), None);
         let high = start + Duration::from_secs(2);
         assert!(entry.observe_ticks(10, high, 100.0));
         assert!(entry.activity.eligible(), "平均值恰好达到 5% 必须进入动态分配");
-        assert_eq!(entry.fallback_target(high, true, 3, 255), None);
+        assert_eq!(entry.fallback_target(high, true, 3, 255, 0.05), None);
         assert!(!entry.observe_ticks(10000, high + Duration::from_millis(500), 100.0));
-        assert_eq!(entry.fallback_target(high, true, 3, 255), None, "异常值不能把高负载线程降入兜底");
+        assert_eq!(entry.fallback_target(high, true, 3, 255, 0.05), None, "异常值不能把高负载线程降入兜底");
         assert!(entry.observe_ticks(10000, start + Duration::from_secs(8), 100.0));
-        assert_eq!(entry.fallback_target(start + Duration::from_secs(8), true, 3, 255), Some(3));
-        assert_eq!(entry.fallback_target(start + Duration::from_secs(21), true, 3, 255), None);
+        assert_eq!(entry.fallback_target(start + Duration::from_secs(8), true, 3, 255, 0.05), Some(3));
+        assert_eq!(entry.fallback_target(start + Duration::from_secs(21), true, 3, 255, 0.05), None);
     }
 
     #[test]
@@ -843,7 +889,7 @@ mod tests {
         assert!(tracked.observe_ticks(110, start + Duration::from_millis(1100), 100.0));
         assert!((tracked.latest_busy - 1.0).abs() < 1e-9);
         assert!(tracked.activity.eligible());
-        assert!(tracked.keep_owned(start + Duration::from_millis(1200)));
+        assert!(tracked.keep_owned(start + Duration::from_millis(1200), 0.05));
     }
 
     #[test]
@@ -852,13 +898,13 @@ mod tests {
         let mut tracked = Tracked::new(100, start);
         assert!(tracked.observe_ticks(130, start + Duration::from_millis(500), 100.0));
         assert!(!tracked.observe_ticks(1, start + Duration::from_secs(1), 100.0));
-        assert!(tracked.keep_owned(start + Duration::from_secs(1)));
+        assert!(tracked.keep_owned(start + Duration::from_secs(1), 0.05));
         assert!(!tracked.observe_ticks(1000, start + Duration::from_millis(1500), 100.0));
         assert!((tracked.activity.average() - 0.6).abs() < 1e-9);
-        assert!(tracked.keep_owned(start + Duration::from_millis(3800)));
-        assert!(!tracked.keep_owned(start + Duration::from_millis(3801)));
+        assert!(tracked.keep_owned(start + Duration::from_millis(3800), 0.05));
+        assert!(!tracked.keep_owned(start + Duration::from_millis(3801), 0.05));
         // 异常值只作为新计数基线，下一次合理增量仍能恢复采样。
         assert!(tracked.observe_ticks(1030, start + Duration::from_secs(2), 100.0));
-        assert!(tracked.keep_owned(start + Duration::from_secs(2)));
+        assert!(tracked.keep_owned(start + Duration::from_secs(2), 0.05));
     }
 }

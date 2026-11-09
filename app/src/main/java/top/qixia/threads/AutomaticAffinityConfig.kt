@@ -1,18 +1,34 @@
 package top.qixia.threads
 
-/** 自动模式只保存开关；兜底核心复用主进程规则，避免两份范围互相覆盖。 */
+/** 每应用的独立开关；兜底核心仍复用主进程规则，性能记录不隐式开启自动分配。 */
 internal object AutomaticAffinityConfig {
-    fun modes(raw: String): Map<String, Boolean> = buildMap {
+    data class Options(val automatic: Boolean, val fallback: Boolean, val recording: Boolean,
+        val custom: List<AutomaticCustomRule> = emptyList())
+
+    fun entries(raw: String): Map<String, Options> = buildMap {
         raw.lineSequence().forEach { line ->
             val parts = line.substringBefore('#').trim().split(',').map(String::trim)
             val pkg = parts.first()
             if (pkg.length >= 128 || '.' !in pkg || pkg.split('.').any { part ->
                     part.isEmpty() || part.any { it !in 'a'..'z' && it !in 'A'..'Z' && it !in '0'..'9' && it != '_' }
                 }) return@forEach
-            if (parts.size != 1 && parts != listOf(pkg, "fallback")) return@forEach
-            put(pkg, get(pkg) == true || parts.size == 2)
+            val flags = parts.drop(1)
+            val customFlags = flags.filter { it.startsWith("custom=") }
+            if (customFlags.size > 1 || flags.any { it !in setOf("auto", "fallback", "record") && !it.startsWith("custom=") }) return@forEach
+            val custom = customFlags.firstOrNull()?.let { AutomaticCustomRules.decode(it.removePrefix("custom=")) ?: return@forEach }
+            val previous = get(pkg)
+            put(pkg, Options(
+                automatic = previous?.automatic == true || flags.isEmpty() || "auto" in flags || "fallback" in flags || custom != null,
+                fallback = previous?.fallback == true || "fallback" in flags,
+                recording = previous?.recording == true || "record" in flags,
+                custom = custom ?: previous?.custom.orEmpty()
+            ))
         }
     }
+
+    fun modes(raw: String): Map<String, Boolean> = entries(raw).filterValues { it.automatic }.mapValues { it.value.fallback }
+
+    fun recordingPackages(raw: String): Set<String> = entries(raw).filterValues { it.recording }.keys
 
     fun fallbackCpus(rules: List<RuleSyntax.Rule>, pkg: String, present: Set<Int>?): String? =
         rules.asSequence().filter { it.owner == pkg && it.thread == null && !it.cpus.equals("auto", true) }

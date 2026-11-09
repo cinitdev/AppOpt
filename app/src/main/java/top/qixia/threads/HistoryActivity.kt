@@ -1,4 +1,4 @@
-package top.qixia.threads
+﻿package top.qixia.threads
 
 import android.content.ContentValues
 import android.content.ClipData
@@ -266,7 +266,7 @@ class HistoryActivity : AppCompatActivity() {
             // round_count = 采样轮数, 每轮间隔 0.5 秒; 显示成采样时长
             val durationSec = s.rounds / 2
             val durationStr = formatDuration(durationSec)
-            card.sessionThreads.text = "${s.threadCount} 条记录"
+            card.sessionThreads.text = "${s.threadCount} 个线程"
             card.sessionDuration.text = durationStr
             // 默认全部折叠; 点击头部展开本卡, 同时折叠上一张展开的卡(单展开互斥)
             setCardExpanded(card, false)
@@ -325,7 +325,7 @@ class HistoryActivity : AppCompatActivity() {
         val durationSec = session.rounds / 2
         view.sessionManageTitle.text = "校准记录"
         view.sessionManageMeta.text =
-            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 条记录 · ${formatDuration(durationSec)}"
+            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 个线程 · ${formatDuration(durationSec)}"
 
         view.sessionManageCancel.setOnClickListener { dialog.dismiss() }
         view.sessionManageExport.setOnClickListener {
@@ -346,7 +346,7 @@ class HistoryActivity : AppCompatActivity() {
 
         view.sessionDeleteTitle.text = "删除校准记录"
         view.sessionDeleteMeta.text =
-            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 条记录"
+            "$appLabel · ${formatHistoryTime(session.epoch)} · ${session.threadCount} 个线程"
         view.sessionDeleteCancel.setOnClickListener { dialog.dismiss() }
         view.sessionDeleteConfirm.setOnClickListener {
             dialog.dismiss()

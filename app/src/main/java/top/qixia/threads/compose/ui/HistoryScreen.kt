@@ -329,7 +329,7 @@ private fun HistoryRecordCard(app: HistoryPackageModel, session: SessionSummary,
                     }
                     VerticalDivider(Modifier.height(36.dp), color = OceanOutline)
                     Column(Modifier.weight(.8f).padding(start = 17.dp)) {
-                        Text(if (session.source == HistorySource.PERFORMANCE) "帧率样本" else "线程记录", color = OceanTextSecondary, fontSize = 10.sp)
+                        Text(if (session.source == HistorySource.PERFORMANCE) "帧率样本" else "活跃线程", color = OceanTextSecondary, fontSize = 10.sp)
                         Row(Modifier.padding(top = 5.dp), verticalAlignment = Alignment.Bottom) {
                             Text("${if (session.source == HistorySource.PERFORMANCE) fps?.samples ?: 0 else session.threadCount}", color = OceanText, fontSize = 23.sp, lineHeight = 34.sp,
                                 fontWeight = FontWeight.SemiBold)

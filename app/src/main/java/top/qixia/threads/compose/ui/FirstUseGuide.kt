@@ -42,7 +42,7 @@ private val pages = listOf(
     GuidePage(setOf("history_logs_diagnostics_v1"), "HISTORY", "采集历史会保留",
         "这里查看每次采集的活跃线程与负载；旁边的日志页用于排查守护进程问题。放弃分配建议不会删除采集历史。"),
     GuidePage(setOf("rule_generation_settings_v1", "cpuset_runtime_v1"), "SETTINGS", "设置与帮助在这里",
-        "设置中可选择规则保存格式和 cpuset 根目录。核心建议根据实际处理器与线程负载计算。“帮助与维护”中可导出诊断包。")
+        "设置中可选择规则保存格式和 cpuset 根目录，“设备与维护”中可查看核心拓扑、导出诊断包。刷新率管理位于设置内的“扩展”页。")
 )
 
 /** 只高亮真实测量得到的控件，不轮询、不执行后台 IO 或操作。 */

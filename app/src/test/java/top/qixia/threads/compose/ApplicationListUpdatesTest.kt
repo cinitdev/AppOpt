@@ -37,6 +37,35 @@ class ApplicationListUpdatesTest {
         assertEquals(added, enabled.withAutomaticAffinity(false))
     }
 
+    @Test fun automaticOnlyAppMovesBetweenCatalogAndConfiguredWithoutLosingRecording() {
+        val catalogApp = app("game").copy(performanceRecordingEnabled = true)
+        val initial = ApplicationsUiState(loading = false, addable = listOf(catalogApp))
+
+        val enabled = initial.automaticModeChanged("game", true, catalogApp)
+        assertEquals("game", enabled.configured.single().packageName)
+        assertTrue(enabled.configured.single().automaticAffinityEnabled)
+        assertTrue(enabled.configured.single().automaticOnly)
+        assertTrue(enabled.configured.single().performanceRecordingEnabled)
+
+        val disabled = enabled.automaticModeChanged("game", false)
+        assertTrue(disabled.configured.isEmpty())
+        assertEquals("game", disabled.visibleItems.single().packageName)
+        assertFalse(disabled.addable.single().automaticAffinityEnabled)
+        assertFalse(disabled.addable.single().automaticOnly)
+        assertTrue(disabled.addable.single().performanceRecordingEnabled)
+    }
+
+    @Test fun automaticOnlyEntryWithoutCatalogSnapshotReturnsToAddableOnDisable() {
+        val configuredOnly = ApplicationsUiState(configured = listOf(
+            app("game").withAutomaticAffinity(true).copy(automaticOnly = true)
+        ))
+
+        val disabled = configuredOnly.automaticModeChanged("game", false)
+        assertTrue(disabled.configured.isEmpty())
+        assertEquals("game", disabled.addable.single().packageName)
+        assertTrue(disabled.visibleItems.single().packageName == "game")
+    }
+
     @Test fun addDeleteAndReaddKeepCatalogueAndOtherPendingChanges() {
         val a = app("a")
         val b = app("b")

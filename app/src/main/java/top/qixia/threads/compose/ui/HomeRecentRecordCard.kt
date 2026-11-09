@@ -113,7 +113,7 @@ internal fun HomeRecentRecordCard(
                     HomeRecordStat("峰值帧率", homeFpsText(latest.fps?.peak), "FPS", Modifier.weight(1f))
                     VerticalDivider(Modifier.height(38.dp), color = MintBorder, thickness = .5.dp)
                     if (latest.report != null) {
-                        HomeRecordStat("采样线程", latest.report.threadCount.toString(), "个",
+                        HomeRecordStat("活跃线程", latest.report.threadCount.toString(), "个",
                             Modifier.weight(1f).padding(start = 12.dp))
                     } else {
                         HomeRecordStat("本次时长", homeDuration(latest.endedAtMs - latest.startedAtMs), "",

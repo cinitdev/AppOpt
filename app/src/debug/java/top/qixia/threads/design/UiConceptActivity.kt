@@ -123,6 +123,7 @@ class UiConceptActivity : ComponentActivity() {
             else if (screen == "rule-editor") RuleEditorFixture()
             else if (screen.startsWith("mint-")) HomeVisualFixture(screen)
             else if (screen.startsWith("history-")) HistoryVisualFixture(screen)
+            else if (screen == "settings-layout") SettingsVisualFixture()
             else ConceptApp(concept = concept, screen = screen)
         }
     }

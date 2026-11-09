@@ -48,7 +48,7 @@ fun QixiaThreadsApp(
     val reviews by viewModel.calibrationReviews.state.collectAsStateWithLifecycle()
     var destinationName by rememberSaveable { mutableStateOf(MainDestination.HOME.name) }
     val destination = MainDestination.fromSavedName(destinationName)
-    val applicationPageState = rememberSaveableStateHolder()
+    val pageState = rememberSaveableStateHolder()
     var showHomeEnvironment by rememberSaveable { mutableStateOf(false) }
     var showModuleUpdate by rememberSaveable { mutableStateOf(false) }
     var showRefreshRate by rememberSaveable { mutableStateOf(false) }
@@ -95,7 +95,7 @@ fun QixiaThreadsApp(
     ) { padding ->
         val diagnostic = state.affinityDiagnostics
         if (showRefreshRate) RefreshRateScreen(refreshRates, padding, null,
-            { showRefreshRate = false }, viewModel.refreshRates::change)
+            { showRefreshRate = false }, viewModel.refreshRates::change, viewModel.refreshRates::refreshApps)
         else if (diagnostic != null) AffinityDiagnosticsScreen(diagnostic, padding,
             viewModel::closeAffinityDiagnostics, viewModel::refreshAffinityDiagnostics)
         else when (destination) {
@@ -107,13 +107,14 @@ fun QixiaThreadsApp(
                 { app, session -> viewModel.openHistoryRecord(app, session); navigate(MainDestination.HISTORY) },
                 reviews.pending.size, { viewModel.calibrationReviews.open() }
             )
-            MainDestination.APPLICATIONS -> applicationPageState.SaveableStateProvider("applications") {
+            MainDestination.APPLICATIONS -> pageState.SaveableStateProvider("applications") {
                 ApplicationsScreen(state, padding, viewModel::refreshDashboard,
                     { showHomeEnvironment = true },
                     viewModel::selectApplicationTab, viewModel::setApplicationQuery, viewModel::setHideMissing,
                     viewModel::addApplication, viewModel::deleteApplication, { onLaunchApp(it.packageName) },
                     viewModel::openRuleEditor, viewModel::setAutoStartCalibration, viewModel::setAutomaticAffinity,
                     viewModel::openAffinityDiagnostics, viewModel::setAutomaticFallback,
+                    onAutomaticCustom = viewModel::setAutomaticCustom,
                     onPerformanceRecording = { app, enabled ->
                         if (enabled && !android.provider.Settings.canDrawOverlays(context)) onOpenOverlayPermission()
                         else viewModel.setPerformanceRecording(app, enabled)
@@ -137,7 +138,7 @@ fun QixiaThreadsApp(
                 viewModel::selectLogSource, viewModel::selectLogFilter, viewModel::exportVisibleLogs,
                 viewModel::selectLogCategory, viewModel::setLogQuery
             )
-            MainDestination.SETTINGS -> SettingsScreen(
+            MainDestination.SETTINGS -> pageState.SaveableStateProvider("settings") { SettingsScreen(
                 state, padding, { viewModel.loadSettings(force = true) },
                 viewModel::updatePolicy, viewModel::restoreDefaultPolicy,
                 onExportDiagnostics = viewModel::exportDiagnostics,
@@ -145,8 +146,9 @@ fun QixiaThreadsApp(
                 moduleDownloadState = moduleDownloadState,
                 onOpenModuleUpdate = { showModuleUpdate = true },
                 onAutoHistoryChange = viewModel::setAutomaticHistory,
-                onRefreshRate = { showRefreshRate = true }
-            )
+                onRefreshRate = { showRefreshRate = true },
+                onJoyoseChange = viewModel::setJoyoseSmartOpDisabled
+            ) }
         }
     }
     if (guidePending && !startupBlocked && !state.refreshing && !state.environment.loading &&

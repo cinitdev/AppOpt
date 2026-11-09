@@ -3,6 +3,7 @@ package top.qixia.threads.compose
 import android.graphics.drawable.Drawable
 import top.qixia.threads.CalibPolicy
 import top.qixia.threads.DaemonBridge
+import top.qixia.threads.JoyoseSmartOpState
 import top.qixia.threads.ModuleUpdater
 import top.qixia.threads.db.SessionSummary
 import top.qixia.threads.db.ThreadData
@@ -88,11 +89,15 @@ data class AppItemModel(
     val componentKind: AppComponentKind = if (installed) AppComponentKind.APP else AppComponentKind.MISSING_APP,
     val automaticFallbackSupported: Boolean = false,
     val automaticFallbackEnabled: Boolean = false,
-    val mainFallbackCpus: String? = null
+    val mainFallbackCpus: String? = null,
+    val automaticOnly: Boolean = false,
+    val automaticCustomSupported: Boolean = false,
+    val automaticCustomRules: List<top.qixia.threads.AutomaticCustomRule> = emptyList()
 ) {
     val stableKey: String = "${state.name}:$packageName"
     val isSystemComponent: Boolean get() = componentKind == AppComponentKind.SYSTEM_COMPONENT
     val available: Boolean get() = installed || isSystemComponent
+    val automaticMinimumLoad: Int get() = automaticCustomRules.minOfOrNull { it.threshold } ?: 5
 }
 
 data class DeviceMetricsUiState(
@@ -258,7 +263,8 @@ data class SettingsUiState(
     val savedPolicy: CalibPolicy = policy,
     val autoHistoryEnabled: Boolean = false,
     val autoHistorySaving: Boolean = false,
-    val autoHistorySupported: Boolean = false
+    val autoHistorySupported: Boolean = false,
+    val joyose: JoyoseSmartOpState = JoyoseSmartOpState()
 ) {
     val editable: Boolean
         get() = hasRoot && readSuccess && !lockedByPendingUpdate

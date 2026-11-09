@@ -121,14 +121,17 @@ persist_result() {
 		mv -f "$RESULT.tmp" "$RESULT"
 }
 cleanup_completed_update() {
-	# 仅事务持有者可以清理，失败、中断和待安装 APK 均保留重试资料。
+	# 仅事务持有者可以清理；失败和中断保留现场，待安装 APK 保留安装资料。
 	[ -n "$OWNER" ] && [ "$(readlink "$LOCK")" = "$OWNER" ] || return 1
 	case "$(phase)" in applied|rebooted) ;; *) return 0 ;; esac
-	[ ! -e "$STAGED" ] && [ ! -e "$ACTIVE/update" ] && [ ! -d "$ACTIVE/config/app" ] || return 0
+	[ ! -e "$STAGED" ] && [ ! -e "$ACTIVE/update" ] || return 0
 	local state=$(state_file) file
 	[ "$(prop version "$state")" = "$(prop versionCode "$ACTIVE/module.prop")" ] || return 0
 	[ "$(prop build "$state")" = "$(sha256sum "$ACTIVE/config/bin/QiXiaRs" | cut -d ' ' -f 1)" ] || return 0
 	persist_result || return 1
+	# 安装脚本不属于运行文件；即使 APK 等待用户确认，也不应留在生效目录。
+	rm -f "$ACTIVE/customize.sh" || return 1
+	[ ! -d "$ACTIVE/config/app" ] || return 0
 	# 日志归入已有日志目录；脚本与备份不再作为长期运行依赖。
 	mkdir -p "$ACTIVE/logs" || return 1
 	for file in "$TX/update.log" "$TX/app-update.log"; do
@@ -155,10 +158,10 @@ take_lock() {
 
 runtime_files() {
 	local root=$1 file
-	for file in service.sh module.prop uninstall.sh customize.sh; do
+	for file in service.sh module.prop uninstall.sh; do
 		[ ! -f "$root/$file" ] || printf '%s\n' "$file"
 	done
-	for file in "$root"/config/bin/QiXiaRs "$root"/config/ebpf/*.bpf.o \
+	for file in "$root"/tools/*.sh "$root"/config/bin/QiXiaRs "$root"/config/ebpf/*.bpf.o \
 		"$root"/config/tools/*.sh "$root"/config/tools/*.jar \
 		"$root"/config/app/*.apk "$root"/config/app/app.prop; do
 		[ ! -f "$file" ] || printf '%s\n' "${file#"$root/"}"
@@ -227,6 +230,7 @@ eligible() {
 		[ ! -e "$ACTIVE/$file" ] && [ ! -e "$STAGED/$file" ] || { REASON='模块已停用或待移除，不自动启动'; return 1; }
 	done
 	for file in service.sh config/bin/QiXiaRs config/ebpf/queuebuffer_probe.bpf.o \
+		tools/service_joyose.sh tools/service_watchdog.sh tools/service_app_install.sh tools/service_runtime.sh \
 		config/ebpf/queuebuffer_probe_perf.bpf.o config/ebpf/queuebuffer_probe_stats.bpf.o \
 		config/tools/qixia_foreground_helper.sh config/tools/qixia_foreground_helper.jar \
 		config/tools/qixia_java_service.sh config/tools/qixia_refresh_helper.sh config/tools/qixia_refresh_helper.jar; do
@@ -291,7 +295,10 @@ merge_policy_defaults() {
 	if [ ! -e "$ACTIVE/config/refresh_rate.conf" ] && [ -f "$STAGED/config/refresh_rate.conf" ]; then
 		copy_file "$STAGED/config/refresh_rate.conf" "$ACTIVE/config/refresh_rate.conf" || return 1
 	fi
-	if [ -f "$ACTIVE/config/calib_policy.conf" ] && [ -f "$STAGED/config/calib_policy.conf" ]; then
+	if [ ! -e "$ACTIVE/config/calib_policy.conf" ] && [ -f "$STAGED/config/calib_policy.conf" ]; then
+		# 生效目录缺少策略时也要承接首次初始化保存的 Joyose 恢复状态。
+		copy_file "$STAGED/config/calib_policy.conf" "$ACTIVE/config/calib_policy.conf" || return 1
+	elif [ -f "$ACTIVE/config/calib_policy.conf" ] && [ -f "$STAGED/config/calib_policy.conf" ]; then
 		# 新版本只补缺失键；刷入前后的用户选择始终以生效目录为准。
 		awk '
 		{ key=$0; sub(/#.*/, "", key); if (index(key,"=") == 0) key="";

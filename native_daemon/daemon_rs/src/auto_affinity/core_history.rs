@@ -287,6 +287,7 @@ pub(super) fn release_reason(
     average_percent: Option<f64>,
     inactive: bool,
     unrestricted: bool,
+    threshold_percent: f64,
 ) -> &str {
     if let Some(reason) = stop {
         return reason;
@@ -295,7 +296,7 @@ pub(super) fn release_reason(
         "sample_unavailable"
     } else if inactive {
         "inactive"
-    } else if average_percent.is_some_and(|average| average < 5.0) {
+    } else if average_percent.is_some_and(|average| average < threshold_percent) {
         "low_average"
     } else if unrestricted {
         "unrestricted"
@@ -434,24 +435,24 @@ mod tests {
     #[test]
     fn release_reasons_preserve_the_exact_five_percent_boundary_and_stop_context() {
         assert_eq!(
-            release_reason(None, Some(4.999), false, false),
+            release_reason(None, Some(4.999), false, false, 5.0),
             "low_average"
         );
         assert_eq!(
-            release_reason(None, Some(5.0), false, false),
+            release_reason(None, Some(5.0), false, false, 5.0),
             "not_selected"
         );
-        assert_eq!(release_reason(None, Some(0.5), true, false), "inactive");
+        assert_eq!(release_reason(None, Some(0.5), true, false, 5.0), "inactive");
         assert_eq!(
-            release_reason(None, Some(40.0), false, true),
+            release_reason(None, Some(40.0), false, true, 5.0),
             "unrestricted"
         );
         assert_eq!(
-            release_reason(None, None, false, false),
+            release_reason(None, None, false, false, 5.0),
             "sample_unavailable"
         );
         for reason in ["foreground_left", "mode_disabled", "paused", "shutdown"] {
-            assert_eq!(release_reason(Some(reason), Some(1.0), true, false), reason);
+            assert_eq!(release_reason(Some(reason), Some(1.0), true, false, 5.0), reason);
         }
     }
 

@@ -409,12 +409,34 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
             if (enabled) "已开启，进入应用后点击胶囊开始记录，长按可关闭" else "已关闭此应用的性能记录"
         }
 
-    fun setAutomaticAffinity(app: AppItemModel, enabled: Boolean) =
+    fun setAutomaticAffinity(app: AppItemModel, enabled: Boolean) {
+        var capabilities: DaemonBridge.AutomaticAffinityState? = null
         runPackageAction(app.packageName, "正在更新自动核心分配",
-            onSuccess = { it.automaticModeChanged(app.packageName, enabled) }) {
+            onSuccess = { apps ->
+                val updated = apps.automaticModeChanged(app.packageName, enabled, app)
+                updated.copy(configured = updated.configured.map {
+                    if (it.packageName == app.packageName && capabilities != null) it.copy(
+                        automaticCustomSupported = capabilities!!.customSupported,
+                        automaticFallbackSupported = capabilities!!.fallbackSupported) else it
+                })
+            }) {
             check(repository.setAutomaticAffinity(app.packageName, enabled)) { "保存失败，请确认已安装支持自动分配的新模块" }
+            if (enabled && !app.automaticCustomSupported) capabilities = DaemonBridge.readAutomaticAffinity()
             if (enabled) "已开启 ${app.label} 的自动分配，直接进入游戏即可" else "已关闭自动分配，恢复原有规则模式"
         }
+    }
+
+    fun setAutomaticCustom(app: AppItemModel, rules: List<top.qixia.threads.AutomaticCustomRule>) {
+        var saved = rules
+        runPackageAction(app.packageName, "正在保存自定义分配",
+            onSuccess = { apps -> apps.copy(configured = apps.configured.map {
+                if (it.packageName == app.packageName) it.copy(automaticCustomRules = saved,
+                    automaticAffinityDetail = "设置已保存，前台运行时生效") else it
+            }) }) {
+            saved = DaemonBridge.setAutomaticCustom(app.packageName, rules)
+            if (saved.isEmpty()) "已恢复默认自动分配算法" else "已保存 ${saved.size} 档自定义分配，按平均负载匹配核心"
+        }
+    }
 
     fun setAutomaticFallback(app: AppItemModel, enabled: Boolean, cpus: String?) {
         var saved: DaemonBridge.AutomaticFallbackResult? = null
@@ -427,8 +449,8 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
                     automaticAffinityDetail = "设置已保存，前台运行时生效") else it
             }) }) {
             saved = DaemonBridge.setAutomaticFallback(app.packageName, enabled, cpus)
-            if (enabled) "主进程低负载线程使用 CPU ${saved?.cpus}，达到 5% 后动态分配"
-            else "已关闭主进程兜底，低于 5% 的线程恢复系统调度"
+            if (enabled) "主进程低负载线程使用 CPU ${saved?.cpus}，达到 ${app.automaticMinimumLoad}% 后${if (app.automaticCustomRules.isEmpty()) "动态" else "按自定义档位"}分配"
+            else "已关闭主进程兜底，低于 ${app.automaticMinimumLoad}% 的线程恢复系统调度"
         }
     }
 
@@ -849,6 +871,26 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
                     message = if (!saved) "记录开关保存失败，请检查模块状态后重试"
                         else if (enabled) "已开启：前台使用超过 3 分钟才保存自动分配记录"
                         else "已关闭自动分配记录，已有历史保留"
+                ) }
+            }
+        }
+    }
+
+    fun setJoyoseSmartOpDisabled(disabled: Boolean) {
+        val settings = _state.value.settings
+        if (!settings.editable || !settings.joyose.available || settings.loading || settings.saving || settings.autoHistorySaving) return
+        _state.update { it.copy(settings = it.settings.copy(saving = true)) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = runCatching { DaemonBridge.setJoyoseSmartOpDisabled(disabled) }
+            withContext(Dispatchers.Main) {
+                val observed = result.getOrNull()
+                val applied = observed?.successful == true && observed.available && observed.disabled == disabled
+                _state.update { current -> current.copy(
+                    settings = current.settings.copy(saving = false,
+                        joyose = observed?.takeIf { it.recognized } ?: current.settings.joyose),
+                    message = if (applied) {
+                        if (disabled) "已禁用 Joyose SmartOpService" else "已启用 Joyose SmartOpService"
+                    } else observed?.failureMessage ?: "Joyose 操作失败，请刷新设置后重试"
                 ) }
             }
         }

@@ -75,19 +75,27 @@ impl Activity {
     pub(super) fn peak(&self) -> f64 {
         self.samples.iter().map(|v| v.0).fold(0.0, f64::max)
     }
+    #[cfg(test)]
     pub(super) fn eligible(&self) -> bool {
+        self.eligible_at(0.05)
+    }
+    pub(super) fn eligible_at(&self, threshold: f64) -> bool {
         // 入选判断应与报告和释放判断所用均值一致。围绕阈值比较
         // 还能保护恒定 5% 不受除法舍入影响，
         // 两种表示都不能拒绝对方恰好达到边界的情况。
         !self.samples.is_empty()
-            && (self.average() >= 0.05
-                || self.samples.iter().map(|v| (v.0 - 0.05) * v.1).sum::<f64>() >= 0.0)
+            && (self.average() >= threshold
+                || self.samples.iter().map(|v| (v.0 - threshold) * v.1).sum::<f64>() >= 0.0)
     }
     pub(super) fn dormant(&self) -> bool {
         self.quiet >= 2
     }
+    #[cfg(test)]
     pub(super) fn keep_owned_without_sample(&self, age: Duration) -> bool {
-        self.eligible() && age <= MISSING_SAMPLE_GRACE
+        self.keep_owned_at(age, 0.05)
+    }
+    pub(super) fn keep_owned_at(&self, age: Duration, threshold: f64) -> bool {
+        self.eligible_at(threshold) && age <= MISSING_SAMPLE_GRACE
     }
 }
 

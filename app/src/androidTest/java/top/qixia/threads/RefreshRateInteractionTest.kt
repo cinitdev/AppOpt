@@ -1,4 +1,4 @@
-package top.qixia.threads
+﻿package top.qixia.threads
 
 import android.graphics.Bitmap
 import androidx.compose.foundation.layout.PaddingValues
@@ -21,7 +21,7 @@ class RefreshRateInteractionTest {
         apps=listOf(RefreshApp("com.example.game","测试游戏")),runtime=mapOf("version" to "1"))
     @Test fun selectingHighRefreshPersistsAndGlobalUiCanScroll() {
         var state by mutableStateOf(fixture)
-        compose.setContent { QixiaThreadsTheme { RefreshRateScreen(state,PaddingValues(top=32.dp,bottom=24.dp),null,{},{k,v -> state=state.copy(policy=state.policy.with(k,v))}) } }
+        compose.setContent { QixiaThreadsTheme { RefreshRateScreen(state,PaddingValues(top=32.dp,bottom=24.dp),null,{},{k,v -> state=state.copy(policy=state.policy.with(k,v))},{}) } }
         compose.onNodeWithText("应用/游戏").assertIsDisplayed()
         compose.onNodeWithText("游戏刷新率").assertDoesNotExist()
         compose.onNodeWithText("实际屏幕").assertDoesNotExist()
@@ -42,7 +42,7 @@ class RefreshRateInteractionTest {
     }
     @Test fun appRulesCanBeEditedAndClearedWithoutGlobalChanges() {
         var state by mutableStateOf(fixture)
-        compose.setContent { QixiaThreadsTheme { RefreshRateScreen(state,PaddingValues(top=32.dp,bottom=24.dp),"com.example.game",{},{k,v -> state=state.copy(policy=state.policy.with(k,v))}) } }
+        compose.setContent { QixiaThreadsTheme { RefreshRateScreen(state,PaddingValues(top=32.dp,bottom=24.dp),"com.example.game",{},{k,v -> state=state.copy(policy=state.policy.with(k,v))},{}) } }
         compose.onNodeWithContentDescription("关闭应用刷新率").assertIsDisplayed()
         compose.onNodeWithTag("app-refresh-sheet").performTouchInput {
             swipe(androidx.compose.ui.geometry.Offset(centerX, 20f), androidx.compose.ui.geometry.Offset(centerX, height * .85f), 500)

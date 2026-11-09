@@ -119,7 +119,7 @@ fun CalibrationReviewSheet(state: CalibrationReviewsState, onDismiss: () -> Unit
                     item(key = "advanced-rules") {
                         CalibrationAdvancedRulesCard(review, !state.busy) { editingProcess = it }
                     }
-                    item { Text("仅采集期间平均负载达到 5% 的活跃线程参与生成建议；历史记录仍保留全部活跃线程。通配规则可能匹配同组其他成员，容量预算计入整组负载。核心池内由系统调度；保存后是固定规则。",
+                    item { Text("仅采集期间平均负载达到 5% 的活跃线程参与生成建议；历史记录只保留持续活跃线程（长时间反复有负载，活跃几下就休眠的不再记录）。通配规则可能匹配同组其他成员，容量预算计入整组负载。核心池内由系统调度；保存后是固定规则。",
                         color = OceanTextSecondary, fontSize = 11.sp, modifier = Modifier.padding(8.dp)) }
                     item { Text("每个应用仅保留最新一次待确认建议；重新采集会替换旧建议，采集历史仍然保留。",
                         color = OceanTextSecondary, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) }
