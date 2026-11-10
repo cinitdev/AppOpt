@@ -7,6 +7,9 @@ public final class RefreshSettingJournal {
     public interface Store {
         String get(String key) throws Exception;
         void put(String key, String value) throws Exception;
+        default void putAll(Map<String, String> values) throws Exception {
+            for (Map.Entry<String, String> entry : values.entrySet()) put(entry.getKey(), entry.getValue());
+        }
     }
     private static final String PREFIX = "baseline.setting.";
     public static void capture(Properties state, List<String> keys, Store store) throws Exception {
@@ -17,8 +20,10 @@ public final class RefreshSettingJournal {
     }
     public static void apply(Properties state, List<String> keys, String value, Store store) throws Exception {
         for (String key : keys) if (!state.containsKey(PREFIX + key)) throw new IllegalStateException("未保存设置原值: " + key);
-        for (String key : keys) {
-            store.put(key, value);
+        Map<String, String> values = new LinkedHashMap<>();
+        for (String key : keys) values.put(key, value);
+        store.putAll(values);
+        for (String key : values.keySet()) {
             if (!Objects.equals(value, store.get(key))) throw new IllegalStateException("设置未生效: " + key);
         }
     }

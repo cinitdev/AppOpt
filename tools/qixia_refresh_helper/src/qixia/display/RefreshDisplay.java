@@ -273,12 +273,13 @@ final class RefreshDisplay {
             } finally { RefreshSurface.release(); }
         } }catch(Exception e) { failure=e; }
         try { if (state.containsKey("baseline.settings_touched")) {
-            RefreshSettings savedUser=new RefreshSettings(Integer.parseInt(state.getProperty("baseline.user","0")));
             if(state.stringPropertyNames().stream().noneMatch(k->k.startsWith("baseline.setting."))) {
                 state.setProperty("baseline.setting.system/peak_refresh_rate",state.getProperty("baseline.peak"));
                 state.setProperty("baseline.setting.system/min_refresh_rate",state.getProperty("baseline.min"));
             }
-            RefreshSettingJournal.restore(state,savedUser);
+            try(RefreshSettings savedUser=new RefreshSettings(Integer.parseInt(state.getProperty("baseline.user","0")))) {
+                RefreshSettingJournal.restore(state,savedUser);
+            }
         } }catch(Exception e) { if(failure==null)failure=e;else failure.addSuppressed(e); }
         try { if (state.containsKey("baseline.surface_touched") && boot.equals(state.getProperty("baseline.boot")) && hasSurfaceBaseline(state)) {
             Object spec = specs();
@@ -306,7 +307,7 @@ final class RefreshDisplay {
         } }catch(Exception e) { if(failure==null)failure=e;else failure.addSuppressed(e); }
         if(failure!=null)throw failure;
         state.keySet().removeIf(k -> k.toString().startsWith("baseline."));
-        settings=new RefreshSettings();observedAt=-30000;
+        settings.close();settings=new RefreshSettings();observedAt=-30000;
     }
     private String setting(String key) throws Exception { String s = settings.get(key); return s == null ? "<absent>" : s; }
     private Object setSpecs(Object spec) throws Exception {

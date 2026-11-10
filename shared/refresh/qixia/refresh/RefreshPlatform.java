@@ -19,7 +19,8 @@ public final class RefreshPlatform {
     public String name() { return flyme ? "Flyme" : vivo ? "vivo" : xiaomi ? "小米" : oplus ? "Oplus" : "通用"; }
     public List<String> settings() {
         if (flyme) return Collections.singletonList("system/flyme_force_rate");
-        if (vivo) return Arrays.asList("system/peak_refresh_rate", "system/min_refresh_rate", "secure/vivo_screen_refresh_rate_mode");
+        if (vivo) return Arrays.asList("secure/vivo_screen_refresh_rate_mode", "global/vivo_screen_refresh_rate_mode",
+            "system/peak_refresh_rate", "system/min_refresh_rate");
         if (xiaomi) return Arrays.asList("system/peak_refresh_rate", "secure/miui_refresh_rate", "secure/user_refresh_rate");
         return Arrays.asList("system/peak_refresh_rate", "system/min_refresh_rate", "secure/user_refresh_rate");
     }
