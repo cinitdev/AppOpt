@@ -661,37 +661,3 @@ pub(super) fn combine_rules(rules: &[&Rule]) -> Option<CombinedRule> {
         None
     }
 }
-
-#[cfg(test)]
-mod scan_evidence_tests {
-    use super::*;
-
-    #[test]
-    fn unreadable_indexed_child_is_attributed_to_its_exact_base_package() {
-        let process_index = ProcessIndex {
-            entries: BTreeMap::from([(
-                42,
-                ProcessIndexEntry {
-                    pid: 42,
-                    starttime: 7,
-                    first_seen_elapsed_ms: 1,
-                    comm: "worker".to_string(),
-                    cmdline: "com.example:worker".to_string(),
-                },
-            )]),
-            ..ProcessIndex::default()
-        };
-        let packages = BTreeSet::from(["com.example".to_string()]);
-
-        assert_eq!(
-            indexed_candidate_package(&process_index, 42, &packages).as_deref(),
-            Some("com.example")
-        );
-        assert!(indexed_candidate_package(
-            &process_index,
-            42,
-            &BTreeSet::from(["com.example.extra".to_string()])
-        )
-        .is_none());
-    }
-}

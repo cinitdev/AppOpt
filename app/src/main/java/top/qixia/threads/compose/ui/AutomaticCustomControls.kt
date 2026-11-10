@@ -11,7 +11,6 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -73,7 +72,7 @@ internal fun AutomaticCustomControls(app: AppItemModel, enabled: Boolean,
         editing = true
     }
 
-    Column(Modifier.fillMaxWidth().testTag("automatic-custom-controls")) {
+    Column(Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("分配模式", color = OceanText, fontWeight = FontWeight.Medium, fontSize = 14.sp,
                 modifier = Modifier.weight(1f))
@@ -117,10 +116,10 @@ internal fun AutomaticCustomControls(app: AppItemModel, enabled: Boolean,
                         label = { Text("平均 ≥", fontSize = 11.sp) }, suffix = { Text("%") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
                         keyboardActions = KeyboardActions(onDone = { focus.clearFocus() }),
-                        modifier = Modifier.width(100.dp).testTag("custom-threshold-$index"))
+                        modifier = Modifier.width(100.dp))
                     TextButton(onClick = { focus.clearFocus(); expanded = if (expanded == index) -1 else index },
                         enabled = enabled && !loading,
-                        modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("custom-cores-$index")) {
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
                         Text(if (cpus.isBlank()) "选择核心范围" else "CPU $cpus", fontSize = 12.sp)
                     }
                     IconButton(onClick = {
@@ -173,7 +172,7 @@ internal fun AutomaticCustomControls(app: AppItemModel, enabled: Boolean,
                     if (rules == app.automaticCustomRules) editing = false
                     else if (rules != null) { pending = rules; onSave(rules) }
                 }, enabled = enabled && !loading && validCores,
-                    modifier = Modifier.testTag("save-custom-rules")) { Text("保存", fontSize = 12.sp) }
+                    modifier = Modifier) { Text("保存", fontSize = 12.sp) }
             }
         }
         HorizontalDivider(Modifier.padding(vertical = 6.dp), color = OceanOutline.copy(alpha = .6f))

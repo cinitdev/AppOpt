@@ -17,7 +17,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -134,7 +133,7 @@ fun HistoryScreen(
                 }
             }
         }
-        LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("history-records"), state = listState,
+        LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState,
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)) {
             item(key = "summary") {
@@ -291,7 +290,7 @@ private fun HistoryRecordCard(app: HistoryPackageModel, session: SessionSummary,
     LaunchedEffect(selecting) { menu = false }
     val fps = app.sessionFps[session.id]
     Surface(onClick = onOpen, enabled = !busy,
-        modifier = Modifier.testTag("history-record-${session.id}").semantics {
+        modifier = Modifier.semantics {
             if (selecting) {
                 role = Role.Checkbox
                 toggleableState = if (selected) ToggleableState.On else ToggleableState.Off

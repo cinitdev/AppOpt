@@ -188,14 +188,6 @@ pub(crate) fn poll_inner(ctx: &mut QixiaThreadsEbpfCtx) -> Result<i32, String> {
     // 再进入 Surface/TID 分流的滑动窗口。RingBuf 原本就是有序的，排序不会改变语义。
     events.sort_by_key(|event| event.timestamp_ns);
 
-    // 仅诊断测试可输出逐帧证据，正式守护不编译这条路径。
-    #[cfg(test)]
-    if std::env::var_os("QIXIA_TEST_TRACE").is_some() {
-        let now = monotonic_ns();
-        for event in &events {
-            println!("frame,{now},{},{},{},{:x}", event.timestamp_ns, event.pid, event.tid, event.surface_ptr);
-        }
-    }
 
     let mut accepted = 0;
     let mut latest_ts = 0u64;

@@ -64,12 +64,6 @@ pub(super) fn restored_mask_matches(requested: u64, actual: u64, parked: u64) ->
     requested & !parked != 0 && actual != 0
         && (actual == requested || actual == requested & !parked)
 }
-#[cfg(test)]
-pub(super) fn assert_restored_for_test(requested: u64, actual: u64) {
-    let parked = parked().unwrap();
-    assert!(restored_mask_matches(requested, actual, parked),
-        "restore readback: requested={requested:x} actual={actual:x} parked={parked:x}");
-}
 pub(super) fn owner(key: &(i32, i32, u64)) -> String {
     owner_at(&root(), key)
 }
@@ -125,10 +119,6 @@ pub(super) fn prepare(key: &(i32, i32, u64), requested: u64) -> io::Result<()> {
     }
     Ok(())
 }
-#[cfg(test)]
-pub(super) fn groups(key: &(i32, i32, u64)) -> io::Result<Vec<String>> {
-    groups_at(&root(), key)
-}
 pub(super) fn groups_at(root: &str, key: &(i32, i32, u64)) -> io::Result<Vec<String>> {
     if !valid_root(root) { return Err(io::Error::other("自动分配根组无效")); }
     let directory = match fs::read_dir(path(&owner_at(root, key))?) {
@@ -175,63 +165,4 @@ pub(super) fn cleanup_empty_groups(root: &str, key: &(i32, i32, u64), preserve: 
 }
 pub(super) fn move_thread(tid: i32, relative: &str) -> io::Result<()> {
     shared::move_tid_to_existing_cpuset(tid, relative)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn paths_cannot_escape_controller_and_owned_names_are_unambiguous() {
-        for bad in ["relative", "/../x", "/x/./y", "/x\n", "/x\0"] { assert!(!valid_path(bad)); }
-        assert!(valid_path("/top-app"));
-        assert!(owned_path(&target(&(1, 2, 3), 0xc0)));
-        assert_eq!(origin(&target(&(1, 2, 3), 0xc0)), Some((1, 2, 3)));
-        assert!(origin("/QiXiaRs/auto/1-2-3/0/extra").is_none());
-        assert!(!owned_path("/QiXiaRs/automatic/0-7"));
-    }
-    #[test]
-    fn configured_roots_remain_distinct_from_rom_groups() {
-        assert_eq!(root(), format!("/{}/auto", name()));
-        for root in ["/GameCpu/auto", "/top-app/auto", "/QiXiaRs/auto"] {
-            assert!(valid_root(root));
-            let group = target_at(root, &(1, 2, 3), 0x30);
-            assert_eq!(owned_root(&group), Some(root));
-            assert_eq!(origin(&group), Some((1, 2, 3)));
-        }
-        for bad in ["/top-app", "/GameCpu/automatic", "/../auto", "/a/b/auto", "/GameCpu/auto/"] {
-            assert!(!valid_root(bad), "{bad}");
-        }
-        assert!(!owned_path("/top-app/0-3"));
-        assert!(!owned_path("/GameCpu/automatic/1-2-3/0"));
-        assert!(origin("/GameCpu/auto/1-2-3/0/extra").is_none());
-    }
-    #[test]
-    fn core_ctl_cpu_lists_distinguish_empty_parking_from_invalid_data() {
-        assert_eq!(parse_parked("\n").unwrap(), 0);
-        assert_eq!(parse_parked("4,7\n").unwrap(), 0x90);
-        assert_eq!(parse_parked("0").unwrap(), 1);
-        assert_eq!(parse_parked("4-7").unwrap(), 0xf0);
-        for invalid in ["ff", "0x90", "7-4", "4,,7", "4,", "64", "-1"] {
-            assert!(parse_parked(invalid).is_err(), "{invalid}");
-        }
-    }
-    #[test]
-    fn online_but_parked_cores_are_not_admitted() {
-        assert_eq!(schedulable(0xff, 0xff, 0x90), 0x6f);
-        assert_eq!(schedulable(0xff, 0x3f, 0x90), 0x2f);
-        assert_eq!(schedulable(0x0f, 0xff, 0x90), 0x0f);
-        assert_eq!(schedulable(0xff, 0xff, 0xff), 0);
-        assert_eq!(schedulable(0xff, 0xff, 0), 0xff);
-    }
-    #[test]
-    fn restore_accepts_only_exact_nonempty_parking_filter() {
-        assert!(restored_mask_matches(0xff, 0x6f, 0x90));
-        assert!(restored_mask_matches(0xff, 0xff, 0x90));
-        assert!(!restored_mask_matches(0xff, 0x2f, 0x90));
-        assert!(!restored_mask_matches(0xff, 0x7f, 0x90));
-        assert!(!restored_mask_matches(0xff, 0x6f, 0));
-        assert!(!restored_mask_matches(0xff, 0x1ff, 0));
-        assert!(!restored_mask_matches(0x90, 0, 0x90));
-        assert!(!restored_mask_matches(0x90, 0x90, 0x90));
-    }
 }

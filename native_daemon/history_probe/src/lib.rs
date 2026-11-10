@@ -94,6 +94,3 @@ impl Collector {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

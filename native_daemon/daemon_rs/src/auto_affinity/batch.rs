@@ -125,10 +125,6 @@ fn recovery_paths_from_text(text: &str) -> io::Result<BTreeSet<String>> {
         entry.original_cpuset.into_iter().chain(std::iter::once(entry.owned_root))).collect())
 }
 
-#[cfg(test)]
-pub(super) fn restore(entry: &Entry) -> io::Result<()> {
-    restore_observed(entry, &mut EventLog::default())
-}
 
 fn written_mask_matches(current: u64, written: u64, previous: Option<u64>, online: u64, parked: u64) -> bool {
     current != 0 && [Some(written), previous].into_iter().flatten().any(|mask| {
@@ -342,12 +338,6 @@ impl Guard {
     fn start() -> io::Result<Self> {
         let token = format!("{}-{}", std::process::id(), crate::elapsed_realtime_ms());
         let executable = std::env::current_exe()?;
-        // 只有集成测试可通过独立二进制运行生产租约守卫；
-        // 发布构建不允许使用环境变量覆盖。
-        #[cfg(test)]
-        let executable = std::env::var_os("QIXIA_TEST_GUARD_EXE")
-            .map(std::path::PathBuf::from)
-            .unwrap_or(executable);
         let mut child = Command::new(executable)
             .args(["--auto-affinity-lease", &token])
             .stdin(Stdio::piped())
@@ -414,8 +404,6 @@ pub(super) struct Batch {
     history_package: Option<String>,
     verified: BTreeSet<Identity>,
     retries: BTreeMap<Identity, Retry>,
-    #[cfg(test)]
-    fail_after_cpuset: Option<Identity>,
 }
 impl Default for Batch {
     fn default() -> Self {
@@ -423,8 +411,6 @@ impl Default for Batch {
             entries: BTreeMap::new(), guard: None,
             history: EventLog::operations(), history_package: None,
             verified: BTreeSet::new(), retries: BTreeMap::new(),
-            #[cfg(test)]
-            fail_after_cpuset: None,
         }
     }
 }
@@ -573,200 +559,3 @@ impl Drop for Batch {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct RecoveryJournal {
-        directory: std::path::PathBuf,
-        path: String,
-    }
-
-    impl RecoveryJournal {
-        fn new() -> Self {
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let directory = std::env::temp_dir().join(format!("qixia-recovery-{}-{id}", std::process::id()));
-            fs::create_dir(&directory).unwrap();
-            let path = directory.join("recovery.state").to_str().unwrap().to_owned();
-            Self { directory, path }
-        }
-    }
-
-    impl Drop for RecoveryJournal {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.path);
-            let _ = fs::remove_dir(&self.directory);
-        }
-    }
-
-    #[test]
-    fn failed_recovery_does_not_rewrite_journal_or_wake_itself() {
-        use std::os::unix::fs::MetadataExt;
-        let journal = RecoveryJournal::new();
-        let text = "v4 abc 1-2 3 4 5 ff 80 - 2f6261636b67726f756e64 - 2f516958696152732f6175746f\n";
-        let remaining = decode(text).unwrap();
-        persist_at(&journal.path, &remaining).unwrap();
-        let inode = fs::metadata(&journal.path).unwrap().ino();
-        let mut monitor = crate::CommandFileMonitor::new(&[&journal.path]).unwrap();
-        // 模拟同一线程持续恢复失败。只使用测试临时文件，不操作手机的线程或恢复日志。
-        for _ in 0..32 {
-            commit_recovery(&journal.path, text, &remaining).unwrap();
-        }
-        assert!(!monitor.drain().unwrap(), "相同恢复项反复写入会再次唤醒配置主循环");
-        assert_eq!(fs::metadata(&journal.path).unwrap().ino(), inode);
-        assert_eq!(fs::read_to_string(&journal.path).unwrap(), text);
-    }
-
-    #[test]
-    fn recovery_progress_is_saved_and_newer_journal_is_preserved() {
-        let journal = RecoveryJournal::new();
-        let first = "v1 abc 1-2 3 4 5 ff 80\n";
-        let second = "v1 abc 1-2 3 6 7 ff 40\n";
-        let initial = format!("{first}{second}");
-        persist_at(&journal.path, &decode(&initial).unwrap()).unwrap();
-        let remaining = decode(second).unwrap();
-        commit_recovery(&journal.path, &initial, &remaining).unwrap();
-        assert_eq!(fs::read_to_string(&journal.path).unwrap(), second);
-        // 旧守卫不能清空或覆盖新控制器刚刚提交的恢复基线。
-        let newer = "v1 abc 8-9 3 6 7 ff 20\n";
-        persist_at(&journal.path, &decode(newer).unwrap()).unwrap();
-        commit_recovery(&journal.path, second, &BTreeMap::new()).unwrap();
-        commit_recovery(&journal.path, &initial, &remaining).unwrap();
-        assert_eq!(fs::read_to_string(&journal.path).unwrap(), newer);
-        commit_recovery(&journal.path, newer, &BTreeMap::new()).unwrap();
-        assert!(!std::path::Path::new(&journal.path).exists());
-        fs::write(&journal.path, "").unwrap();
-        commit_recovery(&journal.path, "", &BTreeMap::new()).unwrap();
-        assert!(!std::path::Path::new(&journal.path).exists());
-    }
-
-    #[test]
-    fn release_keeps_written_and_previous_masks_including_kernel_filters() {
-        assert!(written_mask_matches(0x20, 0x20, None, 0xff, 0x90));
-        assert!(written_mask_matches(0x20, 0xa0, None, 0xff, 0x90));
-        assert!(written_mask_matches(0x20, 0xa0, None, 0x7f, 0));
-        assert!(written_mask_matches(0x20, 0x04, Some(0xa0), 0xff, 0x90));
-        assert!(written_mask_matches(0x80, 0x80, None, 0xff, 0x80));
-        assert!(!written_mask_matches(0x6f, 0x04, None, 0xff, 0x90));
-        assert!(!written_mask_matches(0x1f, 0x20, None, 0xff, 0));
-        assert!(!written_mask_matches(0, 0x80, None, 0xff, 0x80));
-    }
-    #[test]
-    fn affinity_only_single_record_and_multi_record_intents_remain_recoverable() {
-        let old = "v1 abc 1-2 3 4 5 ff c0\n";
-        assert_eq!(decode(old).unwrap().len(), 1);
-        let batch = format!("{old}v2 abc 1-2 3 6 7 ff 80 10\n");
-        let entries = decode(&batch).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[&(3, 6, 7)].previous, Some(16));
-        let again = entries.values().map(Entry::encode).collect::<String>();
-        assert_eq!(decode(&again).unwrap().len(), 2);
-        assert!(decode(&(old.to_owned() + old)).is_err());
-        assert!(decode(&(old.to_owned() + "v1 abc 8-9 3 6 7 ff 80\n")).is_err());
-        assert!(decode("v2 abc 1-2 3 4 5 ff 80 100\n").is_err());
-    }
-    #[test]
-    fn cpuset_journal_accepts_equal_or_expanded_masks_but_requires_safe_baseline() {
-        for (original, desired) in [(0xff, 0xff), (1, 0xc0)] {
-            let text = format!("v4 abc 1-2 3 4 5 {original:x} {desired:x} - 2f746f702d617070 - 2f516958696152732f6175746f\n");
-            let entries = decode(&text).unwrap();
-            assert_eq!(entries[&(3, 4, 5)].original_cpuset.as_deref(), Some("/top-app"));
-            let encoded = entries.values().next().unwrap().encode();
-            assert!(encoded.starts_with("v4 "));
-            assert_eq!(decode(&encoded).unwrap()[&(3, 4, 5)].owned_root, "/QiXiaRs/auto");
-        }
-        for path in ["2f2e2e2f78", "2f516958696152732f6175746f2f30", "zz", "2f0a"] {
-            assert!(decode(&format!("v4 abc 1-2 3 4 5 1 c0 - {path} - 2f516958696152732f6175746f\n")).is_err());
-        }
-        assert!(decode("v1 abc 1-2 3 4 5 1 c0\n").is_err());
-        assert!(decode("v2 abc 1-2 3 4 5 ff ff 1\n").is_err());
-        let child = decode("v4 abc 1-2 3 6 7 ff 1 - 2f 3-4-5 2f516958696152732f6175746f\n").unwrap();
-        assert_eq!(child[&(3, 6, 7)].inherited_from, Some((3, 4, 5)));
-        assert!(decode("v4 abc 1-2 3 6 7 ff 1 - 2f 3-4-0 2f516958696152732f6175746f\n").is_err());
-        assert!(decode("v3 abc 1-2 3 6 7 ff 1 - 2f 3-4-5\n").is_err());
-    }
-    #[test]
-    fn v4_keeps_original_root_across_configuration_changes_and_rejects_unsafe_roots() {
-        let previous = decode("v4 abc 1-2 3 4 5 ff 1 - 2f746f702d617070 - 2f516958696152732f6175746f\n").unwrap();
-        let mut entry = previous[&(3, 4, 5)].clone();
-        for root in ["/EarlierSetting/auto", "/top-app/auto", "/QiXiaRs/auto"] {
-            entry.owned_root = root.into();
-            let encoded = entry.encode();
-            let restored = decode(&encoded).unwrap();
-            assert_eq!(restored[&(3, 4, 5)].owned_root, root);
-            assert_eq!(restored[&(3, 4, 5)].encode(), encoded);
-        }
-        for root in ["/", "/top-app", "/../auto", "/a/b/auto", "/a/auto/"] {
-            entry.owned_root = root.into();
-            assert!(decode(&entry.encode()).is_err());
-        }
-        for malformed in ["v4", "v4 abc 1-2 3 4 5 ff 1 - 2f -", "v3 abc"] {
-            assert!(decode(malformed).is_err());
-        }
-    }
-    #[test]
-    fn cleanup_references_preserve_raw_old_baseline_and_lease_root() {
-        let previous = decode("v4 abc 1-2 3 4 5 ff 1 - 2f - 2f516958696152732f6175746f\n").unwrap();
-        let mut entry = previous[&(3, 4, 5)].clone();
-        entry.original_cpuset = Some("/QiXia/7".into());
-        entry.owned_root = "/EarlierSetting/auto".into();
-        assert_eq!(recovery_paths_from_text(&entry.encode()).unwrap(),
-            BTreeSet::from(["/QiXia/7".into(), "/EarlierSetting/auto".into()]));
-        let mut child = entry.clone();
-        child.record.tid = 6;
-        child.record.start = 7;
-        child.inherited_from = Some((3, 4, 5));
-        assert_eq!(recovery_paths_from_text(&(entry.encode() + &child.encode())).unwrap(),
-            recovery_paths_from_text(&entry.encode()).unwrap());
-        for malformed in ["", "corrupt", "v4 abc"] {
-            assert!(recovery_paths_from_text(malformed).is_err());
-        }
-    }
-    #[test]
-    fn thread_failures_back_off_independently_and_remain_bounded() {
-        let mut batch = Batch::default();
-        let mut changes = Changes::default();
-        for _ in 0..8 { batch.failed((1, 2, 3), None, "write_failed", &mut changes); }
-        batch.failed((1, 4, 5), None, "write_failed", &mut changes);
-        assert_eq!(Retry::delay(batch.retries[&(1, 2, 3)].failures), Duration::from_secs(4));
-        assert_eq!(Retry::delay(batch.retries[&(1, 4, 5)].failures), Duration::from_millis(250));
-        // 防止此纯逻辑测试尝试恢复生产环境日志。
-        batch.history_package = None;
-        std::mem::forget(batch);
-    }
-    #[test]
-    fn new_requested_or_available_mask_bypasses_old_failure_backoff() {
-        let now = Instant::now();
-        let target = RetryTarget { desired: 0x30, available: Some(0xff) };
-        let retry = Retry { failures: 8, due: now + Duration::from_secs(4), target: Some(target) };
-        assert!(retry.waiting(Some(target), now));
-        assert!(!retry.waiting(Some(RetryTarget { desired: 0x40, ..target }), now));
-        assert!(!retry.waiting(Some(RetryTarget { available: Some(0x7f), ..target }), now));
-        assert!(!retry.waiting(Some(RetryTarget { available: None, ..target }), now));
-        assert!(!retry.waiting(None, now), "retirement must not wait for an allocation retry");
-        assert!(!retry.waiting(Some(target), now + Duration::from_secs(4)));
-    }
-    #[test]
-    fn maximum_recovery_batch_with_long_paths_round_trips_within_byte_limit() {
-        let path = format!("/{}", "a".repeat(255));
-        let entries: BTreeMap<_, _> = (1..=inherited::MAX_RECOVERY).map(|index| {
-            let key = (1, index as i32, index as u64);
-            (key, Entry { record: Record { boot: "abcdef-1234".into(), token: "1-123456789".into(),
-                pid: key.0, tid: key.1, start: key.2, original: 0xff, written: 1 },
-                previous: None, original_cpuset: Some(path.clone()), owned_root: format!("/{}/auto", "b".repeat(48)), inherited_from: Some((1, 2, 3)) })
-        }).collect();
-        let text = entries.values().map(Entry::encode).collect::<String>();
-        assert!(text.len() < MAX_JOURNAL_BYTES);
-        assert_eq!(decode(&text).unwrap().len(), inherited::MAX_RECOVERY);
-    }
-}
-
-#[cfg(test)]
-#[path = "batch_device_tests.rs"]
-mod device_tests;
-
-#[cfg(test)]
-#[path = "batch_inheritance_device_tests.rs"]
-mod inheritance_device_tests;

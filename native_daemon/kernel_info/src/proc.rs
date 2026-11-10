@@ -45,30 +45,3 @@ pub fn read_cmdline(pid: i32) -> io::Result<String> {
             .to_owned(),
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn names_with_parentheses_and_non_utf8_do_not_break_identity() {
-        let mut bytes = b"42 (a ) \xff) S".to_vec();
-        for index in 1..20 {
-            bytes.extend_from_slice(
-                format!(
-                    " {}",
-                    match index {
-                        11 => 7,
-                        12 => 8,
-                        19 => 99,
-                        _ => 0,
-                    }
-                )
-                .as_bytes(),
-            );
-        }
-        let stat = parse_stat(&bytes).unwrap();
-        assert_eq!((stat.start, stat.ticks), (99, 15));
-        assert!(stat.name.contains(')'));
-        assert!(parse_stat(b"42 (incomplete) S").is_none());
-    }
-}

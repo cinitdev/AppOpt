@@ -17,7 +17,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -114,7 +113,7 @@ internal fun CoreThreadRecords(thread: CoreTableIndex.Thread, report: CoreTimeli
                 }
             }
             CompositionLocalProvider(LocalOverscrollFactory provides null) {
-            LazyColumn(Modifier.weight(1f).padding(horizontal = 16.dp).testTag("core-event-table"), state = list,
+            LazyColumn(Modifier.weight(1f).padding(horizontal = 16.dp), state = list,
                 contentPadding = PaddingValues(bottom = 20.dp)) {
                 item(key = "graph", contentType = "graph") {
                     if (showChart) {
@@ -150,7 +149,7 @@ internal fun CoreThreadRecords(thread: CoreTableIndex.Thread, report: CoreTimeli
 @Composable
 private fun CoreEventTableRow(row: CoreRecordRow, selected: Boolean, onSelect: () -> Unit) {
     Column(Modifier.fillMaxWidth().background(if (selected) Color(0xFFEDF3FF) else Color.White)
-        .testTag("core-event-" + row.index).clickable(onClick = onSelect).padding(horizontal = 12.dp, vertical = 14.dp)) {
+        .clickable(onClick = onSelect).padding(horizontal = 12.dp, vertical = 14.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.width(84.dp)) {
                 Text(row.time, fontSize = 10.sp, color = OceanText, fontWeight = FontWeight.Medium)

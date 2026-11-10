@@ -19,10 +19,7 @@ import kotlinx.coroutines.sync.withLock
 import top.qixia.threads.CalibPolicy
 import top.qixia.threads.DaemonBridge
 
-class QixiaThreadsViewModel @JvmOverloads constructor(
-    application: Application,
-    autoRefreshOnInit: Boolean = true
-) : AndroidViewModel(application) {
+class QixiaThreadsViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = QixiaThreadsRepository(application)
     private val preferences = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val _state = MutableStateFlow(
@@ -92,8 +89,7 @@ class QixiaThreadsViewModel @JvmOverloads constructor(
                 }
             }
         }
-        // 隔离的设置回归测试可跳过无关的历史导入。
-        if (autoRefreshOnInit) refreshDashboard()
+        refreshDashboard()
     }
 
     fun setUiVisible(visible: Boolean) {

@@ -27,21 +27,3 @@ impl ManualFallback {
         self.allowed
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn fallback_is_rate_limited_and_expires_even_with_positive_probes() {
-        let mut gate = ManualFallback::default();
-        let now = Instant::now();
-        assert!(gate.allows(now, || true));
-        assert!(gate.allows(now + Duration::from_millis(500), || panic!(
-            "probe repeated"
-        )));
-        assert!(!gate.allows(now + Duration::from_secs(2), || false));
-        assert!(!gate.allows(now + Duration::from_secs(30), || panic!("expired probe")));
-        gate.reset();
-        assert!(gate.allows(now + Duration::from_secs(31), || true));
-    }
-}

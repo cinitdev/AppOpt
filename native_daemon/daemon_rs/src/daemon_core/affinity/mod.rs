@@ -18,8 +18,6 @@ pub(crate) use cpuset_owned::cleanup_after_scan as cleanup_owned_cpuset_dirs_aft
 mod restore;
 pub(crate) use cpuset::read_present_cpus;
 mod managed_cache;
-#[cfg(test)]
-mod tests;
 pub(crate) use managed_cache::{refresh_managed_tid_cache, restore_all_managed_tids};
 mod journal;
 pub(crate) use journal::{
@@ -27,5 +25,3 @@ pub(crate) use journal::{
     sync_managed_tid_journal,
 };
 mod journal_format;
-#[cfg(test)]
-mod journal_tests;

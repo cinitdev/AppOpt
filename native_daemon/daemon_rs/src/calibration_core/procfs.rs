@@ -22,11 +22,6 @@ pub(super) fn read_thread_stat(path: &str) -> Option<(String, u64, u64)> {
     Some((stat.name, stat.ticks, stat.start))
 }
 
-#[cfg(test)]
-pub(super) fn parse_thread_stat(text: &str) -> Option<(String, u64, u64)> {
-    let stat = qixia_kernel_info::proc::parse_stat(text.as_bytes())?;
-    Some((stat.name, stat.ticks, stat.start))
-}
 pub(super) fn parse_pid_text(text: &str) -> Option<i32> {
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -68,46 +63,4 @@ pub(super) fn safe_history_name(name: &str) -> String {
         }
     }
     encoded
-}
-
-#[cfg(test)]
-mod history_name_tests {
-    use super::{parse_thread_stat, safe_history_name};
-
-    pub(super) fn stat_line(name: &str) -> String {
-        format!(
-            "123 ({name}) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20"
-        )
-    }
-
-    #[test]
-    pub(super) fn thread_stat_reuses_comm_and_cpu_fields() {
-        let (name, ticks, starttime) = parse_thread_stat(&stat_line("RenderThread")).unwrap();
-        assert_eq!(name, "RenderThread");
-        assert_eq!(ticks, 23);
-        assert_eq!(starttime, 19);
-    }
-
-    #[test]
-    pub(super) fn thread_stat_accepts_spaces_and_closing_parentheses_in_name() {
-        let (name, ticks, starttime) =
-            parse_thread_stat(&stat_line("Render ) Thread 2")).unwrap();
-        assert_eq!(name, "Render ) Thread 2");
-        assert_eq!(ticks, 23);
-        assert_eq!(starttime, 19);
-    }
-
-    #[test]
-    pub(super) fn thread_stat_rejects_empty_or_incomplete_input() {
-        assert!(parse_thread_stat("123 () S 1 2 3").is_none());
-        assert!(parse_thread_stat("123 RenderThread S 1 2 3").is_none());
-        assert!(parse_thread_stat("123 (RenderThread) S 1 2 3").is_none());
-    }
-
-    #[test]
-    pub(super) fn history_name_uses_versioned_reversible_encoding() {
-        assert_eq!(safe_history_name("RenderThread"), "e1:RenderThread");
-        assert_eq!(safe_history_name("a|b,c;d%"), "e1:a%7Cb%2Cc%3Bd%25");
-        assert_eq!(safe_history_name("线程"), "e1:%E7%BA%BF%E7%A8%8B");
-    }
 }

@@ -21,7 +21,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
@@ -305,7 +304,7 @@ internal fun appRuleEdit(existing: String?, idle: String, active: String): AppRu
     ModalBottomSheet(onDismissRequest=onDismiss,containerColor=OceanBackground,
         sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=true),sheetGesturesEnabled=false,
         dragHandle=null,shape=RoundedCornerShape(topStart=28.dp,topEnd=28.dp)) {
-        Column(Modifier.fillMaxWidth().heightIn(max=LocalConfiguration.current.screenHeightDp.dp * .85f).testTag("app-refresh-sheet")) {
+        Column(Modifier.fillMaxWidth().heightIn(max=LocalConfiguration.current.screenHeightDp.dp * .85f)) {
             Row(Modifier.fillMaxWidth().padding(start=20.dp,end=10.dp,top=16.dp,bottom=12.dp),verticalAlignment=Alignment.CenterVertically) {
                 RefreshAppIcon(app)
                 Spacer(Modifier.width(12.dp))

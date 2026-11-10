@@ -54,11 +54,9 @@
 # 只生成 build/QixiaBuilder.exe
 powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1
 
-# 运行工具自检后，更新本目录分发的 EXE 和 SHA-256
-powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1 -Test -Package
+# 更新本目录分发的 EXE 和 SHA-256
+powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1 -Package
 ```
-
-自检包括版本同步、有／无发布清单、参数转义、日志隐藏凭据、构建锁、停止进程树和失败状态，不会发布版本或连接手机。自检需要项目源码和 Git for Windows。
 
 若 `build/QixiaBuilder.exe` 正在运行，编译时可添加 `-OutputDirectory build/builder-package`，使用其他输出目录而不关闭现有窗口。
 

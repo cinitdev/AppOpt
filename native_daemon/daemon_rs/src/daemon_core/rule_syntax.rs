@@ -9,22 +9,8 @@ pub struct CanonicalGroup {
     pub rules: Vec<CanonicalRule>,
 }
 
-// 源文本范围仅供解析器回归测试使用。守护进程不再重写配置，
-// 因此正式运行时的解析流程不为此分配内存。
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub struct BlockRange {
-    pub owner: String,
-    pub start_line: usize,
-    pub end_line: usize,
-}
-
 struct ParsedDocument {
     groups: Vec<CanonicalGroup>,
-    #[cfg(test)]
-    ranges: Vec<BlockRange>,
-    #[cfg(test)]
-    valid: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -54,19 +40,10 @@ pub fn parse_config_groups(text: &str) -> Vec<CanonicalGroup> {
     parse_document(text).groups
 }
 
-#[cfg(test)]
-fn block_ranges(text: &str) -> Option<Vec<BlockRange>> {
-    let document = parse_document(text);
-    document.valid.then_some(document.ranges)
-}
 
 fn parse_document(text: &str) -> ParsedDocument {
     let lines = text.lines().collect::<Vec<_>>();
     let mut groups = Vec::new();
-    #[cfg(test)]
-    let mut ranges = Vec::new();
-    #[cfg(test)]
-    let mut valid = true;
     let mut index = 0;
 
     while index < lines.len() {
@@ -80,16 +57,8 @@ fn parse_document(text: &str) -> ParsedDocument {
         if let Some(header) = parse_yaml_header(raw) {
             let end = yaml_end(&lines, index);
             let parsed = parse_yaml_body(&lines[index + 1..end], &header.owner);
-            #[cfg(test)]
-            { valid &= parsed.is_some(); }
             groups.push(CanonicalGroup {
                 rules: parsed.unwrap_or_default(),
-            });
-            #[cfg(test)]
-            ranges.push(BlockRange {
-                owner: header.owner,
-                start_line: index,
-                end_line: end,
             });
             index = end;
             continue;
@@ -97,8 +66,6 @@ fn parse_document(text: &str) -> ParsedDocument {
 
         if let Some(mut header) = parse_brace_header(code) {
             let Some(end) = brace_block_end(&lines, index) else {
-                #[cfg(test)]
-                { valid = false; }
                 break;
             };
             let close = code_part(lines[end - 1]);
@@ -120,8 +87,6 @@ fn parse_document(text: &str) -> ParsedDocument {
             let body = &lines[index + 1..end - 1];
             let parsed = parse_brace_body(body, &header);
             block_valid &= parsed.is_some();
-            #[cfg(test)]
-            { valid &= block_valid; }
             groups.push(CanonicalGroup {
                 rules: if block_valid {
                     parsed.unwrap_or_default()
@@ -129,21 +94,11 @@ fn parse_document(text: &str) -> ParsedDocument {
                     Vec::new()
                 },
             });
-            #[cfg(test)]
-            ranges.push(BlockRange {
-                owner: header.owner,
-                start_line: index,
-                end_line: end,
-            });
             index = end;
             continue;
         }
 
         let legacy = parse_legacy_rule(code);
-        #[cfg(test)]
-        if legacy.is_none() && code.contains(['{', '}']) {
-            valid = false;
-        }
         let rules = legacy.into_iter().collect();
         groups.push(CanonicalGroup { rules });
         index += 1;
@@ -151,10 +106,6 @@ fn parse_document(text: &str) -> ParsedDocument {
 
     ParsedDocument {
         groups,
-        #[cfg(test)]
-        ranges,
-        #[cfg(test)]
-        valid,
     }
 }
 
@@ -707,179 +658,6 @@ fn canonical(key: &str, cpus: &str) -> CanonicalRule {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn function_blocks_keep_comma_separated_cpu_masks() {
-        let groups = parse_config_groups(
-            "app(com.example, 0-3,6-7) {\n  thread(RenderThread, 0-3,6-7)\n}\n",
-        );
-        let rules = &groups[0].rules;
-        assert_eq!(rules[0].key, "com.example{RenderThread}");
-        assert_eq!(rules[0].cpus, "0-3,6-7");
-        assert_eq!(rules[1].key, "com.example");
-        assert_eq!(rules[1].cpus, "0-3,6-7");
-    }
-
-    #[test]
-    fn quoted_function_names_disambiguate_commas_from_cpu_masks() {
-        let groups = parse_config_groups(
-            "app(com.example, 0-3,5,7) {\n\
-             thread(\"worker,0\", 4-7)\n\
-             process(\"remote,0\", 0-3) {\n\
-             thread(\"Binder,worker\", 0-3,5,7)\n\
-             }\n\
-             }\n",
-        );
-        let rules = &groups[0].rules;
-        assert!(rules
-            .iter()
-            .any(|rule| { rule.key == "com.example{worker,0}" && rule.cpus == "4-7" }));
-        assert!(rules.iter().any(|rule| {
-            rule.key == "com.example:remote,0{Binder,worker}" && rule.cpus == "0-3,5,7"
-        }));
-        assert!(rules
-            .iter()
-            .any(|rule| { rule.key == "com.example:remote,0" && rule.cpus == "0-3" }));
-    }
-
-    #[test]
-    fn invalid_cpu_member_does_not_drop_the_surrounding_block() {
-        let text = "com.example=0-3 {\n  RenderThread=6-7\n  Worker=abc\n}\n";
-        let document = parse_document(text);
-        assert!(document.valid);
-        let ranges = block_ranges(text).unwrap();
-        assert_eq!(ranges.len(), 1);
-        assert_eq!((&*ranges[0].owner, ranges[0].start_line, ranges[0].end_line), ("com.example", 0, 4));
-        let groups = parse_config_groups(text);
-        let rules = &groups[0].rules;
-        assert!(rules
-            .iter()
-            .any(|rule| rule.key == "com.example{RenderThread}"));
-        assert!(!rules.iter().any(|rule| rule.key == "com.example{Worker}"));
-        assert!(rules.iter().any(|rule| rule.key == "com.example"));
-    }
-
-    #[test]
-    fn invalid_members_are_isolated_in_all_block_formats() {
-        let cases = [
-            (
-                "standard",
-                "com.example {\n  Good=4-7\n  Bad=abc\n  malformed\n}\n",
-                vec!["com.example{Good}"],
-            ),
-            (
-                "tagged",
-                "com.example={\n  thread:Good=4-7\n  thread:Bad=abc\n  malformed\n  fallback=0-3\n}\n",
-                vec!["com.example{Good}", "com.example"],
-            ),
-            (
-                "natural",
-                "app com.example fallback 0-3 {\n  thread Good=4-7\n  thread Bad=abc\n  malformed\n}\n",
-                vec!["com.example{Good}", "com.example"],
-            ),
-            (
-                "nested",
-                "com.example={\n  threads {\n    Good=4-7\n    Bad=abc\n  }\n  processes {\n    child=0-3\n    bad=abc\n  }\n  fallback=0-3\n}\n",
-                vec!["com.example{Good}", "com.example:child", "com.example"],
-            ),
-            (
-                "function",
-                "app(com.example, 0-3) {\n  thread(Good, 4-7)\n  thread(Bad, abc)\n  process(child, 0-2) {\n    thread(ChildGood, 5-7)\n    thread(ChildBad, abc)\n  }\n  process(remote, abc) {\n    thread(RemoteGood, 1-2)\n  }\n  process(empty, ) {\n    thread(EmptyGood, 1-2)\n  }\n}\n",
-                vec![
-                    "com.example{Good}",
-                    "com.example:child{ChildGood}",
-                    "com.example:child",
-                    "com.example:remote{RemoteGood}",
-                    "com.example:empty{EmptyGood}",
-                    "com.example",
-                ],
-            ),
-            (
-                "yaml",
-                "com.example:\n    threads:\n        Good: 4-7\n        Bad: abc\n        malformed\n    processes:\n        child: 0-3\n        bad: abc\n    fallback: 0-3\n",
-                vec!["com.example{Good}", "com.example:child", "com.example"],
-            ),
-        ];
-
-        for (name, text, expected_keys) in cases {
-            let document = parse_document(text);
-            assert!(
-                document.valid,
-                "{name} block should remain structurally valid"
-            );
-            assert_eq!(
-                block_ranges(text).map(|ranges| ranges.len()),
-                Some(1),
-                "{name} block range should remain usable"
-            );
-            let rules = &document.groups[0].rules;
-            for key in expected_keys {
-                assert!(
-                    rules.iter().any(|rule| rule.key == key),
-                    "{name} missing valid rule {key}"
-                );
-            }
-            assert!(
-                rules.iter().all(|rule| {
-                    !rule.key.contains("Bad")
-                        && !rule.key.contains("bad")
-                        && !rule.key.contains("malformed")
-                }),
-                "{name} retained an invalid member"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_block_structure_still_invalidates_block_ranges() {
-        let malformed = [
-            "com.example {\n  Good=0-3\n",
-            "com.example={\n  threads {\n    Good=0-3\n  }\n",
-            "app(com.example) {\n  process(child, 0-3) {\n    thread(Good, 0-3)\n  }\n",
-            "com.example:\n  threads:\n    Good: 0-3\n",
-            "com.example={\n  fallback=0-3\n  fallback=4-7\n}\n",
-            "com.example:\n    fallback: 0-3\n    fallback: 4-7\n",
-            "com.example {\n  Good=0-3\n}\n}\n",
-        ];
-
-        for text in malformed {
-            assert!(
-                block_ranges(text).is_none(),
-                "malformed block must not provide health ranges: {text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn function_process_blocks_expand_child_threads_and_optional_fallback() {
-        let groups = parse_config_groups(
-            "app(com.tencent.mobileqq, 0-6) {\n\
-             process(MSF, 0-3) {\n\
-             thread(Thread_*, 0-7)\n\
-             }\n\
-             process(push) {\n\
-             thread(Push-Worker, 4-7)\n\
-             }\n\
-             }\n",
-        );
-        let rules = &groups[0].rules;
-        assert!(rules
-            .iter()
-            .any(|rule| { rule.key == "com.tencent.mobileqq:MSF" && rule.cpus == "0-3" }));
-        assert!(rules.iter().any(|rule| {
-            rule.key == "com.tencent.mobileqq:MSF{Thread_*}" && rule.cpus == "0-7"
-        }));
-        assert!(rules.iter().any(|rule| {
-            rule.key == "com.tencent.mobileqq:push{Push-Worker}" && rule.cpus == "4-7"
-        }));
-        assert!(rules
-            .iter()
-            .any(|rule| { rule.key == "com.tencent.mobileqq" && rule.cpus == "0-6" }));
-    }
-}
 
 fn brace_block_end(lines: &[&str], start: usize) -> Option<usize> {
     let mut depth = 0isize;

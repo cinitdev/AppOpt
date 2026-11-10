@@ -12,7 +12,6 @@ android {
         applicationId = "top.qixia.threads"
         minSdk = 31
         targetSdk = 36
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 207
         versionName = "v2.0.7"
     }
@@ -62,7 +61,6 @@ dependencies {
     val composeBom = platform(libs.androidx.compose.bom)
 
     implementation(composeBom)
-    androidTestImplementation(composeBom)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
@@ -76,8 +74,6 @@ dependencies {
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.compose.ui.tooling.preview)
     debugImplementation(libs.androidx.compose.ui.tooling)
-    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
-    debugImplementation(libs.androidx.compose.ui.test.manifest)
     implementation(libs.markwon.core)
     implementation(libs.markwon.ext.strikethrough)
     implementation(libs.markwon.ext.tables)
@@ -86,9 +82,6 @@ dependencies {
     implementation(libs.markwon.linkify)
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
-    testImplementation(libs.junit)
-    androidTestImplementation(libs.androidx.junit)
-    androidTestImplementation(libs.androidx.espresso.core)
 }
 
 // 传感器、单位换算、CPU 差分与计数均由 Rust 负责，不打包 Shell/C 采集资源。
@@ -117,8 +110,4 @@ val buildHistoryProbe by tasks.registering {
 }
 android.sourceSets.getByName("main").assets.srcDir(historyProbeOutput)
 android.sourceSets.getByName("main").java.srcDir(rootProject.file("shared/refresh"))
-// 设备回归直接读取安装脚本源码，避免测试维护另一份实现。
-android.sourceSets.getByName("androidTest").assets.srcDir(rootProject.file("magisk_module"))
-// 设备测试直接验证独立安装助手的错误分类，不维护第二份判断逻辑。
-android.sourceSets.getByName("androidTest").java.srcDir(rootProject.file("tools/qixia_pkg_helper/src"))
 tasks.named("preBuild").configure { dependsOn(buildHistoryProbe) }

@@ -24,7 +24,6 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -62,7 +61,7 @@ internal fun CoreThreadTable(
                 Text("线程", Modifier.width(ThreadColumnWidth).padding(start = 13.dp, top = 16.dp, bottom = 16.dp),
                     fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = OceanText)
                 Box(Modifier.width(1.dp).height(44.dp).background(OceanOutline))
-                Row(Modifier.weight(1f).horizontalScroll(horizontal).testTag("core-table-columns"),
+                Row(Modifier.weight(1f).horizontalScroll(horizontal),
                     verticalAlignment = Alignment.CenterVertically) {
                     TableCell("核心分布", "允许范围 / 最近执行采样", coreWidth, header = true)
                     TableCell("范围来源", "最近记录", 90.dp, header = true)
@@ -71,7 +70,7 @@ internal fun CoreThreadTable(
                 }
             }
             HorizontalDivider(color = OceanOutline)
-            LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("core-data-table")) {
+            LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
                 itemsIndexed(threads, key = { _, thread -> thread.identity.stableKey }, contentType = { _, _ -> "thread" }) { position, thread ->
                     CoreSnapshotRow(thread, time, cpuIds, coreWidth, horizontal, position % 2 == 1) { onThread(thread) }
                 }
@@ -120,7 +119,7 @@ private fun CoreSnapshotRow(
     val allowed = remember(range) { range?.afterCpus?.toSet().orEmpty() }
     Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)
         .background(if (alternate) Color(0xFFFAFBFE) else Color.White)
-        .testTag("core-row-" + thread.identity.stableKey), verticalAlignment = Alignment.CenterVertically) {
+        , verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.width(ThreadColumnWidth).fillMaxHeight().clickable(onClick = onClick)
             .padding(start = 13.dp, end = 9.dp, top = 15.dp, bottom = 15.dp), verticalArrangement = Arrangement.Center) {
             Text(thread.name, fontSize = 12.sp, lineHeight = 17.sp, fontWeight = FontWeight.SemiBold,

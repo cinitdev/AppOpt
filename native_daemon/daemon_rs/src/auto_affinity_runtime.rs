@@ -9,9 +9,6 @@ mod batch;
 mod core_history;
 #[path = "auto_affinity/cpuset.rs"]
 pub(in crate::auto_affinity) mod cpuset;
-#[cfg(test)]
-#[path = "auto_affinity/device_tests.rs"]
-mod device_tests;
 #[path = "auto_affinity/live.rs"]
 mod live;
 #[path = "auto_affinity/sampling.rs"]
@@ -306,26 +303,6 @@ impl Runtime {
     }
 }
 
-#[cfg(test)]
-mod cadence_tests {
-    use super::*;
-
-    #[test]
-    fn suspended_controller_waits_for_events_without_busy_polling() {
-        assert_eq!(Runtime::default().next_sample_delay(), Duration::from_secs(1));
-    }
-
-    #[test]
-    fn ownership_wakes_between_load_samples_without_waiting_for_placement_dwell() {
-        let start = Instant::now();
-        assert_eq!(work_delay(start, None, None), Duration::ZERO);
-        assert_eq!(work_delay(start, Some(start), Some(start)), Duration::from_millis(250));
-        let check = start + Duration::from_millis(250);
-        assert_eq!(work_delay(check, Some(start), Some(start)), Duration::ZERO);
-        assert_eq!(work_delay(check, Some(start), Some(check)), Duration::from_millis(250));
-        assert_eq!(work_delay(start + Duration::from_millis(500), Some(start), Some(check)), Duration::ZERO);
-    }
-}
 
 #[derive(Clone, Debug)]
 struct Record {
@@ -420,14 +397,6 @@ fn parse_stat(bytes: &[u8]) -> Option<(u64, u64)> {
     let stat = qixia_kernel_info::proc::parse_stat(bytes)?;
     Some((stat.start, stat.ticks))
 }
-#[cfg(test)]
-fn thread_stat(pid: i32, tid: i32) -> io::Result<ThreadStat> {
-    let stat = qixia_kernel_info::proc::read_stat(format!("/proc/{pid}/task/{tid}/stat"))?;
-    Ok(ThreadStat {
-        start: stat.start,
-        ticks: stat.ticks,
-    })
-}
 fn same_identity(r: &Record) -> io::Result<bool> {
     match fs::read(format!("/proc/{}/task/{}/stat", r.pid, r.tid)) {
         Ok(s) => Ok(parse_stat(&s).is_some_and(|(start, _)| start == r.start)),
@@ -436,37 +405,7 @@ fn same_identity(r: &Record) -> io::Result<bool> {
     }
 }
 
-#[cfg(test)]
-fn restore_record(r: &Record) -> io::Result<()> {
-    batch::restore(&batch::Entry {
-        record: r.clone(),
-        previous: None,
-        original_cpuset: None,
-        owned_root: cpuset::root(),
-        inherited_from: None,
-    })
-}
 
-#[cfg(test)]
-fn candidate_pool(
-    cores: &[Core],
-    original: u64,
-    online: u64,
-    loads: &[Option<f64>; 64],
-    limits: &[Option<f64>; 64],
-    measured: super::demand::Demand,
-) -> Option<u64> {
-    let demand = super::planner::Demand {
-        allowed: original & online,
-        total: measured.units,
-        serial: measured.units,
-        parallel: 1,
-    };
-    let mut budget = super::planner::Budget::new(cores, limits);
-    budget.reserve_external(loads);
-    let mask = budget.assign(&demand).0;
-    (mask != 0 && mask != original & online).then_some(mask)
-}
 pub fn recover_journal(token: Option<&str>) -> io::Result<()> {
     batch::recover(token)
 }
@@ -546,163 +485,4 @@ fn cpu_loads(before: &[(u64, u64)], after: &[(u64, u64)]) -> [Option<f64>; 64] {
         let idle = b.1.checked_sub(a.1)?;
         (total > 0 && idle <= total).then(|| 1.0 - idle as f64 / total as f64)
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    #[ignore = "Bounded CPU probe: run explicitly on an Android device with time_in_state"]
-    fn device_demand_probe_reads_real_frequency_residency() {
-        let pid = std::process::id() as i32;
-        let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
-        let cores = topology();
-        let policies = sampling::policies(&cores).expect("device CPU policies");
-        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
-        let mut window = sampling::DemandWindow::default();
-        let mut valid = 0;
-        let mut before = cpu_times();
-        log_info!("device capacities: {:?}", cores);
-        for index in 0..7 {
-            if index > 0 {
-                let work = Instant::now();
-                while work.elapsed() < Duration::from_millis(1100) {
-                    std::hint::black_box(12345u64.wrapping_mul(6789));
-                }
-            }
-            let stat = thread_stat(pid, tid).unwrap();
-            let residency =
-                sampling::residency(pid, tid).expect("real thread frequency accounting");
-            let after = cpu_times();
-            if let Some(demand) = window.push(Instant::now(), stat, residency, &policies, hz) {
-                let pool = candidate_pool(
-                    &cores,
-                    affinity(tid).unwrap(),
-                    online_mask().unwrap(),
-                    &cpu_loads(&before, &after),
-                    &sampling::limits(&policies),
-                    demand,
-                );
-                log_info!(
-                    "READ ONLY round={index} work={:.2} busy={:.3} candidate={pool:?}",
-                    demand.units,
-                    demand.busy
-                );
-                assert!(
-                    demand.units > 0.0
-                        && demand.units
-                            <= 1.1 * cores.iter().map(|c| c.capacity).max().unwrap() as f64
-                );
-                assert!(demand.busy > 0.7);
-                valid += 1;
-            }
-            before = after;
-        }
-        assert!(
-            valid >= 2,
-            "reliable demand estimates should be available after warmup"
-        );
-    }
-    #[test]
-    fn corrupt_recovery_records_are_rejected() {
-        assert!(Record::decode("v1 abc 1-2 3 4 5 ff c0").is_some());
-        for text in [
-            "v1 abc 1-2 3 4 5 03 c0",
-            "v1 abc 1-2 3 4 5 ff 0",
-            "v1 abc x;id 3 4 5 ff c0",
-            "v1 abc 1-2 -3 4 5 ff c0",
-        ] {
-            assert!(Record::decode(text).is_none());
-        }
-    }
-    #[test]
-    fn busy_or_missing_cpu_samples_prevent_a_trial() {
-        assert!(cpu_loads(&[], &[]).iter().all(Option::is_none));
-        let a = vec![(100, 20); 64];
-        let mut b = vec![(200, 100); 64];
-        assert!(cpu_loads(&a, &b)[6].unwrap() < 0.21);
-        b[6] = (200, 21);
-        assert!(cpu_loads(&a, &b)[6].unwrap() > 0.98);
-        b[6] = (99, 21);
-        assert!(cpu_loads(&a, &b)[6].is_none());
-    }
-    #[test]
-    fn stat_parser_handles_parentheses_and_spaces_in_names() {
-        let tail = (0..20)
-            .map(|i| {
-                if i == 11 {
-                    "7"
-                } else if i == 12 {
-                    "8"
-                } else if i == 19 {
-                    "99"
-                } else {
-                    "0"
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(
-            parse_stat(format!("42 (worker ) name) {tail}").as_bytes()),
-            Some((99, 15))
-        );
-    }
-    #[test]
-    fn non_utf8_thread_names_preserve_identity_and_reject_reuse() {
-        std::thread::spawn(|| {
-            let name = b"worker-\xff\0";
-            assert_eq!(unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0, 0, 0) }, 0);
-            let pid = std::process::id() as i32;
-            let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
-            let bytes = fs::read(format!("/proc/{pid}/task/{tid}/stat")).unwrap();
-            assert!(std::str::from_utf8(&bytes).is_err());
-            let (start, _) = parse_stat(&bytes).unwrap();
-            let mut record = Record {
-                boot: String::new(), token: String::new(), pid, tid, start,
-                original: 1, written: 1,
-            };
-            assert!(same_identity(&record).unwrap());
-            record.start += 1;
-            assert!(!same_identity(&record).unwrap());
-        }).join().unwrap();
-    }
-    #[test]
-    fn restore_checks_identity_and_respects_external_changes() {
-        std::thread::spawn(|| {
-            let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
-            let pid = std::process::id() as i32;
-            let original = affinity(tid).unwrap();
-            if original.count_ones() < 3 {
-                return;
-            }
-            let selected = original & original.wrapping_neg();
-            let other = (original & !selected) & (original & !selected).wrapping_neg();
-            let stat = thread_stat(pid, tid).unwrap();
-            for written in [selected, selected | other] {
-                let record = Record {
-                    boot: boot_id().unwrap(),
-                    token: "1-2".into(),
-                    pid,
-                    tid,
-                    start: stat.start,
-                    original,
-                    written,
-                };
-                write_affinity(tid, written).unwrap();
-                let mut stale = record.clone();
-                stale.start += 1;
-                restore_record(&stale).unwrap();
-                assert_eq!(affinity(tid).unwrap(), written);
-                restore_record(&record).unwrap();
-                cpuset::assert_restored_for_test(original, affinity(tid).unwrap());
-                let external = if written == selected { other } else { selected };
-                write_affinity(tid, external).unwrap();
-                restore_record(&record).unwrap();
-                assert_eq!(affinity(tid).unwrap(), external);
-                write_affinity(tid, original).unwrap();
-            }
-        })
-        .join()
-        .unwrap();
-    }
 }

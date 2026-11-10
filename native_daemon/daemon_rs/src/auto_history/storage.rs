@@ -38,13 +38,6 @@ pub(super) const HISTORY_GATE: GatePolicy = GatePolicy {
     min_span_ms: 30_000,
 };
 
-/// 测试口径：任何一次有负载采样都立即确认，用于与活跃策略无关的容量/轮转测试。
-#[cfg(test)]
-pub(super) const OPEN_GATE: GatePolicy = GatePolicy {
-    min_samples: 1,
-    min_percent: 0,
-    min_span_ms: 0,
-};
 
 #[derive(Clone, Copy)]
 struct ThreadGate {
@@ -60,8 +53,6 @@ const HEADER: &str = "QIXIA_AUTO_HISTORY\t1\n";
 #[path = "storage_compression.rs"]
 mod compression;
 use compression::{completed_path, read_prefix};
-#[cfg(test)]
-use compression::read_text;
 fn has_history_header(bytes: &[u8]) -> bool {
     bytes.starts_with(HEADER.as_bytes())
 }
@@ -109,19 +100,6 @@ pub(super) struct Recording {
 }
 
 impl Recording {
-    #[cfg(test)]
-    pub fn new(directory: &Path, package: &str, start_ms: u64) -> io::Result<Self> {
-        Self::create(directory, package, start_ms, true)
-    }
-    #[cfg(test)]
-    fn create(
-        directory: &Path,
-        package: &str,
-        start_ms: u64,
-        prune_before_start: bool,
-    ) -> io::Result<Self> {
-        Self::create_source(directory, package, start_ms, prune_before_start, "auto")
-    }
     fn create_source(directory: &Path, package: &str, start_ms: u64, prune_before_start: bool, source: &str) -> io::Result<Self> {
         fs::create_dir_all(directory)?;
         // 记录器是唯一写入方，调用前上一分段已关闭。
@@ -185,23 +163,6 @@ impl Recording {
 
     pub fn elapsed_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
-    }
-    #[cfg(test)]
-    pub fn start_ms(&self) -> u64 {
-        self.start_ms
-    }
-    #[cfg(test)]
-    pub fn rotate(&mut self, directory: &Path, start_ms: u64) -> io::Result<()> {
-        let mut next = Recording::new(directory, &self.package, start_ms)?;
-        // 轮转只换文件，不重置活跃确认口径。
-        next.policy = self.policy;
-        next.device(&self.device_fields)?;
-        let old = std::mem::replace(self, next);
-        if let Err(error) = old.finish(start_ms) {
-            self.core_loss(0, true);
-            return Err(error);
-        }
-        Ok(())
     }
     pub fn device(&mut self, fields: &[(String, String)]) -> io::Result<()> {
         for (key, value) in fields.iter().take(5) {
@@ -488,15 +449,6 @@ impl Recording {
         drop(self.output);
         Ok(Some((self.path, self._open)))
     }
-    #[cfg(test)]
-    pub fn finish(self, end_ms: u64) -> io::Result<()> {
-        if let Some((path, open)) = self.seal(end_ms, None)? {
-            compression::publish(&path)?;
-            drop(open);
-            prune(path.parent().unwrap_or_else(|| Path::new(".")), end_ms)?;
-        }
-        Ok(())
-    }
 }
 
 #[path = "storage_capture.rs"]
@@ -745,237 +697,4 @@ pub(super) fn prune(directory: &Path, now_ms: u64) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-#[path = "storage_core_tests.rs"]
-mod core_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn directory(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "qixia-auto-history-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-    #[test]
-    fn history_keeps_sustained_threads_and_drops_short_activity() {
-        let dir = directory("gate");
-        let mut run = Recording::new(&dir, "com.game", 1_000).unwrap();
-        let steady = ThreadSample {
-            pid: 1,
-            tid: 2,
-            start: 3,
-            name: "worker\t汉".into(),
-            percent: 12.0,
-        };
-        let early_burst = ThreadSample {
-            pid: 1,
-            tid: 4,
-            start: 5,
-            name: "early burst".into(),
-            percent: 0.0,
-        };
-        let middle_burst = ThreadSample {
-            pid: 1,
-            tid: 6,
-            start: 7,
-            name: "middle burst".into(),
-            percent: 0.0,
-        };
-        // 40 秒记录：开局和中段各有一次 3 秒突发，都不能越过固定 30 秒门槛。
-        for round in 0..80u64 {
-            let early_percent = if (0..6).contains(&round) { 40.0 } else { 0.0 };
-            let middle_percent = if (40..46).contains(&round) { 40.0 } else { 0.0 };
-            run.threads(
-                1_000 + round * 500,
-                &[
-                    steady.clone(),
-                    ThreadSample {
-                        percent: early_percent,
-                        ..early_burst.clone()
-                    },
-                    ThreadSample {
-                        percent: middle_percent,
-                        ..middle_burst.clone()
-                    },
-                ],
-            )
-            .unwrap();
-        }
-        let path = run.path.with_extension("log.gz");
-        run.finish(41_000).unwrap();
-        let text = read_text(&path).unwrap();
-        assert!(text.contains(&hex("worker\t汉".as_bytes())));
-        assert!(!text.contains(&hex("early burst".as_bytes())));
-        assert!(!text.contains(&hex("middle burst".as_bytes())));
-        // 固定 30 秒存在期满足后才开始写行，之后每轮都保留（含 0%）。
-        assert_eq!(text.lines().filter(|l| l.starts_with("T\t")).count(), 20);
-        assert!(text.contains("\t12.0000\n"));
-        assert!(text.contains("thread_count\t1\n"));
-        fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn recovery_drops_partial_rows_and_never_imports_empty_runs() {
-        let dir = directory("recovery");
-        let good = dir.join("auto_1000_1_0.tmp");
-        fs::write(&good, format!("{HEADER}source\tauto\npackage\tcom.game\nstart_ms\t1000\nF\t2000\t60\t17\nT\t2500\tpartial")).unwrap();
-        fs::write(dir.join("auto_1000_1_1.tmp"), HEADER).unwrap();
-        recover(&dir).unwrap();
-        let text = read_text(good.with_extension("log.gz")).unwrap();
-        assert!(text.contains("end_ms\t2000\nduration_ms\t1000\nrecovered\t1"));
-        assert!(!text.contains("partial"));
-        assert!(!dir.join("auto_1000_1_1.tmp").exists());
-        fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn retains_raw_metrics_and_rejects_nonfinite_fps() {
-        let dir = directory("metrics");
-        let mut run = Recording::new(&dir, "com.game", 1000).unwrap();
-        run.fps(2000, f64::NAN, 0.0).unwrap();
-        let mut sample = qixia_history_probe::Sample::default();
-        sample.charging = Some(false);
-        sample.values.insert("battery_ma".into(), 1500.0);
-        run.metrics(2000, &sample).unwrap();
-        let path = run.path.with_extension("log.gz");
-        run.finish(3000).unwrap();
-        let text = read_text(path).unwrap();
-        assert!(!text.contains("F\t"));
-        assert!(text.contains("M\t2000\t0\tbattery_ma=1500.000000"));
-        fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn segment_limits_and_retention_keep_recording_bounded() {
-        let dir = directory("retention");
-        for index in 0..35u64 {
-            let mut run = Recording::new(&dir, "com.game", 1000 + index).unwrap();
-            run.fps(2000 + index, 60.0, 16.6).unwrap();
-            if index == 0 {
-                run.bytes = MAX_BYTES - 128 * 1024;
-                assert!(run.full());
-                run.bytes = 100;
-                run.started = Instant::now() - MAX_DURATION;
-                assert!(run.full());
-            }
-            run.finish(3000 + index).unwrap();
-        }
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 35);
-        let mut run = Recording::new(&dir, "com.other", 9000).unwrap();
-        run.changes(9100, &[((1, 2, 3), 0)]).unwrap();
-        run.device(&[("model".into(), "sample\tmodel\n".into())])
-            .unwrap();
-        let path = run.path.with_extension("log.gz");
-        run.finish(9000).unwrap();
-        let text = read_text(path).unwrap();
-        assert!(text.contains("A\t9100\t1\t2\t3\trestore\n"));
-        assert!(text.contains("D\tmodel\tsample model \n"));
-        assert!(!text.contains("duration_ms\t0\n"));
-        fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn retry_recovers_closed_incomplete_runs_without_count_eviction() {
-        let dir = directory("retry");
-        for index in 0..35 {
-            fs::write(
-                dir.join(format!("auto_1000_1_{index}.tmp")),
-                format!(
-                    "{HEADER}source\tauto\npackage\tcom.game\nstart_ms\t1000\nF\t2000\t60\t17\n"
-                ),
-            )
-            .unwrap();
-        }
-        // 尚未恢复的暂存文件不能因历史条数被删除。
-        prune(&dir, 3000).unwrap();
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 35);
-        let run = Recording::new(&dir, "com.game", 3000).unwrap();
-        assert_eq!(
-            fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(Result::ok)
-                .filter(|e| owned_file(&e.path(), "log"))
-                .count(),
-            35
-        );
-        run.finish(4000).unwrap(); // 空重试不能生成可导入的记录。
-        recover(&dir).unwrap(); // 有界恢复的下一轮继续处理剩余临时文件。
-        assert!(fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .all(|e| owned_file(&e.path(), "log")));
-        prune(&dir, crate::history_retention::MAX_AGE_MS + 2_000).unwrap();
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 35);
-        prune(&dir, crate::history_retention::MAX_AGE_MS + 2_001).unwrap();
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn many_completed_archives_do_not_block_new_recordings_or_recovery() {
-        let dir = directory("many-archives");
-        for index in 0..1001 {
-            fs::write(dir.join(format!("auto_1000_1_{index}.log")),
-                format!("{HEADER}package\tcom.game\nstart_ms\t1000\nend_ms\t2000\n")).unwrap();
-        }
-        let pending = dir.join("auto_3000_1_0.tmp");
-        fs::write(&pending, format!("{HEADER}package\tcom.game\nstart_ms\t3000\nF\t4000\t60\t17\n")).unwrap();
-        let run = Recording::new(&dir, "com.game", 5000).unwrap();
-        assert!(!pending.exists());
-        assert!(pending.with_extension("log.gz").exists());
-        run.finish(6000).unwrap();
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1002);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn retention_is_global_keeps_active_recording_and_waits_for_new_completion() {
-        let dir = directory("global-retention");
-        // 测试故意让数字时间戳跨越位数边界。
-        for stamp in 6..=14 {
-            let mut run = Recording::new(
-                &dir,
-                if stamp % 2 == 0 { "com.one" } else { "com.two" },
-                stamp,
-            )
-            .unwrap();
-            run.fps(stamp + 1, 60.0, 16.6).unwrap();
-            run.finish(stamp + 2).unwrap();
-        }
-        let completed = || {
-            fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(Result::ok)
-                .filter(|entry| owned_file(&entry.path(), "log"))
-                .map(|entry| entry.path())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(completed().len(), 9);
-        assert!(completed().iter().all(|path| {
-            path.file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .split('_')
-                .nth(1)
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-                >= 6
-        }));
-        let active = Recording::new(&dir, "com.three", 15).unwrap();
-        let active_path = active.path.clone();
-        prune(&dir, crate::history_retention::MAX_AGE_MS + 10).unwrap();
-        assert!(active_path.exists());
-        assert_eq!(completed().len(), 7);
-        active.finish(16).unwrap(); // 空启动不能淘汰现有的完整记录。
-        assert_eq!(completed().len(), 7);
-        fs::remove_dir_all(dir).unwrap();
-    }
 }

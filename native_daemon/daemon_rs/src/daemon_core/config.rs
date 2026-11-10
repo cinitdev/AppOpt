@@ -138,54 +138,6 @@ pub(super) fn parse_rule_key(left: &str, cpus: &str) -> Option<Rule> {
     })
 }
 
-#[cfg(test)]
-mod config_tests {
-    use super::*;
-
-    #[test]
-    fn child_process_thread_rules_keep_the_full_owner() {
-        let rule = parse_rule_key("com.tencent.mobileqq:MSF{Thread_*}", "0-7")
-            .expect("子进程线程规则应可解析");
-        assert_eq!(rule.owner, "com.tencent.mobileqq:MSF");
-        assert_eq!(rule.thread.as_deref(), Some("Thread_*"));
-        assert_eq!(rule.cpus, "0-7");
-        assert!(!rule.auto);
-
-        let chrome = parse_rule_key(
-            "com.android.chrome:sandboxed_process0:org.chromium.content.app.\
-             SandboxedProcessService0:3{CrRendererMain}",
-            "7",
-        )
-        .expect("Chromium 多段子进程名称应可解析");
-        assert_eq!(chrome.thread.as_deref(), Some("CrRendererMain"));
-        assert_eq!(
-            chrome.owner,
-            "com.android.chrome:sandboxed_process0:org.chromium.content.app.\
-             SandboxedProcessService0:3"
-        );
-    }
-
-    #[test]
-    fn automatic_mode_suspends_only_its_own_rules_without_deleting_them() {
-        let rules = vec![parse_rule_key("com.game{RenderThread}", "4-7").unwrap(),
-            parse_rule_key("com.game:worker", "0-7").unwrap(),
-            parse_rule_key("com.other", "0-7").unwrap(),
-            parse_rule_key("com.game", "0-3").unwrap(),
-            parse_rule_key("com.game:worker{Job*}", "4-5").unwrap()];
-        let mut state = DaemonState::default();
-        state.auto_affinity_packages.insert("com.game".into());
-        let index = build_runtime_rule_index(&rules, &HashMap::new(), None, &state);
-        assert_eq!(index.active_rule_indices, vec![2]);
-        assert!(!index.plan.all_pkgs.contains("com.game"));
-        assert!(!index.health_rule_packages.contains("com.game"));
-        assert!(!index.health_rules_by_owner.contains_key("com.game:worker"));
-        assert!(!index.rules_by_owner.contains_key("com.game"));
-        state.auto_affinity_packages.clear();
-        let index = build_runtime_rule_index(&rules, &HashMap::new(), None, &state);
-        assert_eq!(index.active_rule_indices, vec![0,1,2,3,4]);
-        assert_eq!(rules[0].cpus, "4-7");
-    }
-}
 
 pub(super) fn parse_uid_map(path: &Path) -> io::Result<HashMap<String, u32>> {
     parse_uid_map_with_key(path).map(|(map, _)| map)

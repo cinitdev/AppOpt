@@ -24,7 +24,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.disabled
@@ -63,7 +62,6 @@ internal fun CoreTimeNavigator(index: CoreTableIndex, selectedTime: MutableLongS
             CoreTimeReadout(index, selectedTime)
             Box(
                 Modifier.fillMaxWidth().padding(top = 3.dp).height(48.dp)
-                    .testTag("core-time-scrubber")
                     .semantics {
                         contentDescription = "调度记录时间游标，左右滑动更新整张表格"
                         val progress = index.progressAt(selectedTime.longValue).coerceIn(0f, 1f)

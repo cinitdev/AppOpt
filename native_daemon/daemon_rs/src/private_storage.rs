@@ -153,10 +153,6 @@ impl Storage {
     }
 }
 
-#[cfg(test)]
-fn atomic_recent_usage(root: &Path, data: &[u8], prepare: impl FnOnce(&fs::File) -> io::Result<()>) -> io::Result<()> {
-    atomic_app_state(root, "recent_usage.tsv", data, true, prepare)
-}
 
 fn atomic_app_state(root: &Path, name: &str, data: &[u8], durable: bool, prepare: impl FnOnce(&fs::File) -> io::Result<()>) -> io::Result<()> {
     use std::io::Write;
@@ -182,37 +178,4 @@ fn atomic_app_state(root: &Path, name: &str, data: &[u8], durable: bool, prepare
     })();
     if result.is_err() { let _ = fs::remove_file(temporary); }
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn atomic_summary_replacement_keeps_old_file_on_prepare_failure() {
-        let root = std::env::temp_dir().join(format!("qixia-summary-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        fs::create_dir(&root).unwrap();
-        let path = root.join("recent_usage.tsv");
-        atomic_recent_usage(&root, b"old", |_| Ok(())).unwrap();
-        assert!(atomic_recent_usage(&root, b"partial", |_| Err(io::Error::other("label denied"))).is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"old");
-        assert!(!root.join(".recent_usage.tsv.tmp").exists());
-        atomic_recent_usage(&root, b"complete", |_| Ok(())).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"complete");
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(root).unwrap();
-    }
-    #[test]
-    fn storage_is_scoped_to_registered_app_and_user() {
-        for (uid, path) in [(10123, "/data/user/0/top.qixia.threads/files"), (10123, "/data/data/top.qixia.threads/files"), (1010123, "/data/user/10/top.qixia.threads/files"),
-            (10123, "/mnt/expand/abcd-1234/user/0/top.qixia.threads/files")] {
-            assert!(parse(&format!("version=1\nuid={uid}\nfiles={path}\n")).is_ok());
-        }
-        for path in ["/data/user/10/top.qixia.threads/files", "/data/user/0/other.app/files", "/data/user/0/top.qixia.threads/files/../databases", "/data/adb/modules/QixiaThreads"] {
-            assert!(parse(&format!("version=1\nuid=10123\nfiles={path}\n")).is_err());
-        }
-        assert!(parse("version=1\nversion=1\nuid=10123\nfiles=/data/user/0/top.qixia.threads/files\n").is_err());
-        assert!(parse("version=1\nuid=0\nfiles=/data/user/0/top.qixia.threads/files\n").is_err());
-    }
 }

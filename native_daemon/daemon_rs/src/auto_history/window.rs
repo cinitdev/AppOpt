@@ -27,20 +27,3 @@ impl Window {
         Some((self.timestamp_ms, std::mem::take(&mut self.threads).into_values().map(|(sample, _)| sample).collect()))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn short_activity_survives_next_idle_sample_and_missing_is_not_zero() {
-        let mut window = Window::default();
-        let sample = ThreadSample { pid: 1, tid: 2, start: 3, name: "brief worker".into(), percent: 2.0 };
-        window.observe(1000, vec![sample.clone()]);
-        window.observe(2100, vec![ThreadSample { percent: 0.0, ..sample.clone() }, ThreadSample { tid: 4, percent: 3.0, ..sample }]);
-        let (time, samples) = window.take().unwrap();
-        assert_eq!(time, 2100);
-        assert_eq!(samples[0].percent, 1.0);
-        assert_eq!(samples[1].percent, 3.0);
-        assert!(window.take().is_none());
-    }
-}

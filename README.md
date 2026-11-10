@@ -101,6 +101,7 @@ ActivityTaskManager/TaskStackListener 写入 `foreground_task.state`。App 侧�
 共用模块现有看门狗；关闭时停止输入监听与显示评估，仅保留配置变更监听和低频检查。
 档位来自当前分辨率的屏幕模式，不预设 60／90／120 Hz 上限。按接口能力选择物理模式或显示范围控制，
 兼容模式分别处理通用、小米、vivo 与特定 Flyme 设置；Oplus 新系统补充物理模式解析。
+兼容设置通过 SettingsProvider 合并提交，批量接口不可用时回退逐项写入并核验；vivo 同时处理 secure／global 刷新率键，关闭时分别恢复原值。新版 OriginOS 分支依据接口分析补齐，尚无 vivo 真机验证。
 `strict`、`compatible` 默认 `auto`：Android 15 及更新的天玑默认启用，显式 `0`／`1` 始终优先。
 读不到物理刷新率时仍可提交兼容设置，并显示未验证；厂商、温控与 LTPO 策略仍可能限制实际执行。
 DisplayModes 默认 `-1 -1 -1`（自动匹配），自定义 ID 以空格分隔，按当前分辨率的真实刷新率从高到低对应。
@@ -348,10 +349,8 @@ EXE 可以移动到其他位置，但构建时仍需包含 `build_module.sh` 的
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1
-# 同时验证参数、日志、项目锁和停止进程树
-powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1 -Test
 # 更新仓库内分发的 EXE 与 SHA-256 校验文件
-powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1 -Test -Package
+powershell -ExecutionPolicy Bypass -File .\tools\windows_builder\build.ps1 -Package
 ```
 
 仅编译工具自身使用 Windows .NET Framework 自带的 C# 编译器；普通构建输出 `build/QixiaBuilder.exe`，加 `-Package` 才更新仓库内的分发文件。
@@ -507,7 +506,7 @@ BPF 对象需要保留 BTF。当前脚本已经给 BPF 编译保留 `-g`，同�
 - `build/`、`app/build/`、`*.log` 和模块 zip 属于生成产物，不应提交到仓库。
 - Rust `target/`、本机 IDE 配置、`design/` 内的草稿与测试截图也不提交。
 - `modules_update/` 在本地和更新分支单独维护，不随 GitHub `master` 源码提交。已有跟踪文件仍需在暂存时排除，不能仅依赖 `.gitignore`。
-- 主分支保留源码、测试、构建工具及必要资源；仅额外分发 `tools/windows_builder/QixiaBuilder.exe` 与校验文件，APK、模块 ZIP 和其他构建产物仍不提交。
+- 主分支保留正式源码、构建工具及必要资源；测试代码、调试页面和临时验证材料不纳入提交。仅额外分发 `tools/windows_builder/QixiaBuilder.exe` 与校验文件，APK、模块 ZIP 和其他构建产物仍不提交。
 
 ## 文档
 

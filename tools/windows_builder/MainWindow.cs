@@ -9,7 +9,6 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Markup;
 using System.Windows.Media;
-using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 
 namespace Qixia.Builder
@@ -274,52 +273,5 @@ namespace Qixia.Builder
         }
         void Guard(Action action) { try { action(); } catch (Exception ex) { ShowError(ex); } }
         void ShowError(Exception ex) { MessageBox.Show(Window, new LogSanitizer(Get<PasswordBox>("Token").Password).Clean(ex.Message), "柒夏构建中心", MessageBoxButton.OK, MessageBoxImage.Information); }
-
-        public async System.Threading.Tasks.Task VerifyUi(string screenshot)
-        {
-            string sourceProject = Field("ProjectPath").Text;
-            Field("ProjectPath").Text = SelfTests.VersionFixture(sourceProject);
-            ReadVersion();
-            Field("VersionName").Text = "v9.8.8";
-            Field("VersionCode").Text = "988";
-            SaveVersion();
-            if (Field("VersionName").Text != "v9.8.8" || loadedVersion.Code != 988)
-                throw new Exception("版本编辑、保存或重新读取失败。");
-            Field("ProjectPath").Text = sourceProject;
-            ReadVersion();
-            Get<ComboBox>("Variant").SelectedIndex = 1;
-            if (Options(false).Variant != "debug") throw new Exception("调试版选择失效。");
-            Get<ComboBox>("Variant").SelectedIndex = 2;
-            if (Options(false).Variant != "no") throw new Exception("仅模块选择失效。");
-            Get<ComboBox>("Action").SelectedIndex = 1;
-            if (Options(false).Variant != "release" || Get<ComboBox>("Variant").IsEnabled) throw new Exception("发布模式没有限制正式版。");
-            Get<ComboBox>("Target").SelectedIndex = 1;
-            if (Options(false).Target != "github" || Get<StackPanel>("PublishOptions").Visibility != Visibility.Visible) throw new Exception("发布平台选项异常。");
-            Get<ComboBox>("Action").SelectedIndex = 0;
-            Get<ComboBox>("Target").SelectedIndex = 0;
-            if (!Get<ComboBox>("Variant").IsEnabled) throw new Exception("返回构建模式后未解锁构建类型。");
-            await Start(true);
-            if (Label("StateLabel").Text != "环境检查通过" || !Button("StartButton").IsEnabled || Button("StopButton").IsEnabled)
-                throw new Exception("界面环境检查未通过，或按钮状态未恢复。");
-            RenderPreview(screenshot, 1180, 860);
-        }
-
-        public void RenderPreview(string path, double width, double height)
-        {
-            Window.Width = width; Window.Height = height;
-            Window.Show(); Window.UpdateLayout();
-            var content = (FrameworkElement)Window.Content;
-            var bounds = VisualTreeHelper.GetDescendantBounds(content);
-            var target = new RenderTargetBitmap((int)Math.Ceiling(content.ActualWidth + 56), (int)Math.Ceiling(content.ActualHeight + 42), 96, 96, PixelFormats.Pbgra32);
-            var visual = new DrawingVisual();
-            using (var context = visual.RenderOpen()) {
-                context.DrawRectangle(Window.Background, null, new Rect(0, 0, target.PixelWidth, target.PixelHeight));
-                context.DrawRectangle(new VisualBrush(content), null, new Rect(28, 22, bounds.Width, bounds.Height));
-            }
-            target.Render(visual);
-            var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(target));
-            using (var output = File.Create(path)) encoder.Save(output);
-            Window.Close();
-        }
     }
 }

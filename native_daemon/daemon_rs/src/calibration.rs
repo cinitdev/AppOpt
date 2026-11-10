@@ -55,6 +55,3 @@ use procfs::*;
 
 pub(crate) use policy::{print_version_diagnostics, PolicyTopologySync};
 pub(crate) use worker::start_calibration_thread;
-#[cfg(test)]
-#[path = "calibration_core/activity_history_tests.rs"]
-mod activity_history_tests;

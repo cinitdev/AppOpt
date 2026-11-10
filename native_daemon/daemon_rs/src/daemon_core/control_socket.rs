@@ -386,31 +386,3 @@ unsafe extern "C" {
     fn recv(fd: i32, buf: *mut std::ffi::c_void, len: usize, flags: i32) -> isize;
     fn close(fd: i32) -> i32;
 }
-
-#[cfg(all(test, any(target_os = "android", target_os = "linux")))]
-mod diagnostic_socket_tests {
-    use super::*;
-
-    // 分别由设备 shell 与 Root 执行，验证实际对端身份；不会启动或修改运行中的守护。
-    #[test]
-    fn diagnostics_socket_checks_peer_and_returns_complete_readonly_report() {
-        let mut pair = [-1; 2];
-        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) }, 0);
-        socket_set_recv_timeout(pair[0], Duration::from_secs(2)).unwrap();
-        socket_set_recv_timeout(pair[1], Duration::from_secs(2)).unwrap();
-        socket_send_all(pair[0], b"qixia.diagnostics v1 com.qixia.sockettest\n").unwrap();
-        daemon_socket_handle_client(pair[1]);
-        close_fd(pair[1]);
-        let mut bytes = [0u8; 4096];
-        let count = unsafe { libc::recv(pair[0], bytes.as_mut_ptr().cast(), bytes.len(), 0) };
-        close_fd(pair[0]);
-        if unsafe { libc::geteuid() } == 0 {
-            assert!(count > 0);
-            let reply = std::str::from_utf8(&bytes[..count as usize]).unwrap();
-            assert!(reply.starts_with("QIXIA_DIAG\t1\tcom.qixia.sockettest\t"));
-            assert!(reply.ends_with("END\n"));
-        } else {
-            assert_eq!(count, 0, "非 Root 不应读取诊断");
-        }
-    }
-}

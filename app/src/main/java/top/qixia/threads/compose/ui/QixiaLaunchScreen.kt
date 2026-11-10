@@ -19,7 +19,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -70,7 +69,7 @@ internal fun QixiaLaunchScreen(started: Boolean, readyToReveal: Boolean = true,
                     firstVisibleFrame()
                 }
             }
-            .background(OceanBackground).testTag("qixia-launch")
+            .background(OceanBackground)
     ) {
         val compact = maxHeight < 480.dp
         Column(
@@ -120,7 +119,7 @@ internal fun QixiaLaunchScreen(started: Boolean, readyToReveal: Boolean = true,
                 Image(painterResource(R.drawable.qixia_author_avatar),
                     stringResource(R.string.qixia_author_name) + "的酷安头像",
                     Modifier.size(if (compact) 38.dp else 48.dp).clip(CircleShape)
-                        .border(2.dp, Color.White, CircleShape).testTag("qixia-author-avatar"),
+                        .border(2.dp, Color.White, CircleShape),
                     contentScale = ContentScale.Crop)
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(stringResource(R.string.qixia_author_name), fontSize = 14.sp, lineHeight = 21.sp,

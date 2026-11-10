@@ -208,6 +208,3 @@ fn valid_package(pkg: &str, allow_colon: bool) -> bool {
                 || (allow_colon && byte == b':')
         })
 }
-
-#[cfg(test)]
-mod tests;

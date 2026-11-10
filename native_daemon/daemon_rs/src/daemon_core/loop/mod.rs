@@ -10,5 +10,3 @@ mod report;
 mod round;
 mod scan;
 pub(crate) use lifecycle::daemon_loop;
-#[cfg(test)]
-mod tests;

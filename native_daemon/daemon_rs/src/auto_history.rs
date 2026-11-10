@@ -1,9 +1,9 @@
 //! 可选的前台历史记录；本模块不修改亲和性，也不启动校准。
 //! 关闭记录后只保留配置事件监听器。
 mod core_events;
-#[cfg(any(target_os = "android", target_os = "linux", test))]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 mod performance;
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android"))]
 mod display;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 mod runtime;
@@ -95,70 +95,4 @@ pub(crate) struct CoreEvent {
     pub running_cpu: Option<u32>,
     pub average: Option<f64>,
     pub reason: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    const ENABLED: &str = "auto_history_version=1\nauto_history_enabled=1";
-    const DISABLED: &str = "auto_history_version=1\nauto_history_enabled=0";
-    #[test]
-    fn recording_is_strictly_opt_in() {
-        for text in [
-            "",
-            "enabled=0",
-            "enabled=1",
-            DISABLED,
-            "auto_history_enabled=1",
-            "auto_history_version=2\nauto_history_enabled=1",
-            "auto_history_version=1\nauto_history_version=1\nauto_history_enabled=1",
-            "auto_history_version=1\nauto_history_enabled=yes",
-            "auto_history_version=1\nauto_history_enabled=1\nauto_history_enabled=0",
-            "auto_history_version=1\nauto_history_enabled=0\nauto_history_enabled=1",
-            "auto_history_version=1\nauto_history_enabled=1\nbroken",
-        ] {
-            assert!(!config_enabled(text), "{text}");
-        }
-        assert!(config_enabled(ENABLED));
-        assert!(config_enabled("version=2\n# opt-in\nauto_history_version = 1\nauto_history_enabled = 1 # on\ncpuset_name=Custom\nenabled=0\ndetected_all=0-7\n"));
-    }
-    #[test]
-    fn recording_requires_enabled_selected_foreground_and_no_calibration() {
-        let foreground = "status=ok\ninteractive=1\nfocused_visible=1\nboot_id=abc\nupdated_elapsed_ms=1000\nfocused_package=com.game\n";
-        assert_eq!(
-            eligible_target(ENABLED, "idle", foreground, "com.game", 2000, "abc"),
-            Some("com.game".into())
-        );
-        assert!(eligible_target(ENABLED, "idle", foreground, "com.game,record", 2000, "abc").is_none());
-        for selected in ["com.game,auto,record", "com.game,fallback,record"] {
-            assert_eq!(eligible_target(ENABLED, "idle", foreground, selected, 2000, "abc"), Some("com.game".into()));
-        }
-        assert!(
-            eligible_target(DISABLED, "idle", foreground, "com.game", 2000, "abc").is_none()
-        );
-        assert!(eligible_target(
-            ENABLED,
-            "sampling com.game",
-            foreground,
-            "com.game",
-            2000,
-            "abc"
-        )
-        .is_none());
-        assert!(
-            eligible_target(ENABLED, "idle", foreground, "com.other", 2000, "abc").is_none()
-        );
-        assert!(eligible_target(
-            ENABLED,
-            "idle",
-            &foreground.replace("interactive=1", "interactive=0"),
-            "com.game",
-            2000,
-            "abc"
-        )
-        .is_none());
-        assert!(
-            eligible_target(ENABLED, "idle", foreground, "com.game", 30_000, "abc").is_none()
-        );
-    }
 }

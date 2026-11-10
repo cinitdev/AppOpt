@@ -15,7 +15,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -132,7 +131,7 @@ fun RuleEditorScreen(state: RuleEditorUiState, onDraftChange: (String) -> Unit,
                             shape = RoundedCornerShape(20.dp), label = { Text("规则内容") })
                     }
                 } else {
-                    LazyColumn(Modifier.weight(1f).testTag("rule-list"), state = listState,
+                    LazyColumn(Modifier.weight(1f), state = listState,
                         contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 12.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         if (entries.isEmpty()) item {

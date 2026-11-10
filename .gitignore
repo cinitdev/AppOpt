@@ -45,6 +45,17 @@ target/
 *.bak
 *.log.*
 
+# 开发测试与临时界面不纳入项目源码分发。
+/app/src/test/
+/app/src/androidTest/
+/app/src/debug/java/top/qixia/threads/design/
+/tools/*/test/
+/scripts/test_*.py
+/native_daemon/**/tests/
+/native_daemon/**/tests.rs
+/native_daemon/**/*_tests.rs
+/tools/windows_builder/SelfTests.cs
+
 # 仅纳入项目文档；本地交接记录仍由上面的 *.md 规则忽略。
 !/README.md
 !/FPS_EBPF_INTEGRATION.md

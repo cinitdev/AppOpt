@@ -150,8 +150,6 @@ pub(super) fn apply(batch: &mut Batch, requests: &[Request], maintain: bool) -> 
                 return Err(io::Error::other("专属 cpuset 读回失败"));
             }
             reason = "write_failed";
-            #[cfg(test)]
-            if batch.fail_after_cpuset == Some(key) { return Err(io::Error::other("测试：迁入后写入失败")); }
             if affinity(key.1)? != desired { write_affinity(key.1, desired)?; }
             reason = "readback_failed";
             actual = Some(affinity(key.1)?);
@@ -164,9 +162,6 @@ pub(super) fn apply(batch: &mut Batch, requests: &[Request], maintain: bool) -> 
             if let (Some(pkg), Err(error)) = (batch.history_package.as_deref(), &result) {
                 crate::auto_affinity::diagnostics::failure(pkg, key, &error.to_string());
             }
-            #[cfg(test)]
-            eprintln!("auto takeover failed: identity={key:?} phase={reason} error={:?} requested={desired:x} before={before:x} readback={actual:?} now_online={:?} now_affinity={:?} now_group={:?}",
-                result.as_ref().err(), online_mask(), affinity(key.1), cpuset::current(key.0, key.1));
             if matches!(same_identity(&entry.record), Ok(false)) {
                 batch.history.record(key, "exit", "unknown", Some(before), actual, "thread_exit");
                 batch.verified.remove(&key);

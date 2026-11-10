@@ -10,7 +10,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import top.qixia.threads.RuleConfigLogic
@@ -67,7 +66,7 @@ internal fun RuleCoreChooser(allowed: Set<Int>, cpuText: String, onChange: (Stri
                 repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
-        OutlinedTextField(cpuText, onChange, Modifier.fillMaxWidth().testTag("rule-core-range"), singleLine = true,
+        OutlinedTextField(cpuText, onChange, Modifier.fillMaxWidth(), singleLine = true,
             label = { Text("核心范围", fontSize = 12.sp) }, placeholder = { Text("例如 0-3,5", fontSize = 13.sp) },
             textStyle = LocalTextStyle.current.copy(fontSize = 14.sp), shape = RoundedCornerShape(14.dp),
             isError = cpuText.isNotBlank() && (selected.isEmpty() || !allowed.containsAll(selected)))

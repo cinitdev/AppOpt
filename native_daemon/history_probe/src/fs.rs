@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// 所有路径均为固定内核接口；替代根目录仅用于测试样例。
+/// 在指定文件系统根目录下读取固定内核接口。
 pub struct KernelFs(pub PathBuf);
 impl KernelFs {
     pub fn new(root: impl Into<PathBuf>) -> Self {

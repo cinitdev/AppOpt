@@ -137,17 +137,3 @@ pub(crate) fn restore_affinity_target(original: &CpuMask, current: &CpuMask) -> 
     let clipped = original.intersection(current);
     (!clipped.is_empty()).then_some(clipped)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn missing_cpuset_is_not_evidence_that_a_live_thread_exited() {
-        for status in [ManagedTidIdentityStatus::Current, ManagedTidIdentityStatus::Unreadable] {
-            let error = classify_restore_error(io::Error::from_raw_os_error(2), || status);
-            assert!(!is_thread_gone_error(&error));
-        }
-        let error = classify_restore_error(io::Error::from_raw_os_error(2), || ManagedTidIdentityStatus::GoneOrReused);
-        assert!(is_thread_gone_error(&error));
-    }
-}

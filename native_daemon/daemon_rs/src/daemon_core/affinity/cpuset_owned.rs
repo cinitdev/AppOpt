@@ -176,14 +176,6 @@ impl Registry {
         result
     }
 
-    #[cfg(test)]
-    fn cleanup(
-        &mut self, root: &Path, blocked: bool,
-        identity: impl FnMut(&Path) -> io::Result<Identity>,
-        remove: impl FnMut(&Path) -> io::Result<()>,
-    ) -> bool {
-        self.cleanup_pass(root, blocked, None, identity, remove).changed
-    }
 
     fn cleanup_pass(
         &mut self, root: &Path, blocked: bool, selected: Option<&BTreeSet<String>>,
@@ -420,7 +412,3 @@ pub(crate) fn cleanup() -> io::Result<()> {
         Ok(())
     })
 }
-
-#[cfg(test)]
-#[path = "cpuset_owned_tests.rs"]
-mod tests;

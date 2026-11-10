@@ -29,15 +29,10 @@ namespace Qixia.Builder
         public Task<BuildResult> Run(BuildOptions options)
         {
             options.Validate();
-            return Task.Run(() => RunCore(options, "--worker", null));
+            return Task.Run(() => RunCore(options));
         }
 
-        internal Task<BuildResult> RunTest(BuildOptions options, string test)
-        {
-            return Task.Run(() => RunCore(options, "--test-worker", test));
-        }
-
-        BuildResult RunCore(BuildOptions options, string workerMode, string test)
+        BuildResult RunCore(BuildOptions options)
         {
             using (var mutex = new Mutex(false, HostPaths.MutexName(options.Project))) {
                 bool owns = false;
@@ -71,7 +66,7 @@ namespace Qixia.Builder
                             emit(File.Exists(Path.Combine(options.Project, "modules_update/QixiaThreads.json"))
                                 ? "- 本地更新清单已同步。" : "- 未附带发布清单，仅进行本地版本同步。");
                         }
-                        var info = new ProcessStartInfo(Program.Executable, workerMode) {
+                        var info = new ProcessStartInfo(Program.Executable, "--worker") {
                             WorkingDirectory = options.Project, UseShellExecute = false, CreateNoWindow = true,
                             RedirectStandardOutput = true, RedirectStandardError = true, RedirectStandardInput = true,
                             StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
@@ -79,7 +74,6 @@ namespace Qixia.Builder
                         foreach (var pair in options.EnvironmentValues()) info.EnvironmentVariables[pair.Key] = pair.Value;
                         info.EnvironmentVariables["QIXIA_GUI_BASH"] = options.Bash;
                         info.EnvironmentVariables["QIXIA_GUI_ARGUMENTS"] = String.Join(" ", Array.ConvertAll(options.ScriptArguments(), HostPaths.Quote));
-                        if (test != null) info.EnvironmentVariables["QIXIA_GUI_TEST"] = test;
                         using (var process = new Process { StartInfo = info }) {
                             process.OutputDataReceived += (s, e) => emit(e.Data);
                             process.ErrorDataReceived += (s, e) => emit(e.Data);

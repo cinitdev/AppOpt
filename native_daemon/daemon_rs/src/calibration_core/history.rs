@@ -244,34 +244,3 @@ pub(super) fn process_history_details(
     let details = child_thread_details(owner, child_threads, total_samples);
     format!("v3p:{}", details.strip_prefix("v3:").unwrap_or(&details))
 }
-
-#[cfg(test)]
-mod process_history_marker_tests {
-    use super::*;
-
-    #[test]
-    pub(super) fn process_rows_are_marked_even_without_child_threads() {
-        assert_eq!(
-            process_history_details("com.example:worker", &[], 60),
-            "v3p:"
-        );
-    }
-
-    #[test]
-    pub(super) fn history_retains_all_sessions_in_the_time_window() {
-        let old = (1..=16)
-            .map(|index| format!("# {index} 60\n1.0 1.0 e1:t|1.0\n"))
-            .collect::<String>();
-        let tail = retention::retained_text(&old, crate::history_retention::MAX_AGE_MS / 1000 + 7);
-        assert!(tail.starts_with("# 7 60\n"));
-        assert_eq!(tail.lines().filter(|line| line.starts_with('#')).count(), 10);
-    }
-
-    #[test]
-    pub(super) fn sample_series_is_serialized_in_queue_order() {
-        let samples = VecDeque::from([3.0, 1.26, 9.0]);
-        let mut out = String::new();
-        append_sample_series(&mut out, &samples).unwrap();
-        assert_eq!(out, "3.0,1.3,9.0");
-    }
-}

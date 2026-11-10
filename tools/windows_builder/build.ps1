@@ -1,4 +1,4 @@
-﻿param([switch]$Test, [switch]$Package, [string]$OutputDirectory)
+﻿param([switch]$Package, [string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $framework = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319'
@@ -21,16 +21,6 @@ $compilerArguments += Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.cs' | 
 & $compiler @compilerArguments
 if ($LASTEXITCODE -ne 0) { throw 'EXE 编译失败。' }
 Write-Output ('已生成：' + $outputExe)
-if ($Test) {
-    $testProcess = Start-Process -FilePath $outputExe -ArgumentList '--self-test' -WindowStyle Hidden -Wait -PassThru `
-        -RedirectStandardOutput (Join-Path $outputDirectory 'builder-tests.stdout.log') `
-        -RedirectStandardError (Join-Path $outputDirectory 'builder-tests.stderr.log')
-    Get-Content -LiteralPath (Join-Path $outputDirectory 'builder-tests.stdout.log') -Encoding UTF8
-    if ($testProcess.ExitCode -ne 0) {
-        Get-Content -LiteralPath (Join-Path $outputDirectory 'builder-tests.stderr.log') -Encoding UTF8
-        throw 'EXE 自检失败。'
-    }
-}
 if ($Package) {
     # 明确指定时才更新仓库中的分发文件，普通构建仍输出到 build。
     $distributedExe = Join-Path $PSScriptRoot 'QixiaBuilder.exe'

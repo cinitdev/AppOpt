@@ -25,7 +25,6 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -105,7 +104,7 @@ private fun CoreLanePlot(graph: CoreTraceGraph, cursor: MutableIntState, indices
     val lanes = graph.lanes
     val height = (lanes.size * 23 + 12).dp
     Box(Modifier.fillMaxWidth().heightIn(max = 210.dp).verticalScroll(rememberScrollState())) {
-        Canvas(Modifier.fillMaxWidth().height(height).testTag("core-lane-plot")
+        Canvas(Modifier.fillMaxWidth().height(height)
             .semantics { contentDescription = "核心时间轴，横向滑动查看事件" }
             .pointerInput(graph, indices, labelWidth, endInset) {
                 detectTapGestures { position ->

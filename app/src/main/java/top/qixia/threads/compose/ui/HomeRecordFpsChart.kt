@@ -13,7 +13,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
@@ -28,7 +27,7 @@ internal fun HomeRecordFpsChart(fps: HomeFpsSummary?, startedAtMs: Long, endedAt
         fps?.points.orEmpty().filter { it.fps.isFinite() && it.fps in 0f..1000f &&
             it.timestampMs in startedAtMs..endedAtMs }.take(160).sortedBy { it.timestampMs }
     }
-    Column(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 13.dp).testTag("home_fps_chart")) {
+    Column(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 13.dp)) {
         Box(Modifier.fillMaxWidth().height(62.dp), contentAlignment = Alignment.Center) {
             Canvas(Modifier.fillMaxSize().semantics {
                 contentDescription = if (points.isEmpty()) "本次记录暂无帧率曲线" else

@@ -26,19 +26,3 @@ pub(super) fn take_command() -> Option<Command> {
     if read.is_err() || text.len() > 1024 { return None; }
     parse(&text)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test] fn switch_and_commands_are_strict_and_manual() {
-        assert!(enabled("com.game,record\ncom.other", "com.game"));
-        assert!(enabled("com.game,fallback,record", "com.game"));
-        assert!(!enabled("com.game,fallback", "com.game"));
-        assert!(!enabled("com.game,record", "com.gam"));
-        assert!(parse("start com.game record-1").unwrap().start);
-        assert!(!parse("stop com.game record-1").unwrap().start);
-        for text in ["start com.game", "auto com.game abc", "start com.game abc extra", "start com.game;id abc"] {
-            assert!(parse(text).is_none());
-        }
-    }
-}

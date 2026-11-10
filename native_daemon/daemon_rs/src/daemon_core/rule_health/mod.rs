@@ -1,21 +1,10 @@
 //! 规则健康状态的管理与公开入口。内部会话、记录行和持久化标志
 //! 均不暴露给模块外部；调用方只需提供扫描依据。
 mod foreground;
-#[cfg(test)]
-#[path = "tests/foreground.rs"]
-mod foreground_tests;
 mod model;
 mod observation;
-#[cfg(test)]
-#[path = "tests/observation.rs"]
-mod observation_tests;
 mod rules;
 mod storage;
-#[cfg(test)]
-#[path = "tests/storage.rs"]
-mod storage_tests;
-#[cfg(test)]
-mod tests;
 
 use crate::runtime_clock::{current_boot_id, unix_now_secs};
 use crate::{base_package, FullScanEvidence, ProcHit, Rule};

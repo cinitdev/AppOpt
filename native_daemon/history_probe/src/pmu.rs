@@ -20,13 +20,13 @@ struct Attr {
 }
 
 #[derive(Clone, Copy, Default)]
-#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 struct Count {
     value: u64,
     enabled: u64,
     running: u64,
 }
-#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn rate(old: Count, new: Count, elapsed_ms: u64) -> Option<f64> {
     if elapsed_ms == 0 || elapsed_ms > 6000 {
         return None;
@@ -42,16 +42,16 @@ fn rate(old: Count, new: Count, elapsed_ms: u64) -> Option<f64> {
     (result.is_finite() && (0.0..=20000.0).contains(&result)).then_some(result)
 }
 
-#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 const RETRY_MS: u64 = 60_000;
 
-#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 struct Counter<T> {
     handle: Option<T>,
     previous: Option<(Count, u64)>,
     retry_after: u64,
 }
-#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 impl<T> Default for Counter<T> {
     fn default() -> Self {
         Self {
@@ -61,7 +61,7 @@ impl<T> Default for Counter<T> {
         }
     }
 }
-#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 impl<T> Counter<T> {
     fn sample(
         &mut self,
@@ -162,87 +162,5 @@ impl Pmu {
         #[cfg(not(any(target_os = "android", target_os = "linux")))]
         let _ = now;
         values
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn failed_counter_retries_without_busy_loop_or_cross_generation_delta() {
-        let mut counter = Counter::<()>::default();
-        assert_eq!(counter.sample(0, || None, |_| panic!("no handle")), None);
-        assert_eq!(
-            counter.sample(59_999, || panic!("retry too soon"), |_| None),
-            None
-        );
-        let count = |value| Count {
-            value,
-            enabled: value,
-            running: value,
-        };
-        assert_eq!(
-            counter.sample(60_000, || Some(()), |_| Some(count(1_000_000_000))),
-            None
-        );
-        assert_eq!(
-            counter.sample(
-                62_000,
-                || panic!("already open"),
-                |_| Some(count(3_000_000_000))
-            ),
-            Some(1000.0)
-        );
-        assert_eq!(
-            counter.sample(64_000, || panic!("already open"), |_| None),
-            None
-        );
-        assert!(counter.handle.is_none());
-        assert_eq!(
-            counter.sample(66_000, || panic!("retry too soon"), |_| None),
-            None
-        );
-        // 重新打开的 perf 计数器从零开始；首次读数应作为新基线，
-        // 不能减去旧文件描述符的计数。
-        assert_eq!(
-            counter.sample(124_000, || Some(()), |_| Some(count(10))),
-            None
-        );
-        assert_eq!(
-            counter.sample(
-                126_000,
-                || panic!("already open"),
-                |_| Some(count(2_000_000_010))
-            ),
-            Some(1000.0)
-        );
-    }
-
-    #[test]
-    fn hardware_count_requires_reliable_window() {
-        let old = Count::default();
-        let new = Count {
-            value: 2_000_000_000,
-            enabled: 2_000_000_000,
-            running: 2_000_000_000,
-        };
-        assert_eq!(rate(old, new, 2000), Some(1000.0));
-        assert_eq!(
-            rate(
-                old,
-                Count {
-                    running: 1_000_000_000,
-                    ..new
-                },
-                2000
-            ),
-            None
-        );
-        assert_eq!(rate(old, new, 7000), None);
-        assert_eq!(rate(new, old, 2000), None);
-    }
-    #[test]
-    fn attr_uses_oldest_compatible_abi_size() {
-        #[cfg(any(target_os = "android", target_os = "linux"))]
-        assert_eq!(std::mem::size_of::<Attr>(), 64);
     }
 }

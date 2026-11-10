@@ -347,7 +347,3 @@ pub(super) fn recoverable(text: &str, usage: &BTreeMap<String, u64>) -> bool {
     let minimum = if text.lines().any(|line| line == "source\tperformance") { 0 } else { MIN_FOREGROUND_MS };
     !marked(text) || proven_usage(text, usage).is_some_and(|ms| ms > minimum)
 }
-
-#[cfg(test)]
-#[path = "storage_capture_tests.rs"]
-mod tests;

@@ -16,7 +16,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -51,10 +50,10 @@ fun ModuleUpdateSheet(
         properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false,
             usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
     ) {
-        Box(Modifier.fillMaxSize().safeDrawingPadding().testTag("module-update-window"),
+        Box(Modifier.fillMaxSize().safeDrawingPadding(),
             contentAlignment = Alignment.BottomCenter) {
             Surface(Modifier.widthIn(max = 640.dp).fillMaxWidth().heightIn(max = maxHeight)
-                .testTag("module-update-dialog"), color = OceanSurface,
+                , color = OceanSurface,
                 shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)) {
                 Column(Modifier.fillMaxWidth().height(maxHeight)) {
                     Spacer(Modifier.height(22.dp))
@@ -78,7 +77,7 @@ fun ModuleUpdateSheet(
                     Spacer(Modifier.height(18.dp))
                     // 主体只保留一个滚动区域，较长更新说明也不会遮住操作按钮。
                     key(update.remoteVersionCode, update.zipUrl) {
-                        Column(Modifier.weight(1f).fillMaxWidth().testTag("module-update-content")
+                        Column(Modifier.weight(1f).fillMaxWidth()
                             .verticalScroll(rememberScrollState())
                             .padding(horizontal = 22.dp).padding(bottom = 20.dp),
                             verticalArrangement = Arrangement.spacedBy(20.dp)) {

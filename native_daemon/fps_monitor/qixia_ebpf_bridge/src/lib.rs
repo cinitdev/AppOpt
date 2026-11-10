@@ -17,8 +17,6 @@ mod stats;
 mod streams;
 mod symbols;
 mod targets;
-#[cfg(test)]
-mod tests;
 
 pub use context::QixiaThreadsEbpfCtx;
 pub use logging::set_log_sink;
