@@ -28,6 +28,9 @@ mod file_event;
 use file_event::*;
 #[path = "daemon_core/entry.rs"]
 mod entry;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[path = "daemon_core/control_lock.rs"]
+mod control_lock;
 #[path = "daemon_core/rule_syntax.rs"]
 mod rule_syntax;
 #[path = "daemon_core/runtime_cache.rs"]

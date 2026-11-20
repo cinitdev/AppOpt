@@ -234,7 +234,7 @@ private fun RuntimeStatusPanel(env: EnvironmentUiState, onOpenEnvironment: () ->
         Triple("使用情况", Icons.Outlined.Assessment, env.usageAccessGranted),
         Triple("Root", Icons.Outlined.Security, env.hasRoot),
         Triple("守护进程", Icons.Outlined.Shield, env.daemonRuntime.running),
-        Triple("前台监听", Icons.Outlined.Visibility, env.foregroundState?.available == true)
+        Triple("前台监听", Icons.Outlined.Visibility, env.foregroundState?.connected == true)
     )
     Panel("运行状态", action = if (env.loading) "检测中" else if (states.all { it.third }) "查看详情" else "检查环境",
         onAction = onOpenEnvironment) {

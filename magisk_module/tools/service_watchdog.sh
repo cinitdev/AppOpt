@@ -55,7 +55,7 @@ publish_watchdog_lock_from_recovery() {
 
 acquire_watchdog_lock() {
 	local owner current_boot current_start recovery_owner
-	mkdir -p "$WATCHDOG_STATE_DIR"
+	/system/bin/mkdir -p "$WATCHDOG_STATE_DIR" || exit 1
 	current_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 	[ -n "$current_boot" ] || exit 1
 	current_start="$(service_watchdog_starttime "$$")"
@@ -212,6 +212,22 @@ foreground_helper_healthy() {
     java_service_healthy "$MODDIR/config/foreground_task.state" && [ "$JAVA_SERVICE_STATUS" != error ]
 }
 
+# 助手确认关机后只等待系统回收，不重拉服务；只接受本次开机的标记。
+# 用内建读取已有快照，不增加日常 getprop 子进程。
+foreground_system_stopping() {
+    local key value boot="" status="" reason=""
+    [ -r "$MODDIR/config/foreground_task.state" ] || return 1
+    while IFS='=' read -r key value; do
+        case "$key" in
+            boot_id) boot=$value ;;
+            status) status=$value ;;
+            reason) reason=$value ;;
+        esac
+    done < "$MODDIR/config/foreground_task.state"
+    [ -n "$boot" ] && [ "$boot" = "$CURRENT_BOOT_ID" ] &&
+        [ "$status" = stopped ] && [ "$reason" = system_shutdown ]
+}
+
 java_service_healthy() {
     local key value pid="" start="" boot="" status=""
     JAVA_SERVICE_STATUS=""
@@ -277,6 +293,7 @@ watch_services() {
     local failure_logged=0 helper_tick=0 helper_checked=0 refresh_failure_logged=0 daemon_start_ts="" daemon_failures=0 daemon_next_start=0
     local daemon_alive exit_code end_ts runtime requested delay now_ts uptime_idle
     while true; do
+        if foreground_system_stopping; then sleep 5; continue; fi
         # 用单调时钟计算重启间隔，避免每轮派生 date，也不受用户调整系统时间影响。
         IFS=' ' read -r now_ts uptime_idle < /proc/uptime || now_ts=0
         now_ts=${now_ts%%.*}

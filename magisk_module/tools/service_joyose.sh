@@ -10,10 +10,14 @@ joyose_component_matches() {
 		grep -Fqx -e "$JOY_COMPONENT" -e 'com.xiaomi.joyose/com.xiaomi.joyose.smartop.SmartOpService'
 }
 
+joyose_system_supported() {
+	[ -n "$(getprop ro.miui.ui.version.code)$(getprop ro.miui.ui.version.name)$(getprop ro.mi.os.version.code)$(getprop ro.mi.os.version.name)" ]
+}
+
 joyose_probe() {
 	local info services
 	JOY_AVAILABLE=0; JOY_DISABLED=unknown; JOY_STATE=unknown; JOY_REASON=unsupported_system
-	[ -n "$(getprop ro.miui.ui.version.code)$(getprop ro.miui.ui.version.name)$(getprop ro.mi.os.version.code)$(getprop ro.mi.os.version.name)" ] || return 0
+	joyose_system_supported || return 0
 	JOY_REASON=state_unreadable
 	# 共享系统 UID 的包信息可能超过单个命令参数上限，直接流式解析，不存入 Shell 参数。
 	# 保留 dumpsys 退出状态，失败或超时不能当成组件缺失。
@@ -104,6 +108,12 @@ joyose_run() (
 	JOY_AVAILABLE=0; JOY_DISABLED=unknown; JOY_REASON=state_unreadable
 	JOY_REQUESTED=$(joyose_policy_value joyose_smartop_disabled)
 	case "$JOY_REQUESTED" in 0|1) ;; *) JOY_REQUESTED=1 ;; esac
+	# 非米系系统不承担 Joyose 策略，不获取策略锁或写入默认值，避免刷入时出现无关错误。
+	if ! joyose_system_supported; then
+		JOY_REASON=unsupported_system
+		if [ "$1" = --joyose-set ]; then joyose_output 0; exit 1; fi
+		joyose_output 1; exit 0
+	fi
 	if [ "$1" = --joyose-status ]; then
 		if joyose_probe; then joyose_output 1; else joyose_output 0; exit 1; fi
 		exit 0
@@ -115,7 +125,7 @@ joyose_run() (
 		fi
 	fi
 	# 与 App 设置保存、Rust 拓扑补齐共用目录锁，防止覆盖其他策略键。
-	mkdir -p "$MODDIR/config" || exit 1
+	/system/bin/mkdir -p "$MODDIR/config" || exit 1
 	waited=0
 	while ! mkdir "$JOY_LOCK" 2>/dev/null; do
 		now=$(date +%s); mtime=$(stat -c %Y "$JOY_LOCK" 2>/dev/null || printf 0)

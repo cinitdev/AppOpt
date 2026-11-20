@@ -35,8 +35,8 @@ class QixiaThreadsViewModel(application: Application) : AndroidViewModel(applica
 
     private var dashboardGeneration = 0L
     private var dashboardJob: Job? = null
-    private var autoStartJob: Job? = null
     private var dashboardRefreshPending = false
+    private var autoStartJob: Job? = null
     private var historyLoaded = false
     private var historyImportJob: Job? = null
     private var historyListJob: Job? = null
@@ -137,6 +137,17 @@ class QixiaThreadsViewModel(application: Application) : AndroidViewModel(applica
                         )
                     }
                 }
+                // 只在短暂恢复期间复查助手，避免恢复后仍停留在“恢复中”；
+                // 复用首页周期，不重复加载应用列表，也不增加常驻轮询任务。
+                val recoveringForeground = _state.value.environment.foregroundState?.takeIf { it.recovering }
+                if (recoveringForeground != null) {
+                    runCatching(DaemonBridge::readTaskForegroundState).onSuccess { foreground ->
+                        _state.update { current ->
+                            if (current.environment.foregroundState !== recoveringForeground) current
+                            else current.copy(environment = current.environment.copy(foregroundState = foreground))
+                        }
+                    }
+                }
                 // 守护进程可能在 onResume 之后才结束上一轮前台会话。
                 // 复用首页可见时的刷新周期，低成本检查文件标记；
                 // 不为刷新最近 FPS 摘要而导入历史或新增轮询任务。
@@ -184,9 +195,8 @@ class QixiaThreadsViewModel(application: Application) : AndroidViewModel(applica
                             current.copy(
                                 refreshing = false,
                                 environment = snapshot.environment.copy(configuredAppCount = apps.configured.size,
-                                    ruleCount = apps.configured.sumOf(AppItemModel::ruleCount),
-                                    autoStartStatus = current.environment.autoStartStatus,
-                                    autoStartChecking = current.environment.autoStartChecking),
+                                    autoStart = current.environment.autoStart,
+                                    ruleCount = apps.configured.sumOf(AppItemModel::ruleCount)),
                                 applications = apps
                             )
                         }
@@ -216,21 +226,18 @@ class QixiaThreadsViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    /** 自启动查询独立于首屏加载，进入环境页及从系统设置返回时更新。 */
-    fun refreshAutoStart() {
-        if (autoStartJob?.isActive == true) return
-        if (!_state.value.environment.hasRoot) {
-            _state.update { it.copy(environment = it.environment.copy(
-                autoStartStatus = top.qixia.threads.AutoStartStatus.UNKNOWN, autoStartChecking = false)) }
-            return
-        }
-        _state.update { it.copy(environment = it.environment.copy(autoStartChecking = true)) }
+    /** 厂商接口可能耗时或不可用，单独更新此项，不延长首屏转圈。 */
+    private fun refreshAutoStart() {
+        autoStartJob?.cancel()
+        val hasRoot = _state.value.environment.hasRoot
+        _state.update { it.copy(environment = it.environment.copy(autoStart = top.qixia.threads.AutoStartState())) }
         autoStartJob = viewModelScope.launch {
-            val status = withContext(Dispatchers.IO) {
-                runCatching { top.qixia.threads.AutoStartAccess.read() }
-                    .getOrDefault(top.qixia.threads.AutoStartStatus.UNKNOWN)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { top.qixia.threads.AutoStartAccess.read(hasRoot) }.getOrElse {
+                    top.qixia.threads.AutoStartState(top.qixia.threads.AutoStartStatus.UNREADABLE, "读取失败，请稍后刷新")
+                }
             }
-            _state.update { it.copy(environment = it.environment.copy(autoStartStatus = status, autoStartChecking = false)) }
+            _state.update { it.copy(environment = it.environment.copy(autoStart = result)) }
         }
     }
 

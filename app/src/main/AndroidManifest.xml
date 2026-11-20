@@ -54,6 +54,16 @@
             android:name=".UpdateInstallActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".BootstrapActivity"
+            android:process=":overlay"
+            android:permission="android.permission.DUMP"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay" />
+
         <service
             android:name=".HistoryCleanupService"
             android:permission="android.permission.BIND_JOB_SERVICE"
@@ -77,6 +87,13 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="性能优化悬浮球与帧率监测" />
         </service>
+
+        <!-- 仅唤醒胶囊进程，不开放配置修改入口。 -->
+        <provider
+            android:name=".WakeProvider"
+            android:process=":overlay"
+            android:authorities="top.qixia.threads.wake"
+            android:exported="false" />
 
     </application>
 </manifest>

@@ -1,4 +1,12 @@
-# 仅供 service.sh 用 . 加载函数，不独立启动，不创建常驻 Shell。
+# 由服务入口用 . 加载函数，不独立启动，不创建常驻 Shell。
+
+system_shutdown_requested() {
+	case "$(getprop sys.shutdown.requested 2>/dev/null)" in 0*|1*) return 0 ;; esac
+	case "$(getprop sys.powerctl 2>/dev/null)" in
+		shutdown|shutdown,*|reboot|reboot,*) return 0 ;;
+	esac
+	return 1
+}
 
 wait_sys_boot_completed() {
 	local i=9

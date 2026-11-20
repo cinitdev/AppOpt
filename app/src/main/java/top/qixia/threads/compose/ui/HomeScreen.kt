@@ -31,7 +31,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import top.qixia.threads.R
-import top.qixia.threads.AutoStartStatus
 import top.qixia.threads.compose.*
 import top.qixia.threads.compose.theme.*
 import top.qixia.threads.db.SessionSummary
@@ -161,10 +160,8 @@ private fun HomePendingModuleCard(onDetails: () -> Unit) {
 @Composable
 private fun HomeEnvironmentCard(env: EnvironmentUiState, onClick: () -> Unit) {
     val count = listOf(env.overlayGranted, env.usageAccessGranted, env.hasRoot,
-        env.daemonRuntime.running, env.foregroundState?.available == true).count { it }
-    val baseReady = env.featuresAvailable && count == 5 && env.statusMessage == null
-    val autoAllowed = env.autoStartStatus == AutoStartStatus.ALLOWED
-    val ready = baseReady && env.autoStartStatus != AutoStartStatus.BLOCKED
+        env.daemonRuntime.running, env.foregroundState?.connected == true).count { it }
+    val ready = env.featuresAvailable && count == 5 && env.statusMessage == null
     val color = if (env.loading || ready) PorcelainOnTonal else OceanWarning
     Surface(onClick, color = OceanSurfaceHigh, shape = RoundedCornerShape(18.dp),
         border = BorderStroke(.6.dp, MintBorder)) {
@@ -180,7 +177,6 @@ private fun HomeEnvironmentCard(env: EnvironmentUiState, onClick: () -> Unit) {
                 Text(when {
                     env.loading -> "正在检查权限与服务"
                     env.pendingModuleUpdate -> "模块等待重启生效"
-                    ready && autoAllowed -> "权限与服务已就绪"
                     ready -> "基础权限与服务已就绪"
                     else -> "权限与服务待检查"
                 },
@@ -189,10 +185,8 @@ private fun HomeEnvironmentCard(env: EnvironmentUiState, onClick: () -> Unit) {
                 Text(when {
                     env.loading -> "读取权限与守护状态"
                     env.pendingModuleUpdate -> "校准与配置写入暂不可用 · 点击查看详情"
-                    env.autoStartChecking -> "$count 项基础检查通过 · 自启动检查中"
-                    ready && autoAllowed -> "6 项检查通过 · 点击查看详情"
-                    ready -> "5 项基础检查通过 · 自启动待确认"
-                    else -> "${count + if (autoAllowed) 1 else 0} / 6 项已就绪 · 点击检查详情"
+                    ready -> "自启动：${env.autoStart.label} · 点击查看详情"
+                    else -> "$count / 5 项已就绪 · 点击检查详情"
                 },
                     color = OceanTextSecondary, fontSize = 10.sp, lineHeight = 14.sp)
             }

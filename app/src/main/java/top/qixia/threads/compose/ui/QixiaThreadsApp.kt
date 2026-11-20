@@ -176,7 +176,6 @@ fun QixiaThreadsApp(
             viewModel.calibrationReviews::selectProcess)
     }
     if (showHomeEnvironment && reviews.active == null) {
-        LaunchedEffect(Unit) { viewModel.refreshAutoStart() }
         HomeEnvironmentSheet(state.environment, { showHomeEnvironment = false },
             onOpenOverlayPermission, onOpenUsagePermission)
     }

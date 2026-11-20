@@ -38,9 +38,15 @@ internal object PrivateCaptureStorage {
 class QixiaThreadsApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        instance = this
         PrivateCaptureStorage.initialize(this)
         if (getProcessName().endsWith(":overlay")) return
         SceneBlacklistSync.initialize(this)
         HistoryCleanupService.schedule(this)
+    }
+
+    companion object {
+        lateinit var instance: QixiaThreadsApplication
+            private set
     }
 }

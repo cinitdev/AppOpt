@@ -3,6 +3,7 @@ package top.qixia.threads
 import android.net.LocalServerSocket
 import android.os.SystemClock
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.util.Locale
@@ -457,7 +458,9 @@ object DaemonBridge {
         val reason: String,
         val selection: String,
         val error: String,
-        val raw: String
+        val raw: String,
+        val connected: Boolean = available,
+        val recovering: Boolean = false
     )
 
     data class DaemonRuntime(
@@ -922,7 +925,8 @@ object DaemonBridge {
     }
 
     fun readTaskForegroundState(): TaskForegroundState {
-        val raw = runAsRoot("cat ${shellQuote(FOREGROUND_TASK_STATE_FILE)} 2>/dev/null")
+        val raw = runAsRoot("printf 'current_boot_id='; cat /proc/sys/kernel/random/boot_id; " +
+            "cat ${shellQuote(FOREGROUND_TASK_STATE_FILE)} 2>/dev/null")
             .substringBefore(ERR_MARK)
         return parseTaskForegroundState(raw, SystemClock.elapsedRealtime())
     }
@@ -941,11 +945,13 @@ object DaemonBridge {
         }
         val status = values["status"].orEmpty()
         val packageName = values["focused_package"].orEmpty().ifBlank { null }
-        val available = status == "ok" && packageName != null &&
-            age != null && age <= FOREGROUND_TASK_MAX_AGE_MS
+        val sameBoot = !values["boot_id"].isNullOrBlank() && values["boot_id"] == values["current_boot_id"]
+        val fresh = sameBoot && age != null && age <= FOREGROUND_TASK_MAX_AGE_MS
+        val connected = fresh && status in setOf("ok", "empty")
+        val available = connected && status == "ok" && packageName != null
         return TaskForegroundState(
             available = available,
-            status = status.ifBlank { "missing" },
+            status = if (status.isEmpty()) "missing" else if (!fresh) "stale" else status,
             mode = values["mode"].orEmpty(),
             packageName = packageName,
             activityName = values["focused_activity"].orEmpty().ifBlank { null },
@@ -960,8 +966,10 @@ object DaemonBridge {
             generation = values["generation"]?.toLongOrNull(),
             reason = values["reason"].orEmpty(),
             selection = values["selection"].orEmpty(),
-            error = values["error"].orEmpty(),
-            raw = raw
+            error = if (fresh) values["error"].orEmpty() else "",
+            raw = raw,
+            connected = connected,
+            recovering = fresh && status == "recovering"
         )
     }
 
@@ -2217,41 +2225,68 @@ object DaemonBridge {
     /** 锁内原子写入 applist.conf，避免 App 与守护进程相互覆盖或留下半文件。 */
     private fun writeConfigFileLocked(content: String, token: String,
         expectedContent: String? = null, allowPendingUpdate: Boolean = false): Boolean {
-        val b64 = android.util.Base64.encodeToString(
-            content.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
-        )
-        val expected = expectedContent?.let {
-            android.util.Base64.encodeToString(it.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+        // 内容不能拼进 su -c 命令行：Linux 单参数上限 128KB，配置超过约 98KB 后
+        // base64 会超限，导致“写入配置失败，请检查 Root 权限”。改为先落到应用缓存，
+        // root 侧只接收文件路径并复制到目标。
+        val payload = try {
+            File(QixiaThreadsApplication.instance.cacheDir, "config-mutation-$token.bin").apply {
+                parentFile?.mkdirs()
+                writeBytes(content.toByteArray(Charsets.UTF_8))
+            }
+        } catch (error: Exception) {
+            return false
         }
-        val result = runRootCommand(configFileMutationScript(b64, token, expected, allowPendingUpdate))
-        return result.success && result.output.trim() == token
+        return try {
+            val expectedHash = expectedContent?.let { sha256Hex(it.toByteArray(Charsets.UTF_8)) }
+            val result = runRootCommand(configFileMutationScript(
+                payload.absolutePath, token, expectedHash,
+                expectedContent != null && expectedContent.isEmpty(), allowPendingUpdate))
+            result.success && result.output.trim() == token
+        } finally {
+            payload.delete()
+        }
     }
 
-    /** 使用编码参数，让生成器不依赖 Android，并保留精确文件字节。 */
-    internal fun configFileMutationScript(b64: String, token: String,
-        expected: String? = null, allowPendingUpdate: Boolean = false): String {
-        val pendingGuard = if (expected != null && !allowPendingUpdate) """
+    private fun sha256Hex(bytes: ByteArray): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+        val builder = StringBuilder(digest.size * 2)
+        for (byte in digest) builder.append("%02x".format(byte.toInt() and 0xff))
+        return builder.toString()
+    }
+
+    /** 内容走文件、期望值走哈希，避免命令行长度上限；由 root 从应用缓存复制。 */
+    internal fun configFileMutationScript(payloadPath: String, token: String,
+        expectedSha256: String? = null, expectedMissingOk: Boolean = false,
+        allowPendingUpdate: Boolean = false): String {
+        val pendingGuard = if (expectedSha256 != null && !allowPendingUpdate) """
             [ ! -e '$POLICY_UPDATE_FILE' ] && [ ! -e '$MODULE_UPDATE_DIR/module.prop' ] &&
                 [ ! -e '$MODULE_DIR/update' ] || exit 1
         """.trimIndent() else ""
-        val sourceGuard = expected?.let { encoded -> """
+        val sourceGuard = expectedSha256?.let { hash ->
+            """
             if [ -f "${'$'}target" ]; then
-                printf '%s' '$encoded' | base64 -d | cmp -s - "${'$'}target" || exit 1
-            elif [ -e "${'$'}target" ] || [ -L "${'$'}target" ] || [ -n '$encoded' ]; then
+                if command -v sha256sum >/dev/null 2>&1; then
+                    current=${'$'}(sha256sum "${'$'}target" 2>/dev/null | cut -d' ' -f1)
+                else
+                    current=${'$'}(toybox sha256sum "${'$'}target" 2>/dev/null | cut -d' ' -f1)
+                fi
+                [ "${'$'}current" = '$hash' ] || exit 1
+            elif [ -e "${'$'}target" ] || [ -L "${'$'}target" ] || [ ${if (expectedMissingOk) 1 else 0} -eq 0 ]; then
                 exit 1
             fi
-        """.trimIndent() }.orEmpty()
+            """.trimIndent()
+        }.orEmpty()
         val tmp = "$CONFIG_FILE.app-$token.tmp"
         return """
             lock='$CONFIG_LOCK_DIR'
             target='$CONFIG_FILE'
             tmp='$tmp'
+            payload='$payloadPath'
             [ "${'$'}(cat "${'$'}lock/owner" 2>/dev/null)" = '$token' ] || exit 1
+            [ -f "${'$'}payload" ] || exit 1
             $pendingGuard
             trap 'rm -f "${'$'}tmp"' EXIT
-            if ! printf '%s' '$b64' | base64 -d > "${'$'}tmp"; then
-                exit 1
-            fi
+            cp "${'$'}payload" "${'$'}tmp" || exit 1
             chmod 0644 "${'$'}tmp" 2>/dev/null || true
             chown 0:0 "${'$'}tmp" 2>/dev/null || true
             [ "${'$'}(cat "${'$'}lock/owner" 2>/dev/null)" = '$token' ] || exit 1

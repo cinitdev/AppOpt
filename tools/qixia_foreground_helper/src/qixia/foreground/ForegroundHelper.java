@@ -7,6 +7,8 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.os.Build;
 import android.os.Handler;
+import android.os.IBinder;
+import android.os.IInterface;
 import android.os.Looper;
 import android.os.Process;
 import android.os.RemoteException;
@@ -17,10 +19,12 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.io.RandomAccessFile;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.channels.FileLock;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -48,6 +52,7 @@ public final class ForegroundHelper {
     private static final int DEAD_SERVICE_FAILURE_THRESHOLD = 3;
     private static final int DEAD_SERVICE_EXIT_CODE = 75;
     private static final int MAX_TASKS = 24;
+    private static final long FULL_TASK_QUERY_RETRY_MS = 60000L;
     private static final int MAX_EXIT_RECORDS = 64;
     private static final int MAX_RESTORED_LIFECYCLE_RECORDS = 64;
     private static final File BOOT_ID_FILE = new File("/proc/sys/kernel/random/boot_id");
@@ -68,6 +73,9 @@ public final class ForegroundHelper {
     private static File appListFile;
     private static File uidMapFile;
     private static Object activityTaskManager;
+    private static IBinder taskServiceBinder;
+    private static RandomAccessFile instanceLockFile;
+    private static FileLock instanceLock;
     private static Object packageManager;
     private static Object powerManager;
     private static Method getTasksMethod;
@@ -90,7 +98,12 @@ public final class ForegroundHelper {
     private static long lastBootIdReadAttemptElapsed;
     private static String lastReliableFrontPackage;
     private static int consecutiveDeadServiceFailures;
-    private static boolean deadServiceExitScheduled;
+    private static int consecutiveUidMapFailures;
+    private static volatile boolean deadServiceExitScheduled;
+    private static volatile long nextTaskRetryElapsed;
+    private static int taskQueryLimit = MAX_TASKS;
+    private static long nextFullTaskQueryElapsed;
+    private static boolean taskQueryMayBeTruncated;
     private static String lastTaskError = "";
     private static long lastTaskErrorLogElapsed;
     private static Set<String> lastInScopePackages = new LinkedHashSet<>();
@@ -109,15 +122,15 @@ public final class ForegroundHelper {
     @SuppressWarnings("deprecation") // 独立 app_process 必须显式注册主消息循环，厂商 framework 会读取它。
     public static void main(String[] args) {
         if (args.length == 2 && "--autostart-status".equals(args[0])) {
-            String status = "unknown";
+            Looper.prepareMainLooper();
             try {
                 int user = Integer.parseInt(args[1]);
-                if (user < 0) throw new IllegalArgumentException("无效用户");
-                Looper.prepareMainLooper();
-                PerformanceOverlayController.initialize();
-                status = PerformanceOverlayController.autoStartStatus(user);
-            } catch (Exception error) { System.err.println("自启动检查不可用: " + error); }
-            System.out.println("qixia_autostart=" + status);
+                if (user < 0) throw new IllegalArgumentException("invalid user");
+                AutoStartInspector.print(user);
+            } catch (Exception error) {
+                System.out.println("qixia_autostart=unreadable");
+                System.out.println("qixia_autostart_detail=无效的用户编号");
+            }
             System.exit(0);
         }
         if (args.length != 1 || args[0] == null || args[0].isEmpty()) {
@@ -132,7 +145,12 @@ public final class ForegroundHelper {
             System.exit(1);
         }
         configDir = parent == null ? new File("/data/adb/modules/QixiaThreads/config") : parent;
+        // 生命周期锁之外再限制状态写入者，防止绕过 Shell 入口直接启动多个助手。
+        if (!acquireInstanceLock()) {
+            return;
+        }
         EventLog.init(configDir, Process.myPid());
+        PerformanceOverlayController.initializeState(new File(new File(configDir, "state"), "capsule_start.state"));
         appListFile = new File(configDir, "applist.conf");
         uidMapFile = new File(new File(configDir, "state"), "package_uid.map");
         lastBootIdReadAttemptElapsed = SystemClock.elapsedRealtime();
@@ -154,8 +172,36 @@ public final class ForegroundHelper {
         Looper.loop();
     }
 
+    private static boolean acquireInstanceLock() {
+        try {
+            instanceLockFile = new RandomAccessFile(stateFile.getPath() + ".lock", "rw");
+            instanceLock = instanceLockFile.getChannel().tryLock();
+            if (instanceLock != null) {
+                // 持有到进程完全退出，包括 shutdown hook；不能提前放行新写入者。
+                return true;
+            }
+            System.err.println("前台助手已运行，跳过重复启动");
+            instanceLockFile.close();
+        } catch (IOException error) {
+            System.err.println("无法获取前台助手实例锁: " + error);
+        }
+        return false;
+    }
+
+    private static void captureTaskServiceBinder(Class<?> managerClass) {
+        taskServiceBinder = null;
+        try {
+            Object service = invoke(managerClass.getMethod("getService"), null);
+            if (service instanceof IInterface) {
+                taskServiceBinder = ((IInterface) service).asBinder();
+            }
+        } catch (Throwable ignored) {
+            // 厂商不提供该诊断入口时仍使用 getTasks 门面，不影响前台查询。
+        }
+    }
+
     private static void connectActivityTaskManager() {
-        if (deadServiceExitScheduled) {
+        if (stopForSystemShutdown()) {
             return;
         }
         try {
@@ -167,6 +213,7 @@ public final class ForegroundHelper {
             }
 
             getTasksMethod = managerClass.getMethod("getTasks", int.class);
+            captureTaskServiceBinder(managerClass);
             Class<?> listenerClass = Class.forName("android.app.TaskStackListener");
             registerMethod = managerClass.getMethod("registerTaskStackListener", listenerClass);
             unregisterMethod = managerClass.getMethod("unregisterTaskStackListener", listenerClass);
@@ -181,14 +228,12 @@ public final class ForegroundHelper {
             listener = null;
             listenerRegistered = false;
             startupError = "connect=" + errorText(error);
-            writeErrorState("connect", error);
-            logTaskError("ActivityTaskManager 初始化失败", error);
-            recordDeadServiceFailure(error);
+            handleTaskFailure("ActivityTaskManager 初始化失败", "connect", error);
         }
     }
 
     private static void reconcile() {
-        if (deadServiceExitScheduled) {
+        if (stopForSystemShutdown()) {
             return;
         }
         long nowElapsed = SystemClock.elapsedRealtime();
@@ -226,6 +271,7 @@ public final class ForegroundHelper {
                 + Build.VERSION.SDK_INT + " reason=" + reason);
             return true;
         } catch (Throwable listenerError) {
+            if (stopForSystemShutdown()) return false;
             listenerRegistered = false;
             String error = "listener=" + errorText(listenerError);
             boolean changed = !error.equals(startupError);
@@ -234,7 +280,12 @@ public final class ForegroundHelper {
                 EventLog.warn("[前台助手] TaskStackListener 注册失败, 降级轮询: "
                     + startupError);
             }
-            recordDeadServiceFailure(listenerError);
+            // 注册失败仍可轮询；只有查询失败才累计连续错误，避免一轮失败被重复计数。
+            if (isDeadSystemService(listenerError) && taskBinderKnownDead()) {
+                writeFailureState("error", "listener", errorText(listenerError));
+                logTaskError("注册任务监听失败，系统服务连接已失效", listenerError);
+                scheduleDeadServiceExit();
+            }
             return false;
         }
     }
@@ -275,6 +326,7 @@ public final class ForegroundHelper {
             }
             refreshScheduled = true;
         }
+        long waitMs = Math.max(delayMs, nextTaskRetryElapsed - SystemClock.elapsedRealtime());
         handler.postDelayed(() -> {
             final long reliableEventElapsed;
             final List<FrontMoveEvent> frontMoveEvents;
@@ -287,7 +339,7 @@ public final class ForegroundHelper {
             }
             applyFrontMoveEvents(frontMoveEvents);
             refreshState(reason, reliableEventElapsed);
-        }, delayMs);
+        }, waitMs);
     }
 
     private static void applyFrontMoveEvents(List<FrontMoveEvent> events) {
@@ -305,8 +357,16 @@ public final class ForegroundHelper {
         pruneExitRecords();
     }
 
-    @SuppressWarnings("unchecked")
     private static void refreshState(String reason, long reliableEventElapsed) {
+        if (stopForSystemShutdown()) {
+            return;
+        }
+        long retryDelay = nextTaskRetryElapsed - SystemClock.elapsedRealtime();
+        if (retryDelay > 0L) {
+            // 失败前已经入队的回调也要延后，并保留它携带的应用切换时间。
+            requestRefresh(reason, retryDelay, reliableEventElapsed, null);
+            return;
+        }
         refreshBootIdIfNeeded();
         if (activityTaskManager == null || getTasksMethod == null) {
             connectActivityTaskManager();
@@ -314,52 +374,117 @@ public final class ForegroundHelper {
                 return;
             }
         }
+        if (deadServiceExitScheduled) {
+            return;
+        }
 
         try {
             // 此时间戳描述快照查询的开始时刻；若使用查询结束时间，可能把健康检查截止前
             // 刚发生的状态变化误判到截止后。
             long snapshotElapsed = SystemClock.elapsedRealtime();
             long snapshotWall = System.currentTimeMillis();
-            Object value = invoke(getTasksMethod, activityTaskManager, MAX_TASKS);
-            if (!(value instanceof List)) {
-                throw new IllegalStateException("ActivityTaskManager.getTasks returned no list");
+            List<ActivityManager.RunningTaskInfo> tasks = queryTasks();
+            if (stopForSystemShutdown()) return;
+            if (consecutiveDeadServiceFailures > 0) {
+                EventLog.info("[前台助手] 任务读取已恢复，继续监听前台应用");
             }
-            List<ActivityManager.RunningTaskInfo> tasks =
-                (List<ActivityManager.RunningTaskInfo>) value;
             consecutiveDeadServiceFailures = 0;
-            lastTaskError = "";
+            nextTaskRetryElapsed = 0L;
             writeTaskState(tasks, reason, snapshotElapsed, snapshotWall, reliableEventElapsed);
         } catch (Throwable error) {
-            writeErrorState(reason, error);
-            unregisterListener();
-            activityTaskManager = null;
-            getTasksMethod = null;
-            registerMethod = null;
-            unregisterMethod = null;
-            listener = null;
-            listenerRegistered = false;
-            logTaskError("读取任务失败", error);
-            recordDeadServiceFailure(error);
+            // DeadSystemRuntimeException 也可能来自短暂 Binder 事务错误。保留已注册的监听器，
+            // 延迟重试查询，不反复注销和注册，也不把同一个 framework 单例误当作新连接。
+            handleTaskFailure("读取任务失败", reason, error);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<ActivityManager.RunningTaskInfo> queryTasks() throws Exception {
+        long nowElapsed = SystemClock.elapsedRealtime();
+        int limit = nowElapsed >= nextFullTaskQueryElapsed ? MAX_TASKS : taskQueryLimit;
+        boolean reduced = false;
+        while (true) {
+            try {
+                Object value = invoke(getTasksMethod, activityTaskManager, limit);
+                if (!(value instanceof List)) {
+                    throw new IllegalStateException("ActivityTaskManager.getTasks returned no list");
+                }
+                List<ActivityManager.RunningTaskInfo> tasks =
+                    (List<ActivityManager.RunningTaskInfo>) value;
+                taskQueryLimit = limit;
+                taskQueryMayBeTruncated = limit < MAX_TASKS && tasks.size() >= limit;
+                if (reduced) {
+                    // 部分 ROM 在任务中附带很大的扩展 Bundle。缩量只处理活连接上的事务错误，
+                    // 成功后暂时复用该范围，避免每次前台回调都重试超大的回复。
+                    nextFullTaskQueryElapsed = nowElapsed + FULL_TASK_QUERY_RETRY_MS;
+                    EventLog.warn("[前台助手] 任务查询缩量恢复: task_limit=" + limit
+                        + " task_count=" + tasks.size() + "，稍后重试完整范围");
+                } else if (limit == MAX_TASKS) {
+                    nextFullTaskQueryElapsed = 0L;
+                }
+                return tasks;
+            } catch (Exception error) {
+                if (limit <= 1 || taskServiceBinder == null || !taskServiceBinder.isBinderAlive()
+                        || !isTaskTransactionFailure(error)) {
+                    throw error;
+                }
+                limit = Math.max(1, limit / 2);
+                reduced = true;
+            }
+        }
+    }
+
+    private static boolean isTaskTransactionFailure(Throwable error) {
+        if (isDeadSystemService(error)) {
+            return true;
+        }
+        Throwable value = error;
+        for (int depth = 0; value != null && depth < 12; depth++, value = value.getCause()) {
+            if ("android.os.TransactionTooLargeException".equals(value.getClass().getName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
-     * 监听和轮询共用 ActivityTaskManager Binder。Binder 已死亡时，反射重连仍可能取得
-     * framework 缓存的旧代理；连续失败后退出进程，让外层 watchdog 创建全新的 app_process。
+     * framework 会缓存代理；确认 Binder 死亡后直接退出，由看门狗创建全新的进程。
+     * 活连接上的事务错误允许间隔重试，连续失败才重建，成功读取任务后清零计数。
      */
-    private static void recordDeadServiceFailure(Throwable error) {
-        if (!isDeadSystemService(error) || deadServiceExitScheduled) {
-            return;
-        }
-        consecutiveDeadServiceFailures++;
-        if (consecutiveDeadServiceFailures < DEAD_SERVICE_FAILURE_THRESHOLD) {
-            return;
-        }
-        scheduleDeadServiceExit();
+    private static void handleTaskFailure(String action, String reason, Throwable error) {
+        if (stopForSystemShutdown()) return;
+        boolean transientError = isTaskTransactionFailure(error);
+        consecutiveDeadServiceFailures = transientError ? consecutiveDeadServiceFailures + 1 : 0;
+        boolean recovering = transientError && !taskBinderKnownDead()
+            && consecutiveDeadServiceFailures < DEAD_SERVICE_FAILURE_THRESHOLD;
+        writeFailureState(recovering ? "recovering" : "error", reason, errorText(error));
+        logTaskError(recovering ? action + "，正在重试" : action, error, reason, recovering);
+        if (isDeadSystemService(error) && !recovering) scheduleDeadServiceExit();
+        else retryTaskRead();
+    }
+
+    private static boolean stopForSystemShutdown() {
+        if (deadServiceExitScheduled) return true;
+        if (!SystemLifecycle.shuttingDown()) return false;
+        deadServiceExitScheduled = true;
+        writeFailureState("stopped", "system_shutdown", "");
+        EventLog.info("[前台助手] 系统正在关机或重启，已停止前台任务读取；下次开机自动恢复");
+        // 此时不再访问 Binder，也不等待注销监听。状态带开机标识，不能影响下次启动。
+        handler.postDelayed(() -> System.exit(0), DEAD_SERVICE_EXIT_DELAY_MS);
+        return true;
+    }
+
+    private static boolean taskBinderKnownDead() {
+        return taskServiceBinder != null && !taskServiceBinder.isBinderAlive();
+    }
+
+    private static void retryTaskRead() {
+        nextTaskRetryElapsed = SystemClock.elapsedRealtime() + POLL_RETRY_MS;
+        requestRefresh("service_retry", POLL_RETRY_MS);
     }
 
     private static void scheduleDeadServiceExit() {
-        if (deadServiceExitScheduled) {
+        if (stopForSystemShutdown()) {
             return;
         }
         deadServiceExitScheduled = true;
@@ -383,11 +508,39 @@ public final class ForegroundHelper {
     }
 
     private static void logTaskError(String action, Throwable error) {
+        logTaskError(action, error, "");
+    }
+
+    private static void logTaskError(String action, Throwable error, String reason) {
+        logTaskError(action, error, reason, false);
+    }
+
+    private static void logTaskError(String action, Throwable error, String reason, boolean recovering) {
         String text = action + ": " + errorText(error);
         long nowElapsed = SystemClock.elapsedRealtime();
         if (!text.equals(lastTaskError)
                 || nowElapsed - lastTaskErrorLogElapsed >= DUPLICATE_ERROR_LOG_INTERVAL_MS) {
-            EventLog.error("[前台助手] " + text);
+            StringBuilder detail = new StringBuilder("[前台助手] ").append(text)
+                .append("\nSDK=").append(Build.VERSION.SDK_INT)
+                .append(" boot_id=").append(bootId)
+                .append(" binder_alive=").append(taskServiceBinder == null ? "unknown"
+                    : Boolean.toString(taskServiceBinder.isBinderAlive()))
+                .append(" listener=").append(listenerRegistered)
+                .append(" task_limit=").append(taskQueryLimit)
+                .append(" consecutive_failures=").append(consecutiveDeadServiceFailures)
+                .append(" reason=").append(reason);
+            // 保留原始调用位置和原因链；限制长度与频率，不在异常循环中无限写日志。
+            Throwable cause = error;
+            for (int depth = 0; cause != null && depth < 6 && detail.length() < 6000; depth++) {
+                detail.append("\n").append(depth == 0 ? "" : "Caused by: ").append(errorText(cause));
+                StackTraceElement[] stack = cause.getStackTrace();
+                for (int i = 0; i < stack.length && i < 16 && detail.length() < 6000; i++) {
+                    detail.append("\n  at ").append(stack[i]);
+                }
+                cause = cause.getCause();
+            }
+            if (recovering) EventLog.warn(detail.toString());
+            else EventLog.error(detail.toString());
             lastTaskError = text;
             lastTaskErrorLogElapsed = nowElapsed;
         }
@@ -457,6 +610,11 @@ public final class ForegroundHelper {
             if (inScopePackages.contains(pkg)) {
                 continue;
             }
+            // 缩量后列表可能不完整，缺席不能证明应用离开。实际切换事件仍正常记录退出，
+            // 这里只暂存未确认的生命周期；不会把缺席应用冒充为当前可见应用。
+            if (taskQueryMayBeTruncated) {
+                continue;
+            }
             recordExit(pkg, observedExitElapsed);
             lifecyclePackages.remove(pkg);
         }
@@ -467,7 +625,12 @@ public final class ForegroundHelper {
         }
         // 应用快速重新进入后仍保留退出记录。消费者会将退出时间与生命周期进入时间比较，
         // 因此旧退出记录不会中断新生命周期，也不会在两次读取之间丢失。
-        lastInScopePackages = new LinkedHashSet<>(inScopePackages);
+        if (taskQueryMayBeTruncated) {
+            lastInScopePackages.retainAll(lifecyclePackages.keySet());
+            lastInScopePackages.addAll(inScopePackages);
+        } else {
+            lastInScopePackages = new LinkedHashSet<>(inScopePackages);
+        }
         pruneExitRecords();
         final long currentGeneration = ++generation;
         writeState(out -> {
@@ -494,6 +657,8 @@ public final class ForegroundHelper {
             line(out, "lifecycle_packages", joinLifecycleRecords());
             line(out, "exited_packages", joinExitRecords());
             line(out, "task_count", String.valueOf(taskCount));
+            line(out, "task_query_limit", String.valueOf(taskQueryLimit));
+            line(out, "task_query_limited", taskQueryMayBeTruncated ? "1" : "0");
             line(out, "error", startupError);
         });
         PerformanceOverlayController.update(configDir, handler,
@@ -501,7 +666,7 @@ public final class ForegroundHelper {
             "1".equals(interactiveState()));
     }
 
-    private static void writeErrorState(String reason, Throwable error) {
+    private static void writeFailureState(String status, String reason, String error) {
         if (stateFile == null) {
             return;
         }
@@ -510,7 +675,7 @@ public final class ForegroundHelper {
         writeState(out -> {
             line(out, "version", "2");
             line(out, "boot_id", bootId);
-            line(out, "status", "error");
+            line(out, "status", status);
             line(out, "mode", listenerRegistered ? "listener" : "poll");
             line(out, "sdk", String.valueOf(Build.VERSION.SDK_INT));
             line(out, "pid", String.valueOf(Process.myPid()));
@@ -518,7 +683,7 @@ public final class ForegroundHelper {
             line(out, "generation", String.valueOf(currentGeneration));
             line(out, "updated_elapsed_ms", String.valueOf(nowElapsed));
             line(out, "updated_wall_ms", String.valueOf(System.currentTimeMillis()));
-            line(out, "interactive", interactiveState());
+            line(out, "interactive", "unknown");
             line(out, "reason", reason);
             line(out, "selection", "none");
             line(out, "focused_package", "");
@@ -531,7 +696,7 @@ public final class ForegroundHelper {
             line(out, "lifecycle_packages", joinLifecycleRecords());
             line(out, "exited_packages", joinExitRecords());
             line(out, "task_count", "0");
-            line(out, "error", errorText(error));
+            line(out, "error", error);
         });
     }
 
@@ -563,7 +728,7 @@ public final class ForegroundHelper {
     }
 
     private static void uidMapLoop() {
-        if (deadServiceExitScheduled) {
+        if (stopForSystemShutdown()) {
             return;
         }
         syncPackageUidMap("loop");
@@ -636,16 +801,25 @@ public final class ForegroundHelper {
                     }
                 }
             } catch (Throwable error) {
+                if (stopForSystemShutdown()) return;
+                boolean binderDead = packageManager instanceof IInterface
+                    && !((IInterface) packageManager).asBinder().isBinderAlive();
                 packageManager = null;
-                EventLog.error("[前台助手] 生成 package_uid.map 失败: " + errorText(error));
-                if (isDeadSystemService(error)) {
-                    writeErrorState("package_uid_map", error);
+                consecutiveUidMapFailures++;
+                boolean recovering = isTaskTransactionFailure(error) && !binderDead
+                    && consecutiveUidMapFailures < DEAD_SERVICE_FAILURE_THRESHOLD;
+                logTaskError("生成 package_uid.map 失败" + (recovering ? "，稍后重试" : ""),
+                    error, "package_uid_map", recovering);
+                // 包管理一次事务失败不能打断仍然健康的前台监听；连续失败再重建代理。
+                if (isDeadSystemService(error) && !recovering) {
+                    writeFailureState("error", "package_uid_map", errorText(error));
                     scheduleDeadServiceExit();
                 }
                 return;
             }
         }
 
+        consecutiveUidMapFailures = 0;
         UidMapWriteResult writeResult = writeUidMap(uidMap);
         if (writeResult == UidMapWriteResult.FAILED) {
             return;
@@ -856,7 +1030,9 @@ public final class ForegroundHelper {
             return;
         }
         try {
-            invoke(unregisterMethod, activityTaskManager, listener);
+            if (!taskBinderKnownDead() && !SystemLifecycle.shuttingDown()) {
+                invoke(unregisterMethod, activityTaskManager, listener);
+            }
         } catch (Throwable ignored) {
         } finally {
             listenerRegistered = false;

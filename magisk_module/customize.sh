@@ -94,7 +94,8 @@ check_required_files() {
 }
 extract_bin() {
 	ui_print "********************************************"
-	mkdir -p $MODPATH/config/bin
+	# 显式使用系统 mkdir，避免 Root 管理器的 standalone BusyBox 在根目录钩子下失败。
+	/system/bin/mkdir -p "$MODPATH/config/bin" || abort "! 无法创建二进制目录"
 	if [ "$ARCH" == "arm" ]; then
 		BIN_ABI_DIR="armeabi-v7a"
 	elif [ "$ARCH" == "arm64" ]; then
@@ -283,7 +284,7 @@ configure_joyose_smartop() {
 
 remove_sys_perf_config() {
 	for SYSPERFCONFIG in $(ls /system/vendor/bin/msm_irqbalance); do
-		[[ ! -d $MODPATH${SYSPERFCONFIG%/*} ]] && mkdir -p $MODPATH${SYSPERFCONFIG%/*}
+		[[ ! -d $MODPATH${SYSPERFCONFIG%/*} ]] && /system/bin/mkdir -p "$MODPATH${SYSPERFCONFIG%/*}"
 		ui_print "- Remove :$SYSPERFCONFIG"
 		touch $MODPATH$SYSPERFCONFIG
 	done
@@ -435,7 +436,7 @@ preserve_config() {
 }
 
 add_default_rules() {
-	mkdir -p "$MODPATH/config"
+	/system/bin/mkdir -p "$MODPATH/config" || abort "! 无法创建配置目录"
 	local CONFIG_FILE="$MODPATH/config/applist.conf"
 	preserve_config applist.conf "线程规则配置" && return
 	[ -f "$MODPATH/rules.sh" ] || abort "! 找不到默认规则文件 rules.sh"
@@ -454,7 +455,7 @@ normalize_cpuset_name() {
 }
 
 prepare_calib_policy() {
-	mkdir -p "$MODPATH/config"
+	/system/bin/mkdir -p "$MODPATH/config" || abort "! 无法创建配置目录"
 	local PENDING_POLICY="$MODPATH/config/calib_policy.conf"
 	if ! preserve_config calib_policy.conf "自动校准策略"; then
 		cat > "$PENDING_POLICY" <<EOF
@@ -538,17 +539,49 @@ prepare_auto_history() {
 	fi
 }
 
-# 重建临时进程索引，保留规则判定结果和线程恢复数据。
+# 状态文件由正在运行的守护进程原子替换；一次打开读取完整快照，不与后续的新版本比较。
+# 安装末尾会统一设置权限，不复制旧文件的属主、时间等元数据，避免 cp -p 的附加操作失败。
+copy_runtime_state_snapshot() {
+	local SOURCE="$1" DESTINATION="$2" TEMP="$2.install.$$" ERROR_FILE="$2.copy-error.$$" ATTEMPT=0
+	RUNTIME_STATE_COPY_ERROR=""
+	if [ -L "$SOURCE" ] || [ -L "$DESTINATION" ] ||
+		{ [ -e "$DESTINATION" ] && [ ! -f "$DESTINATION" ]; }; then
+		RUNTIME_STATE_COPY_ERROR="运行状态路径不是普通文件，未覆盖目标"
+		return 1
+	fi
+	while [ "$ATTEMPT" -lt 3 ]; do
+		if { cat "$SOURCE" > "$TEMP" && mv -f "$TEMP" "$DESTINATION"; } 2> "$ERROR_FILE"; then
+			rm -f "$ERROR_FILE"
+			return 0
+		fi
+		ATTEMPT=$((ATTEMPT + 1))
+		[ "$ATTEMPT" -ge 3 ] || sleep 0.1
+	done
+	RUNTIME_STATE_COPY_ERROR="$(sed -n '1,4p' "$ERROR_FILE" 2>/dev/null)"
+	rm -f "$TEMP" "$ERROR_FILE"
+	return 1
+}
+
+# 重建临时进程索引；规则检测缓存尽量保留，线程恢复基线和存储注册信息必须保留。
 prepare_runtime_state_dir() {
-	mkdir -p "$MODPATH/config/state"
+	/system/bin/mkdir -p "$MODPATH/config/state" || abort "! 无法创建模块运行状态目录"
 	rm -f "$MODPATH/config/state/package_uid.map" "$MODPATH/config/state/package_uid.map."*.tmp \
 		"$MODPATH/config/state/pid_cache.tsv" "$MODPATH/config/state/pid_cache.tsv."*.tmp
 	[ -n "$QIXIA_UPGRADE_SOURCE" ] || return 0
 	local FILE
 	for FILE in rule_health.tsv managed_tids.tsv auto_affinity.restore app_storage.conf refresh_rate.state; do
 		[ -f "$QIXIA_UPGRADE_SOURCE/config/state/$FILE" ] || continue
-		cp -pf "$QIXIA_UPGRADE_SOURCE/config/state/$FILE" "$MODPATH/config/state/" \
-			|| abort "! 模块运行状态保留失败：$FILE"
+		if copy_runtime_state_snapshot "$QIXIA_UPGRADE_SOURCE/config/state/$FILE" "$MODPATH/config/state/$FILE"; then
+			continue
+		fi
+		[ -z "$RUNTIME_STATE_COPY_ERROR" ] || ui_print "! $RUNTIME_STATE_COPY_ERROR"
+		if [ "$FILE" = rule_health.tsv ]; then
+			# 仅清理新安装目录的检测缓存，不修改正在生效的模块及用户线程规则。
+			rm -f "$MODPATH/config/state/$FILE" || abort "! 无法清理新安装目录的规则检测缓存"
+			ui_print '! 规则检测缓存未能保留，将由守护进程重新检测；继续安装'
+		else
+			abort "! 重要运行数据保留失败：$FILE；原文件仍保留"
+		fi
 	done
 }
 
@@ -579,7 +612,7 @@ relocate_current_collection_files() {
 			[ -d "$FILES" ] && [ "$(stat -c %u "$FILES")" = "$UID_VALUE" ] \
 				|| abort "! 请解锁并打开新版 App 后重试；原采集数据已保留"
 			DESTINATION="$FILES/capture/$KIND"
-			mkdir -p "$DESTINATION" || abort "! 无法准备 App 私有采集目录"
+			/system/bin/mkdir -p "$DESTINATION" || abort "! 无法准备 App 私有采集目录"
 			NAME=${SOURCE##*/}
 			if [ -e "$DESTINATION/$NAME" ]; then
 				cmp -s "$SOURCE" "$DESTINATION/$NAME" || abort "! 采集文件同名冲突，双方数据均已保留：$NAME"

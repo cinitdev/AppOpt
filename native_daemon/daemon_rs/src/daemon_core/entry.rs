@@ -9,6 +9,10 @@ use super::*;
 // 入口只做参数分流，业务逻辑分别放在守护主循环、CLI、前台状态和控制套接字模块里。
 pub(super) fn run() {
     #[cfg(any(target_os = "android", target_os = "linux"))]
+    if env::args().nth(1).as_deref() == Some("--try-lock-fd") {
+        std::process::exit(control_lock::run());
+    }
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     if env::args().nth(1).as_deref() == Some("--check-daemon") {
         let result = daemon_socket_health_client();
         if let Err(error) = &result { eprintln!("守护健康检查失败: {error}"); }
@@ -204,6 +208,7 @@ pub(super) fn print_help() {
            --scan-once   只打印命中的进程/线程规则, 不修改绑核\n\
            --app-state <包名>  打印 cgroup 前台包状态\n\
            --find-pid <进程名>  从 QixiaThreads 进程索引查询 PID\n\
+           --try-lock-fd <句柄>  尝试取得继承文件句柄的排他锁，退出码 75 表示占用\n\
             --find-processes <名称...>  输出当前存在的进程名\n\
             -b, --cpuset-name <名称>  设置 /dev/cpuset 下的 QixiaThreads 运行组名称\n\
             -P, --ping-daemon <socket> <token>  请求守护进程回连 App 验证 socket\n\

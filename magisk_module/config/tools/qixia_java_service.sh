@@ -27,6 +27,38 @@ shift
 JAR="$DIR/$NICE_NAME.jar"
 BIN_RS="$MODDIR/config/bin/QiXiaRs"
 RESTART_COOLDOWN_SECONDS=20
+. "$MODDIR/tools/service_runtime.sh" || exit 1
+
+# 用内核文件锁串行化 App、看门狗和热更新发起的生命周期操作。
+# 锁文件保持同一 inode，不能在释放时删除；进程异常退出后由内核自动释放锁。
+acquire_control_lock() {
+    local attempt=0 lock_status
+    if [ ! -x "$BIN_RS" ]; then
+        echo "[Java 服务] Rust 锁工具不可执行：$BIN_RS" >&2
+        return 1
+    fi
+    /system/bin/mkdir -p "$MODDIR/config/state" || return 1
+    exec 9>"$MODDIR/config/state/$NICE_NAME.control.lock" || return 1
+    while [ "$attempt" -lt 60 ]; do
+        # 显式继承 fd 9，直接由随包 Rust 二进制调用内核文件锁。
+        # 只有明确的锁占用才等待，句柄、权限或程序错误立即报告。
+        if "$BIN_RS" --try-lock-fd 9 9>&9; then
+            return 0
+        else
+            lock_status=$?
+        fi
+        if [ "$lock_status" -ne 75 ]; then
+            echo "[Java 服务] $NICE_NAME 文件锁调用失败（退出码 $lock_status），已停止服务变更" >&2
+            exec 9>&-
+            return 1
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    exec 9>&-
+    echo "[Java 服务] 等待 $NICE_NAME 生命周期锁超时" >&2
+    return 1
+}
 
 find_app_process() {
     for candidate in /system/bin/app_process /system/bin/app_process64 /system/bin/app_process32; do
@@ -124,12 +156,6 @@ helper_running() {
     return 1
 }
 
-stop_all_helpers() {
-    for pid in $(helper_pids); do
-        kill "$pid" 2>/dev/null || true
-    done
-}
-
 # 系统服务死亡时 Java 助手会主动退出。短暂冷却可避免 system_server 尚未恢复时反复拉起。
 helper_restart_cooling_down() {
     [ -f "$STATE" ] || return 1
@@ -171,19 +197,21 @@ helper_dead_system_state() {
 }
 
 start_helper() {
+    # 系统已经进入关机阶段时不再拉起助手，不把正常退出写成启动故障。
+    system_shutdown_requested && return 0
     if helper_running; then
         running_pid=$helper_pid
-        if ! helper_dead_system_state; then
+        if [ "$NICE_NAME" = qixia_foreground_helper ] || ! helper_dead_system_state; then
+            # 前台助手自己判断短暂错误和死亡连接，不能看到一次 error 就抢先杀掉它。
             # 模块更新或异常重启可能留下旧助手，始终只保留已经验证的实例。
             stop_other_helpers "$running_pid"
             return 0
         fi
-        stop_all_helpers
+        # 刷新率助手退出时需要恢复原值，退出超时不能继续启动第二个实例。
+        stop_helper || return 1
     fi
-    # 状态文件失效时仍可能残留旧助手，先清理孤儿，避免多个进程争写同一状态文件。
-    stop_all_helpers
     [ "${1:-}" = "force" ] || ! helper_restart_cooling_down || return 0
-    mkdir -p "$MODDIR/config" "$MODDIR/config/state" "$MODDIR/logs"
+    /system/bin/mkdir -p "$MODDIR/config" "$MODDIR/config/state" "$MODDIR/logs" || return 1
     [ -f "$JAR" ] || {
         echo "[前台助手] 找不到 jar: $JAR" >> "$LOG"
         return 1
@@ -198,7 +226,7 @@ start_helper() {
         -Xnoimage-dex2oat \
         /system/bin \
         --nice-name="$NICE_NAME" \
-        "$CLASS" "$STATE" >> "$LOG" 2>&1 </dev/null &
+        "$CLASS" "$STATE" >> "$LOG" 2>&1 </dev/null 9>&- &
     started_pid=$!
     # 启动等待有时间上限；只通过 Java 原子写入的任务快照持久保存进程身份。
     attempt=0
@@ -225,6 +253,12 @@ stop_helper() {
     done
     return 1
 }
+
+case "${1:-start}" in
+    start|stop|restart) acquire_control_lock || exit 1 ;;
+    status) ;;
+    *) echo "用法: $0 [start|stop|restart|status]"; exit 2 ;;
+esac
 
 case "${1:-start}" in
     start) start_helper ;;

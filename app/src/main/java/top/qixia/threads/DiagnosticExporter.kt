@@ -284,6 +284,7 @@ object DiagnosticExporter {
         emit_file 'config/auto_affinity.state' '/data/adb/modules/QixiaThreads/config/auto_affinity.state'
         emit_file 'config/state/auto_affinity.restore' '/data/adb/modules/QixiaThreads/config/state/auto_affinity.restore'
         emit_file 'config/foreground_task.state' '/data/adb/modules/QixiaThreads/config/foreground_task.state'
+        emit_file 'config/state/capsule_start.state' '/data/adb/modules/QixiaThreads/config/state/capsule_start.state' 4096
         emit_file 'config/state/app_storage.conf' '${PrivateCaptureStorage.REGISTRATION}'
 
         history_count=0

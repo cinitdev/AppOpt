@@ -112,7 +112,7 @@ class QixiaThreadsRepository(private val application: Application) {
         val foreground = if (usable) {
             runCatching {
                 val current = DaemonBridge.readTaskForegroundState()
-                if (current.available) current else {
+                if (current.connected || current.recovering) current else {
                     DaemonBridge.ensureTaskForegroundHelper()
                     DaemonBridge.readTaskForegroundState()
                 }

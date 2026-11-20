@@ -72,11 +72,37 @@ detach_runtime() {
 	command -v setsid >/dev/null 2>&1 || return 1
 	align_runtime_cgroups "$$" /proc/1/cgroup "/proc/$$/cgroup" "/proc/$$/mountinfo"
 }
+runtime_cgroups_healthy() (
+	local target=$1 current=$2 cpuset
+	[ -r "$target" ] && [ -r "$current" ] || exit 1
+	cmp -s "$target" "$current" && exit 0
+	# 用户可以给 sh 配置线程规则，Rust 接管后看门狗会进入本模块 cpuset。
+	# 复用启动脚本的自定义组名解析，只允许这一个控制器发生已知变化；
+	# freezer、统一 cgroup v2 及其他控制器仍须与 init 完全一致。
+	[ -r "$ACTIVE/tools/service_runtime.sh" ] || exit 1
+	. "$ACTIVE/tools/service_runtime.sh"
+	CALIB_POLICY="$ACTIVE/config/calib_policy.conf"
+	cpuset="/$(read_cpuset_name)"
+	awk -F: -v cpuset="$cpuset" '
+	FILENAME == ARGV[1] {
+		if (NF != 3 || $1 in paths) invalid=1
+		paths[$1]=$3; controllers[$1]=$2; expected++; next
+	}
+	{
+		if (NF != 3 || !($1 in paths) || seen[$1]++ || $2 != controllers[$1]) { invalid=1; next }
+		count++
+		if ($3 == paths[$1]) next
+		if ($2 == "cpuset" && ($3 == cpuset || index($3, cpuset "/") == 1)) next
+		invalid=1
+	}
+	END { exit (invalid || expected == 0 || count != expected) ? 1 : 0 }
+	' "$target" "$current"
+)
 service_environment_healthy() {
 	local owner pid stamp
 	owner=$(readlink "$ACTIVE/config/state/service_watchdog.lock")
 	pid=${owner%%:*}; stamp=${owner##*:}
-	alive "$pid:$stamp" && cmp -s /proc/1/cgroup "/proc/$pid/cgroup"
+	alive "$pid:$stamp" && runtime_cgroups_healthy /proc/1/cgroup "/proc/$pid/cgroup"
 }
 show_result() {
 	[ "${SHOW_RESULT:-0}" = 1 ] || return 0
@@ -117,7 +143,7 @@ persist_result() {
 	# 首次安装尚无生效目录时，仅使用事务状态，不能创建一个空的生效模块。
 	[ -d "$ACTIVE/config" ] || return 0
 	[ -f "$TX/status" ] || return 0
-	mkdir -p "${RESULT%/*}" && cp "$TX/status" "$RESULT.tmp" &&
+	/system/bin/mkdir -p "${RESULT%/*}" && cp "$TX/status" "$RESULT.tmp" &&
 		mv -f "$RESULT.tmp" "$RESULT"
 }
 cleanup_completed_update() {
@@ -133,7 +159,7 @@ cleanup_completed_update() {
 	rm -f "$ACTIVE/customize.sh" || return 1
 	[ ! -d "$ACTIVE/config/app" ] || return 0
 	# 日志归入已有日志目录；脚本与备份不再作为长期运行依赖。
-	mkdir -p "$ACTIVE/logs" || return 1
+	/system/bin/mkdir -p "$ACTIVE/logs" || return 1
 	for file in "$TX/update.log" "$TX/app-update.log"; do
 		[ ! -f "$file" ] || tail -n 200 "$file" >> "$ACTIVE/logs/HotUpdate.log" || return 1
 	done
@@ -279,7 +305,7 @@ start_service() {
 }
 copy_file() {
 	local source=$1 destination=$2
-	mkdir -p "${destination%/*}" && cp -p "$source" "$destination.hot-new" &&
+	/system/bin/mkdir -p "${destination%/*}" && cp -p "$source" "$destination.hot-new" &&
 		cmp -s "$source" "$destination.hot-new" && mv -f "$destination.hot-new" "$destination"
 }
 backup_runtime() {
@@ -390,7 +416,7 @@ apply_update() {
 	# 工作进程先脱离管理器控制组；安装页只等服务检查，不负责托管长期服务。
 	detach_runtime || return 1
 	[ "$mode" = sync ] || wait_installers "$waiters" || return 1
-	mkdir -p "$TX" && chmod 0700 "$TX" || return 1
+	/system/bin/mkdir -p "$TX" && chmod 0700 "$TX" || return 1
 	take_lock || return 0
 	[ -d "$STAGED" ] || { recover; return $?; }
 	VERSION=$(prop versionCode "$STAGED/module.prop")
@@ -469,7 +495,7 @@ installer_waiters() {
 
 queue_update() {
 	# 独立副本保证替换 service/tools 时工作进程不会读到半个新脚本。
-	mkdir -p "$TX" && chmod 0700 "$TX" || return 1
+	/system/bin/mkdir -p "$TX" && chmod 0700 "$TX" || return 1
 	# 排队命令本身就是独立 Shell，先同步完成隔离，失败时保留原服务和重启更新。
 	detach_runtime || { printf '%s\n' '无法建立独立后台环境，保留重启更新' >&2; return 1; }
 	if alive "$(readlink "$LOCK")"; then
@@ -580,7 +606,7 @@ case "$1" in
 		CALLER="$2:$(starttime "$2"):$BOOT"
 		alive "$CALLER" || exit 1
 		detach_runtime || exit 1
-		mkdir -p "$TX" || exit 1
+		/system/bin/mkdir -p "$TX" || exit 1
 		setsid sh "$0" --install-app "$CALLER" </dev/null >> "$TX/app-update.log" 2>&1 &
 		;;
 	--install-app)

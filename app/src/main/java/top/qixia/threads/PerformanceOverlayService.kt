@@ -36,11 +36,16 @@ class PerformanceOverlayService : Service() {
     private var disablePending = false
     private var lastCompletionAt = 0L
     private var generation = 0
+    private var launchReply: CapsuleReply? = null
+    private var foregroundFailure: String? = null
+    private var lastLaunchHeartbeat = 0L
     private val pulse = object : Runnable {
         override fun run() {
             if (destroyed) return
             consumeState()
             render()
+            if (!closing && capsuleContainer?.isAttachedToWindow == true &&
+                SystemClock.elapsedRealtime() - lastLaunchHeartbeat >= 5000L) reportLaunch("running")
             main.postDelayed(this, 500)
         }
     }
@@ -51,10 +56,12 @@ class PerformanceOverlayService : Service() {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel("performance_recording", "性能记录胶囊", NotificationManager.IMPORTANCE_LOW))
         val open = PendingIntent.getActivity(this, 0, Intent(this, QixiaThreadsComposeActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        startForeground(2406, Notification.Builder(this, "performance_recording")
+        runCatching { startForeground(2406, Notification.Builder(this, "performance_recording")
             .setSmallIcon(R.mipmap.ic_launcher).setContentTitle("性能记录胶囊")
             .setContentText("点击胶囊开始或结束，长按关闭当前应用的性能记录")
-            .setContentIntent(open).setOngoing(true).build())
+            .setContentIntent(open).setOngoing(true).build()) }.onFailure {
+            foregroundFailure = "前台服务启动失败：${it.javaClass.simpleName}"
+        }
         main.post(pulse)
     }
 
@@ -62,20 +69,29 @@ class PerformanceOverlayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val pkg = intent?.getStringExtra("target_pkg").orEmpty()
+        val incoming = CapsuleReply.from(intent)
+        foregroundFailure?.let { incoming?.send("failed", it); stopSelf(); return START_NOT_STICKY }
         if (!pkg.matches(Regex("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+"))) { stopSelf(); return START_NOT_STICKY }
         if (intent?.getStringExtra("operation") == "leave") {
             // 原服务已经退出时，迟到的离开通知可能冷启动一个新实例。
             if (packageNameTarget.isEmpty() && desiredPackage.isEmpty()) {
+                incoming?.send("idle")
                 stopSelf(); return START_NOT_STICKY
             }
             if (pkg == desiredPackage || pkg == packageNameTarget) {
+                launchReply = incoming
                 desiredPackage = ""
                 leave()
-            }
+                reportLaunch("idle")
+            } else incoming?.send("idle")
             return START_NOT_STICKY
         }
         desiredPackage = pkg
-        if (pkg == packageNameTarget && !closing) return START_NOT_STICKY
+        launchReply = incoming
+        if (pkg == packageNameTarget && !closing && capsuleContainer?.isAttachedToWindow == true) {
+            reportLaunch("running")
+            return START_NOT_STICKY
+        }
         if (token != null) { leave(); return START_NOT_STICKY }
         showPackage(pkg)
         return START_NOT_STICKY
@@ -88,6 +104,7 @@ class PerformanceOverlayService : Service() {
             main.post {
                 if (destroyed || revision != generation || desiredPackage != pkg) return@post
                 if (!enabled || !Settings.canDrawOverlays(this)) {
+                    reportLaunch("failed", if (enabled) "未授予悬浮窗权限" else "目标应用未启用性能记录或配置读取失败")
                     if (enabled) toast("请先在柒夏线程授予悬浮窗权限")
                     stopSelf(); return@post
                 }
@@ -147,8 +164,13 @@ class PerformanceOverlayService : Service() {
                 else -> false
             }
         }
-        try { windows.addView(view, params); capsule = text; capsuleContainer = view; capsuleBackground = 0; render() }
-        catch (_: Exception) { toast("胶囊显示失败，请检查悬浮窗权限"); stopSelf() }
+        try {
+            windows.addView(view, params); capsule = text; capsuleContainer = view; capsuleBackground = 0; render()
+            view.post { if (!destroyed && !closing && capsuleContainer === view && view.isAttachedToWindow) reportLaunch("running") }
+        } catch (error: Exception) {
+            reportLaunch("failed", "创建悬浮窗口失败：${error.javaClass.simpleName}")
+            toast("胶囊显示失败，请检查悬浮窗权限"); stopSelf()
+        }
     }
 
     private fun startFpsMonitor(pkg: String) {
@@ -291,6 +313,7 @@ class PerformanceOverlayService : Service() {
                 else "已离开应用，胶囊已收起；下次进入会再次显示")
         }
         removeCapsule()
+        reportLaunch("idle")
         stopFpsMonitor()
         if (token != null) stopRecording() else continueOrStop()
     }
@@ -326,9 +349,18 @@ class PerformanceOverlayService : Service() {
     }
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+    private fun reportLaunch(status: String, reason: String = "") {
+        val reply = launchReply ?: return
+        if (status == "running" && (reply.pkg != packageNameTarget || capsuleContainer?.isAttachedToWindow != true)) return
+        if (status == "idle" && desiredPackage.isNotEmpty() && reply.pkg != packageNameTarget) return
+        lastLaunchHeartbeat = SystemClock.elapsedRealtime()
+        reply.send(status, reason)
+        if (status == "failed" || status == "idle") launchReply = null
+    }
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 
     override fun onDestroy() {
+        reportLaunch(if (closing) "idle" else "failed", if (closing) "" else "胶囊服务已停止")
         destroyed = true
         generation++
         main.removeCallbacksAndMessages(null)

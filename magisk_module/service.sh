@@ -48,6 +48,7 @@ if [ "$1" != --install-app ]; then
 fi
 
 [ "$1" = --install-app ] || wait_sys_boot_completed
+system_shutdown_requested && exit 0
 
 cd "$MODDIR"
 BIN="$MODDIR/config/bin/QiXiaRs"
@@ -58,8 +59,9 @@ CALIB_POLICY="$MODDIR/config/calib_policy.conf"
 FOREGROUND_HELPER_LOG="$MODDIR/logs/ForegroundHelper.log"
 QIXIA_IN_APP_UPDATE_FLAG="/data/adb/qixia_in_app_update"
 
-mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" \
-	"$MODDIR/config/state" "$MODDIR/logs"
+# 使用系统实现，绕过 standalone BusyBox 对绝对路径逐级 mkdir 的差异。
+/system/bin/mkdir -p "$MODDIR/config" "$MODDIR/config/bin" "$MODDIR/config/ebpf" \
+	"$MODDIR/config/state" "$MODDIR/logs" || exit 1
 [ "$1" = --install-app ] || rm -f "$RS_RESTART_FLAG" 2>/dev/null || true
 
 # 二进制不存在直接退出

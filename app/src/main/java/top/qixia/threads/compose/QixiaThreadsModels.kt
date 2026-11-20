@@ -123,8 +123,7 @@ data class EnvironmentUiState(
     val foregroundState: DaemonBridge.TaskForegroundState? = null,
     val overlayGranted: Boolean = false,
     val usageAccessGranted: Boolean = false,
-    val autoStartStatus: top.qixia.threads.AutoStartStatus = top.qixia.threads.AutoStartStatus.UNKNOWN,
-    val autoStartChecking: Boolean = false,
+    val autoStart: top.qixia.threads.AutoStartState = top.qixia.threads.AutoStartState(),
     val configuredAppCount: Int = 0,
     val ruleCount: Int = 0,
     val statusMessage: String? = null
