@@ -12,8 +12,8 @@ android {
         applicationId = "top.qixia.threads"
         minSdk = 31
         targetSdk = 36
-        versionCode = 207
-        versionName = "v2.0.7"
+        versionCode = 208
+        versionName = "v2.0.8"
     }
 
     signingConfigs {
