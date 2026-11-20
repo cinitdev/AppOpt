@@ -73,9 +73,6 @@ impl Activity {
             0.0
         }
     }
-    pub(super) fn peak(&self) -> f64 {
-        self.samples.iter().map(|v| v.0).fold(0.0, f64::max)
-    }
     pub(super) fn planning_peak(&self) -> f64 {
         let mut age = 0.0;
         let mut peak: f64 = 0.0;
