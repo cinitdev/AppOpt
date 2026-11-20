@@ -9,6 +9,7 @@ pub(super) const MAX_TRACKED: usize = 4096;
 pub(super) const MAX_ACTIVE: usize = MAX_TRACKED;
 const MISSING_SAMPLE_GRACE: Duration = Duration::from_millis(3300);
 const ACTIVITY_WINDOW_SECONDS: f64 = 6.0;
+const PLANNING_PEAK_HALF_LIFE_SECONDS: f64 = 2.0;
 
 /// 帧反馈较差时，请求普通规划器临时增加余量；
 /// 不撤销接管，也不改变活跃度入选门槛。
@@ -74,6 +75,17 @@ impl Activity {
     }
     pub(super) fn peak(&self) -> f64 {
         self.samples.iter().map(|v| v.0).fold(0.0, f64::max)
+    }
+    pub(super) fn planning_peak(&self) -> f64 {
+        let mut age = 0.0;
+        let mut peak: f64 = 0.0;
+        for (busy, elapsed) in self.samples.iter().rev() {
+            let midpoint_age = age + elapsed / 2.0;
+            let decay = 2.0_f64.powf(-midpoint_age / PLANNING_PEAK_HALF_LIFE_SECONDS);
+            peak = peak.max(*busy * decay);
+            age += elapsed;
+        }
+        peak
     }
     pub(super) fn eligible_at(&self, threshold: f64) -> bool {
         // 入选判断应与报告和释放判断所用均值一致。围绕阈值比较

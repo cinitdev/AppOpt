@@ -113,10 +113,15 @@ pub(super) fn apply(batch: &mut Batch, requests: &[Request], maintain: bool) -> 
         }
         let new = old.is_none_or(|entry| entry.inherited_from.is_some());
         let changed = old.is_some_and(|e| e.record.written != request.mask);
+        let target = cpuset::target(&key, request.mask);
+        let accepted_narrower = request.accept_narrower_affinity
+            && group == target
+            && before != 0
+            && before & !request.mask == 0;
         let entry = Entry { record, previous: old.and_then(|e| changed.then_some(e.record.written)),
             original_cpuset: Some(baseline_group), owned_root: cpuset::root(), inherited_from: None };
         if new || changed || old.is_some_and(|e| e.inherited_from.is_some()) { intended.insert(key, entry); dirty = true; }
-        plans.push((key, before, group, new, changed));
+        plans.push((key, before, group, new, changed, accepted_narrower));
     }
     // 首次写入 cgroup tasks 前，每个受影响线程的两份恢复基线都已持久化，
     // 之后任何阶段崩溃都可恢复。
@@ -130,11 +135,11 @@ pub(super) fn apply(batch: &mut Batch, requests: &[Request], maintain: bool) -> 
     if dirty { persist(&intended)?; }
     batch.entries = intended;
     dirty = false;
-    for (key, before, group, new, changed) in plans {
+    for (key, before, group, new, changed, accepted_narrower) in plans {
         let entry = batch.entries[&key].clone();
         let desired = entry.record.written;
         let target = cpuset::target(&key, desired);
-        let drift = group != target || before != desired;
+        let drift = group != target || (before != desired && !accepted_narrower);
         if !new && !changed && !drift {
             batch.verified.insert(key); batch.retries.remove(&key); continue;
         }

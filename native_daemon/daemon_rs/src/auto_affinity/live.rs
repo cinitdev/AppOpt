@@ -291,7 +291,7 @@ impl Controller {
                 present.contains(&(key.0, key.1))
                     && ((self.batch.mask(key).is_some() && !self.fallback_requests.contains(key)) || t.activity.eligible_at(custom::threshold(&self.custom_rules)))
             })
-            .map(|(key, entry)| ((key.0, key.1), self.batch.mask(key).is_some(), entry.activity.peak())))
+            .map(|(key, entry)| ((key.0, key.1), self.batch.mask(key).is_some(), entry.activity.planning_peak())))
             .into_iter()
             .collect();
         // 及时采样已知活跃线程，并轮换其余线程，
@@ -463,7 +463,7 @@ impl Controller {
             } else {
                 managed && entry.keep_owned(now, threshold)
             };
-            eligible.then_some((*key, managed, entry.activity.peak()))
+            eligible.then_some((*key, managed, entry.activity.planning_peak()))
         }));
 
         let mut requests = if custom_mode {
@@ -472,7 +472,7 @@ impl Controller {
             active.iter().filter_map(|key| {
                 let mask = custom::target(&self.custom_rules, &self.tracked[key].activity, available)?;
                 let original = self.batch.original(key).or_else(|| affinity(key.1).ok())?;
-                Some(Request { identity: *key, original, mask })
+                Some(Request { identity: *key, original, mask, accept_narrower_affinity: false })
             }).collect::<Vec<_>>()
         } else {
             // 系统迁移不会取消符合条件线程的期望分配。
@@ -532,7 +532,7 @@ impl Controller {
                 let scale = measured.map_or(maximum,
                     |d| (d.units / d.busy.max(0.01)).min(maximum));
                 let units = self.feedback_pressure.workload(now, planner::workload(entry.activity.average(),
-                    entry.activity.peak(), maximum, scale, measured.map_or(0.0, |d| d.units)));
+                    entry.activity.planning_peak(), maximum, scale, measured.map_or(0.0, |d| d.units)));
                 if let Some(current) = current.filter(|_| sampled.contains(key)) {
                     if settled_pin == Some(current) {
                         pinned_busy[current.trailing_zeros() as usize] += entry.latest_busy;
@@ -564,7 +564,7 @@ impl Controller {
                 let held = if promoting || self.mode_changed { 0 } else { self.batch.mask(key).unwrap_or(0) };
                 if !sampled.contains(key) && held != 0 && held & !available == 0 {
                     budget.reserve_placement(demand, held);
-                    requests.push(Request { identity: *key, original: *original, mask: held });
+                    requests.push(Request { identity: *key, original: *original, mask: held, accept_narrower_affinity: false });
                     continue;
                 }
                 let current_fits = budget.fits(demand, held);
@@ -577,7 +577,7 @@ impl Controller {
                     before.stronger_lane(available, held, desired)) {
                     budget = before;
                     budget.reserve_placement(demand, held);
-                    requests.push(Request { identity: *key, original: *original, mask: held });
+                    requests.push(Request { identity: *key, original: *original, mask: held, accept_narrower_affinity: false });
                     continue;
                 }
                 if let Some(mask) = entry.placement.choose_available(now, held, desired, available, current_fits, materially_better) {
@@ -589,6 +589,7 @@ impl Controller {
                         identity: *key,
                         original: *original,
                         mask: mask & available,
+                        accept_narrower_affinity: false,
                     });
                 }
                 // 待生效分配仍占用所提议核心池的预算。否则每个新线程
@@ -605,7 +606,7 @@ impl Controller {
             for (key, entry) in &self.tracked {
                 let Some(mask) = entry.fallback_target(now, self.main_pids.contains(&key.0), self.fallback_mask, available, threshold) else { continue; };
                 let Some(original) = self.batch.original(key).or_else(|| affinity(key.1).ok()) else { continue; };
-                requests.push(Request { identity: *key, original, mask });
+                requests.push(Request { identity: *key, original, mask, accept_narrower_affinity: true });
                 fallback_requests.insert(*key);
             }
         }

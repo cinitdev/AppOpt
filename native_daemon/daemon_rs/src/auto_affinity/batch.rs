@@ -369,6 +369,7 @@ pub(super) struct Request {
     pub identity: Identity,
     pub original: u64,
     pub mask: u64,
+    pub accept_narrower_affinity: bool,
 }
 #[derive(Default)]
 pub(super) struct Changes {
